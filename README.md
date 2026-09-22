@@ -1,7 +1,7 @@
 # agydra
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.1.0-green)
+![Version](https://img.shields.io/badge/version-1.2.0-green)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey)
 [![Author: DragonJAR](https://img.shields.io/badge/author-DragonJAR-orange)](https://www.DragonJAR.org)
@@ -50,6 +50,26 @@ pip install .        # or: pipx install .
 ```sh
 python3 -m agydra --help
 ```
+
+## ⚡ One-command install
+
+Two equivalent entry points:
+
+```sh
+python3 agydra.py    # from a fresh clone: no install needed, delegates to the package
+agydra setup         # once installed (alias: agydra install)
+```
+
+The idempotent setup (safe to re-run):
+
+- Validates Python ≥ 3.9.
+- Creates `<repo>/.venv` and runs `pip install -e .` inside it (local metadata only, no network fetch).
+- Writes a managed shim at `~/.local/bin/agydra` so `agydra` works from any directory.
+- Verifies the install by running `agydra --version`, then suggests `agydra doctor`.
+
+On Windows there is no shim: setup prints the venv `Scripts` directory that must be on `PATH`. Use `agydra setup -n` (`--dry-run`) to print the current install state (venv, console script, shim, `PATH`) without touching anything.
+
+> **Safety:** setup refuses to overwrite a foreign file at `~/.local/bin/agydra` (it only rewrites shims carrying the marker "Managed by agydra setup"), refreshes stale shims automatically, and recreates a venv missing its interpreter. `agydra doctor` now includes an `install` check covering venv + console script + shim + `PATH`.
 
 ## ⚙️ Prerequisites
 
@@ -173,6 +193,7 @@ OAuth tokens are never copied
 | `agydra rename A B` · `mv` | Rename a profile (refuses busy) |
 | `agydra delete NAME\|# [-f] [--no-backup]` · `rm` | Backup ZIP then delete (refuses busy) |
 | `agydra share-config SRC TARGET...` · `share` | Copy `settings.json` + `mcp.json` only |
+| `agydra setup [-n]` · `install` | One-command install: create the venv, install the console script, verify; `-n` prints the current install state. `python3 agydra.py` is the zero-install bootstrap from a fresh clone |
 | `agydra doctor` · `doc` | Diagnostics; exit 1 iff any check fails |
 
 | Flag | Long form | Description |
@@ -254,7 +275,7 @@ A corrupt config degrades to defaults for reads but refuses writes.
 - Every feature must work cross-platform (macOS, Linux, Windows) from the
   single codebase; keep `platforms.py` the only per-OS layer.
 - Run the full suite before opening a change:
-  `python3 -m pytest -q` (102 passed + 3 platform skips on macOS).
+  `python3 -m pytest -q` (121 passed + 3 platform skips on macOS).
 - See [AGENTS.md](AGENTS.md) for conventions.
 
 ## 📄 License

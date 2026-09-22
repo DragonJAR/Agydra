@@ -38,6 +38,26 @@ pip install .      # o: pipx install .
 python3 -m agydra --help
 ```
 
+## ⚡ Instalación en un comando
+
+Dos puntos de entrada equivalentes:
+
+```sh
+python3 agydra.py    # desde un clon limpio: sin instalar nada, delega en el paquete
+agydra setup         # una vez instalado (alias: agydra install)
+```
+
+El setup es idempotente (puede re-ejecutarse sin riesgo):
+
+- Valida Python ≥ 3.9.
+- Crea `<repo>/.venv` y ejecuta `pip install -e .` dentro (solo metadatos locales, sin descargas de red).
+- Escribe un shim administrado en `~/.local/bin/agydra` para que `agydra` funcione desde cualquier directorio.
+- Verifica la instalación ejecutando `agydra --version` y sugiere `agydra doctor`.
+
+En Windows no hay shim: el setup imprime el directorio `Scripts` del venv que debe estar en el `PATH`. Con `agydra setup -n` (`--dry-run`) imprimes el estado actual de la instalación (venv, console script, shim, `PATH`) sin tocar nada.
+
+> **Seguridad:** el setup se niega a sobrescribir un archivo ajeno en `~/.local/bin/agydra` (solo reescribe shims que llevan el marcador "Managed by agydra setup"), refresca automáticamente un shim obsoleto y recrea un venv al que le falte el intérprete. `agydra doctor` ahora incluye un check `install` que cubre venv + console script + shim + `PATH`.
+
 ## ⚙️ Requisitos previos
 
 | Requisito | Detalle |
@@ -53,7 +73,7 @@ agydra doctor
 ```
 
 ```text
-agydra doctor — agydra 1.1.0 on darwin
+agydra doctor — agydra 1.2.0 on darwin
 legend: [ok]=pass [!!]=warn [XX]=fail
 [ok] agy binary: /usr/local/bin/agy
 [ok] store writable: ~/Library/Application Support/agydra
@@ -188,6 +208,7 @@ copied: personal/mcp.json
 | `rename A B` | `mv` | Renombra un perfil (rechaza ocupados). |
 | `delete NOMBRE\|# [-f] [--no-backup]` | `rm` | ZIP de respaldo y borrar (rechaza ocupados). |
 | `share-config ORIGEN DESTINO...` | `share` | Copia solo `settings.json` + `mcp.json` entre perfiles. |
+| `setup [-n]` | `install` | Instalación en un comando: crea el venv, instala el console script y verifica; `-n` imprime el estado actual. `python3 agydra.py` es el bootstrap sin instalación desde un clon limpio. |
 | `doctor` | `doc` | Diagnóstico completo del entorno. |
 
 | Flag corto | Flag largo | Función |

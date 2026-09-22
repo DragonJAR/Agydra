@@ -171,6 +171,50 @@ def _check_sandbox(_store: Store):
     return WARN, "linux sandbox: bwrap not installed (optional hardening disabled)"
 
 
+def _check_bootstrap(_store: Store):
+    """Report the one-command install state (venv, shim, PATH)."""
+    from . import bootstrap
+
+    root = bootstrap.project_root()
+    state = bootstrap.check_state(root)
+    parts = []
+    status = OK
+    if sys.platform.startswith("win"):
+        # Windows: no shim; the venv Scripts dir itself must be on PATH.
+        if not state["venv"]:
+            return WARN, (
+                "install: venv missing — run `python3 agydra.py` (repo root) "
+                "or `agydra setup` to create it"
+            )
+        if not state["console"]:
+            return WARN, f"install: console script missing — re-run `agydra setup` ({bootstrap.console_script(root)})"
+        if not state["on_path"]:
+            return WARN, f"install: venv Scripts dir not on PATH: {bootstrap.console_script(root).parent}"
+        return OK, f"install: {bootstrap.console_script(root)} on PATH"
+    if not state["venv"]:
+        return WARN, "install: venv missing — run `python3 agydra.py` or `agydra setup`"
+    if not state["console"]:
+        return WARN, "install: console script missing — re-run `agydra setup`"
+    shim_state = state["shim_state"]
+    if shim_state == "ok":
+        parts.append(f"shim ok ({bootstrap.shim_path()})")
+    elif shim_state == "foreign":
+        return WARN, (
+            f"install: foreign file at {bootstrap.shim_path()} — inspect and "
+            "remove it, then re-run `agydra setup`"
+        )
+    elif shim_state == "stale":
+        parts.append("shim stale (venv moved?) — re-run `agydra setup`")
+        status = WARN
+    else:
+        parts.append("shim missing — re-run `agydra setup`")
+        status = WARN
+    if not state["on_path"]:
+        parts.append(f"{bootstrap.user_bin_dir()} not on PATH")
+        status = WARN
+    return status, "install: " + "; ".join(parts)
+
+
 CHECKS = [
     ("binary", _check_binary),
     ("store", _check_store),
@@ -180,6 +224,7 @@ CHECKS = [
     ("keychain", _check_keychain),
     ("schema", _check_schema_canary),
     ("sandbox", _check_sandbox),
+    ("install", _check_bootstrap),
 ]
 
 

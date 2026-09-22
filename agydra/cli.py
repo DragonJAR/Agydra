@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import __version__, account, keychain, locks, platforms, resolver, runner
+from .bootstrap import BootstrapError
 from .isolation import IsolationError
 from .store import Store, StoreError, atomic_copy
 
@@ -40,6 +41,7 @@ _SUBCOMMAND_ALIASES: Dict[str, Tuple[str, ...]] = {
     "share-config": ("share",),
     "use": ("u",),
     "doctor": ("doc",),
+    "setup": ("install",),
     "help": (),
     "version": (),
 }
@@ -390,9 +392,30 @@ def cmd_doctor(store: Store, _args) -> int:
     return run_checks(store)
 
 
+def cmd_setup(_store: Store, args) -> int:
+    """Idempotent one-command installer (venv + console script + PATH shim).
+
+    Available both from the installed CLI and (via the repo-root agydra.py)
+    from a fresh clone with no installation at all. ``-n/--dry-run`` reports
+    the current install state without touching anything.
+    """
+    from . import bootstrap
+
+    if getattr(args, "dry_run", False):
+        state = bootstrap.check_state(bootstrap.project_root())
+        print("agydra setup (dry run) — current install state:")
+        for key, present in (("venv", state["venv"]), ("console script", state["console"])):
+            print(f"  {'[ok]' if present else '[--]'} {key}")
+        print(f"  [{'ok' if state['shim_ok'] else '!!'}] shim: {state['shim_state']}")
+        print(f"  [{'ok' if state['on_path'] else '!!'}] shim dir on PATH: {state['on_path']}")
+        print("run `agydra setup` to create or repair anything marked [--]/[!!]")
+        return 0
+    return bootstrap.run()
+
+
 def _report_error(exc: BaseException) -> int:
     """Single error-mapping table shared by both dispatch paths."""
-    if isinstance(exc, (StoreError, IsolationError)):
+    if isinstance(exc, (StoreError, IsolationError, BootstrapError)):
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if isinstance(exc, EOFError):
@@ -499,6 +522,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.set_defaults(func=cmd_use)
         elif sub == "doctor":
             parser.set_defaults(func=cmd_doctor)
+        elif sub == "setup":
+            parser.add_argument(
+                "-n", "--dry-run", action="store_true",
+                help="print what setup would do without touching anything",
+            )
+            parser.set_defaults(func=cmd_setup)
         args = parser.parse_args(rest)
         try:
             return args.func(store, args)
