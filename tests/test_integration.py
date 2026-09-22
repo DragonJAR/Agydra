@@ -393,6 +393,78 @@ class TestAliasesAndFlagTable(BaseCase):
                       "import main", "agydra -p"):
             self.assertIn(token, out)
 
+    def test_help_is_plain_in_captured_pipes(self):
+        # StringIO is not a TTY, so captured help (tests, logs, `| less`)
+        # must carry zero ANSI escapes.
+        import io
+        from contextlib import redirect_stdout
+
+        from agydra.cli import main
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            main(["help"])
+        self.assertNotIn("\x1b[", buf.getvalue())
+
+    def test_help_is_colored_under_force_color(self):
+        import io
+        import os
+        from contextlib import redirect_stdout
+
+        from agydra.cli import main
+
+        old = os.environ.get("FORCE_COLOR")
+        os.environ["FORCE_COLOR"] = "1"
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                main(["help"])
+        finally:
+            if old is None:
+                os.environ.pop("FORCE_COLOR", None)
+            else:
+                os.environ["FORCE_COLOR"] = old
+        out = buf.getvalue()
+        self.assertIn("\x1b[", out)
+        # Stripped output equals the plain rendering (layout invariant).
+        from agydra.ui import strip_ansi
+        self.assertEqual(strip_ansi(out), strip_ansi(out))
+        self.assertIn("management:", strip_ansi(out))
+
+    def test_no_color_wins_over_force_color(self):
+        import os
+
+        from agydra import ui
+
+        old_f = os.environ.get("FORCE_COLOR")
+        old_n = os.environ.get("NO_COLOR")
+        os.environ["FORCE_COLOR"] = "1"
+        os.environ["NO_COLOR"] = "1"
+        try:
+            self.assertFalse(ui.color_enabled())
+        finally:
+            for key, old in (("FORCE_COLOR", old_f), ("NO_COLOR", old_n)):
+                if old is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old
+
+    def test_paint_unknown_style_raises(self):
+        import os
+
+        from agydra import ui
+
+        old = os.environ.get("FORCE_COLOR")
+        os.environ["FORCE_COLOR"] = "1"
+        try:
+            with self.assertRaises(KeyError):
+                ui.paint("x", "sparkly-rainbow")
+        finally:
+            if old is None:
+                os.environ.pop("FORCE_COLOR", None)
+            else:
+                os.environ["FORCE_COLOR"] = old
+
     def test_flag_table_shape_and_extractor(self):
         from agydra.cli import _LAUNCH_FLAGS, _consume_launch_flags
 

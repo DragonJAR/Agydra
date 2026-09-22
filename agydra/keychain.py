@@ -176,12 +176,14 @@ def launch_guard(store, profile: str, capture: bool = False):
         def __enter__(self):
             self._lock = None
             self._had_shared: Optional[bytes] = None
+            self._swapped = False
             try:
                 self._lock = _serialize_lock(store)
                 self._had_shared = read_slot(shared_slot())
                 slot = load_profile_slot(store, profile)
                 if slot is not None:
                     write_slot(shared_slot(), slot)
+                    self._swapped = True
             except (KeychainError, OSError) as exc:
                 warn(
                     f"keychain swap skipped ({exc}); continuing without "
@@ -191,6 +193,18 @@ def launch_guard(store, profile: str, capture: bool = False):
 
         def __exit__(self, *exc_info):
             try:
+                # Persist whatever agy left in the shared slot as this
+                # profile's private slot BEFORE restoring the shared slot,
+                # but ONLY when we actually swapped this profile's token in.
+                # Without this, a token refresh during the session (e.g. agy
+                # rotated the OAuth token mid-launch) would be overwritten on
+                # exit by the stale pre-launch snapshot, making the keychain
+                # item look "lost" the next time the profile is opened.
+                if self._swapped:
+                    current = read_slot(shared_slot())
+                    if current is not None:
+                        save_profile_slot(store, profile, current)
+
                 if capture:
                     # Login flow: agy just wrote THIS profile's fresh token
                     # into the shared slot. Persist it to the profile slot
@@ -199,7 +213,7 @@ def launch_guard(store, profile: str, capture: bool = False):
                 else:
                     if self._had_shared is not None:
                         write_slot(shared_slot(), self._had_shared)
-                    elif self._lock is not None and read_slot(shared_slot()) is not None:
+                    elif self._swapped and read_slot(shared_slot()) is not None:
                         # No previous shared token and a profile slot was swapped
                         # in: remove it again so we leave no shared state behind.
                         try:

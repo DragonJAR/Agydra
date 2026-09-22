@@ -261,6 +261,10 @@ El almacén de datos en runtime vive fuera del repo: `%LOCALAPPDATA%\agydra` (Wi
 
 `agydra.json`, en la raíz del almacén:
 
+**Color:** toda la ayuda y el estado se colorean automáticamente en TTY y se
+desactivan en pipes/CI. `NO_COLOR=1` fuerza salida plana; `FORCE_COLOR=1` la
+fuerza a color.
+
 ```json
 {
   "default_profile": "work",

@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 
 from . import __version__, account, isolation, keychain, platforms
 from .store import Store
+from .ui import paint
 
 OK = "ok"
 WARN = "warn"
@@ -254,8 +255,16 @@ CHECKS = [
 
 
 def run_checks(store: Store) -> int:
-    print(f"agydra doctor — agydra {__version__} on {sys.platform}")
-    print("legend: [ok]=pass [!!]=warn [XX]=fail")
+    print(
+        paint("agydra doctor", "cyan", "bold")
+        + f" — agydra {__version__} on {sys.platform}"
+    )
+    print(
+        paint("legend: ", "dim")
+        + paint("[ok]", "green", "bold") + paint("=pass ", "dim")
+        + paint("[!!]", "yellow", "bold") + paint("=warn ", "dim")
+        + paint("[XX]", "red", "bold") + paint("=fail", "dim")
+    )
     # Single scan shared by every check (see _DoctorContext).
     scan = store.scan()
     ctx = _DoctorContext(
@@ -268,12 +277,18 @@ def run_checks(store: Store) -> int:
             status, message = check(store, ctx)
         except Exception as exc:  # defensive: doctor must always complete
             status, message = FAIL, f"{label}: unexpected error: {exc}"
-        symbol = {OK: "[ok]", WARN: "[!!]", FAIL: "[XX]"}[status]
+        symbol_color = {OK: "green", WARN: "yellow", FAIL: "red"}[status]
+        symbol = paint({OK: "[ok]", WARN: "[!!]", FAIL: "[XX]"}[status], symbol_color, "bold")
         print(f"{symbol} {message}")
         if status == FAIL:
             exit_code = 1
     if exit_code:
-        print("\nresult: FAIL — fix the [XX] items above")
+        print()
+        print(
+            paint("result: ", "red", "bold")
+            + paint("FAIL — fix the [XX] items above", "red")
+        )
     else:
-        print("\nresult: healthy")
+        print()
+        print(paint("result: healthy", "green", "bold"))
     return exit_code

@@ -259,10 +259,16 @@ A corrupt config degrades to defaults for reads but refuses writes.
 **Binary resolution order:** `--binary` flag → `agy_binary` in `agydra.json` →
 `AGYDRA_AGY_BIN` env var → `PATH`.
 
+**Color:** all help and status output is colored automatically on TTYs and
+disabled otherwise (pipes, CI). `NO_COLOR=1` forces plain output;
+`FORCE_COLOR=1` forces color on.
+
 ## ⚠️ Limitations
 
-- agydra does **not** install, update or manage `agy` itself, nor manage or
-  refresh its OAuth tokens — it only isolates the sessions `agy` creates.
+- agydra does **not** install, update or manage `agy` itself — it only
+  isolates the sessions `agy` creates. (On macOS it *does* swap/restore the
+  shared keychain slot per profile and persist refreshed tokens back to the
+  profile slot.)
 - The isolation relies on `agy` deriving its data dir from the home variable;
   the schema canary in `doctor` detects if a future `agy` changes this
   derivation and warns instead of silently breaking isolation.
@@ -275,7 +281,7 @@ A corrupt config degrades to defaults for reads but refuses writes.
 - Every feature must work cross-platform (macOS, Linux, Windows) from the
   single codebase; keep `platforms.py` the only per-OS layer.
 - Run the full suite before opening a change:
-  `python3 -m pytest -q` (132 passed + 3 platform skips on macOS).
+  `python3 -m pytest -q` (148 passed + 3 platform skips on macOS).
 - See [AGENTS.md](AGENTS.md) for conventions.
 
 ## 📄 License

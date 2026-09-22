@@ -13,6 +13,39 @@ from . import __version__, account, keychain, locks, platforms, resolver, runner
 from .bootstrap import BootstrapError
 from .isolation import IsolationError
 from .store import Store, StoreError, _rename_dir_with_retry, atomic_copy
+from .ui import error as _error, note as _note, paint, paint_each, strip_ansi
+
+
+class ColoredHelpFormatter(argparse.HelpFormatter):
+    """HelpFormatter that paints argparse's structural anchors.
+
+    Python 3.14's argparse colors its own output natively: the parser calls
+    ``formatter._set_color(parser.color)`` after ``__init__`` (and again on
+    every ``_get_formatter``), stacking a SECOND color layer under ours —
+    both keyed to the same FORCE_COLOR/TTY signals. We override
+    ``_set_color`` to keep the native theme permanently off and paint the
+    anchors ourselves through the shared ui palette, so the CLI has exactly
+    one color source (DRY) and identical styling across surfaces. Only
+    anchors are styled — the ``usage:`` label, section headers and option
+    invocations — so the layout stays byte-identical with the plain
+    formatter once escapes are stripped (test invariant).
+    """
+
+    def _set_color(self, color) -> None:  # type: ignore[override]
+        super()._set_color(False)
+
+    def _format_usage(self, usage, actions, groups, prefix) -> str:
+        rendered = super()._format_usage(usage, actions, groups, prefix)
+        head, sep, tail = rendered.partition(" ")
+        if not sep:
+            return rendered
+        return paint(head, "cyan", "bold") + sep + tail
+
+    def start_section(self, heading: str) -> None:
+        super().start_section(paint(heading, "cyan", "bold"))
+
+    def _format_action_invocation(self, action):  # type: ignore[override]
+        return paint(super()._format_action_invocation(action), "bold")
 
 # ---------------------------------------------------------------------------
 # Single source of truth for the launcher vocabulary: canonical flag ->
@@ -64,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
             "'agydra -p <profile> <agy args...>' runs agy with that profile's "
             "isolated OAuth store; the real ~/.gemini is never modified."
         ),
+        formatter_class=ColoredHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"agydra {__version__}")
     parser.add_argument(
@@ -170,11 +204,9 @@ def _warn_late_flags(values: Dict[str, object], raw: Sequence[str]) -> None:
                 else:
                     spelling = token
             if spelling:
-                print(
-                    f"agydra: note: '{spelling}' was passed to agy, not agydra — "
-                    "agydra flags must come first: "
-                    f"agydra {spelling} <agy args...>",
-                    file=sys.stderr,
+                _note(
+                    f"'{spelling}' was passed to agy, not agydra — agydra flags "
+                    f"must come first: agydra {spelling} <agy args...>"
                 )
                 return
 
@@ -195,10 +227,11 @@ def cmd_list(store: Store, _args) -> int:
         return 0
     default = store.default_name()
     width = max(len(p.name) for p in profiles)
-    print(
+    header = (
         f"{'#':<3}{'PROFILE':<{width + 2}}{'EMAIL':<34}{'AUTH':<20}"
         f"{'DEFAULT':<9}{'BUSY':<6}LAST USED"
     )
+    print(paint(header, "bold"))
     for idx, profile in enumerate(profiles, start=1):
         # ONE lock probe per row: a second probe could flip between the
         # email decision and the BUSY column, contradicting itself.
@@ -214,11 +247,21 @@ def cmd_list(store: Store, _args) -> int:
             store.profile_data_dir(profile.name), store, profile.name,
             profile_count=len(profiles),
         )
-        is_default = "*" if profile.name == default else ""
-        last = profile.last_used or "-"
+        is_default = paint("*", "green", "bold") if profile.name == default else ""
+        # Column values carry semantic state: green when usable, yellow when
+        # busy, dim for absent data. Alignment is preserved by painting AFTER
+        # the f-string layout is computed.
+        state_color = (
+            "green" if state == "authenticated"
+            else "yellow" if state != "not-authenticated"
+            else None
+        )
+        state_shown = paint(state, state_color) if state_color else state
+        busy_shown = paint("yes", "yellow", "bold") if busy else "-"
+        last = paint(profile.last_used or "-", "dim")
         print(
-            f"{idx:<3}{profile.name:<{width + 2}}{email:<34}{state:<20}"
-            f"{is_default:<9}{'yes' if busy else '-':<6}{last}"
+            f"{idx:<3}{profile.name:<{width + 2}}{email:<34}{state_shown:<20}"
+            f"{is_default:<9}{busy_shown:<6}{last}"
         )
     return 0
 
@@ -275,7 +318,7 @@ def cmd_status(store: Store, args) -> int:
     try:
         plan = runner.build_plan(store, [])
     except StoreError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _error(str(exc))
         return 1
     if getattr(args, "dry_run", False):
         print(plan.describe())
@@ -479,28 +522,70 @@ _SUBCOMMAND_HELP: Dict[str, str] = {
 
 
 def _management_help() -> str:
-    lines = ["management:"]
+    lines = [paint("management:", "cyan", "bold")]
     for canonical, aliases in _SUBCOMMAND_ALIASES.items():
         spellings = "/".join((canonical, *aliases))
-        lines.append(f"  {spellings:<24} {_SUBCOMMAND_HELP.get(canonical, '')}")
+        lines.append(
+            paint_each(
+                [
+                    (f"  {spellings:<24}", ("bold",)),
+                    (_SUBCOMMAND_HELP.get(canonical, ""), ()),
+                ],
+                separator="",
+            )
+        )
     return "\n".join(lines)
+
+
+# Single source for the `examples:` block — same content rendered both by
+# `agydra help` and asserted by tests, so coverage is automatic and the
+# example set cannot drift from the documented commands.
+_EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
+    (
+        "first run",
+        [
+            ("agydra setup", "one-time install of the shim"),
+            ("agydra create work -d 'work account'", "create a profile"),
+            ("agydra login work", "OAuth flow isolated to 'work'"),
+            ("agydra import main", "copy ~/.gemini into 'main'"),
+        ],
+    ),
+    (
+        "daily use",
+        [
+            ("agydra -p work", "launch agy with 'work'"),
+            ("agydra", "launch agy with default profile"),
+            ("agydra -r", "pick a free authenticated profile"),
+        ],
+    ),
+    (
+        "maintenance",
+        [
+            ("agydra list", "show all profiles + auth state"),
+            ("agydra status -n", "resolved profile (no side effects)"),
+            ("agydra default work", "set 'work' as default"),
+            ("agydra use work", "pin 'work' to this directory"),
+            ("agydra share-config work lab", "copy settings.json + mcp.json"),
+            ("agydra rename old new", "rename a profile (refuses busy)"),
+            ("agydra delete old", "backup ZIP + delete (refuses busy)"),
+            ("agydra doctor", "diagnose the installation"),
+        ],
+    ),
+]
 
 
 def _report_error(exc: BaseException) -> int:
     """Single error-mapping table shared by both dispatch paths."""
     if isinstance(exc, (StoreError, IsolationError, BootstrapError)):
-        print(f"error: {exc}", file=sys.stderr)
+        _error(str(exc))
         return 1
     if isinstance(exc, EOFError):
         # `agydra delete x < /dev/null` (CI, pipes): treat as a declined
         # confirmation instead of showing a raw traceback.
-        print(
-            "error: no input available to confirm; re-run with --force",
-            file=sys.stderr,
-        )
+        _error("no input available to confirm; re-run with --force")
         return 1
     if isinstance(exc, OSError):
-        print(f"error: {exc}", file=sys.stderr)
+        _error(str(exc))
         return 1
     if isinstance(exc, KeyboardInterrupt):
         print("cancelled", file=sys.stderr)
@@ -517,25 +602,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print()
         print(_management_help())
         print()
-        print("examples:")
-        print("  first run:")
-        print("    agydra setup                                  # one-time install of the shim")
-        print("    agydra create work -d 'work account'           # create a profile")
-        print("    agydra login work                              # OAuth flow isolated to 'work'")
-        print("    agydra import main                             # copy ~/.gemini into 'main'")
-        print("  daily use:")
-        print("    agydra -p work                                 # launch agy with 'work'")
-        print("    agydra                                         # launch agy with default profile")
-        print("    agydra -r                                      # pick a free authenticated profile")
-        print("  maintenance:")
-        print("    agydra list                                    # show all profiles + auth state")
-        print("    agydra status -n                               # resolved profile (no side effects)")
-        print("    agydra default work                            # set 'work' as default")
-        print("    agydra use work                                # pin 'work' to this directory")
-        print("    agydra share-config work lab                   # copy settings.json + mcp.json")
-        print("    agydra rename old new                          # rename a profile (refuses busy)")
-        print("    agydra delete old                              # backup ZIP + delete (refuses busy)")
-        print("    agydra doctor                                  # diagnose the installation")
+        print(paint("examples:", "cyan", "bold"))
+        for group, entries in _EXAMPLES:
+            print(f"  {group}:")
+            for command, comment in entries:
+                print(
+                    paint_each(
+                        [
+                            (f"    {command}", ("bold",)),
+                            (f"  # {comment}", ("dim",)),
+                        ]
+                    )
+                )
         return 0
 
     if raw[0] == "version" or raw[0] == "--version":
@@ -545,7 +623,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sub = _CANONICAL.get(raw[0])
     if sub is not None:
         rest = raw[1:]
-        parser = argparse.ArgumentParser(prog=f"agydra {sub}")
+        parser = argparse.ArgumentParser(
+            prog=f"agydra {sub}", formatter_class=ColoredHelpFormatter
+        )
         if sub == "list":
             parser.set_defaults(func=cmd_list)
         elif sub == "create":
@@ -632,10 +712,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         values, agy_args = _consume_launch_flags(raw)
         if values["profile"] is not None and values["random"]:
-            print(
-                "error: -p/--profile and -r/--random are mutually exclusive",
-                file=sys.stderr,
-            )
+            _error("-p/--profile and -r/--random are mutually exclusive")
             return 2
         _warn_late_flags(values, raw)
         plan = runner.build_plan(
