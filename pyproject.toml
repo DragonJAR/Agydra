@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agydra"
+version = "1.1.0"
+description = "Multi-profile launcher for the agy CLI (isolated OAuth per profile) on macOS, Linux and Windows"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "agydra contributors" }]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+
+[project.scripts]
+agydra = "agydra.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agydra*"]

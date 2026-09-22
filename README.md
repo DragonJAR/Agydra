@@ -1,0 +1,272 @@
+# agydra
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Version](https://img.shields.io/badge/version-1.1.0-green)
+![Python](https://img.shields.io/badge/python-3.9%2B-blue)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey)
+[![Author: DragonJAR](https://img.shields.io/badge/author-DragonJAR-orange)](https://www.DragonJAR.org)
+[![Read in Español](https://img.shields.io/badge/Read_in-Español-blue)](README.es.md)
+
+> **One `agy` installation, many isolated Google accounts.** `agydra` is a
+> multi-profile launcher for the `agy` CLI (Google Antigravity) that gives every
+> profile its own private OAuth session via a per-profile home overlay — the
+> real `~/.gemini` is never touched and `agy` is never intercepted. It works on
+> **macOS, Linux and Windows** from a single **stdlib-only** codebase
+> (Python ≥ 3.9, zero third-party runtime dependencies): one DRY core, thin
+> per-OS adapters for homes, secrets and locks.
+
+## 🎯 What This Tool Does
+
+- **Per-profile OAuth isolation** — each profile authenticates into its own
+  private store; credentials never mix between accounts.
+- **Parallel sessions** — run several `agy` accounts at the same time, each in
+  its own overlay home.
+- **Kernel-held session locks** — a busy profile can't be deleted or renamed,
+  and locks can never go stale (the OS releases them when `agy` exits).
+- **Per-project pinning** — `agydra use` pins a profile to a project directory
+  with a `.agydra` marker file.
+- **Dry-run plans** — inspect exactly what a launch will do before doing it.
+- **Non-destructive deletes** — every delete creates a backup ZIP first.
+- **Config sharing without secrets** — copy `settings.json` + `mcp.json`
+  between profiles, never credentials.
+- **Diagnostics** — `agydra doctor` checks binary, store permissions, profiles,
+  locks, isolation, schema canary and sandbox in one pass.
+
+```
+agy                 → generic session, keeps using the real ~/.gemini (untouched)
+agydra -p work ...  → same agy binary, but HOME points at the profile overlay
+```
+
+## 📦 Installation
+
+**Option 1 — install from a checkout**
+
+```sh
+pip install .        # or: pipx install .
+```
+
+**Option 2 — run without installing**
+
+```sh
+python3 -m agydra --help
+```
+
+## ⚙️ Prerequisites
+
+| Requirement | Notes |
+|---|---|
+| Python ≥ 3.9 | Standard library only — zero third-party runtime deps |
+| `agy` CLI | On `PATH`, or point agydra at it via `-b`, config or env |
+| bwrap (optional) | Linux only: sandbox masking of DBus/keyring sockets |
+
+**Verification**
+
+```sh
+$ agydra doctor
+```
+
+## 🚀 Usage Examples
+
+**1. Create your first profile and log in**
+
+```sh
+agydra create work
+agydra login work
+agydra -p work "your prompt"
+```
+
+```text
+work: created (becomes default if it's the first)
+OAuth flow runs isolated to the 'work' profile
+launches agy with the work profile's private session
+```
+
+**2. Pin a profile per project directory**
+
+```sh
+cd ~/projects/inbox-zero
+agydra use personal
+agydra "triage my inbox"
+```
+
+```text
+.agydra marker written for this directory
+launch uses 'personal' — no -p needed inside this tree
+```
+
+**3. Run parallel sessions / grab a free profile**
+
+```sh
+agydra -r "quick question"      # least-recently-used FREE AUTHENTICATED profile
+```
+
+```text
+picks the free profile automatically (needs 2+ profiles)
+other busy profiles stay untouched
+```
+
+**4. Inspect a launch plan without running it**
+
+```sh
+agydra --dry-run -p work "your prompt"
+```
+
+```text
+resolved profile: work
+binary, overlay path and environment redirection are printed
+nothing is executed, nothing is written
+```
+
+**5. Share settings between profiles (never credentials)**
+
+```sh
+agydra share-config work personal side
+```
+
+```text
+settings.json + mcp.json copied from work → personal, side
+OAuth tokens are never copied
+```
+
+## 📖 Capabilities
+
+**Profile management**
+
+| Capability | Description |
+|---|---|
+| Isolated OAuth per profile | Each profile has a fully private `agy` data store |
+| Parallel sessions | Multiple authenticated accounts at once |
+| Import existing `~/.gemini` | Copies (never moves) into a profile |
+| Backup on delete | ZIP into `backups/`, last 5 kept |
+| Rename / default / per-dir pin | `rename` updates default refs; `use` writes `.agydra` |
+
+**Isolation & safety**
+
+| Mechanism | Description |
+|---|---|
+| Home overlay | `<overlay>/.gemini` → profile store; rest of home mirrored by links |
+| Real `~/.gemini` | NEVER touched by agydra |
+| No interception | `agy` is launched as-is, only with redirected home |
+| Session locks | Kernel-held (flock fd into exec / msvcrt byte-range); no stale locks |
+| Busy refusal | `delete` / `rename` refuse profiles with live sessions |
+
+**Cross-platform matrix**
+
+| Platform | Mechanism |
+|---|---|
+| macOS | Transparent keychain bridge: swaps the fixed shared keychain slot for a per-profile private slot around each launch, restores after; failures are non-fatal warnings |
+| Linux | Optional bwrap sandbox masking DBus/keyring sockets when `use_linux_sandbox=true`; degrades with a warning if bwrap is missing |
+| Windows | Directory links fall back to junctions (`mklink /J`), no admin rights needed |
+
+## 🧭 Commands
+
+| Command | Description |
+|---|---|
+| `agydra [-p PROFILE\|#] [-r] [-n] [-b PATH] <agy args...>` | Launch `agy` with the resolved profile. Flags must come **before** agy args (a late `-p` is passed to agy with a warning). `-r` picks a free profile, `-n` dry-run, `-b` binary override |
+| `agydra list` · `ls` · `l` | Table: number, email, default, auth state, busy, last use |
+| `agydra create NAME [-d DESC]` · `c` | Create a profile store |
+| `agydra login NAME\|#` · `in` | Run agy's OAuth flow isolated to that profile |
+| `agydra import NAME` · `imp` | **Copy** (never move) the generic `~/.gemini` into a profile |
+| `agydra status [-n]` · `st` | Resolved profile + reason + binary + email + auth + busy; zero side effects |
+| `agydra default [NAME\|#]` · `d` | Get or set the default profile |
+| `agydra use NAME\|#` · `u` | Write `.agydra` marker pinning a profile per project directory |
+| `agydra rename A B` · `mv` | Rename a profile (refuses busy) |
+| `agydra delete NAME\|# [-f] [--no-backup]` · `rm` | Backup ZIP then delete (refuses busy) |
+| `agydra share-config SRC TARGET...` · `share` | Copy `settings.json` + `mcp.json` only |
+| `agydra doctor` · `doc` | Diagnostics; exit 1 iff any check fails |
+
+| Flag | Long form | Description |
+|---|---|---|
+| `-p` | `--profile` | Profile by name or 1-based number (from `list`) |
+| `-r` | `--random` | Least-recently-used **free authenticated** profile (needs 2+); mutually exclusive with `-p` |
+| `-n` | `--dry-run` | Print the launch plan, execute nothing |
+| `-b PATH` | `--binary` | Override the `agy` binary for this launch |
+
+**Resolution cascade** (launch without `-p`): `--profile` flag → `AGYDRA_PROFILE`
+env var → `.agydra` marker file (nearest ancestor of CWD, written by
+`agydra use`; overrides `-r`) → configured `default_profile` → first profile.
+
+**Exit codes:** `0` ok · `1` errors · `2` `-p` + `-r` conflict · `126` not
+executable · `127` not found · `130` Ctrl-C.
+
+## 🔧 Project Structure
+
+```text
+agydra/
+├── agydra/
+│   ├── __main__.py     # python -m agydra entry point
+│   ├── models.py       # Profile/Config dataclasses, explicit (de)serialization
+│   ├── platforms.py    # OS paths, binary discovery, exec/launch per platform
+│   ├── store.py        # Profile store: CRUD, atomic JSON writes, backups
+│   ├── locks.py        # Kernel-held per-profile session locks
+│   ├── resolver.py     # Profile resolution cascade with human-readable reasons
+│   ├── account.py      # Email/auth detection from a profile's data directory
+│   ├── keychain.py     # macOS per-profile keychain slot bridge
+│   ├── isolation.py    # Home-overlay construction and environment redirection
+│   ├── runner.py       # Launch orchestration: resolve → plan → overlay → run
+│   ├── doctor.py       # Diagnostics: binary, permissions, isolation, canary
+│   └── cli.py          # argparse CLI: launcher + management subcommands
+├── tests/              # ~105 tests (fake home + fake agy binary fixtures)
+├── README.md           # This document (English)
+├── README.es.md        # Spanish version
+├── AGENTS.md           # Development conventions
+├── LICENSE             # MIT
+└── pyproject.toml      # Packaging metadata
+```
+
+## ⚙️ Configuration
+
+Stored at `<store root>/agydra.json`, where the store root is
+`%LOCALAPPDATA%\agydra` (Windows), `~/Library/Application Support/agydra`
+(macOS) or `$XDG_DATA_HOME/agydra` / `~/.local/share/agydra` (Linux);
+`AGYDRA_HOME` overrides.
+
+```json
+{
+  "default_profile": "work",
+  "settings": {
+    "use_linux_sandbox": true,
+    "copy_settings_on_create": true,
+    "windows_redirect_home": true
+  },
+  "agy_binary": "/usr/local/bin/agy"
+}
+```
+
+A corrupt config degrades to defaults for reads but refuses writes.
+
+**Binary resolution order:** `--binary` flag → `agy_binary` in `agydra.json` →
+`AGYDRA_AGY_BIN` env var → `PATH`.
+
+## ⚠️ Limitations
+
+- agydra does **not** install, update or manage `agy` itself, nor manage or
+  refresh its OAuth tokens — it only isolates the sessions `agy` creates.
+- The isolation relies on `agy` deriving its data dir from the home variable;
+  the schema canary in `doctor` detects if a future `agy` changes this
+  derivation and warns instead of silently breaking isolation.
+- Windows-specific branches are exercised on real Windows; on other platforms
+  they are covered by unit tests only.
+
+## 🤝 Contributing
+
+- Keep the runtime **stdlib-only** — no third-party dependencies.
+- Every feature must work cross-platform (macOS, Linux, Windows) from the
+  single codebase; keep `platforms.py` the only per-OS layer.
+- Run the full suite before opening a change:
+  `python3 -m pytest -q` (102 passed + 3 platform skips on macOS).
+- See [AGENTS.md](AGENTS.md) for conventions.
+
+## 📄 License
+
+Released under the MIT License — see [LICENSE](LICENSE).
+
+## 👨💻 Author
+
+[![DragonJAR](https://img.shields.io/badge/Author-DragonJAR-orange?style=for-the-badge&logo=dragonjar)](https://www.DragonJAR.org)
+
+---
+
+`agydra` is an independent community tool and is not affiliated with or
+endorsed by Google. `agy` / Antigravity are Google products. Use your own
+accounts responsibly.
