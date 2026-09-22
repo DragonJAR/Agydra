@@ -26,7 +26,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from . import platforms
 from .ui import warn
@@ -45,6 +45,11 @@ SHARED_ACCOUNT = "antigravity"
 _SLOT_SERVICE_PREFIX = "gemini/agydra/"
 
 NOT_FOUND_CODES = {44, 45, 51, 128}  # item not found / security not available
+
+# Written under the store's keychain dir when self-healing the target
+# keychain fails once (e.g. the user cancels the create-keychain password
+# prompt): its presence means "don't ask again this store", not "retry".
+_SKIP_MARKER_NAME = ".setup-skipped"
 
 
 class KeychainError(RuntimeError):
@@ -72,11 +77,17 @@ def _run(args, input_bytes: Optional[bytes] = None) -> subprocess.CompletedProce
     )
 
 
-def read_slot(service: str) -> Optional[bytes]:
-    """Return the slot's secret bytes, or None when absent/unreadable."""
-    result = _run(
-        ["find-generic-password", "-s", service, "-a", SHARED_ACCOUNT, "-w"]
-    )
+def read_slot(service: str, keychain_path: Optional[Path] = None) -> Optional[bytes]:
+    """Return the slot's secret bytes, or None when absent/unreadable.
+
+    ``keychain_path``, when given, is appended as the explicit target so the
+    lookup never depends on the ambient "default keychain" — see
+    ``_ensure_target_keychain``.
+    """
+    args = ["find-generic-password", "-s", service, "-a", SHARED_ACCOUNT, "-w"]
+    if keychain_path is not None:
+        args.append(str(keychain_path))
+    result = _run(args)
     if result.returncode == 0:
         return result.stdout
     if result.returncode in NOT_FOUND_CODES:
@@ -87,17 +98,18 @@ def read_slot(service: str) -> Optional[bytes]:
     )
 
 
-def write_slot(service: str, data: bytes) -> None:
+def write_slot(service: str, data: bytes, keychain_path: Optional[Path] = None) -> None:
     # -U updates the item when it already exists, so this is idempotent.
-    result = _run(
-        [
-            "add-generic-password",
-            "-U",
-            "-s", service,
-            "-a", SHARED_ACCOUNT,
-            "-w", data.decode("utf-8", "replace"),
-        ]
-    )
+    args = [
+        "add-generic-password",
+        "-U",
+        "-s", service,
+        "-a", SHARED_ACCOUNT,
+        "-w", data.decode("utf-8", "replace"),
+    ]
+    if keychain_path is not None:
+        args.append(str(keychain_path))
+    result = _run(args)
     if result.returncode != 0:
         raise KeychainError(
             f"keychain write failed (rc={result.returncode}): "
@@ -105,10 +117,11 @@ def write_slot(service: str, data: bytes) -> None:
         )
 
 
-def delete_slot(service: str) -> None:
-    result = _run(
-        ["delete-generic-password", "-s", service, "-a", SHARED_ACCOUNT]
-    )
+def delete_slot(service: str, keychain_path: Optional[Path] = None) -> None:
+    args = ["delete-generic-password", "-s", service, "-a", SHARED_ACCOUNT]
+    if keychain_path is not None:
+        args.append(str(keychain_path))
+    result = _run(args)
     if result.returncode == 0 or result.returncode in NOT_FOUND_CODES:
         return
     raise KeychainError(
@@ -148,6 +161,71 @@ def _serialize_lock(store):
     return handle
 
 
+def _login_keychain_path() -> Path:
+    return platforms.real_home() / "Library" / "Keychains" / "login.keychain-db"
+
+
+def _parse_keychain_list(stdout: bytes) -> List[str]:
+    """Parse `security list-keychains`/`default-keychain` quoted-path output."""
+    paths = []
+    for line in stdout.decode(errors="replace").splitlines():
+        line = line.strip()
+        if line.startswith('"') and line.endswith('"'):
+            paths.append(line[1:-1])
+    return paths
+
+
+def _ensure_target_keychain(store) -> Optional[Path]:
+    """Resolve the keychain `security` should target, self-healing once.
+
+    Every call in this module used to rely on macOS's ambient "default
+    keychain". On a machine where none is configured (or it points at a
+    stale/missing file), that turns every single read/write into a GUI
+    prompt — this resolves it explicitly instead, so read_slot/write_slot/
+    delete_slot always target a concrete file and never guess.
+
+    Self-heal (create + register + set default) runs at most once per
+    profile store: a failed attempt (e.g. the user cancels the native
+    create-keychain password prompt) writes a marker so later launches
+    degrade straight to fail-open instead of repeating the prompt.
+    """
+    marker = _slots_dir(store) / _SKIP_MARKER_NAME
+    if marker.exists():
+        return None
+    try:
+        resolved = _run(["default-keychain", "-d", "user"])
+        if resolved.returncode == 0:
+            candidates = _parse_keychain_list(resolved.stdout)
+            if candidates and Path(candidates[0]).exists():
+                return Path(candidates[0])
+
+        target = _login_keychain_path()
+        if not target.exists():
+            created = _run(["create-keychain", str(target)])
+            if created.returncode != 0:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.touch()
+                warn(
+                    "could not create a login keychain "
+                    f"(rc={created.returncode}); keychain bridge disabled "
+                    "until it exists (see `agydra doctor`)"
+                )
+                return None
+
+        listed = _run(["list-keychains", "-d", "user"])
+        existing = _parse_keychain_list(listed.stdout) if listed.returncode == 0 else []
+        if str(target) not in existing:
+            # -s SETS the search list, it does not append: the existing
+            # entries must be passed through or they'd be dropped.
+            _run(["list-keychains", "-d", "user", "-s", *existing, str(target)])
+
+        _run(["default-keychain", "-d", "user", "-s", str(target)])
+        return target
+    except OSError as exc:
+        warn(f"keychain resolution failed ({exc}); continuing without swap")
+        return None
+
+
 def launch_guard(store, profile: str, capture: bool = False):
     """Context manager swapping the shared keychain slot to ``profile``.
 
@@ -177,12 +255,23 @@ def launch_guard(store, profile: str, capture: bool = False):
             self._lock = None
             self._had_shared: Optional[bytes] = None
             self._swapped = False
+            self._keychain_path: Optional[Path] = None
             try:
                 self._lock = _serialize_lock(store)
-                self._had_shared = read_slot(shared_slot())
+                # Resolved ONCE per launch (not per read/write/delete call):
+                # each agydra invocation is its own process (execvpe), so a
+                # module-level cache would never survive to the next launch
+                # anyway — this is the right granularity, not a shortcut.
+                self._keychain_path = _ensure_target_keychain(store)
+                if self._keychain_path is None:
+                    # Resolution already warned (or is deliberately silent
+                    # because a prior attempt was marked skip-once); either
+                    # way, no safe target exists to swap into.
+                    return self
+                self._had_shared = read_slot(shared_slot(), self._keychain_path)
                 slot = load_profile_slot(store, profile)
                 if slot is not None:
-                    write_slot(shared_slot(), slot)
+                    write_slot(shared_slot(), slot, self._keychain_path)
                     self._swapped = True
             except (KeychainError, OSError) as exc:
                 warn(
@@ -193,6 +282,8 @@ def launch_guard(store, profile: str, capture: bool = False):
 
         def __exit__(self, *exc_info):
             try:
+                if self._keychain_path is None:
+                    return False
                 # Persist whatever agy left in the shared slot as this
                 # profile's private slot BEFORE restoring the shared slot,
                 # but ONLY when we actually swapped this profile's token in.
@@ -201,7 +292,7 @@ def launch_guard(store, profile: str, capture: bool = False):
                 # exit by the stale pre-launch snapshot, making the keychain
                 # item look "lost" the next time the profile is opened.
                 if self._swapped:
-                    current = read_slot(shared_slot())
+                    current = read_slot(shared_slot(), self._keychain_path)
                     if current is not None:
                         save_profile_slot(store, profile, current)
 
@@ -212,12 +303,12 @@ def launch_guard(store, profile: str, capture: bool = False):
                     self._capture_and_keep()
                 else:
                     if self._had_shared is not None:
-                        write_slot(shared_slot(), self._had_shared)
-                    elif self._swapped and read_slot(shared_slot()) is not None:
+                        write_slot(shared_slot(), self._had_shared, self._keychain_path)
+                    elif self._swapped and read_slot(shared_slot(), self._keychain_path) is not None:
                         # No previous shared token and a profile slot was swapped
                         # in: remove it again so we leave no shared state behind.
                         try:
-                            delete_slot(shared_slot())
+                            delete_slot(shared_slot(), self._keychain_path)
                         except KeychainError:
                             pass
             except KeychainError as exc:
@@ -234,7 +325,7 @@ def launch_guard(store, profile: str, capture: bool = False):
             return False
 
         def _capture_and_keep(self):
-            data = read_slot(shared_slot())
+            data = read_slot(shared_slot(), self._keychain_path)
             if data is not None:
                 save_profile_slot(store, profile, data)
 
@@ -247,7 +338,8 @@ def capture_shared_slot(store, name: str) -> bool:
     Called right after a successful login: whatever agy just wrote into the
     shared slot belongs to this profile. Returns True when a slot was saved.
     """
-    data = read_slot(shared_slot())
+    keychain_path = _ensure_target_keychain(store)
+    data = read_slot(shared_slot(), keychain_path)
     if data is None:
         return False
     save_profile_slot(store, name, data)
@@ -264,7 +356,9 @@ def clear_shared_slot(store) -> None:
         return
     try:
         with _serialize_lock(store):
-            delete_slot(shared_slot())
+            keychain_path = _ensure_target_keychain(store)
+            if keychain_path is not None:
+                delete_slot(shared_slot(), keychain_path)
     except (KeychainError, OSError) as exc:
         warn(f"could not clear shared keychain slot ({exc})")
 

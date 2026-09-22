@@ -169,6 +169,9 @@ class TestKeychainLoginCapture(unittest.TestCase):
             with mock.patch.object(
                 keychain, "_serialize_lock", return_value=mock.MagicMock()
             ), mock.patch.object(
+                keychain, "_ensure_target_keychain",
+                return_value=Path("/fake/login.keychain-db"),
+            ), mock.patch.object(
                 keychain, "read_slot", side_effect=[None, fresh, fresh]
             ), mock.patch.object(
                 keychain, "write_slot"
