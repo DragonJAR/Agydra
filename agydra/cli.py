@@ -220,6 +220,12 @@ def _assert_free(store: Store, name: str) -> None:
         )
 
 
+# One source for the PROFILE column label: cmd_list's minimum-width guard
+# and its header literal must never drift apart (a renamed label would
+# silently re-fuse the header into "PROFILEEMAIL").
+_PROFILE_LABEL = "PROFILE"
+
+
 def cmd_list(store: Store, _args) -> int:
     profiles = store.list()
     if not profiles:
@@ -227,8 +233,12 @@ def cmd_list(store: Store, _args) -> int:
         return 0
     default = store.default_name()
     width = max(len(p.name) for p in profiles)
+    # Columns must always hold their own label: a short longest-name (e.g.
+    # a single 4-char profile) would otherwise squeeze PROFILE below its
+    # own label length and fuse the header into "PROFILEEMAIL".
+    width = max(width, len(_PROFILE_LABEL))
     header = (
-        f"{'#':<3}{'PROFILE':<{width + 2}}{'EMAIL':<34}{'AUTH':<20}"
+        f"{'#':<3}{_PROFILE_LABEL:<{width + 2}}{'EMAIL':<34}{'AUTH':<20}"
         f"{'DEFAULT':<9}{'BUSY':<6}LAST USED"
     )
     print(paint(header, "bold"))
@@ -445,6 +455,18 @@ def cmd_import(store: Store, args) -> int:
             "plain `agy` to create it, then retry: agydra import " + name
         )
     data_dir = store.profile_data_dir(name)
+    if data_dir.exists() and any(data_dir.iterdir()):
+        raise StoreError(
+            f"profile {name!r} already has data ({data_dir}); "
+            "delete it first (agydra delete " + name + ") or pick an empty profile."
+        )
+    # Windows ``os.rename`` raises FileExistsError if dst exists even when
+    # empty (POSIX rename overwrites an empty dst). ``store.create`` pre-
+    # creates data/ so the just-emptied check above leaves it standing —
+    # rmdir it now so the rename works on both OSes. Raises loud if a TOCTOU
+    # writer populated it between the guard and here.
+    if data_dir.exists():
+        data_dir.rmdir()
     # Same atomic discipline as every other writer: land the copy in a
     # sibling tmp dir, then swap it in with one rename. A crash mid-copy
     # must never leave half-landed tokens that auth_state would read.
