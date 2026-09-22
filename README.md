@@ -1,11 +1,17 @@
 # agydra
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.2.0-green)
-![Python](https://img.shields.io/badge/python-3.9%2B-blue)
-![Platforms](https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey)
-[![Author: DragonJAR](https://img.shields.io/badge/author-DragonJAR-orange)](https://www.DragonJAR.org)
-[![Read in Español](https://img.shields.io/badge/Read_in-Español-blue)](README.es.md)
+<p align="center">
+  <img src="logo.png" alt="agydra logo" width="180">
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/version-1.2.0-green" alt="Version">
+  <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="Python">
+  <img src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey" alt="Platforms">
+  <a href="https://www.DragonJAR.org"><img src="https://img.shields.io/badge/author-DragonJAR-orange" alt="Author: DragonJAR"></a>
+  <a href="README.es.md"><img src="https://img.shields.io/badge/Read_in-Español-blue" alt="Read in Español"></a>
+</p>
 
 > **One `agy` installation, many isolated Google accounts.** `agydra` is a
 > multi-profile launcher for the `agy` CLI (Google Antigravity) that gives every

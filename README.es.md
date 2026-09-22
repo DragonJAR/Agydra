@@ -1,11 +1,17 @@
 # agydra
 
-[![Licencia: MIT](https://img.shields.io/badge/Licencia-MIT-yellow.svg)](LICENSE)
-[![Versión: 1.1.0](https://img.shields.io/badge/Versi%C3%B3n-1.1.0-blue.svg)](pyproject.toml)
-[![Python: 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
-[![Plataformas: macOS·Linux·Windows](https://img.shields.io/badge/Plataformas-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey.svg)](#-matriz-multiplataforma)
-[![Autor: DragonJAR](https://img.shields.io/badge/Autor-DragonJAR-orange.svg)](https://www.DragonJAR.org)
-[![Read in English](https://img.shields.io/badge/Read%20in-English-0078D4?logo=readme&logoColor=white)](README.md)
+<p align="center">
+  <img src="logo.png" alt="logo de agydra" width="180">
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/Licencia-MIT-yellow.svg" alt="Licencia: MIT"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Versi%C3%B3n-1.1.0-blue.svg" alt="Versión"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white" alt="Python"></a>
+  <img src="https://img.shields.io/badge/Plataformas-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey.svg" alt="Plataformas">
+  <a href="https://www.DragonJAR.org"><img src="https://img.shields.io/badge/Autor-DragonJAR-orange.svg" alt="Autor: DragonJAR"></a>
+  <a href="README.md"><img src="https://img.shields.io/badge/Read%20in-English-0078D4?logo=readme&logoColor=white" alt="Read in English"></a>
+</p>
 
 > **Lanzador multi-perfil para el CLI `agy` (Google Antigravity) con sesiones OAuth totalmente aisladas por perfil.** Una única instalación de `agy`, muchas cuentas de Google con sesión independiente en la misma máquina, sobre **macOS, Linux y Windows** desde una sola base de código. `agydra` está construido solo con la librería estándar de Python (cero dependencias de terceros en runtime), no intercepta `agy` jamás y nunca toca tu `~/.gemini` real: cada perfil autentica en su almacén privado mediante un home overlay.
 
