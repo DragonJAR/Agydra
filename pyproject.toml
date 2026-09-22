@@ -26,4 +26,7 @@ agydra = "agydra.cli:main"
 include = ["agydra*"]
 
 [tool.setuptools.dynamic]
-version = { attr = "agydra.__version__" }
+# Fully qualified past the root bootstrap module: setuptools' static version
+# reader tries <name>.py before <name>/__init__.py, so a bare package-level
+# attr would resolve to agydra.py and break the editable build.
+version = { attr = "agydra.__init__.__version__" }

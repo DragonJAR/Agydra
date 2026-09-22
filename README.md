@@ -182,7 +182,7 @@ OAuth tokens are never copied
 
 | Command | Description |
 |---|---|
-| `agydra [-p PROFILE\|#] [-r] [-n] [-b PATH] <agy args...>` | Launch `agy` with the resolved profile. Flags must come **before** agy args (a late `-p` is passed to agy with a warning). `-r` picks a free profile, `-n` dry-run, `-b` binary override |
+| `agydra [-p PROFILE\|#] [-r] [-n] [-b PATH] <agy args...>` | Launch `agy` with the resolved profile. Flags must come **before** agy args (a late `-p` is passed to agy with a warning). Short flags bundle: `-nr -p work` == `-n -r -p work`. `-r` picks a free profile, `-n` dry-run, `-b` binary override. Profile names may not collide with a subcommand or alias (`status`, `ls`, `mv`, ...) — the dispatcher would shadow them |
 | `agydra list` · `ls` · `l` | Table: number, email, default, auth state, busy, last use |
 | `agydra create NAME [-d DESC]` · `c` | Create a profile store |
 | `agydra login NAME\|#` · `in` | Run agy's OAuth flow isolated to that profile |

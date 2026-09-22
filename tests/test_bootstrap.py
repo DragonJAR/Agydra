@@ -76,6 +76,45 @@ def _sandbox_home(base: Path) -> _HomeSandbox:
     return _HomeSandbox(old)
 
 
+class VersionAttrGuard(unittest.TestCase):
+    """The dynamic-version attr must resolve to agydra/__init__.py even though
+    a root bootstrap module named agydra.py exists in the project root.
+
+    setuptools' static reader (config/expand.py::_find_module) tries
+    ``<name>.py`` before ``<name>/__init__.py``, so ``attr = "agydra.__version__"``
+    reads the root module instead of the package and the editable install
+    fails with ``AttributeError: module 'agydra' has no attribute '__version__'``.
+    """
+
+    def test_pyproject_version_attr_is_shadow_proof(self):
+        import re
+
+        root = Path(__file__).resolve().parent.parent
+        directive = next(
+            (
+                line
+                for line in (root / "pyproject.toml").read_text(encoding="utf-8").splitlines()
+                if re.match(r'\s*version\s*=\s*\{\s*attr\s*=', line)
+            ),
+            "",
+        )
+        self.assertIn(
+            '"agydra.__init__.__version__"',
+            directive,
+            "pyproject.toml must keep the fully-qualified attr so the root "
+            "agydra.py bootstrap module cannot shadow the package during "
+            "setuptools' static version resolution",
+        )
+
+    def test_root_bootstrap_module_has_no_version_literal(self):
+        # Belt-and-suspenders: if someone ever adds __version__ to agydra.py,
+        # a plain-attr regression would fail confusingly later; assert the
+        # invariant directly at the source instead.
+        root = Path(__file__).resolve().parent.parent
+        module = (root / "agydra.py").read_text(encoding="utf-8")
+        self.assertNotIn("__version__", module)
+
+
 class Helpers(unittest.TestCase):
     def test_python_ok_thresholds(self):
         self.assertTrue(bootstrap.python_ok((3, 9, 0)))

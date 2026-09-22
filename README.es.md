@@ -197,7 +197,7 @@ copied: personal/mcp.json
 
 | Comando | Alias | Descripción |
 |---|---|---|
-| `agydra [-p PERFIL\|#] [-r] [-n] [-b RUTA] <args de agy...>` | — | Lanza `agy` con la sesión aislada del perfil resuelto. Los flags de agydra van **antes** de los args de agy; un `-p` tardío va a `agy` y se imprime un aviso. |
+| `agydra [-p PERFIL\|#] [-r] [-n] [-b RUTA] <args de agy...>` | — | Lanza `agy` con la sesión aislada del perfil resuelto. Los flags de agydra van **antes** de los args de agy; un `-p` tardío va a `agy` y se imprime un aviso. Los flags cortos se agrupan estilo getopt: `-nr -p work` == `-n -r -p work`. Los nombres de perfil no pueden chocar con un subcomando o alias (`status`, `ls`, `mv`, ...) — el dispatcher los opacaría. |
 | `list` | `ls`, `l` | Tabla de perfiles: número, email, default, estado de auth, ocupado, último uso. |
 | `create NOMBRE [-d DESC]` | `c` | Crea el almacén de un perfil. |
 | `login NOMBRE\|#` | `in` | Corre el OAuth de `agy` aislado a ese perfil. |

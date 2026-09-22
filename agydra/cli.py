@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import __version__, account, keychain, locks, platforms, resolver, runner
+from . import __version__, account, keychain, locks, platforms, resolver, runner, vocab
 from .bootstrap import BootstrapError
 from .isolation import IsolationError
 from .store import Store, StoreError, _rename_dir_with_retry, atomic_copy
@@ -60,33 +60,18 @@ _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool]] = {
     "dry-run": ("-n", "--dry-run", False),
     "binary": ("-b", "--binary", True),
 }
-
-# Canonical subcommand -> extra aliases. _CANONICAL resolves any spelling to
-# its canonical form; membership in _CANONICAL defines "is a subcommand", so
-# an alias can never exist without its canonical command and vice versa.
-# Display order = usage frequency: setup lifecycle first, then daily
-# inspection, then maintenance, then meta.
-_SUBCOMMAND_ALIASES: Dict[str, Tuple[str, ...]] = {
-    "create": ("c",),
-    "login": ("in",),
-    "import": ("imp",),
-    "list": ("ls", "l"),
-    "default": ("d",),
-    "use": ("u",),
-    "status": ("st",),
-    "rename": ("mv",),
-    "delete": ("rm",),
-    "share-config": ("share",),
-    "doctor": ("doc",),
-    "setup": ("install",),
-    "help": (),
-    "version": (),
+# Short spelling -> (canonical key, takes_value), derived once from the flag
+# table so the bundle path and the table can never disagree (DRY).
+_SHORT_TO_FLAG: Dict[str, Tuple[str, bool]] = {
+    short: (key, takes_value)
+    for key, (short, _long, takes_value) in _LAUNCH_FLAGS.items()
 }
-_CANONICAL: Dict[str, str] = {}
-for _canonical, _aliases in _SUBCOMMAND_ALIASES.items():
-    _CANONICAL[_canonical] = _canonical
-    for _alias in _aliases:
-        _CANONICAL[_alias] = _canonical
+
+# Canonical subcommand vocabulary lives in vocab.py: the dispatcher and the
+# profile-name validator must share one table so a name that shadows a
+# subcommand can never be created in the first place.
+_CANONICAL = vocab.CANONICAL
+_SUBCOMMAND_ALIASES = vocab.SUBCOMMAND_ALIASES
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -123,24 +108,45 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _match_flag(token: str) -> Optional[Tuple[str, object, int]]:
+def _match_flag(token: str) -> Optional[List[Tuple[str, object, int]]]:
     """Match one argv token against the launcher table.
 
-    Returns ``(key, inline_value, tokens_consumed)`` or ``None``. Value flags
-    accept the separated (``-p work``), attached (``-pwork``) and long-equals
-    (``--profile=work``) forms. Booleans match only their exact spellings, so
-    ``-r`` never swallows an unrelated agy token like ``-rx``.
+    Returns the token's matches as ``[(key, value, tokens_consumed), ...]``
+    or ``None`` when the token is not an agydra flag. Value flags accept
+    the separated (``-p work``), attached (``-pwork``) and long-equals
+    (``--profile=work``) forms. Short-flag bundles follow getopt: booleans
+    chain (``-nr``), a value flag with trailing chars eats them inline as
+    its value (``-b/opt/agy``), and a value flag ENDING the bundle takes
+    the next argv token (``-rp work`` == ``-r -p work``). An unknown letter
+    anywhere rejects the WHOLE token, so an unrelated bundle like ``-rx``
+    is never partially consumed — it is simply agy's.
     """
     for key, (short, long_, takes_value) in _LAUNCH_FLAGS.items():
         if takes_value:
             if token == short or token == long_:
-                return key, None, 2
+                return [(key, None, 2)]
             if token.startswith(long_ + "="):
-                return key, token.split("=", 1)[1], 1
+                return [(key, token.split("=", 1)[1], 1)]
             if len(token) > len(short) and token.startswith(short):
-                return key, token[len(short):], 1
+                return [(key, token[len(short):], 1)]
         elif token == short or token == long_:
-            return key, True, 1
+            return [(key, True, 1)]
+    if token.startswith("-") and not token.startswith("--") and len(token) >= 3:
+        matches: List[Tuple[str, object, int]] = []
+        for pos, char in enumerate(token[1:], start=1):
+            hit = _SHORT_TO_FLAG.get("-" + char)
+            if hit is None:
+                return None  # unknown letter: the whole token is agy's
+            key, takes_value = hit
+            if takes_value:
+                inline = token[pos + 1:]
+                if inline:
+                    matches.append((key, inline, 1))
+                else:
+                    matches.append((key, None, 2))  # value in the next token
+                return matches
+            matches.append((key, True, 1))
+        return matches
     return None
 
 
@@ -162,22 +168,25 @@ def _consume_launch_flags(
         if token == "--":
             rest.extend(argv[i + 1:])
             break
+        start = i  # position of this token: a repeat forwards from here
         matched = _match_flag(token)
         if matched is None:
             rest.extend(argv[i:])
             break
-        key, inline, width = matched
-        if width == 2:
-            if i + 1 >= n:
-                raise StoreError(f"{token} requires a value")
-            inline = argv[i + 1]
-        if values[key] is not None:
-            # Repeat of an already-consumed flag: it is agy's now (agy itself
-            # uses -p for --print), so agydra's flag section ends here.
-            rest.extend(argv[i:])
-            break
-        values[key] = inline
-        i += width
+        i += 1
+        for key, inline, width in matched:
+            if width == 2:
+                if i >= n:
+                    raise StoreError(f"{token} requires a value")
+                inline = argv[i]
+                i += 1
+            if values[key] is not None:
+                # Repeat of an already-consumed flag: it is agy's now (agy
+                # itself uses -p for --print), so agydra's flag section ends
+                # here — the repeated token itself included.
+                rest.extend(argv[start:])
+                return values, rest
+            values[key] = inline if inline is not None else True
     return values, rest
 
 
@@ -188,7 +197,8 @@ def _warn_late_flags(values: Dict[str, object], raw: Sequence[str]) -> None:
     silently launch the default profile — the worst kind of bug in a tool
     whose job is keeping accounts separate. A late ``-b`` is equally silent.
     Driven by the same ``_LAUNCH_FLAGS`` table the extractor consumes, in
-    every spelling (attached ``-pwork``, ``--profile=x``, separated ``-p x``).
+    every spelling (attached ``-pwork``, ``--profile=x``, separated ``-p x``,
+    bundled ``-rp work``).
     """
     for key, (short, long_, takes_value) in _LAUNCH_FLAGS.items():
         if not takes_value or values[key] is not None:
@@ -196,14 +206,22 @@ def _warn_late_flags(values: Dict[str, object], raw: Sequence[str]) -> None:
         for i, token in enumerate(raw):
             if token == "--":
                 return  # everything after -- is agy's by contract
-            spelling = None
             matched = _match_flag(token)
-            if matched is not None and matched[0] == key:
-                if matched[2] == 2 and i + 1 < len(raw):
+            if matched is None:
+                continue
+            if not any(m[0] == key for m in matched):
+                continue
+            # Find which sub-match corresponds to `key` to render the
+            # offending spelling accurately (-pwork vs -rp work). A value
+            # always sits in the NEXT argv token, regardless of how many
+            # boolean flags precede it inside the bundle.
+            for m in matched:
+                if m[0] != key:
+                    continue
+                if m[2] == 2 and i + 1 < len(raw):
                     spelling = f"{token} {raw[i + 1]}"
                 else:
                     spelling = token
-            if spelling:
                 _note(
                     f"'{spelling}' was passed to agy, not agydra — agydra flags "
                     f"must come first: agydra {spelling} <agy args...>"
@@ -523,7 +541,7 @@ def cmd_setup(_store: Store, args) -> int:
 
 
 # One-line description per canonical subcommand. Displayed by the top-level
-# help; keep in sync with _SUBCOMMAND_ALIASES (a missing entry falls back
+# help; keep in sync with vocab.SUBCOMMAND_ALIASES (a missing entry falls back
 # to the raw command list, an extra entry is ignored).
 _SUBCOMMAND_HELP: Dict[str, str] = {
     "list": "show all profiles (number, email, auth, busy)",
@@ -545,7 +563,7 @@ _SUBCOMMAND_HELP: Dict[str, str] = {
 
 def _management_help() -> str:
     lines = [paint("management:", "cyan", "bold")]
-    for canonical, aliases in _SUBCOMMAND_ALIASES.items():
+    for canonical, aliases in vocab.SUBCOMMAND_ALIASES.items():
         spellings = "/".join((canonical, *aliases))
         lines.append(
             paint_each(

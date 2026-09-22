@@ -17,7 +17,7 @@ import zipfile
 from pathlib import Path
 from typing import List, Optional
 
-from . import platforms
+from . import platforms, vocab
 from .models import Config, Profile, _utcnow_iso
 from .ui import warn
 
@@ -240,13 +240,23 @@ class Store:
 
     # ---- validation -----------------------------------------------------
     @staticmethod
-    def validate_name(name: str) -> str:
+    def validate_name(name: str, allow_reserved: bool = False) -> str:
         if not NAME_RE.match(name or ""):
             raise StoreError(
                 f"invalid profile name {name!r}: use lowercase letters, digits, "
                 "'-' and '_', starting with a letter or digit (max 64 chars)"
             )
-        return name
+        if allow_reserved or name not in vocab.RESERVED_NAMES:
+            return name
+        # Bare `agydra <name> ...` always dispatches the subcommand, so
+        # such a profile would be unreachable from the shell (the
+        # dispatcher wins over the launcher). Refuse instead of creating
+        # a permanently shadowed profile; existing ones still respond to
+        # `agydra -p <name> ...`.
+        raise StoreError(
+            f"reserved profile name {name!r}: it collides with an agydra "
+            "subcommand (see: agydra help); pick another name"
+        )
 
     # ---- CRUD -----------------------------------------------------------
     def exists(self, name: str) -> bool:
@@ -308,7 +318,10 @@ class Store:
                 profile = Profile.from_dict(_read_json(meta))
                 # The on-disk `name` drives profile_dir(); a hand-edited
                 # metadata must never escape profiles/ via traversal.
-                self.validate_name(profile.name)
+                # allow_reserved=True keeps pre-existing profiles whose
+                # name collides with a subcommand reachable via -p (the
+                # new-vs-legacy asymmetry: refuse at create, never at scan).
+                self.validate_name(profile.name, allow_reserved=True)
                 if profile.name != meta.parent.name:
                     raise ValueError("metadata name does not match its directory")
                 profiles.append(profile)
