@@ -11,7 +11,7 @@ from agydra import platforms
 
 class TestBaseDir(unittest.TestCase):
     def tearDown(self):
-        os.environ.pop("AGYDRA_BASE_DIR_TEST", None)
+        os.environ.pop("AGYDRA_HOME", None)
 
     def test_env_override_wins(self):
         os.environ["AGYDRA_HOME"] = str(Path("/tmp/custom-root"))

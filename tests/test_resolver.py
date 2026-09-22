@@ -1,5 +1,4 @@
 """Resolver cascade: flag → env → marker → default → first → none."""
-import os
 import sys
 import unittest
 from pathlib import Path

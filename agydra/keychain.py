@@ -148,12 +148,24 @@ def _serialize_lock(store):
     return handle
 
 
-def launch_guard(store, profile: str):
+def launch_guard(store, profile: str, capture: bool = False):
     """Context manager swapping the shared keychain slot to ``profile``.
 
     Returns a null-context manager on platforms without a keychain bridge.
     Fail-open: any error while swapping logs a warning and yields anyway, so
     a keychain problem degrades to unswapped behavior instead of aborting.
+
+    ``capture=True`` flips the exit path for the login flow: instead of
+    restoring the pre-launch shared slot (which would DELETE or stale-
+    restore the fresh token agy just wrote), the token is persisted as this
+    profile's private slot and the shared slot keeps pointing at it. Use
+    only around an interactive ``agydra login`` run.
+
+    Why the default exit restores: a normal launch must leave the shared
+    slot exactly as it found it. The login flow, however, relies on the
+    exit running BEFORE cmd_login's capture step (see runner.run's launch
+    ordering), so a plain restore there would overwrite/delete the very
+    token capture needs to read — the capture would always see None.
     """
     if not supported():
         import contextlib
@@ -179,20 +191,38 @@ def launch_guard(store, profile: str):
 
         def __exit__(self, *exc_info):
             try:
-                if self._had_shared is not None:
-                    write_slot(shared_slot(), self._had_shared)
-                elif self._lock is not None and read_slot(shared_slot()) is not None:
-                    # No previous shared token and a profile slot was swapped
-                    # in: remove it again so we leave no shared state behind.
-                    try:
-                        delete_slot(shared_slot())
-                    except KeychainError:
-                        pass
+                if capture:
+                    # Login flow: agy just wrote THIS profile's fresh token
+                    # into the shared slot. Persist it to the profile slot
+                    # and keep the shared slot pointing at it.
+                    self._capture_and_keep()
+                else:
+                    if self._had_shared is not None:
+                        write_slot(shared_slot(), self._had_shared)
+                    elif self._lock is not None and read_slot(shared_slot()) is not None:
+                        # No previous shared token and a profile slot was swapped
+                        # in: remove it again so we leave no shared state behind.
+                        try:
+                            delete_slot(shared_slot())
+                        except KeychainError:
+                            pass
+            except KeychainError as exc:
+                # Fail-open contract: a keychain failure on exit must never
+                # turn a successful session into a raw traceback.
+                warn(f"keychain restore failed ({exc}); shared slot left as-is")
             finally:
                 if self._lock is not None:
-                    fcntl.flock(self._lock.fileno(), fcntl.LOCK_UN)
-                    self._lock.close()
+                    try:
+                        fcntl.flock(self._lock.fileno(), fcntl.LOCK_UN)
+                        self._lock.close()
+                    except OSError:
+                        pass
             return False
+
+        def _capture_and_keep(self):
+            data = read_slot(shared_slot())
+            if data is not None:
+                save_profile_slot(store, profile, data)
 
     return _Guard()
 
@@ -225,12 +255,15 @@ def clear_shared_slot(store) -> None:
         warn(f"could not clear shared keychain slot ({exc})")
 
 
+def describe(store, names: Optional[List[str]] = None) -> Dict[str, object]:
+    """Doctor/report view: which slots exist, no secrets.
 
-def describe(store) -> Dict[str, object]:
-    """Doctor/report view: which slots exist, no secrets."""
+    ``names`` lets a caller that already scanned the store (doctor) skip the
+    re-glob; defaults to scanning when omitted."""
     if not supported():
         return {"supported": False}
-    names = store.names() if store is not None else []
+    if names is None:
+        names = store.names() if store is not None else []
     slots = {}
     for name in names:
         try:

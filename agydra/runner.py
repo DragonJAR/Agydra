@@ -114,9 +114,11 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
     # Acquire the session lock. For -r, losing the race is expected under
     # concurrency: re-pick once from the profiles that are STILL free and
     # retry — repeated losers converge because each attempt removes at least
-    # one candidate from the free set.
+    # one candidate from the free set. The profile count is captured once
+    # (the retry loop must not re-glob the store on every busy cycle).
     handle = None
     attempts = 0
+    max_attempts = len(store.names())
     while True:
         handle = locks.try_lock(store, plan.profile)
         if handle is not None:
@@ -127,7 +129,7 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
                 "using it (agydra -r picks a free one automatically)"
             )
         attempts += 1
-        if attempts > len(store.names()):
+        if attempts > max_attempts:
             raise StoreError(
                 "no free authenticated profile left after concurrent picks"
             )
@@ -154,8 +156,12 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
         argv = isolation.sandbox_wrap(argv)
     # Swap the shared macOS keychain slot to this profile's token for the
     # duration of the launch; no-op (null context) on Linux/Windows, where the
-    # overlay file is already the isolated store.
-    with keychain.launch_guard(store, plan.profile):
+    # overlay file is already the isolated store. ``capture`` is set only by
+    # the login flow (plan.launch_as_child), which needs the fresh token
+    # persisted as this profile's private slot instead of restored-over.
+    with keychain.launch_guard(
+        store, plan.profile, capture=plan.launch_as_child
+    ):
         if platforms.is_windows():
             # Windows launch waits for the child; the parent holds the lock
             # for the session and must release it when the child exits.

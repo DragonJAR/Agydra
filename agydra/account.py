@@ -36,10 +36,13 @@ def _decode_jwt_payload(token: str) -> dict:
         return {}
     padding = "=" * (-len(parts[1]) % 4)
     try:
-        payload = base64.urlsafe_b64decode(parts[1] + padding)
-        return json.loads(payload)
+        decoded = json.loads(base64.urlsafe_b64decode(parts[1] + padding))
     except (binascii.Error, ValueError):
         return {}
+    # A valid-JSON but non-object payload (hand-edited or a future agy
+    # format) must degrade like any other unreadable claim set, never
+    # explode later at claims.get("email").
+    return decoded if isinstance(decoded, dict) else {}
 
 
 def _oauth_obj(data_dir: Path):
@@ -73,9 +76,15 @@ def detect_email(data_dir: Path) -> Optional[str]:
     return None
 
 
-def _macos_keychain_authenticated(store, name) -> Optional[bool]:
+def _macos_keychain_authenticated(
+    store, name, profile_count: Optional[int] = None
+) -> Optional[bool]:
     """macOS fallback: the profile's keychain slot (or, for a single-profile
-    store created before the bridge existed, the shared slot) is present."""
+    store created before the bridge existed, the shared slot) is present.
+
+    ``profile_count`` lets callers that already scanned the store (list,
+    doctor, resolver) pass the cardinality in; without it the single-profile
+    fallback would re-glob the whole store once per listed row."""
     if not platforms.is_macos():
         return None
     try:
@@ -85,18 +94,27 @@ def _macos_keychain_authenticated(store, name) -> Optional[bool]:
             return None
         if name and keychain.load_profile_slot(store, name) is not None:
             return True
-        if store is not None and len(store.names()) == 1:
+        if profile_count is None and store is not None:
+            profile_count = len(store.names())
+        if store is not None and profile_count == 1:
             return keychain.read_slot(keychain.shared_slot()) is not None
         return False
     except Exception:  # defensive: detection must never break listing
         return None
 
 
-def auth_state(data_dir: Path, store=None, name: Optional[str] = None) -> str:
+def auth_state(
+    data_dir: Path,
+    store=None,
+    name: Optional[str] = None,
+    profile_count: Optional[int] = None,
+) -> str:
     """'authenticated' | 'not-authenticated' from whichever backend is live.
 
     ``store``/``name`` enable the precise per-profile keychain lookup on
     macOS; without them only the on-disk token file is consulted.
+    ``profile_count`` is the store's profile cardinality, so callers holding
+    a scan can spare the fallback a re-glob.
     """
     for raw in _oauth_obj(data_dir):
         token = raw.get("token") if isinstance(raw.get("token"), dict) else raw
@@ -104,7 +122,7 @@ def auth_state(data_dir: Path, store=None, name: Optional[str] = None) -> str:
             token.get("access_token") or token.get("refresh_token")
         ):
             return "authenticated"
-    if _macos_keychain_authenticated(store, name):
+    if _macos_keychain_authenticated(store, name, profile_count):
         return "authenticated"
     return "not-authenticated"
 

@@ -1,5 +1,4 @@
 """locks: kernel-held session locks (flock/msvcrt) — acquire, probe, release."""
-import os
 import stat
 import sys
 import unittest
@@ -40,12 +39,13 @@ class TestLocks(BaseCase):
         first.release()
         self.assertIsNotNone(locks.try_lock(self.store, "work"))
 
-    def test_lock_survives_handle_gc(self):
-        """The lock is kernel-held on the open fd: dropping the Python
-        handle without release() must NOT free the profile (on CPython the
-        fd would be closed by GC, so pin the handle explicitly — this test
-        documents the contract for callers: keep the handle alive or the
-        lock dies with it)."""
+    def test_lock_held_while_handle_alive(self):
+        """The lock is kernel-held on the open fd: as long as the caller
+        keeps the handle alive (without release()), the profile stays busy.
+        (Dropping the handle lets CPython's GC close the fd and free the
+        lock — callers must keep the handle alive for the session's
+        lifetime; cross-process survival is covered by the -r integration
+        test with a live gate-held child.)"""
         handle = locks.try_lock(self.store, "work")
         self.assertTrue(locks.is_locked(self.store, "work"))
         handle.release()

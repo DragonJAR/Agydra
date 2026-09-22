@@ -157,9 +157,14 @@ def is_locked(store, name: str) -> bool:
     return locked
 
 
-def in_use_names(store) -> List[str]:
-    """Profiles whose lock is currently held by a running session."""
-    return [n for n in store.names() if is_locked(store, n)]
+def in_use_names(store, names: Optional[List[str]] = None) -> List[str]:
+    """Profiles whose lock is currently held by a running session.
+
+    Pass ``names`` to skip the store scan when the caller already holds a
+    list (e.g. doctor); without it the lock probe still pays one ``names()``
+    to discover candidates."""
+    candidates = names if names is not None else store.names()
+    return [n for n in candidates if is_locked(store, n)]
 
 
 def forget(store, name: str) -> None:

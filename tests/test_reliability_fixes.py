@@ -9,9 +9,10 @@ Each test pins one defect found during the cross-platform audit:
 - Profile.from_dict passed last_used/email through unvalidated, letting
   hand-edited metadata explode later inside resolver's min() key
 """
-import json
 import unittest
 from pathlib import Path
+
+from conftest import isolated_store_env
 
 from agydra import keychain, models, resolver
 from agydra.store import Store, StoreError
@@ -61,78 +62,42 @@ class TestDeleteSlotCodes(unittest.TestCase):
 
 
 class TestMarkerEncoding(unittest.TestCase):
-    def _store_with_profile(self, tmp: Path) -> Store:
-        import os
-
-        os.environ["AGYDRA_HOME"] = str(tmp / "store")
+    def _store_with_profile(self, root: str) -> tuple:
         store = Store()
         store.create("work")
-        return store
+        return store, Path(root)
 
     def test_bom_marker_resolves_cleanly(self):
-        import os
-        import tempfile
-
-        old = os.environ.get("AGYDRA_HOME")
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            store = self._store_with_profile(tmp)
+        with isolated_store_env() as root:
+            store, tmp = self._store_with_profile(root)
             # Editors like Notepad write UTF-8 with BOM; the marker must
             # resolve through the BOM-aware decode, not crash or miss.
             (tmp / ".agydra").write_bytes(b"\xef\xbb\xbf" + "work\n".encode("utf-8"))
-            try:
-                res = resolver.resolve(store, cwd=tmp, env={})
-                self.assertEqual(res.name, "work")
-            finally:
-                if old is None:
-                    os.environ.pop("AGYDRA_HOME", None)
-                else:
-                    os.environ["AGYDRA_HOME"] = old
+            res = resolver.resolve(store, cwd=tmp, env={})
+            self.assertEqual(res.name, "work")
 
     def test_utf16_marker_raises_actionable_storeerror(self):
-        import os
-        import tempfile
-
-        old = os.environ.get("AGYDRA_HOME")
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            store = self._store_with_profile(tmp)
+        with isolated_store_env() as root:
+            store, tmp = self._store_with_profile(root)
             # PowerShell 5.1 `> .agydra` writes UTF-16LE with BOM.
             (tmp / ".agydra").write_bytes("work\n".encode("utf-16"))
-            try:
-                with self.assertRaises(StoreError) as ctx:
-                    resolver.resolve(store, cwd=tmp, env={})
-                self.assertIn("not valid UTF-8", str(ctx.exception))
-            finally:
-                if old is None:
-                    os.environ.pop("AGYDRA_HOME", None)
-                else:
-                    os.environ["AGYDRA_HOME"] = old
+            with self.assertRaises(StoreError) as ctx:
+                resolver.resolve(store, cwd=tmp, env={})
+            self.assertIn("not valid UTF-8", str(ctx.exception))
 
 
 class TestCreateAtomicReserve(unittest.TestCase):
     def test_second_create_of_same_name_fails(self):
-        import os
-        import tempfile
-
-        old = os.environ.get("AGYDRA_HOME")
-        with tempfile.TemporaryDirectory() as td:
-            os.environ["AGYDRA_HOME"] = td
+        with isolated_store_env():
             store = Store()
-            try:
+            store.create("alpha")
+            # Simulate the lost race: the dir exists but metadata was
+            # never written (the pre-fix check-then-act window).
+            meta = store.profile_meta_path("alpha")
+            meta.unlink()
+            with self.assertRaises(StoreError) as ctx:
                 store.create("alpha")
-                # Simulate the lost race: the dir exists but metadata was
-                # never written (the pre-fix check-then-act window).
-                meta = store.profile_meta_path("alpha")
-                meta.unlink()
-                with self.assertRaises(StoreError) as ctx:
-                    store.create("alpha")
-                self.assertIn("already exists", str(ctx.exception))
-            finally:
-                if old is None:
-                    os.environ.pop("AGYDRA_HOME", None)
-                else:
-                    os.environ["AGYDRA_HOME"] = old
+            self.assertIn("already exists", str(ctx.exception))
 
 
 class TestProfileFromDictCoercion(unittest.TestCase):
@@ -155,26 +120,15 @@ class TestProfileFromDictCoercion(unittest.TestCase):
 
 class TestScanSinglePass(unittest.TestCase):
     def test_scan_returns_both_views(self):
-        import os
-        import tempfile
-
-        old = os.environ.get("AGYDRA_HOME")
-        with tempfile.TemporaryDirectory() as td:
-            os.environ["AGYDRA_HOME"] = td
+        with isolated_store_env():
             store = Store()
             store.create("alpha")
             # Corrupt metadata must land in unreadable, not crash scan.
             meta = store.profile_meta_path("alpha")
             meta.write_text("{ not json", encoding="utf-8")
-            try:
-                profiles, unreadable = store.scan()
-                self.assertEqual(profiles, [])
-                self.assertEqual(unreadable, ["alpha"])
-            finally:
-                if old is None:
-                    os.environ.pop("AGYDRA_HOME", None)
-                else:
-                    os.environ["AGYDRA_HOME"] = old
+            profiles, unreadable = store.scan()
+            self.assertEqual(profiles, [])
+            self.assertEqual(unreadable, ["alpha"])
 
 
 class TestDeleteVerifiesRemoval(unittest.TestCase):
@@ -182,28 +136,50 @@ class TestDeleteVerifiesRemoval(unittest.TestCase):
     survives `delete()` must fail loud, not fake success and brick `create`."""
 
     def test_delete_raises_when_dir_survives(self):
-        import os
-        import tempfile
         from unittest import mock
 
         from agydra import store as store_mod
 
-        old = os.environ.get("AGYDRA_HOME")
-        with tempfile.TemporaryDirectory() as td:
-            os.environ["AGYDRA_HOME"] = td
+        with isolated_store_env():
             store = Store()
             store.create("alpha")
-            try:
-                with mock.patch.object(store_mod, "_rmtree"):
-                    # Pretend rmtree did nothing: the dir is still there.
-                    with self.assertRaises(StoreError):
-                        store.delete("alpha")
-                self.assertTrue(store.exists("alpha"))
-            finally:
-                if old is None:
-                    os.environ.pop("AGYDRA_HOME", None)
-                else:
-                    os.environ["AGYDRA_HOME"] = old
+            with mock.patch.object(store_mod, "_rmtree"):
+                # Pretend rmtree did nothing: the dir is still there.
+                with self.assertRaises(StoreError):
+                    store.delete("alpha")
+            self.assertTrue(store.exists("alpha"))
+
+
+class TestKeychainLoginCapture(unittest.TestCase):
+    """Bug guard: the login flow's keychain capture used to be dead — the
+    guard's __exit__ restored the pre-launch shared slot, deleting (or
+    overwriting with a stale snapshot) the fresh token agy just wrote.
+    Fix: launch_guard(capture=True) persists the post-agy token as the
+    profile's private slot and leaves the shared slot pointing at it."""
+
+    def test_capture_keeps_fresh_token(self):
+        # Stub the keychain calls so the test stays macOS-free.
+        import os as _os
+        from unittest import mock
+
+        with isolated_store_env():
+            store = Store()
+            store.create("work")
+            fresh = b"fresh-token"
+            with mock.patch.object(
+                keychain, "_serialize_lock", return_value=mock.MagicMock()
+            ), mock.patch.object(
+                keychain, "read_slot", side_effect=[None, fresh, fresh]
+            ), mock.patch.object(
+                keychain, "write_slot"
+            ), mock.patch.object(
+                keychain, "save_profile_slot"
+            ) as save, mock.patch.object(
+                keychain, "fcntl"
+            ):
+                with keychain.launch_guard(store, "work", capture=True):
+                    pass
+            save.assert_called_once_with(store, "work", fresh)
 
 
 if __name__ == "__main__":

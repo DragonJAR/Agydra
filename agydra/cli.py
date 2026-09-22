@@ -4,13 +4,14 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import __version__, account, keychain, locks, platforms, resolver, runner
 from .bootstrap import BootstrapError
 from .isolation import IsolationError
-from .store import Store, StoreError, atomic_copy
+from .store import Store, StoreError, _rename_dir_with_retry, atomic_copy
 
 # ---------------------------------------------------------------------------
 # Single source of truth for the launcher vocabulary: canonical flag ->
@@ -196,22 +197,25 @@ def cmd_list(store: Store, _args) -> int:
         f"{'DEFAULT':<9}{'BUSY':<6}LAST USED"
     )
     for idx, profile in enumerate(profiles, start=1):
+        # ONE lock probe per row: a second probe could flip between the
+        # email decision and the BUSY column, contradicting itself.
+        busy = locks.is_locked(store, profile.name)
         # Only free profiles may be touched: a live session owns its
         # profile.json (touch on launch) and a concurrent write would
         # resurrect a stale last_used.
-        if locks.is_locked(store, profile.name):
+        if busy:
             email = profile.email or "-"
         else:
             email = account.sync_profile_email(store, profile.name) or "-"
         state = account.auth_state(
-            store.profile_data_dir(profile.name), store, profile.name
+            store.profile_data_dir(profile.name), store, profile.name,
+            profile_count=len(profiles),
         )
         is_default = "*" if profile.name == default else ""
-        busy = "yes" if locks.is_locked(store, profile.name) else "-"
         last = profile.last_used or "-"
         print(
             f"{idx:<3}{profile.name:<{width + 2}}{email:<34}{state:<20}"
-            f"{is_default:<9}{busy:<6}{last}"
+            f"{is_default:<9}{'yes' if busy else '-':<6}{last}"
         )
     return 0
 
@@ -250,22 +254,18 @@ def cmd_login(store: Store, args) -> int:
             print("cancelled")
             return 1
     # A login writes this profile's credentials into the macOS shared keychain
-    # slot; clear it first (only when no other session is live) so the swap
-    # logic can later attribute the slot to this profile via capture.
-    keychain.clear_shared_slot(store)
+    # slot; the launch_guard around runner.run uses capture=True so the exit
+    # path persists that fresh token as THIS profile's private slot instead of
+    # restoring over it (a plain restore would delete/replace the token before
+    # anyone could capture it).
     # Interactive login needs the real TTY and the OAuth browser flow: run agy
     # without arguments so it enters the auth flow under this profile's store.
-    # It runs as a waited child (not exec) so we can snapshot the refreshed
-    # keychain slot after agy exits.
+    # It runs as a waited child (not exec) so the guard's exit runs inside
+    # runner.run, right after agy exits.
     plan = runner.build_plan(store, [], flag_ref=name, launch_as_child=True)
     print(f"launching agy for login under profile {plan.profile!r}...")
     print("complete the OAuth flow in the browser; tokens land in the profile store")
-    code = runner.run(plan, store=store, dry_run=args.dry_run)
-    if code == 0 and not args.dry_run:
-        # Whatever agy just wrote into the shared slot belongs to this
-        # profile: snapshot it so future launches swap it back in.
-        keychain.capture_shared_slot(store, name)
-    return code
+    return runner.run(plan, store=store, dry_run=args.dry_run)
 
 
 def cmd_status(store: Store, args) -> int:
@@ -333,15 +333,22 @@ def cmd_delete(store: Store, args) -> int:
 
 
 def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
-    """Copy only settings.json + mcp.json between profile stores."""
+    """Copy only settings.json + mcp.json between profile stores.
+
+    All targets are validated (existence, self-copy, live sessions) BEFORE
+    the first byte is copied: a bad third target must not leave the first
+    two half-copied."""
     allowed = {"settings.json", "mcp.json"}
     src_dir = store.profile_data_dir(src)
-    copied: List[str] = []
+    resolved: List[str] = []
     for target in targets:
         target_name = store.resolve_ref(target)
         if target_name == src:
             continue
         _assert_free(store, target_name)
+        resolved.append(target_name)
+    copied: List[str] = []
+    for target_name in resolved:
         target_dir = store.profile_data_dir(target_name)
         for name in allowed:
             file = src_dir / name
@@ -372,11 +379,21 @@ def cmd_import(store: Store, args) -> int:
             "plain `agy` to create it, then retry: agydra import " + name
         )
     data_dir = store.profile_data_dir(name)
-    copied = shutil.copytree(
-        real, data_dir, dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns(".DS_Store"),
-    )
-    print(f"imported generic data into profile {name!r}: {copied}")
+    # Same atomic discipline as every other writer: land the copy in a
+    # sibling tmp dir, then swap it in with one rename. A crash mid-copy
+    # must never leave half-landed tokens that auth_state would read.
+    platforms.ensure_dir(data_dir.parent)
+    tmp = Path(tempfile.mkdtemp(prefix=f".import-{name}.", dir=data_dir.parent))
+    try:
+        shutil.copytree(
+            real, tmp, dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns(".DS_Store"),
+        )
+        _rename_dir_with_retry(tmp, data_dir)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    print(f"imported generic data into profile {name!r}: {data_dir}")
     return 0
 
 

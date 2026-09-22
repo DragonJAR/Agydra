@@ -12,7 +12,6 @@ readable ``reason`` so ``status`` can explain why a profile was picked:
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -136,11 +135,12 @@ def pick_free_profile(store, cwd: Optional[Path] = None) -> Resolution:
     Deterministic and side-effect-free (the caller takes the lock later, in
     ``runner.run``, which owns all filesystem mutation):
 
-    1. no store marker pins this directory (``-r`` asks agydra to CHOOSE, so
-       an explicit project pin must win over the choice);
-    2. skip profiles with a live session (advisory lock held);
-    3. skip unauthenticated profiles;
-    4. prefer the least-recently-used, break ties by seq (creation order).
+    1. the 2-profile floor (a choice needs at least two candidates);
+    2. a store marker pinning this directory wins (``-r`` asks agydra to
+       CHOOSE, so an explicit project pin must win over the choice);
+    3. skip profiles with a live session (advisory lock held);
+    4. skip unauthenticated profiles;
+    5. prefer the least-recently-used, break ties by seq (creation order).
     """
     # Single scan, single pass: `list()` and `names()` both glob+parse the
     # whole store, so derive `names` from `profiles` and reuse it. Same
@@ -161,7 +161,10 @@ def pick_free_profile(store, cwd: Optional[Path] = None) -> Resolution:
         raise StoreError(_NO_FREE)
     usable = [
         p for p in free
-        if account.auth_state(store.profile_data_dir(p.name), store, p.name)
+        if account.auth_state(
+            store.profile_data_dir(p.name), store, p.name,
+            profile_count=len(profiles),
+        )
         == "authenticated"
     ]
     if not usable:

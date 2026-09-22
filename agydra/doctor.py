@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 from . import __version__, account, isolation, keychain, platforms
 from .store import Store
@@ -13,7 +15,20 @@ WARN = "warn"
 FAIL = "fail"
 
 
-def _check_binary(store: Store):
+@dataclass
+class _DoctorContext:
+    """Bundle the single store-wide scan shared by every check.
+
+    Doctor used to re-glob profiles/ 4× per run (one per check that read the
+    store). One scan now feeds all checks; downstream helpers consume the
+    cached tuples instead of paying another ``store.scan()``/``store.names()``."""
+
+    scan: Tuple[List, List[str]]
+    names: List[str]
+    profile_count: int
+
+
+def _check_binary(store: Store, _ctx: "_DoctorContext"):
     config = store.load_config()
     binary = platforms.resolve_agy_binary(config.agy_binary)
     if binary is None:
@@ -21,7 +36,7 @@ def _check_binary(store: Store):
     return OK, f"agy binary: {binary}"
 
 
-def _check_store(store: Store):
+def _check_store(store: Store, _ctx: "_DoctorContext"):
     try:
         store.root.mkdir(parents=True, exist_ok=True)
         # Unique probe name: two concurrent `agydra doctor` runs must not
@@ -38,8 +53,8 @@ def _check_store(store: Store):
     return OK, f"store writable: {store.root}"
 
 
-def _check_profiles(store: Store):
-    profiles, unreadable = store.scan()
+def _check_profiles(store: Store, ctx: "_DoctorContext"):
+    profiles, unreadable = ctx.scan
     problems = []
     lines = [f"profiles: {len(profiles)}"]
     for p in profiles:
@@ -50,7 +65,9 @@ def _check_profiles(store: Store):
             problems.append(f"{p.name}: data dir missing ({data_dir})")
             lines.append(f"  - {p.name}: DATA DIR MISSING")
             continue
-        state = account.auth_state(data_dir, store, p.name)
+        state = account.auth_state(
+            data_dir, store, p.name, profile_count=ctx.profile_count
+        )
         lines.append(f"  - {p.name}: {state}")
     default = store.default_name()
     if default and default not in [p.name for p in profiles]:
@@ -73,17 +90,17 @@ def _check_profiles(store: Store):
     return OK, "\n".join(lines)
 
 
-def _check_locks(store: Store):
+def _check_locks(store: Store, ctx: "_DoctorContext"):
     """Report live sessions; a stale lock FILE is not a session (the lock is
     kernel-held, so a crash releases it and the file is just an unlocked
     sentinel). Anything but an explicit pass is a warning: doctor's job is
     to flag, never to guess."""
     from . import locks
 
-    if not store.names():
+    if not ctx.names:
         return WARN, "locks: no profiles to check"
     try:
-        busy = locks.in_use_names(store)
+        busy = locks.in_use_names(store, names=ctx.names)
     except OSError as exc:
         return WARN, f"locks: cannot inspect ({exc})"
     if busy:
@@ -91,9 +108,9 @@ def _check_locks(store: Store):
     return OK, "locks: no live sessions"
 
 
-def _check_isolation(store: Store):
+def _check_isolation(store: Store, ctx: "_DoctorContext"):
     """Verify the overlay mechanism end-to-end for every profile."""
-    profiles = store.names()
+    profiles = ctx.names
     if not profiles:
         return WARN, "isolation not checked (no profiles)"
     real_gemini = platforms.agy_data_dir()
@@ -106,7 +123,10 @@ def _check_isolation(store: Store):
             continue
         overlay = store.overlays_dir / name
         gemini_link = overlay / platforms.AGY_DATA_DIR_NAME
-        if not gemini_link.exists() and not gemini_link.is_symlink():
+        # _is_link (not exists/is_symlink): on Windows a junction whose
+        # target vanished reports exists()=False AND is_symlink()=False,
+        # which would misclassify a launched profile as "never launched".
+        if not gemini_link.exists() and not isolation._is_link(gemini_link):
             # Never launched: runner.build_overlay creates it on first use,
             # so there is nothing to break yet.
             pending.append(name)
@@ -127,18 +147,20 @@ def _check_isolation(store: Store):
     return OK, f"isolation ok for {len(profiles) - len(pending)} profile(s){note}"
 
 
-def _check_schema_canary(store: Store):
+def _check_schema_canary(store: Store, ctx: "_DoctorContext"):
     """Confirm profiles actually contain agy's data layout (schema unchanged).
 
     The authoritative on-disk layout is ``<data>/antigravity-cli/`` (the token
-    file lives inside it); ``oauth_creds.json`` is the legacy alias.
+    file lives inside it); ``oauth_creds.json`` is the legacy alias. Consumes
+    the doctor-wide scan — no re-glob of the store here.
     """
+    names = ctx.names
     any_data = any(
         (store.profile_data_dir(n) / account.AGY_CLI_DIR).exists() or
         (store.profile_data_dir(n) / account.OAUTH_FILE).exists()
-        for n in store.names()
+        for n in names
     )
-    if not store.names():
+    if not names:
         return WARN, "schema canary pending (no profiles to inspect)"
     if not any_data:
         return WARN, (
@@ -148,9 +170,9 @@ def _check_schema_canary(store: Store):
     return OK, "profile stores contain agy data layout (schema canary passed)"
 
 
-def _check_keychain(store: Store):
+def _check_keychain(store: Store, ctx: "_DoctorContext"):
     """Report the macOS keychain bridge state (per-profile credential slots)."""
-    report = keychain.describe(store)
+    report = keychain.describe(store, names=ctx.names)
     if not report.get("supported"):
         if platforms.is_macos():
             return WARN, "keychain bridge: `security` not found (swap disabled)"
@@ -166,7 +188,7 @@ def _check_keychain(store: Store):
     )
 
 
-def _check_sandbox(_store: Store):
+def _check_sandbox(_store: Store, _ctx: "_DoctorContext"):
     if not platforms.is_linux():
         return OK, "linux sandbox: n/a (not linux)"
     if isolation.use_bwrap():
@@ -174,7 +196,7 @@ def _check_sandbox(_store: Store):
     return WARN, "linux sandbox: bwrap not installed (optional hardening disabled)"
 
 
-def _check_bootstrap(_store: Store):
+def _check_bootstrap(_store: Store, _ctx: "_DoctorContext"):
     """Report the one-command install state (venv, shim, PATH)."""
     from . import bootstrap
 
@@ -234,10 +256,16 @@ CHECKS = [
 def run_checks(store: Store) -> int:
     print(f"agydra doctor — agydra {__version__} on {sys.platform}")
     print("legend: [ok]=pass [!!]=warn [XX]=fail")
+    # Single scan shared by every check (see _DoctorContext).
+    scan = store.scan()
+    ctx = _DoctorContext(
+        scan=scan, names=[p.name for p in scan[0]],
+        profile_count=len(scan[0]),
+    )
     exit_code = 0
     for label, check in CHECKS:
         try:
-            status, message = check(store)
+            status, message = check(store, ctx)
         except Exception as exc:  # defensive: doctor must always complete
             status, message = FAIL, f"{label}: unexpected error: {exc}"
         symbol = {OK: "[ok]", WARN: "[!!]", FAIL: "[XX]"}[status]

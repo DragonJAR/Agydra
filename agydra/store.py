@@ -85,7 +85,8 @@ def _replace_with_retry(src: str, dst: Path, attempts: int = 3) -> None:
 def _rename_dir_with_retry(src: Path, dst: Path, attempts: int = 3) -> None:
     """os.rename for directories with the same Windows-backoff discipline:
     AV/indexers holding a handle on the dir produce a transient
-    PermissionError; POSIX semantics are unchanged (fails if dst exists)."""
+    PermissionError. POSIX rename replaces an existing EMPTY dst dir; that
+    case is rejected by Store.rename's guard before we get here."""
     _retry_backoff(attempts, lambda: os.rename(src, dst))
 
 
@@ -348,6 +349,16 @@ class Store:
         profile = self.get(old)
         if self.exists(new):
             raise StoreError(f"profile {new!r} already exists")
+        # POSIX rename(2) silently REPLACES an existing empty directory, so
+        # a concurrent create that just reserved its dir (metadata not yet
+        # written) would be clobbered and both writers would land in the
+        # same dir. Refuse on any existing target dir, not just on written
+        # metadata.
+        if self.profile_dir(new).exists():
+            raise StoreError(
+                f"refusing to rename: target {self.profile_dir(new)} already "
+                "exists (another profile may be creating it)"
+            )
         # Windows AV/indexers can keep a handle on the directory briefly
         # after the profile was last touched (the exact pattern
         # _replace_with_retry exists to mitigate for files).
@@ -462,9 +473,7 @@ class Store:
             except OSError:
                 continue
         stamped.sort()
-        victims = [p for _, p in stamped[:-keep] if keep > 0] if keep > 0 else [
-            p for _, p in stamped
-        ]
+        victims = [p for _, p in (stamped[:-keep] if keep > 0 else stamped)]
         for old in victims:
             try:
                 if old.exists():

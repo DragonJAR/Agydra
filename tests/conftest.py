@@ -1,18 +1,17 @@
 """Shared test fixtures: fake home, fake agy binary, isolated store."""
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import stat
-import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
 
-def write_fake_agy(path: Path, data_dir_env_hint: Path) -> Path:
+def write_fake_agy(path: Path) -> Path:
     """Create a fake `agy` that mimics the real one's home-derived data dir.
 
     Returns the path of the artifact actually written (``agy`` on POSIX,
@@ -95,7 +94,7 @@ class BaseCase(unittest.TestCase):
         # Unrelated home entry that must be mirrored into overlays.
         (self.fake_home / ".gitconfig").write_text("[user]\n", encoding="utf-8")
 
-        self.agy_bin = write_fake_agy(self.bin_dir / "agy", self.fake_home)
+        self.agy_bin = write_fake_agy(self.bin_dir / "agy")
         # Point the override at the artifact that actually exists on this OS
         # (agy.cmd on Windows), not the extensionless POSIX path.
         os.environ["AGYDRA_AGY_BIN"] = str(self.agy_bin)
@@ -104,3 +103,33 @@ class BaseCase(unittest.TestCase):
         os.environ.clear()
         os.environ.update(self._old_env)
         shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _run_cli(self, *args):
+        """Run agydra's CLI in a subprocess (execvpe replaces the process)."""
+        import subprocess
+
+        return subprocess.run(
+            [sys.executable, "-m", "agydra", *args],
+            capture_output=True, text=True, timeout=60,
+        )
+
+
+@contextlib.contextmanager
+def isolated_store_env():
+    """Pin AGYDRA_HOME to a fresh temp dir and restore the old value after.
+
+    Shared by tests that build a bare Store against a throwaway root; keeps
+    the save/restore dance in exactly one place (DRY)."""
+    import tempfile
+
+    old = os.environ.get("AGYDRA_HOME")
+    td = tempfile.TemporaryDirectory()
+    try:
+        os.environ["AGYDRA_HOME"] = td.name
+        yield td.name
+    finally:
+        if old is None:
+            os.environ.pop("AGYDRA_HOME", None)
+        else:
+            os.environ["AGYDRA_HOME"] = old
+        td.cleanup()

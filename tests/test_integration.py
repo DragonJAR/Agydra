@@ -1,5 +1,4 @@
 """Integration: agydra launches agy with the overlay; the generic store is never touched."""
-import json
 import os
 import subprocess
 import sys
@@ -19,13 +18,6 @@ class TestIntegration(BaseCase):
         super().setUp()
         self.store = Store()
         self.store.create("work")
-
-    def _run_cli(self, *args):
-        """Run agydra's CLI in a subprocess (execvpe replaces the process)."""
-        return subprocess.run(
-            [sys.executable, "-m", "agydra", *args],
-            capture_output=True, text=True, timeout=60,
-        )
 
     def test_launch_redirects_agy_to_profile_store(self):
         real_gemini = self.fake_home / ".gemini"
@@ -173,12 +165,6 @@ class TestRandomProfileSelection(BaseCase):
                 '{"access_token": "tok"}', encoding="utf-8"
             )
 
-    def _run_cli(self, *args):
-        return subprocess.run(
-            [sys.executable, "-m", "agydra", *args],
-            capture_output=True, text=True, timeout=60,
-        )
-
     def test_r_picks_a_free_authenticated_profile(self):
         result = self._run_cli("-r")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -254,12 +240,6 @@ class TestBusyGuards(BaseCase):
         super().setUp()
         self.store = Store()
         self.store.create("work")
-
-    def _run_cli(self, *args):
-        return subprocess.run(
-            [sys.executable, "-m", "agydra", *args],
-            capture_output=True, text=True, timeout=60,
-        )
 
     def test_delete_refuses_busy_profile(self):
         handle = locks.try_lock(self.store, "work")
