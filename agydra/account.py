@@ -110,10 +110,20 @@ def auth_state(data_dir: Path, store=None, name: Optional[str] = None) -> str:
 
 
 def sync_profile_email(store, name: str) -> Optional[str]:
-    """Refresh the cached email in profile metadata; returns the email."""
+    """Refresh the cached email in profile metadata; returns the email.
+
+    Re-checks the session lock right before saving: a launch that took the
+    lock between the caller's is_locked() probe and this write would have
+    its fresh last_used (written by runner) clobbered by a full-profile
+    save based on the stale pre-launch snapshot.
+    """
+    from . import locks
+
     profile = store.get(name)
     email = detect_email(store.profile_data_dir(name))
     if email and email != profile.email:
+        if locks.is_locked(store, name):
+            return email  # a live session owns the metadata now
         profile.email = email
         store.save(profile)
     return email

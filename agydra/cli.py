@@ -235,6 +235,10 @@ def cmd_login(store: Store, args) -> int:
         name = _resolver.resolve(store).name
     else:
         name = store.resolve_ref(args.ref)
+    # Login writes this profile's credentials (and captures the shared macOS
+    # slot afterwards): mutating a profile with a live session would let the
+    # capture attribute another session's token to this profile.
+    _assert_free(store, name)
     data_dir = store.profile_data_dir(name)
     state = account.auth_state(data_dir, store, name)
     if state == "authenticated":

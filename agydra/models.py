@@ -46,13 +46,18 @@ class Profile:
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "Profile":
+        # last_used/email are coerced like every other field: hand-edited
+        # metadata with a non-string value must not detonate later inside
+        # resolver's min() key (int vs str TypeError) with a traceback.
+        last_used = raw.get("last_used")
+        email = raw.get("email")
         return cls(
             name=str(raw["name"]),
             seq=int(raw.get("seq") or 0),
             created=str(raw.get("created") or _utcnow_iso()),
-            last_used=raw.get("last_used"),
+            last_used=str(last_used) if last_used is not None else None,
             description=str(raw.get("description") or ""),
-            email=raw.get("email"),
+            email=str(email) if email is not None else None,
         )
 
     def touch(self) -> None:

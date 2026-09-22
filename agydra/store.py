@@ -88,6 +88,20 @@ def _replace_with_retry(src: str, dst: Path, attempts: int = 3) -> None:
             time.sleep(0.05 * (attempt + 1))
 
 
+def _rename_dir_with_retry(src: Path, dst: Path, attempts: int = 3) -> None:
+    """os.rename for directories with the same Windows-backoff discipline:
+    AV/indexers holding a handle on the dir produce a transient
+    PermissionError; POSIX semantics are unchanged (fails if dst exists)."""
+    for attempt in range(attempts):
+        try:
+            os.rename(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def _read_json(path: Path) -> dict:
     # Every persisted document is a JSON object by design; a list/str/int
     # root is corruption and must surface as ValueError so every reader
@@ -112,7 +126,10 @@ def atomic_copy(source: Path, dest: Path) -> None:
     try:
         os.close(fd)
         shutil.copy2(source, tmp)
-        os.replace(tmp, dest)
+        # Share the same Windows-AV retry the other two writers use
+        # (config json + backup zip) so share-config / create on Windows
+        # cannot fail spuriously right after the file lands.
+        _replace_with_retry(str(tmp), dest)
     except BaseException:
         try:
             tmp.unlink()
@@ -205,12 +222,25 @@ class Store:
 
     def create(self, name: str, description: str = "") -> Profile:
         self.validate_name(name)
-        if self.exists(name):
-            raise StoreError(f"profile {name!r} already exists")
+        # Atomic existence reserve: after the parent exists, os.mkdir of the
+        # profile dir fails if it already exists, so two concurrent
+        # `agydra create <name>` cannot both pass an exists()-only check and
+        # clobber each other's metadata.
+        profile_dir = self.profile_dir(name)
+        data_dir = self.profile_data_dir(name)
+        try:
+            self.profiles_dir.mkdir(parents=True, exist_ok=True)
+            profile_dir.mkdir()
+        except FileExistsError:
+            raise StoreError(f"profile {name!r} already exists") from None
+        # Two creates of distinct profiles must not pick the same `seq`:
+        # derive it from the current scan done while the new dir is already
+        # reserved, so concurrent writers see each other's profile.json
+        # before they compute theirs.
         existing = self.list()
         seq = (max((p.seq for p in existing), default=0)) + 1
         profile = Profile(name=name, seq=seq, description=description)
-        platforms.ensure_dir(self.profile_data_dir(name))
+        platforms.ensure_dir(data_dir)
         _atomic_write_json(self.profile_meta_path(name), profile.to_dict())
         # First profile becomes the default.
         config = self.load_config()
@@ -258,6 +288,15 @@ class Store:
         profiles.sort(key=lambda p: (p.seq, p.name))
         return profiles, unreadable
 
+    def scan(self) -> tuple:
+        """Public two-for-one: profiles + unreadable names in ONE pass.
+
+        Callers needing both lists (doctor) must use this instead of
+        list() + unreadable_profiles(), which re-glob and re-parse the
+        whole store twice.
+        """
+        return self._scan()
+
     def list(self) -> List[Profile]:
         return self._scan()[0]
 
@@ -278,7 +317,16 @@ class Store:
         profile = self.get(old)
         if self.exists(new):
             raise StoreError(f"profile {new!r} already exists")
-        os.rename(self.profile_dir(old), self.profile_dir(new))
+        # Windows AV/indexers can keep a handle on the directory briefly
+        # after the profile was last touched (the exact pattern
+        # _replace_with_retry exists to mitigate for files).
+        try:
+            _rename_dir_with_retry(self.profile_dir(old), self.profile_dir(new))
+        except FileExistsError as exc:
+            raise StoreError(
+                f"refusing to rename: target {self.profile_dir(new)} already exists "
+                "(another profile may have just been created with that name)"
+            ) from exc
         profile.name = new
         self.save(profile)
         # The old overlay's .gemini links to profiles/<old>/data, which just

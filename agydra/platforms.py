@@ -104,6 +104,26 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+# venv layout (pip-installed interpreter + console scripts) per OS: the
+# single source of truth shared by bootstrap.py and the repo-root agydra.py.
+if is_windows():  # pragma: no cover - exercised only on Windows
+    VENV_BIN_SUBDIR = "Scripts"
+    _EXE_SUFFIX = ".exe"
+else:
+    VENV_BIN_SUBDIR = "bin"
+    _EXE_SUFFIX = ""
+
+
+def venv_python(venv_base: Path) -> Path:
+    """Interpreter inside a venv directory (OS-correct layout)."""
+    return venv_base / VENV_BIN_SUBDIR / ("python" + _EXE_SUFFIX)
+
+
+def console_script(venv_base: Path, name: str = "agydra") -> Path:
+    """Pip-installed console script inside a venv (OS-correct layout)."""
+    return venv_base / VENV_BIN_SUBDIR / (name + _EXE_SUFFIX)
+
+
 def launch(binary: Path, args: Sequence[str], env: Mapping[str, str]) -> int:
     """Launch agy replacing the current process when possible.
 

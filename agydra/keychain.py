@@ -23,7 +23,6 @@ pre-bridge behavior (no swap) with a loud warning, it never breaks a launch.
 """
 from __future__ import annotations
 
-import fcntl
 import shutil
 import subprocess
 import sys
@@ -31,6 +30,14 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from . import platforms
+
+# POSIX-only module: Windows has no fcntl and can never run this bridge
+# (supported() is macOS-only), but a hard top-level import would make the
+# whole package fail to import on Windows (runner/cli import this module).
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
 
 # The fixed slot agy 1.2.7 uses on macOS (service/account).
 SHARED_SERVICE = "gemini"
@@ -102,7 +109,7 @@ def delete_slot(service: str) -> None:
     result = _run(
         ["delete-generic-password", "-s", service, "-a", SHARED_ACCOUNT]
     )
-    if result.returncode in (0,) | NOT_FOUND_CODES:
+    if result.returncode == 0 or result.returncode in NOT_FOUND_CODES:
         return
     raise KeychainError(
         f"keychain delete failed (rc={result.returncode}): "

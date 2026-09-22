@@ -23,7 +23,9 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Optional, Sequence
+
+from . import platforms
 
 MIN_PYTHON = (3, 9)
 #: venv directory inside the project root.
@@ -76,14 +78,13 @@ def venv_dir(root: Path) -> Path:
 
 
 def venv_python(root: Path) -> Path:
-    base = venv_dir(root)
-    return base / "Scripts" / "python.exe" if sys.platform.startswith("win") else base / "bin" / "python"
+    # Layout lives in platforms.py (single source of truth for OS branches).
+    return platforms.venv_python(venv_dir(root))
 
 
 def console_script(root: Path) -> Path:
     """Console script pip installs inside the venv (OS-correct layout)."""
-    base = venv_dir(root)
-    return base / "Scripts" / "agydra.exe" if sys.platform.startswith("win") else base / "bin" / "agydra"
+    return platforms.console_script(venv_dir(root))
 
 
 def user_bin_dir() -> Path:
@@ -213,7 +214,7 @@ def ensure_path_shim(root: Path, out: Callable[[str], None]) -> Optional[Path]:
     shim path is reported, never clobbered. Returns the shim path, or None
     on Windows where the venv Scripts dir must be added to PATH instead.
     """
-    if sys.platform.startswith("win"):
+    if platforms.is_windows():
         out(
             "Windows: add the venv Scripts dir to PATH to use `agydra` "
             f"everywhere: {console_script(root).parent}"
@@ -278,7 +279,7 @@ def check_state(root: Path) -> dict:
         "shim_state": "missing",
         "on_path": _dir_on_path(user_bin_dir()),
     }
-    if sys.platform.startswith("win"):
+    if platforms.is_windows():
         # No shim on Windows; PATH must contain the venv Scripts dir.
         state["shim_state"] = "n/a"
         state["on_path"] = _dir_on_path(script.parent)
@@ -321,7 +322,7 @@ def run(out: Optional[Callable[[str], None]] = None) -> int:
         return 1
     state = check_state(root)
     if not state["on_path"]:
-        bindir = user_bin_dir() if not sys.platform.startswith("win") else console_script(root).parent
+        bindir = console_script(root).parent if platforms.is_windows() else user_bin_dir()
         say(f"note: {bindir} is not on this shell's PATH; add it or re-login")
     say("setup: agydra is installed and ready (run `agydra doctor` next)")
     return 0

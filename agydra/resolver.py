@@ -48,7 +48,16 @@ def _marker_resolution(store: Store, cwd: Path) -> Optional[Resolution]:
     marker = _find_marker(cwd)
     if marker is None:
         return None
-    ref = marker.read_text(encoding="utf-8").strip()
+    try:
+        # utf-8-sig transparently strips the BOM Notepad leaves behind;
+        # PowerShell 5.1 `>` writes UTF-16LE, whose decode must degrade to
+        # an actionable error instead of a raw traceback on every launch.
+        ref = marker.read_text(encoding="utf-8-sig").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise StoreError(
+            f"project marker {marker} is not valid UTF-8 "
+            f"(PowerShell `>` writes UTF-16; re-save as UTF-8): {exc}"
+        ) from exc
     if not ref:
         return None
     return Resolution(store.resolve_ref(ref), f"project marker {marker}")

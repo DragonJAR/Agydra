@@ -26,17 +26,22 @@ def _check_binary(store: Store):
 def _check_store(store: Store):
     try:
         store.root.mkdir(parents=True, exist_ok=True)
-        probe = store.root / ".write-probe"
-        probe.write_text("x", encoding="utf-8")
-        probe.unlink()
+        # Unique probe name: two concurrent `agydra doctor` runs must not
+        # unlink each other's probe and report a phantom "not writable".
+        import tempfile as _tempfile
+
+        fd, probe_name = _tempfile.mkstemp(
+            dir=str(store.root), prefix=".write-probe.", suffix=".tmp"
+        )
+        os.close(fd)
+        Path(probe_name).unlink()
     except OSError as exc:
         return FAIL, f"store not writable: {store.root} ({exc})"
     return OK, f"store writable: {store.root}"
 
 
 def _check_profiles(store: Store):
-    profiles = store.list()
-    unreadable = store.unreadable_profiles()
+    profiles, unreadable = store.scan()
     problems = []
     lines = [f"profiles: {len(profiles)}"]
     for p in profiles:

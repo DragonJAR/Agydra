@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 MIN_PYTHON = (3, 9)
 
@@ -35,14 +36,9 @@ def _fail(msg: str, hint: str = "") -> int:
     return 1
 
 
-def _venv_python(repo: str) -> str:
-    win = sys.platform.startswith("win")
-    return os.path.join(
-        repo, ".venv", "Scripts" if win else "bin", "python.exe" if win else "python"
-    )
-
-
 def _venv_script(repo: str) -> str:
+    # Layout duplicated from agydra.platforms on purpose: this file runs
+    # BEFORE the package can be imported, so it must stay self-contained.
     win = sys.platform.startswith("win")
     return os.path.join(
         repo, ".venv", "Scripts" if win else "bin", "agydra.exe" if win else "agydra"
@@ -50,7 +46,7 @@ def _venv_script(repo: str) -> str:
 
 
 def main() -> int:
-    repo = os.path.dirname(os.path.abspath(__file__))
+    repo = Path(os.path.dirname(os.path.abspath(__file__)))
     if tuple(sys.version_info[:2]) < MIN_PYTHON:
         return _fail(
             f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required, found "
@@ -60,12 +56,10 @@ def main() -> int:
 
     # Prefer the installed console script; fall back to venv python -m agydra.
     script = _venv_script(repo)
-    vpy = _venv_python(repo)
-    delegate = script if os.path.isfile(script) else None
 
-    if delegate is None:
+    if not os.path.isfile(script):
         # Bootstrap path: import the package from the repo (no install yet).
-        sys.path.insert(0, repo)
+        sys.path.insert(0, str(repo))
         try:
             from agydra import bootstrap
         except ImportError as exc:
@@ -74,8 +68,7 @@ def main() -> int:
         code = bootstrap.run()
         if code != 0:
             return code
-        delegate = script if os.path.isfile(script) else None
-        if delegate is None:
+        if not os.path.isfile(script):
             return _fail(
                 "setup finished but the console script is missing",
                 f"expected it at {script}",
@@ -83,12 +76,12 @@ def main() -> int:
 
     # Re-execute the installed command so subprocess semantics (exit codes,
     # signals, TTY) match a native invocation. os.exec* never returns.
-    argv = [delegate, *sys.argv[1:]]
+    argv = [script, *sys.argv[1:]]
     if sys.platform.startswith("win"):
         import subprocess
 
         return subprocess.run(argv).returncode
-    os.execv(delegate, argv)  # type: ignore[call-overload]
+    os.execv(script, argv)  # type: ignore[call-overload]
     return 127  # pragma: no cover — execv never returns on success
 
 
