@@ -81,7 +81,7 @@ def _link(target: Path, link: Path) -> None:
     os.link(target, link)
 
 
-def _link_points_to(link: Path, target: Path) -> bool:
+def link_points_to(link: Path, target: Path) -> bool:
     try:
         return _is_link(link) and link.resolve() == target.resolve()
     except OSError:
@@ -131,7 +131,7 @@ def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
     entries = _mirrorable_home_entries(real_home, store_root)
 
     gemini_link = overlay / platforms.AGY_DATA_DIR_NAME
-    if _is_link(gemini_link) and not _link_points_to(gemini_link, data_dir):
+    if _is_link(gemini_link) and not link_points_to(gemini_link, data_dir):
         gemini_link.unlink()
     if gemini_link.exists() and not _is_link(gemini_link):
         raise IsolationError(
@@ -145,7 +145,7 @@ def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
         except FileExistsError:
             # concurrent launch of the same profile won the race; verify it
             # points where we expect instead of failing
-            if not _link_points_to(gemini_link, data_dir):
+            if not link_points_to(gemini_link, data_dir):
                 raise
 
     for entry in entries.values():

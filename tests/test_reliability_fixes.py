@@ -77,7 +77,9 @@ class TestMarkerEncoding(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             store = self._store_with_profile(tmp)
-            (tmp / ".agydra").write_bytes("work\n".encode("utf-8"))
+            # Editors like Notepad write UTF-8 with BOM; the marker must
+            # resolve through the BOM-aware decode, not crash or miss.
+            (tmp / ".agydra").write_bytes(b"\xef\xbb\xbf" + "work\n".encode("utf-8"))
             try:
                 res = resolver.resolve(store, cwd=tmp, env={})
                 self.assertEqual(res.name, "work")
@@ -168,6 +170,35 @@ class TestScanSinglePass(unittest.TestCase):
                 profiles, unreadable = store.scan()
                 self.assertEqual(profiles, [])
                 self.assertEqual(unreadable, ["alpha"])
+            finally:
+                if old is None:
+                    os.environ.pop("AGYDRA_HOME", None)
+                else:
+                    os.environ["AGYDRA_HOME"] = old
+
+
+class TestDeleteVerifiesRemoval(unittest.TestCase):
+    """F2: _rmtree must never silently swallow a failed removal — a dir that
+    survives `delete()` must fail loud, not fake success and brick `create`."""
+
+    def test_delete_raises_when_dir_survives(self):
+        import os
+        import tempfile
+        from unittest import mock
+
+        from agydra import store as store_mod
+
+        old = os.environ.get("AGYDRA_HOME")
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["AGYDRA_HOME"] = td
+            store = Store()
+            store.create("alpha")
+            try:
+                with mock.patch.object(store_mod, "_rmtree"):
+                    # Pretend rmtree did nothing: the dir is still there.
+                    with self.assertRaises(StoreError):
+                        store.delete("alpha")
+                self.assertTrue(store.exists("alpha"))
             finally:
                 if old is None:
                     os.environ.pop("AGYDRA_HOME", None)

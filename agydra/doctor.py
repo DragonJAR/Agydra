@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 from pathlib import Path
 
 from . import __version__, account, isolation, keychain, platforms
-from .isolation import IsolationError
-from .store import Store, StoreError
+from .store import Store
 
 OK = "ok"
 WARN = "warn"
@@ -113,7 +111,7 @@ def _check_isolation(store: Store):
             # so there is nothing to break yet.
             pending.append(name)
             continue
-        if not isolation._link_points_to(gemini_link, data_dir):
+        if not isolation.link_points_to(gemini_link, data_dir):
             if gemini_link.resolve() == real_gemini.resolve():
                 failures.append(f"{name}: overlay .gemini points to REAL store")
             else:
@@ -184,7 +182,7 @@ def _check_bootstrap(_store: Store):
     state = bootstrap.check_state(root)
     parts = []
     status = OK
-    if sys.platform.startswith("win"):
+    if platforms.is_windows():
         # Windows: no shim; the venv Scripts dir itself must be on PATH.
         if not state["venv"]:
             return WARN, (

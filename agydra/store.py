@@ -19,6 +19,7 @@ from typing import List, Optional
 
 from . import platforms
 from .models import Config, Profile, _utcnow_iso
+from .ui import warn
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -78,28 +79,29 @@ def _replace_with_retry(src: str, dst: Path, attempts: int = 3) -> None:
     """os.replace with short retries: Windows AV/indexers transiently hold
     freshly written files with PermissionError; a brief backoff avoids a
     spurious failure that POSIX never sees."""
-    for attempt in range(attempts):
-        try:
-            os.replace(src, dst)
-            return
-        except PermissionError:
-            if attempt == attempts - 1:
-                raise
-            time.sleep(0.05 * (attempt + 1))
+    _retry_backoff(attempts, lambda: os.replace(src, dst))
 
 
 def _rename_dir_with_retry(src: Path, dst: Path, attempts: int = 3) -> None:
     """os.rename for directories with the same Windows-backoff discipline:
     AV/indexers holding a handle on the dir produce a transient
     PermissionError; POSIX semantics are unchanged (fails if dst exists)."""
+    _retry_backoff(attempts, lambda: os.rename(src, dst))
+
+
+def _retry_backoff(attempts: int, op, delay: float = 0.05) -> None:
+    """Shared transient-PermissionError policy for every rename/replace in
+    the store: N attempts, linear backoff, re-raise on the last attempt.
+    One place to tune backoff so file writes and dir renames never diverge
+    (they hit the same Windows AV/indexer behavior)."""
     for attempt in range(attempts):
         try:
-            os.rename(src, dst)
+            op()
             return
         except PermissionError:
             if attempt == attempts - 1:
                 raise
-            time.sleep(0.05 * (attempt + 1))
+            time.sleep(delay * (attempt + 1))
 
 
 def _read_json(path: Path) -> dict:
@@ -151,15 +153,21 @@ def _rmtree_readonly_ok(function, path, _excinfo):
 
 
 def _rmtree(path: Path) -> None:
-    """rmtree that tolerates transient Windows AV locks and readonly files."""
+    """rmtree that tolerates transient Windows AV locks and readonly files.
+
+    A failed removal must NEVER be silent: a directory that survives a
+    `delete()` call would lie about state and block the next `create()`
+    with a spurious "already exists". Fail-loud via the shared `warn()`
+    helper so the user knows their profile dir survived the operation.
+    """
     try:
         if sys.version_info >= (3, 12):
             shutil.rmtree(path, onexc=_rmtree_readonly_ok)
         else:
             # onerror is deprecated in 3.12 but is the 3.9-compatible spelling.
             shutil.rmtree(path, onerror=_rmtree_readonly_ok)  # type: ignore[arg-type]
-    except OSError:
-        pass
+    except OSError as exc:
+        warn(f"could not fully remove {path} ({exc})")
 
 
 class Store:
@@ -189,10 +197,9 @@ class Store:
                 # AttributeError cover malformed shapes (non-str values,
                 # non-object settings) inside an otherwise valid object.
                 if not getattr(self, "_config_warned", False):
-                    print(
-                        f"agydra: warning: ignoring corrupt {self.config_path} "
-                        f"({exc}); using defaults until it is fixed or deleted",
-                        file=sys.stderr,
+                    warn(
+                        f"ignoring corrupt {self.config_path} ({exc}); using "
+                        f"defaults until it is fixed or deleted"
                     )
                     self._config_warned = True
                 return Config()
@@ -258,9 +265,9 @@ class Store:
         except FileExistsError:
             raise StoreError(f"profile {name!r} already exists") from None
         # Two creates of distinct profiles must not pick the same `seq`:
-        # derive it from the current scan done while the new dir is already
-        # reserved, so concurrent writers see each other's profile.json
-        # before they compute theirs.
+        # derive it from a scan done while the new dir is already reserved.
+        # Under a truly simultaneous pair of distinct-name creates the seq
+        # can still tie (sorted (seq, name) keeps ordering deterministic).
         existing = self.list()
         seq = (max((p.seq for p in existing), default=0)) + 1
         profile = Profile(name=name, seq=seq, description=description)
@@ -367,8 +374,19 @@ class Store:
         backup_path: Optional[Path] = None
         if backup:
             backup_path = self._write_backup(name)
-        _rmtree(self.profile_dir(name))
+        profile_dir = self.profile_dir(name)
+        _rmtree(profile_dir)
         self._remove_overlay(name)
+        # A surviving profile_dir after _rmtree means the OS refused to
+        # release the tree (Windows AV handle, read-only file). Refuse the
+        # state-changing follow-ups below: leaving the default-profile
+        # pointer intact when the dir is still there would brick a later
+        # `create` of the same name. Fail-loud, never pretend-success.
+        if profile_dir.exists():
+            raise StoreError(
+                f"profile {name!r} could not be fully removed at {profile_dir}; "
+                "remove it manually and retry"
+            )
         config = self.load_config()
         if config.default_profile == name:
             remaining = self.names()

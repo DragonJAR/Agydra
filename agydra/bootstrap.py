@@ -60,7 +60,7 @@ def project_root(cwd: Optional[Path] = None) -> Path:
     like the project; otherwise the first candidate so callers can report it.
     """
     here = Path(__file__).resolve().parent.parent
-    candidates: List[Path] = []
+    candidates: list[Path] = []
     if cwd is not None:
         candidates.append(Path(cwd).resolve())
     candidates.append(here)

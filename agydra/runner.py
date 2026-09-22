@@ -13,7 +13,6 @@ exclusively.
 """
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -21,6 +20,7 @@ from typing import List, Optional, Sequence
 from . import isolation, keychain, locks, platforms, resolver
 from .resolver import PROFILE_ENV
 from .store import Store, StoreError
+from .ui import warn
 
 
 @dataclass
@@ -40,6 +40,9 @@ class LaunchPlan:
     # survive into the rebuilt plan or --binary would silently stop applying.
     random_pick: bool = False
     binary_override: Optional[str] = None
+    # Snapshot of the config setting run() needs, taken at plan time so run()
+    # never re-reads agydra.json (one disk hit per launch, not two).
+    windows_redirect_home: bool = False
 
     def describe(self) -> str:
         lines = [
@@ -80,10 +83,9 @@ def build_plan(
     use_sandbox = bool(config.settings.get("use_linux_sandbox"))
     if use_sandbox and not isolation.use_bwrap():
         use_sandbox = False
-        print(
-            "agydra: warning: use_linux_sandbox is enabled but bwrap is not "
-            "available; falling back to plain overlay isolation",
-            file=sys.stderr,
+        warn(
+            "use_linux_sandbox is enabled but bwrap is not available; "
+            "falling back to plain overlay isolation"
         )
 
     return LaunchPlan(
@@ -98,6 +100,7 @@ def build_plan(
         launch_as_child=launch_as_child,
         random_pick=random_pick,
         binary_override=binary_override,
+        windows_redirect_home=bool(config.settings.get("windows_redirect_home")),
     )
 
 
@@ -138,15 +141,12 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
     profile.touch()
     store.save(profile)
 
-    config = store.load_config()
     data_dir = store.profile_data_dir(plan.profile)
     overlay = isolation.build_overlay(plan.profile, data_dir, store.root)
     env = isolation.isolated_env(
         overlay,
         extra={PROFILE_ENV: plan.profile},
-        config_windows_redirect_home=bool(
-            config.settings.get("windows_redirect_home")
-        ),
+        config_windows_redirect_home=plan.windows_redirect_home,
     )
 
     argv = [str(plan.binary), *plan.args]

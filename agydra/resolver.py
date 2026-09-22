@@ -19,6 +19,7 @@ from typing import Optional
 
 from . import account, locks
 from .store import Store, StoreError
+from .ui import warn
 
 PROFILE_ENV = "AGYDRA_PROFILE"
 MARKER_FILE = ".agydra"
@@ -92,10 +93,9 @@ def resolve(
             # Dangling default (profile deleted behind agydra's back, or a
             # lost-update on concurrent config writes): warn and fall through
             # to "first profile" instead of bricking every launch.
-            print(
-                f"agydra: warning: default profile {default!r} does not exist; "
-                "falling back to the first profile (fix with: agydra default <name>)",
-                file=sys.stderr,
+            warn(
+                f"default profile {default!r} does not exist; falling back to "
+                "the first profile (fix with: agydra default <name>)"
             )
 
     names = store.names()
@@ -142,7 +142,11 @@ def pick_free_profile(store, cwd: Optional[Path] = None) -> Resolution:
     3. skip unauthenticated profiles;
     4. prefer the least-recently-used, break ties by seq (creation order).
     """
-    names = store.names()
+    # Single scan, single pass: `list()` and `names()` both glob+parse the
+    # whole store, so derive `names` from `profiles` and reuse it. Same
+    # pattern as doctor.commit's two-for-one: pay the scan cost once.
+    profiles = store.list()
+    names = [p.name for p in profiles]
     if not names:
         raise StoreError(_NO_PROFILES)
     if len(names) < MIN_PROFILES:
@@ -152,7 +156,6 @@ def pick_free_profile(store, cwd: Optional[Path] = None) -> Resolution:
     if marker is not None:
         return marker
 
-    profiles = store.list()
     free = [p for p in profiles if not locks.is_locked(store, p.name)]
     if not free:
         raise StoreError(_NO_FREE)

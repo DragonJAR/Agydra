@@ -25,11 +25,11 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Dict, Optional
 
 from . import platforms
+from .ui import warn
 
 # POSIX-only module: Windows has no fcntl and can never run this bridge
 # (supported() is macOS-only), but a hard top-level import would make the
@@ -171,10 +171,9 @@ def launch_guard(store, profile: str):
                 if slot is not None:
                     write_slot(shared_slot(), slot)
             except (KeychainError, OSError) as exc:
-                print(
-                    f"agydra: warning: keychain swap skipped ({exc}); "
-                    "continuing without per-profile credential swap",
-                    file=sys.stderr,
+                warn(
+                    f"keychain swap skipped ({exc}); continuing without "
+                    "per-profile credential swap"
                 )
             return self
 
@@ -223,10 +222,7 @@ def clear_shared_slot(store) -> None:
         with _serialize_lock(store):
             delete_slot(shared_slot())
     except (KeychainError, OSError) as exc:
-        print(
-            f"agydra: warning: could not clear shared keychain slot ({exc})",
-            file=sys.stderr,
-        )
+        warn(f"could not clear shared keychain slot ({exc})")
 
 
 
