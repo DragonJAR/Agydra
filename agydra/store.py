@@ -138,6 +138,30 @@ def atomic_copy(source: Path, dest: Path) -> None:
         raise
 
 
+def _rmtree_readonly_ok(function, path, _excinfo):
+    """rmtree handler: chmod + retry readonly files (Windows AV/git often
+    marks them read-only), then give up — deletion must stay best-effort."""
+    import stat as _stat
+
+    try:
+        os.chmod(path, _stat.S_IWRITE)
+        function(path)
+    except OSError:
+        pass
+
+
+def _rmtree(path: Path) -> None:
+    """rmtree that tolerates transient Windows AV locks and readonly files."""
+    try:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=_rmtree_readonly_ok)
+        else:
+            # onerror is deprecated in 3.12 but is the 3.9-compatible spelling.
+            shutil.rmtree(path, onerror=_rmtree_readonly_ok)  # type: ignore[arg-type]
+    except OSError:
+        pass
+
+
 class Store:
     def __init__(self, root: Optional[Path] = None) -> None:
         # Lazy by design: construction has zero filesystem side effects so
@@ -310,7 +334,7 @@ class Store:
         """Drop the overlay for a profile that no longer exists."""
         overlay = self.overlays_dir / name
         if overlay.exists():
-            shutil.rmtree(overlay)
+            _rmtree(overlay)
 
     def rename(self, old: str, new: str) -> Profile:
         self.validate_name(new)
@@ -343,7 +367,7 @@ class Store:
         backup_path: Optional[Path] = None
         if backup:
             backup_path = self._write_backup(name)
-        shutil.rmtree(self.profile_dir(name))
+        _rmtree(self.profile_dir(name))
         self._remove_overlay(name)
         config = self.load_config()
         if config.default_profile == name:

@@ -275,7 +275,7 @@ A corrupt config degrades to defaults for reads but refuses writes.
 - Every feature must work cross-platform (macOS, Linux, Windows) from the
   single codebase; keep `platforms.py` the only per-OS layer.
 - Run the full suite before opening a change:
-  `python3 -m pytest -q` (121 passed + 3 platform skips on macOS).
+  `python3 -m pytest -q` (132 passed + 3 platform skips on macOS).
 - See [AGENTS.md](AGENTS.md) for conventions.
 
 ## 📄 License
