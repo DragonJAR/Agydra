@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 import tempfile
@@ -30,17 +31,19 @@ _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool]] = {
 # Canonical subcommand -> extra aliases. _CANONICAL resolves any spelling to
 # its canonical form; membership in _CANONICAL defines "is a subcommand", so
 # an alias can never exist without its canonical command and vice versa.
+# Display order = usage frequency: setup lifecycle first, then daily
+# inspection, then maintenance, then meta.
 _SUBCOMMAND_ALIASES: Dict[str, Tuple[str, ...]] = {
-    "list": ("ls", "l"),
     "create": ("c",),
     "login": ("in",),
-    "status": ("st",),
+    "import": ("imp",),
+    "list": ("ls", "l"),
     "default": ("d",),
+    "use": ("u",),
+    "status": ("st",),
     "rename": ("mv",),
     "delete": ("rm",),
-    "import": ("imp",),
     "share-config": ("share",),
-    "use": ("u",),
     "doctor": ("doc",),
     "setup": ("install",),
     "help": (),
@@ -370,9 +373,29 @@ def cmd_share_config(store: Store, args) -> int:
 
 
 def cmd_import(store: Store, args) -> int:
-    name = store.resolve_ref(args.ref)
+    # Friendly guard: a path-like arg almost always means the user typed
+    # `agydra import ~/.gemini` (or similar) — `import` takes the TARGET
+    # profile name and auto-detects the source. Detect it here and emit a
+    # corrective message instead of the cryptic "unknown profile".
+    ref = args.ref
+    looks_like_path = ref.startswith(("/", "~", ".", "\\")) or re.match(
+        r"^[a-zA-Z]:[\\/]", ref
+    )
+    if looks_like_path:
+        raise StoreError(
+            f"import takes the TARGET profile name, not a path: {ref!r}. "
+            f"The generic agy data dir is auto-detected "
+            f"({platforms.agy_data_dir()}). "
+            f"Usage: agydra import <profile-name>   (use -s DIR to override the source)."
+        )
+    name = store.resolve_ref(ref)
     _assert_free(store, name)
-    real = platforms.agy_data_dir()
+    if args.source is not None:
+        real = Path(args.source).expanduser()
+        if not real.is_dir():
+            raise StoreError(f"source directory not found: {real}")
+    else:
+        real = platforms.agy_data_dir()
     if not real.is_dir():
         raise StoreError(
             f"no generic agy data directory found at {real} — log in once with "
@@ -434,6 +457,35 @@ def cmd_setup(_store: Store, args) -> int:
     return bootstrap.run()
 
 
+# One-line description per canonical subcommand. Displayed by the top-level
+# help; keep in sync with _SUBCOMMAND_ALIASES (a missing entry falls back
+# to the raw command list, an extra entry is ignored).
+_SUBCOMMAND_HELP: Dict[str, str] = {
+    "list": "show all profiles (number, email, auth, busy)",
+    "create": "create a profile store",
+    "login": "run agy's OAuth flow isolated to a profile",
+    "import": "copy the generic ~/.gemini into a profile (source auto-detected)",
+    "status": "resolved profile + binary + auth info, zero side effects",
+    "default": "get or set the default profile",
+    "use": "pin a profile to the current directory (.agydra marker)",
+    "rename": "rename a profile (refuses busy)",
+    "delete": "backup ZIP then delete a profile (refuses busy)",
+    "share-config": "copy settings.json + mcp.json between profiles",
+    "doctor": "diagnose the installation",
+    "setup": "one-command install of the shim",
+    "help": "show this help",
+    "version": "print the version",
+}
+
+
+def _management_help() -> str:
+    lines = ["management:"]
+    for canonical, aliases in _SUBCOMMAND_ALIASES.items():
+        spellings = "/".join((canonical, *aliases))
+        lines.append(f"  {spellings:<24} {_SUBCOMMAND_HELP.get(canonical, '')}")
+    return "\n".join(lines)
+
+
 def _report_error(exc: BaseException) -> int:
     """Single error-mapping table shared by both dispatch paths."""
     if isinstance(exc, (StoreError, IsolationError, BootstrapError)):
@@ -463,11 +515,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not raw or raw[0] in ("help", "--help", "-h"):
         build_parser().print_help()
         print()
-        commands = " | ".join(
-            "/".join((canonical, *aliases))
-            for canonical, aliases in _SUBCOMMAND_ALIASES.items()
-        )
-        print(f"management: {commands}")
+        print(_management_help())
+        print()
+        print("examples:")
+        print("  first run:")
+        print("    agydra setup                                  # one-time install of the shim")
+        print("    agydra create work -d 'work account'           # create a profile")
+        print("    agydra login work                              # OAuth flow isolated to 'work'")
+        print("    agydra import main                             # copy ~/.gemini into 'main'")
+        print("  daily use:")
+        print("    agydra -p work                                 # launch agy with 'work'")
+        print("    agydra                                         # launch agy with default profile")
+        print("    agydra -r                                      # pick a free authenticated profile")
+        print("  maintenance:")
+        print("    agydra list                                    # show all profiles + auth state")
+        print("    agydra status -n                               # resolved profile (no side effects)")
+        print("    agydra default work                            # set 'work' as default")
+        print("    agydra use work                                # pin 'work' to this directory")
+        print("    agydra share-config work lab                   # copy settings.json + mcp.json")
+        print("    agydra rename old new                          # rename a profile (refuses busy)")
+        print("    agydra delete old                              # backup ZIP + delete (refuses busy)")
+        print("    agydra doctor                                  # diagnose the installation")
         return 0
 
     if raw[0] == "version" or raw[0] == "--version":
@@ -528,7 +596,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif sub == "import":
             parser.add_argument(
                 "ref",
-                help="profile that will receive the generic ~/.gemini data",
+                help="TARGET profile name or 1-based number (source is auto-detected)",
+            )
+            parser.add_argument(
+                "-s", "--source",
+                metavar="DIR",
+                help="generic agy data dir to copy from (default: auto-detected ~/.gemini)",
             )
             parser.set_defaults(func=cmd_import)
         elif sub == "share-config":

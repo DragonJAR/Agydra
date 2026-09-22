@@ -168,7 +168,7 @@ copied: personal/mcp.json
 | Capacidad | Detalle |
 |---|---|
 | Crear y autenticar | `create` crea el almacén del perfil; `login` corre el OAuth de `agy` aislado a ese perfil. |
-| Importar sesión genérica | `import` **copia** (nunca mueve) el `~/.gemini` genérico a un perfil. |
+| Importar sesión genérica | `import NOMBRE` **copia** (nunca mueve) el `~/.gemini` genérico a un perfil; la fuente se autodetecta y `-s DIR` la sobrescribe (pasar una ruta como NOMBRE se rechaza con guía correcta). |
 | Renombrar y borrar | `rename` actualiza la referencia default; `delete` crea un ZIP de respaldo antes de borrar (conserva 5). Ambos rechazan perfiles ocupados. |
 | Fijar por proyecto | `use` escribe el marcador `.agydra` para fijar el perfil de ese directorio. |
 | Inspección sin efectos | `list` y `status` muestran número, email, estado de auth, ocupado y último uso sin tocar el sistema de archivos. |

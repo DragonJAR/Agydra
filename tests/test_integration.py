@@ -275,6 +275,58 @@ class TestBusyGuards(BaseCase):
             handle.release()
 
 
+class TestImportFlow(BaseCase):
+    """`import` takes the TARGET profile name; the generic ~/.gemini source
+    is auto-detected. These lock in the corrective UX for path-as-ref."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("work")
+        # BaseCase already provisions the fake home's generic ~/.gemini
+        # (oauth_creds.json), which auto-detect must find below.
+
+    def test_path_as_ref_gets_corrective_error(self):
+        # `agydra import ~/.gemini` must explain the fix, not say
+        # "unknown profile".
+        result = self._run_cli("import", str(self.fake_home / ".gemini"))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("TARGET profile name, not a path", result.stderr)
+        self.assertIn("agydra import <profile-name>", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_import_copies_generic_into_profile(self):
+        result = self._run_cli("import", "work")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        imported = self.store.profile_data_dir("work") / "oauth_creds.json"
+        self.assertTrue(imported.exists(), "generic data must land in the profile")
+        self.assertEqual(result.returncode, 0)
+        # Source must remain untouched (copy, never move).
+        self.assertTrue((self.fake_home / ".gemini" / "oauth_creds.json").exists())
+
+    def test_import_custom_source_flag(self):
+        custom = self._tmp / "custom-src"
+        custom.mkdir()
+        (custom / "settings.json").write_text('{"x": 1}', encoding="utf-8")
+        result = self._run_cli("import", "work", "--source", str(custom))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(
+            (self.store.profile_data_dir("work") / "settings.json").exists()
+        )
+
+    def test_import_missing_source_reports_path(self):
+        result = self._run_cli(
+            "import", "work", "--source", str(self._tmp / "nope")
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("source directory not found", result.stderr)
+
+    def test_import_requires_existing_profile(self):
+        result = self._run_cli("import", "ghost")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unknown profile", result.stderr)
+
+
 class TestAliasesAndFlagTable(BaseCase):
     def test_all_canonical_aliases_resolve(self):
         from agydra.cli import _CANONICAL, _SUBCOMMAND_ALIASES
@@ -306,6 +358,40 @@ class TestAliasesAndFlagTable(BaseCase):
 
         self.assertIsNone(_CANONICAL.get("totally-not-a-subcommand"))
         self.assertIsNone(_CANONICAL.get(""))
+
+    def test_help_documents_every_subcommand(self):
+        # Every canonical subcommand must appear in the top-level help with
+        # a one-line description; every cmd_ handler must be in the table.
+        from agydra import cli
+        from agydra.cli import _SUBCOMMAND_ALIASES, _SUBCOMMAND_HELP
+
+        self.assertEqual(set(_SUBCOMMAND_HELP), set(_SUBCOMMAND_ALIASES))
+        handlers = {
+            name[len("cmd_"):].replace("_", "-")
+            for name in dir(cli)
+            if name.startswith("cmd_")
+        }
+        # Subcommands handled inline in main() (not as cmd_*): version, help.
+        expected = set(_SUBCOMMAND_ALIASES) - {"version", "help"}
+        self.assertEqual(handlers, expected)
+        # Every alias must appear in the help block (display ordering).
+        order = list(_SUBCOMMAND_ALIASES)
+        self.assertLess(order.index("create"), order.index("list"))
+        self.assertLess(order.index("list"), order.index("rename"))
+
+    def test_management_help_includes_examples_section(self):
+        import io
+        from contextlib import redirect_stdout
+
+        from agydra.cli import main
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["help"]), 0)
+        out = buf.getvalue()
+        for token in ("management:", "examples:", "create", "login",
+                      "import main", "agydra -p"):
+            self.assertIn(token, out)
 
     def test_flag_table_shape_and_extractor(self):
         from agydra.cli import _LAUNCH_FLAGS, _consume_launch_flags

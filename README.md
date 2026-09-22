@@ -186,7 +186,7 @@ OAuth tokens are never copied
 | `agydra list` · `ls` · `l` | Table: number, email, default, auth state, busy, last use |
 | `agydra create NAME [-d DESC]` · `c` | Create a profile store |
 | `agydra login NAME\|#` · `in` | Run agy's OAuth flow isolated to that profile |
-| `agydra import NAME` · `imp` | **Copy** (never move) the generic `~/.gemini` into a profile |
+| `agydra import NAME\|# [-s DIR]` · `imp` | **Copy** (never move) the generic `~/.gemini` into a profile; source is auto-detected, `-s DIR` overrides it (passing a path as NAME is rejected with guidance) |
 | `agydra status [-n]` · `st` | Resolved profile + reason + binary + email + auth + busy; zero side effects |
 | `agydra default [NAME\|#]` · `d` | Get or set the default profile |
 | `agydra use NAME\|#` · `u` | Write `.agydra` marker pinning a profile per project directory |
