@@ -19,7 +19,6 @@ Design invariants (see AGENTS.md):
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -28,14 +27,8 @@ from typing import Callable, Optional, Sequence
 import platforms
 
 MIN_PYTHON = (3, 9)
-#: venv directory inside the project root.
 VENV_DIRNAME = ".venv"
-#: pip must support PEP 660 editable installs of a pyproject.toml-only
-#: project. macOS system Python (3.9) ships pip 21.2.4, which predates it.
 PIP_FLOOR = (21, 3)
-#: Marker line inside a shim file that proves agydra manages it. Only
-#: agydra-managed shims may be rewritten by setup; foreign files are left
-#: untouched and reported.
 SHIM_MARKER = "Managed by agydra setup"
 
 
@@ -43,9 +36,6 @@ class BootstrapError(Exception):
     """A bootstrap step cannot proceed (never raised for existing state)."""
 
 
-# ---------------------------------------------------------------------------
-# Path helpers (the Windows/POSIX branch points for install locations)
-# ---------------------------------------------------------------------------
 
 def python_ok(version_info: Sequence[int]) -> bool:
     """True when the running interpreter satisfies the project floor."""
@@ -78,7 +68,6 @@ def venv_dir(root: Path) -> Path:
 
 
 def venv_python(root: Path) -> Path:
-    # Layout lives in platforms.py (single source of truth for OS branches).
     return platforms.venv_python(venv_dir(root))
 
 
@@ -110,9 +99,6 @@ def _shim_content(target: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
-# ---------------------------------------------------------------------------
-# Execution helpers
-# ---------------------------------------------------------------------------
 
 def _run(argv: Sequence[str]) -> subprocess.CompletedProcess:
     display = " ".join(str(a) for a in argv[:4])
@@ -122,8 +108,10 @@ def _run(argv: Sequence[str]) -> subprocess.CompletedProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
-    except FileNotFoundError as exc:
+    except OSError as exc:
         raise BootstrapError(f"cannot run {display}: {exc}") from exc
 
 
@@ -131,9 +119,6 @@ def _tail(proc: subprocess.CompletedProcess) -> str:
     return (proc.stderr or proc.stdout or "").strip()
 
 
-# ---------------------------------------------------------------------------
-# Steps (each idempotent; each logs through the `out` callback)
-# ---------------------------------------------------------------------------
 
 def ensure_venv(root: Path, out: Callable[[str], None]) -> Path:
     """Create ``<root>/.venv`` when missing; return the venv python path.
@@ -147,7 +132,9 @@ def ensure_venv(root: Path, out: Callable[[str], None]) -> Path:
         return vpy
     if venv_dir(root).exists():
         out(f"removing broken venv (no interpreter): {venv_dir(root)}")
-        shutil.rmtree(venv_dir(root), ignore_errors=True)
+        import store as _store
+
+        _store.rmtree(venv_dir(root))
     out(f"creating venv: {venv_dir(root)}")
     proc = _run([sys.executable, "-m", "venv", str(venv_dir(root))])
     if proc.returncode != 0:
@@ -164,7 +151,6 @@ def _pip_version(vpy: Path) -> Optional[tuple]:
     proc = _run([str(vpy), "-m", "pip", "--version"])
     if proc.returncode != 0:
         return None
-    # "pip 21.2.4 from /path (python 3.9)"
     for tok in (proc.stdout or "").split():
         if tok and tok[0].isdigit() and "." in tok:
             parts = []
@@ -182,9 +168,6 @@ def _pip_supports_pep660(vpy: Path) -> bool:
 
 def install_editable(root: Path, vpy: Path, out: Callable[[str], None]) -> None:
     """``pip install -e <root>`` inside the venv (local metadata, no index)."""
-    # pip < 21.3 (macOS system Python 3.9) cannot do PEP 660 editable installs
-    # of a pyproject.toml-only project; upgrade pip in the venv first. On
-    # modern systems this probe is a no-op and installs stay offline.
     if not _pip_supports_pep660(vpy):
         out(f"upgrading pip inside the venv (needs >= {'.'.join(map(str, PIP_FLOOR))} for editable installs)")
         proc = _run([str(vpy), "-m", "pip", "install", "--quiet", "--no-input", "--upgrade", "pip"])
@@ -260,9 +243,6 @@ def verify_install(root: Path, out: Callable[[str], None]) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
 
 def check_state(root: Path) -> dict:
     """Doctor-style status of every bootstrap precondition (no mutations).
@@ -280,7 +260,6 @@ def check_state(root: Path) -> dict:
         "on_path": _dir_on_path(user_bin_dir()),
     }
     if platforms.is_windows():
-        # No shim on Windows; PATH must contain the venv Scripts dir.
         state["shim_state"] = "n/a"
         state["on_path"] = _dir_on_path(script.parent)
         return state

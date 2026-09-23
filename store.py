@@ -23,6 +23,12 @@ from ui import warn
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
+_WINDOWS_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+
 
 def _backup_stamp() -> str:
     """Timestamp for backup filenames: ``2026-01-02T030405.123Z0000``.
@@ -44,7 +50,6 @@ def _is_backup_stamp(token: str) -> bool:
     return _BACKUP_STAMP_RE.match(token) is not None
 
 
-# One optional ".N" collision counter beyond the stamp itself.
 _BACKUP_STAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{6}\.\d+Z\d{4}(?:\.\d+)?\Z"
 )
@@ -56,14 +61,26 @@ class StoreError(Exception):
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
-    # Unique temp name: concurrent writers (parallel agydra launches updating
-    # last_used, or `list` syncing emails) must not clobber each other's tmp.
+    payload = (json.dumps(data, indent=2, sort_keys=False) + "\n").encode("utf-8")
+    atomic_write_bytes(path, payload)
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write arbitrary bytes atomically: unique tmp in ``path``'s dir, fsync,
+    then ``os.replace``.
+
+    Shared primitive for every non-JSON durable write (keychain credential
+    backups, the ``.agydra`` project marker): same discipline as
+    ``_atomic_write_json`` so a crash mid-write can never leave a
+    half-written file where a reader expects a complete one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(data, indent=2, sort_keys=False) + "\n")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         _replace_with_retry(tmp_name, path)
@@ -82,11 +99,15 @@ def _replace_with_retry(src: str, dst: Path, attempts: int = 3) -> None:
     _retry_backoff(attempts, lambda: os.replace(src, dst))
 
 
-def _rename_dir_with_retry(src: Path, dst: Path, attempts: int = 3) -> None:
+def rename_dir_with_retry(src: Path, dst: Path, attempts: int = 3) -> None:
     """os.rename for directories with the same Windows-backoff discipline:
     AV/indexers holding a handle on the dir produce a transient
     PermissionError. POSIX rename replaces an existing EMPTY dst dir; that
-    case is rejected by Store.rename's guard before we get here."""
+    case is rejected by Store.rename's guard before we get here.
+
+    Public (used across modules, e.g. cli.py's import) — not a store-private
+    helper.
+    """
     _retry_backoff(attempts, lambda: os.rename(src, dst))
 
 
@@ -106,9 +127,6 @@ def _retry_backoff(attempts: int, op, delay: float = 0.05) -> None:
 
 
 def _read_json(path: Path) -> dict:
-    # Every persisted document is a JSON object by design; a list/str/int
-    # root is corruption and must surface as ValueError so every reader
-    # (load_config, _scan) degrades consistently.
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"{path.name}: expected a JSON object, got {type(data).__name__}")
@@ -118,8 +136,12 @@ def _read_json(path: Path) -> dict:
 def atomic_copy(source: Path, dest: Path) -> None:
     """Copy a file atomically: unique tmp in dest's dir, then os.replace.
 
-    Keeps the source's mode/mtime (copy2 semantics) without ever exposing a
-    half-written target to a concurrent reader.
+    Streams through copyfileobj + fsync (the same write+fsync discipline as
+    ``_atomic_write_json``/``atomic_write_bytes``) instead of plain
+    ``shutil.copy2``, which never forces the copy to disk before returning —
+    without fsync a crash right after ``share-config``/``create`` could lose
+    the copy despite it looking committed. ``copystat`` restores the
+    source's mode/mtime (copy2 semantics) on the tmp file before the replace.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -127,11 +149,11 @@ def atomic_copy(source: Path, dest: Path) -> None:
     )
     tmp = Path(tmp_name)
     try:
-        os.close(fd)
-        shutil.copy2(source, tmp)
-        # Share the same Windows-AV retry the other two writers use
-        # (config json + backup zip) so share-config / create on Windows
-        # cannot fail spuriously right after the file lands.
+        with os.fdopen(fd, "wb") as tmp_fh, open(source, "rb") as src_fh:
+            shutil.copyfileobj(src_fh, tmp_fh)
+            tmp_fh.flush()
+            os.fsync(tmp_fh.fileno())
+        shutil.copystat(source, tmp)
         _replace_with_retry(str(tmp), dest)
     except BaseException:
         try:
@@ -153,35 +175,33 @@ def _rmtree_readonly_ok(function, path, _excinfo):
         pass
 
 
-def _rmtree(path: Path) -> None:
+def rmtree(path: Path) -> None:
     """rmtree that tolerates transient Windows AV locks and readonly files.
 
     A failed removal must NEVER be silent: a directory that survives a
     `delete()` call would lie about state and block the next `create()`
     with a spurious "already exists". Fail-loud via the shared `warn()`
     helper so the user knows their profile dir survived the operation.
+
+    Public (used across modules, e.g. bootstrap.py's broken-venv cleanup) —
+    not a store-private helper.
     """
     try:
         if sys.version_info >= (3, 12):
             shutil.rmtree(path, onexc=_rmtree_readonly_ok)
         else:
-            # onerror is deprecated in 3.12 but is the 3.9-compatible spelling.
-            shutil.rmtree(path, onerror=_rmtree_readonly_ok)  # type: ignore[arg-type]
+            shutil.rmtree(path, onerror=_rmtree_readonly_ok)
     except OSError as exc:
         warn(f"could not fully remove {path} ({exc})")
 
 
 class Store:
     def __init__(self, root: Optional[Path] = None) -> None:
-        # Lazy by design: construction has zero filesystem side effects so
-        # read-only commands (status, --dry-run, --version) never create
-        # anything. Mutating paths bootstrap the layout themselves.
         self.root = root or platforms.base_dir()
         self.profiles_dir = self.root / "profiles"
         self.overlays_dir = self.root / "overlays"
         self.backups_dir = self.root / "backups"
 
-    # ---- config ---------------------------------------------------------
     @property
     def config_path(self) -> Path:
         return self.root / CONFIG_FILE
@@ -191,12 +211,6 @@ class Store:
             try:
                 return Config.from_dict(_read_json(self.config_path))
             except (OSError, ValueError, TypeError, AttributeError) as exc:
-                # A corrupt agydra.json must not brick the whole CLI (list,
-                # status, doctor all read it). Degrade to defaults, warn once,
-                # and let save_config refuse to overwrite the broken file so
-                # no mutating command can silently destroy it. TypeError and
-                # AttributeError cover malformed shapes (non-str values,
-                # non-object settings) inside an otherwise valid object.
                 if not getattr(self, "_config_warned", False):
                     warn(
                         f"ignoring corrupt {self.config_path} ({exc}); using "
@@ -228,7 +242,6 @@ class Store:
         except (OSError, ValueError, TypeError, AttributeError):
             return False
 
-    # ---- profile paths --------------------------------------------------
     def profile_dir(self, name: str) -> Path:
         return self.profiles_dir / name
 
@@ -238,7 +251,6 @@ class Store:
     def profile_data_dir(self, name: str) -> Path:
         return self.profile_dir(name) / "data"
 
-    # ---- validation -----------------------------------------------------
     @staticmethod
     def validate_name(name: str) -> str:
         if not NAME_RE.match(name or ""):
@@ -246,27 +258,23 @@ class Store:
                 f"invalid profile name {name!r}: use lowercase letters, digits, "
                 "'-' and '_', starting with a letter or digit (max 64 chars)"
             )
+        if name in _WINDOWS_RESERVED_NAMES:
+            raise StoreError(
+                f"invalid profile name {name!r}: it is a reserved Windows "
+                "device name and would break on Windows; pick another name"
+            )
         if name not in vocab.RESERVED_NAMES:
             return name
-        # Bare `agydra <name> ...` always dispatches the subcommand, so
-        # such a profile would be unreachable from the shell (the
-        # dispatcher wins over the launcher). Refuse instead of creating
-        # a permanently shadowed profile.
         raise StoreError(
             f"reserved profile name {name!r}: it collides with an agydra "
             "subcommand (see: agydra help); pick another name"
         )
 
-    # ---- CRUD -----------------------------------------------------------
     def exists(self, name: str) -> bool:
         return self.profile_meta_path(name).exists()
 
     def create(self, name: str, description: str = "") -> Profile:
         self.validate_name(name)
-        # Atomic existence reserve: after the parent exists, os.mkdir of the
-        # profile dir fails if it already exists, so two concurrent
-        # `agydra create <name>` cannot both pass an exists()-only check and
-        # clobber each other's metadata.
         profile_dir = self.profile_dir(name)
         data_dir = self.profile_data_dir(name)
         try:
@@ -274,16 +282,11 @@ class Store:
             profile_dir.mkdir()
         except FileExistsError:
             raise StoreError(f"profile {name!r} already exists") from None
-        # Two creates of distinct profiles must not pick the same `seq`:
-        # derive it from a scan done while the new dir is already reserved.
-        # Under a truly simultaneous pair of distinct-name creates the seq
-        # can still tie (sorted (seq, name) keeps ordering deterministic).
         existing = self.list()
         seq = (max((p.seq for p in existing), default=0)) + 1
         profile = Profile(name=name, seq=seq, description=description)
         platforms.ensure_dir(data_dir)
         _atomic_write_json(self.profile_meta_path(name), profile.to_dict())
-        # First profile becomes the default.
         config = self.load_config()
         if not config.default_profile:
             config.default_profile = name
@@ -298,8 +301,6 @@ class Store:
         try:
             return Profile.from_dict(_read_json(self.profile_meta_path(name)))
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            # Same degraded-set as _scan: corrupt metadata is reported as an
-            # actionable store error, never a raw traceback at launch time.
             raise StoreError(
                 f"profile {name!r} metadata is corrupt ({exc}); "
                 "restore it from backups/ or recreate the profile"
@@ -315,16 +316,11 @@ class Store:
         for meta in sorted(self.profiles_dir.glob("*/profile.json")):
             try:
                 profile = Profile.from_dict(_read_json(meta))
-                # The on-disk `name` drives profile_dir(); a hand-edited
-                # metadata must never escape profiles/ via traversal.
                 self.validate_name(profile.name)
                 if profile.name != meta.parent.name:
                     raise ValueError("metadata name does not match its directory")
                 profiles.append(profile)
             except (OSError, ValueError, KeyError, TypeError, StoreError):
-                # Corrupt metadata must not disable the whole CLI (list,
-                # resolve, launch); doctor reports unreadable profiles.
-                # StoreError covers validate_name rejections.
                 unreadable.append(meta.parent.name)
         profiles.sort(key=lambda p: (p.seq, p.name))
         return profiles, unreadable
@@ -351,28 +347,20 @@ class Store:
         """Drop the overlay for a profile that no longer exists."""
         overlay = self.overlays_dir / name
         if overlay.exists():
-            _rmtree(overlay)
+            rmtree(overlay)
 
     def rename(self, old: str, new: str) -> Profile:
         self.validate_name(new)
         profile = self.get(old)
         if self.exists(new):
             raise StoreError(f"profile {new!r} already exists")
-        # POSIX rename(2) silently REPLACES an existing empty directory, so
-        # a concurrent create that just reserved its dir (metadata not yet
-        # written) would be clobbered and both writers would land in the
-        # same dir. Refuse on any existing target dir, not just on written
-        # metadata.
         if self.profile_dir(new).exists():
             raise StoreError(
                 f"refusing to rename: target {self.profile_dir(new)} already "
                 "exists (another profile may be creating it)"
             )
-        # Windows AV/indexers can keep a handle on the directory briefly
-        # after the profile was last touched (the exact pattern
-        # _replace_with_retry exists to mitigate for files).
         try:
-            _rename_dir_with_retry(self.profile_dir(old), self.profile_dir(new))
+            rename_dir_with_retry(self.profile_dir(old), self.profile_dir(new))
         except FileExistsError as exc:
             raise StoreError(
                 f"refusing to rename: target {self.profile_dir(new)} already exists "
@@ -380,8 +368,6 @@ class Store:
             ) from exc
         profile.name = new
         self.save(profile)
-        # The old overlay's .gemini links to profiles/<old>/data, which just
-        # vanished: drop the orphan instead of leaving dangling links.
         self._remove_overlay(old)
         config = self.load_config()
         if config.default_profile == old:
@@ -390,18 +376,13 @@ class Store:
         return profile
 
     def delete(self, name: str, backup: bool = True) -> Optional[Path]:
-        self.get(name)  # raises if missing
+        self.get(name)
         backup_path: Optional[Path] = None
         if backup:
             backup_path = self._write_backup(name)
         profile_dir = self.profile_dir(name)
-        _rmtree(profile_dir)
+        rmtree(profile_dir)
         self._remove_overlay(name)
-        # A surviving profile_dir after _rmtree means the OS refused to
-        # release the tree (Windows AV handle, read-only file). Refuse the
-        # state-changing follow-ups below: leaving the default-profile
-        # pointer intact when the dir is still there would brick a later
-        # `create` of the same name. Fail-loud, never pretend-success.
         if profile_dir.exists():
             raise StoreError(
                 f"profile {name!r} could not be fully removed at {profile_dir}; "
@@ -414,7 +395,6 @@ class Store:
             self.save_config(config)
         return backup_path
 
-    #: How many backup zips to keep per profile; older ones are pruned.
     BACKUP_RETENTION = 5
 
     def _write_backup(self, name: str) -> Path:
@@ -429,7 +409,6 @@ class Store:
         backup_path = self.backups_dir / f"{name}-{stamp}.zip"
         counter = 2
         while backup_path.exists():
-            # Same-profile deletes within one timestamp must not collide.
             backup_path = self.backups_dir / f"{name}-{stamp}.{counter}.zip"
             counter += 1
         fd, tmp_name = tempfile.mkstemp(
@@ -476,8 +455,6 @@ class Store:
             if not _is_backup_stamp(remainder):
                 continue
             try:
-                # Capture mtime at discovery: a zip vanishing between glob
-                # and sort must skip, not crash the delete that owns us.
                 stamped.append((path.stat().st_mtime, path))
             except OSError:
                 continue
@@ -488,9 +465,8 @@ class Store:
                 if old.exists():
                     old.unlink()
             except OSError:
-                pass  # retention is best-effort; never fail a delete on it
+                pass
 
-    # ---- derived state --------------------------------------------------
     def default_name(self) -> Optional[str]:
         return self.load_config().default_profile
 

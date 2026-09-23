@@ -5,10 +5,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import resolver  # noqa: E402
-from store import Store, StoreError  # noqa: E402
+import resolver
+from store import Store, StoreError
 
-from conftest import BaseCase  # noqa: E402
+from conftest import BaseCase
 
 
 class TestResolver(BaseCase):
@@ -47,6 +47,14 @@ class TestResolver(BaseCase):
         res = self._resolve(cwd=project)
         self.assertEqual(res.name, "lab")
         self.assertIn("marker", res.reason)
+
+    def test_empty_marker_file_raises_actionable_error(self):
+        project = self._tmp / "project" / "empty_marker"
+        project.mkdir(parents=True)
+        (project / ".agydra").write_text("   \n", encoding="utf-8")
+        with self.assertRaises(StoreError) as ctx:
+            self._resolve(cwd=project)
+        self.assertIn("empty", str(ctx.exception))
 
     def test_default_used_when_nothing_else(self):
         res = self._resolve(cwd=self.fake_home)

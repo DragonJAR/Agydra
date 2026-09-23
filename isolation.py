@@ -59,8 +59,6 @@ def _link(target: Path, link: Path) -> None:
         os.symlink(target, link, target_is_directory=target.is_dir())
         return
     except FileExistsError:
-        # Concurrent launch won the race; let the caller verify the target
-        # instead of falling through to a different link type.
         raise
     except OSError:
         pass
@@ -70,15 +68,12 @@ def _link(target: Path, link: Path) -> None:
             capture_output=True,
         )
         if result.returncode != 0:
-            detail = result.stderr.decode(errors="replace").strip()
+            detail = result.stderr.decode("oem", "replace").strip()
             raise OSError(
                 f"mklink /J failed for {link} "
                 f"(rc={result.returncode}): {detail}"
             )
         return
-    # File target: copy instead of hardlinking — a hardlink shares the
-    # inode, so a write through one profile's HOME would mutate the other
-    # profile's copy (isolation break).
     shutil.copy2(target, link)
 
 
@@ -109,11 +104,9 @@ def _mirrorable_home_entries(real_home: Path, store_root: Path) -> Dict[Path, Pa
         try:
             resolved = entry.resolve()
         except OSError:
-            # Unreadable entry: never mirror it, never fail the launch.
             continue
         if resolved == agy_data_resolved:
             continue
-        # ancestor-of-store test (store is at or below this home entry)
         if store_resolved == resolved or store_resolved.is_relative_to(resolved):
             continue
         entries[resolved] = entry
@@ -144,8 +137,6 @@ def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
         try:
             _link(data_dir, gemini_link)
         except FileExistsError:
-            # concurrent launch of the same profile won the race; verify it
-            # points where we expect instead of failing
             if not link_points_to(gemini_link, data_dir):
                 raise
 
@@ -153,25 +144,16 @@ def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
         link = overlay / entry.name
         if _is_link(link):
             if link.exists():
-                # Existing link still resolves: leave it alone (repairing
-                # every mirror each launch would churn idempotency).
                 continue
-            # Dangling mirror (its real-home entry was renamed/deleted
-            # after a previous launch): drop it so the next pass recreates
-            # it against the current entry, or skip silently if gone.
             try:
                 link.unlink()
             except OSError:
                 continue
         elif link.exists():
-            # A real file/dir we did not create: never touch it.
             continue
         try:
             _link(entry, link)
         except OSError:
-            # A home entry we cannot link (permissions, special file,
-            # cross-volume hardlink) must not break the launch; agy only
-            # needs .gemini to be isolated.
             continue
     return overlay
 
@@ -182,11 +164,6 @@ def isolated_env(overlay: Path, extra: dict, config_windows_redirect_home: bool 
     env[platforms.home_redirect_var()] = str(overlay)
     if platforms.is_windows() and config_windows_redirect_home:
         env["HOME"] = str(overlay)
-    # Redirect XDG vars when present: they would otherwise leak a path to the
-    # real home into the child, letting XDG-aware tools bypass the overlay.
-    # Values inside the real home map onto the mirrored overlay entry (the
-    # link we created in build_overlay), so the child still sees its real
-    # XDG config; values elsewhere pass through untouched.
     real_home = platforms.real_home()
     for xdg_var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
         value = env.get(xdg_var)

@@ -19,10 +19,10 @@ import os
 import sys
 from typing import Optional, Sequence
 
+from platforms import is_windows
+
 RESET = "\x1b[0m"
 
-# Semantic palette: keys are the only style names paint() accepts, so a
-# typo at a call site fails loudly instead of silently dropping color.
 _STYLES: dict[str, str] = {
     "bold": "\x1b[1m",
     "dim": "\x1b[2m",
@@ -32,13 +32,13 @@ _STYLES: dict[str, str] = {
     "red": "\x1b[31m",
 }
 
-_ANSI_RE = None  # compiled lazily; see strip_ansi()
+_ANSI_RE = None
 
 
 def _supports_ansi(stream) -> bool:
     if stream is None:
         return False
-    if os.name == "nt":
+    if is_windows():
         _enable_windows_vt()
     return hasattr(stream, "isatty") and stream.isatty()
 
@@ -50,6 +50,8 @@ def color_enabled(stream: Optional[object] = None) -> bool:
     if os.environ.get("NO_COLOR"):
         return False
     if os.environ.get("FORCE_COLOR", "") not in ("", "0"):
+        if is_windows():
+            _enable_windows_vt()
         return True
     return _supports_ansi(stream)
 
@@ -133,14 +135,14 @@ def _enable_windows_vt() -> None:
     try:
         import ctypes
 
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        for std_handle in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+        kernel32 = ctypes.windll.kernel32
+        for std_handle in (-11, -12):
             handle = kernel32.GetStdHandle(std_handle)
             mode = ctypes.c_uint32()
             if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
                 kernel32.SetConsoleMode(handle, mode.value | 0x0004)
     except Exception:
-        pass  # Windows Terminal / CI: ANSI already pass-through
+        pass
 
 
 def warn(message: str) -> None:

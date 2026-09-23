@@ -6,10 +6,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import locks  # noqa: E402
-from store import Store  # noqa: E402
+import locks
+from store import Store
 
-from conftest import BaseCase  # noqa: E402
+from conftest import BaseCase
 
 
 class TestLocks(BaseCase):
@@ -28,13 +28,12 @@ class TestLocks(BaseCase):
     def test_release_is_idempotent(self):
         handle = locks.try_lock(self.store, "work")
         handle.release()
-        handle.release()  # must not raise
+        handle.release()
         self.assertFalse(locks.is_locked(self.store, "work"))
 
     def test_second_lock_holder_rejected(self):
         first = locks.try_lock(self.store, "work")
         self.assertIsNotNone(first)
-        # A second independent acquirer (another session) must see busy.
         self.assertIsNone(locks.try_lock(self.store, "work"))
         first.release()
         self.assertIsNotNone(locks.try_lock(self.store, "work"))
@@ -65,7 +64,7 @@ class TestLocks(BaseCase):
         locks.try_lock(self.store, "work").release()
         locks.forget(self.store, "work")
         self.assertFalse(locks.lock_path(self.store, "work").exists())
-        locks.forget(self.store, "work")  # idempotent, never raises
+        locks.forget(self.store, "work")
 
     def test_try_lock_error_on_unwritable_dir(self):
         if sys.platform.startswith("win"):

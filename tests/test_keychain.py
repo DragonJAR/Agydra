@@ -5,7 +5,6 @@ from pathlib import Path
 from unittest import mock
 
 import keychain
-from store import Store
 
 
 def _rc(code, out: bytes = b""):
@@ -23,7 +22,7 @@ class TestKeychainNames(unittest.TestCase):
         self.assertEqual(keychain.shared_slot(), "gemini")
 
     def test_describe_supported_flag_shape(self):
-        report = keychain.describe(None)  # type: ignore[arg-type]
+        report = keychain.describe(None)
         self.assertIn("supported", report)
         self.assertIsInstance(report["supported"], bool)
 
@@ -57,8 +56,6 @@ class _MemoryKeychain:
                 return _rc(44)
             return _rc(0, out=self.shared)
         if verb == "add-generic-password":
-            # The secret always follows "-w"; a keychain path may now be
-            # appended after it, so args[-1] is no longer reliable.
             secret = args[args.index("-w") + 1]
             self.shared = secret.encode()
             self.calls.append(("write", self.shared))
@@ -95,22 +92,19 @@ class TestLaunchGuardRestore(unittest.TestCase):
             guard = keychain.launch_guard(store, "alpha")
             state = guard.__enter__()
             self.assertTrue(state._swapped)
-            kc.shared = b"profile-token-v2"  # agy refreshes mid-session
+            kc.shared = b"profile-token-v2"
             state.__exit__(None, None, None)
         return store, kc
 
     def test_refresh_kept_in_profile_slot_and_shared_restored(self):
         store, kc = self._cycle(b"stale")
-        # The refreshed token survives in the profile's private slot...
         self.assertEqual(keychain.load_profile_slot(store, "alpha"), b"profile-token-v2")
-        # ...and the shared slot is left exactly as found (leave-no-trace).
         self.assertEqual(kc.shared, b"stale")
         self.assertIn(("write", b"stale"), kc.calls)
 
     def test_no_prior_shared_token_is_cleaned_up(self):
         store, kc = self._cycle(None)
         self.assertEqual(keychain.load_profile_slot(store, "alpha"), b"profile-token-v2")
-        # Shared slot was absent before launch: exit must remove it again.
         self.assertIsNone(kc.shared)
         self.assertIn(("delete", None), kc.calls)
 
@@ -123,7 +117,7 @@ class TestLaunchGuardRestore(unittest.TestCase):
 
         def exploding_run(args, input_bytes=None):
             if args[0] == "add-generic-password":
-                return _rc(45)  # write fails -> swap skipped
+                return _rc(45)
             return kc.run(args, input_bytes)
 
         with mock.patch.object(keychain, "_run", exploding_run), \
@@ -136,8 +130,31 @@ class TestLaunchGuardRestore(unittest.TestCase):
             state = guard.__enter__()
             self.assertFalse(state._swapped)
             state.__exit__(None, None, None)
-        # Profile slot untouched: the foreign shared token was never saved.
         self.assertEqual(keychain.load_profile_slot(store, "alpha"), b"profile-token-v1")
+
+
+class TestDescribeForwardsKeychainPath(unittest.TestCase):
+    """describe() must resolve the target keychain once (via
+    _ensure_target_keychain) and forward it into read_slot, never rely on the
+    ambient default keychain (commit 18997f6)."""
+
+    def test_ensure_target_keychain_result_forwarded_to_read_slot(self):
+        store = _StoreStub(Path("/fake/store"))
+        calls = []
+
+        def fake_read_slot(service, keychain_path=None):
+            calls.append((service, keychain_path))
+            return b"token"
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                ), \
+                mock.patch.object(keychain, "read_slot", fake_read_slot):
+            report = keychain.describe(store, names=[])
+
+        self.assertTrue(report["shared"])
+        self.assertIn((keychain.shared_slot(), _FAKE_KEYCHAIN), calls)
 
 
 class TestEnsureTargetKeychain(unittest.TestCase):
@@ -159,7 +176,6 @@ class TestEnsureTargetKeychain(unittest.TestCase):
                 result = keychain._ensure_target_keychain(store)
 
             self.assertEqual(result, existing)
-            # No self-heal verbs: a healthy default must short-circuit.
             self.assertEqual([c[0] for c in calls], ["default-keychain"])
 
     def test_missing_default_self_heals_and_preserves_search_list(self):
@@ -175,7 +191,7 @@ class TestEnsureTargetKeychain(unittest.TestCase):
                 calls.append(args)
                 verb = args[0]
                 if verb == "default-keychain" and "-s" not in args:
-                    return _rc(51)  # no default configured
+                    return _rc(51)
                 if verb == "create-keychain":
                     return _rc(0)
                 if verb == "list-keychains" and "-s" not in args:
@@ -190,8 +206,6 @@ class TestEnsureTargetKeychain(unittest.TestCase):
             verbs = [c[0] for c in calls]
             self.assertIn("create-keychain", verbs)
             set_list_call = next(c for c in calls if c[0] == "list-keychains" and "-s" in c)
-            # The pre-existing entry must survive the (destructive) -s set,
-            # not just the newly-created target.
             self.assertIn(other_keychain, set_list_call)
             self.assertIn(str(target), set_list_call)
             self.assertIn(["default-keychain", "-d", "user", "-s", str(target)], [calls[-1]])
@@ -206,7 +220,7 @@ class TestEnsureTargetKeychain(unittest.TestCase):
                 if args[0] == "default-keychain":
                     return _rc(51)
                 if args[0] == "create-keychain":
-                    return _rc(1)  # user cancelled the password prompt
+                    return _rc(1)
                 raise AssertionError(f"unexpected call: {args}")
 
             with mock.patch.object(keychain, "_run", failing_run), \

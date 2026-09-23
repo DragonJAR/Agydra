@@ -71,8 +71,6 @@ class TestResolveAgyBinary(unittest.TestCase):
         p = self._tmp / name
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        # resolve_agy_binary rejects non-executable files on POSIX; every
-        # fixture must look like a real binary.
         p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         return p
 
@@ -105,7 +103,6 @@ class TestResolveAgyBinary(unittest.TestCase):
             self.skipTest("POSIX exec semantics")
         p = self._tmp / "noexec-agy"
         p.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        # Deliberately omit chmod +x.
         os.environ[platforms.AGY_BIN_ENV] = str(p)
         self.assertIsNone(platforms.resolve_agy_binary())
 
@@ -159,8 +156,6 @@ class TestLaunch(unittest.TestCase):
         return p
 
     def test_propagates_child_exit_code(self):
-        # On POSIX launch() replaces the process (execvpe), so propagation is
-        # verified at the CLI boundary in test_integration.py, not in-process.
         if not platforms.is_windows():
             self.skipTest("exec-replacement semantics; covered by CLI integration")
         script = self._script("exit42.cmd", "@echo off\r\nexit /b 42\r\n")

@@ -13,7 +13,7 @@ from agydra import __version__
 import account, banner, keychain, locks, platforms, resolver, runner, vocab
 from bootstrap import BootstrapError
 from isolation import IsolationError
-from store import Store, StoreError, _rename_dir_with_retry, atomic_copy, atomic_write_bytes
+from store import Store, StoreError, atomic_copy, atomic_write_bytes, rename_dir_with_retry
 from ui import error as _error, note as _note, pad, paint, paint_each
 
 
@@ -32,8 +32,9 @@ class ColoredHelpFormatter(argparse.HelpFormatter):
     formatter once escapes are stripped (test invariant).
     """
 
-    def _set_color(self, color) -> None:  # type: ignore[override]
-        super()._set_color(False)
+    def _set_color(self, color) -> None:
+        if hasattr(super(), "_set_color"):
+            super()._set_color(False)
 
     def _format_usage(self, usage, actions, groups, prefix) -> str:
         rendered = super()._format_usage(usage, actions, groups, prefix)
@@ -45,19 +46,9 @@ class ColoredHelpFormatter(argparse.HelpFormatter):
     def start_section(self, heading: str) -> None:
         super().start_section(paint(heading, "cyan", "bold"))
 
-    def _format_action_invocation(self, action):  # type: ignore[override]
+    def _format_action_invocation(self, action):
         return paint(super()._format_action_invocation(action), "bold")
 
-# ---------------------------------------------------------------------------
-# Single source of truth for the launcher vocabulary: canonical flag ->
-# (short, long, takes_value). The extractor, the late-flag warning and the
-# help text all derive from this one table, so they can never disagree about
-# what an agydra flag is. Only flags appearing BEFORE the first non-flag
-# token are consumed; later ones belong to agy (agy itself uses -p/--print).
-# ---------------------------------------------------------------------------
-# The trailing (metavar, help) pair also feeds build_parser's add_argument
-# calls, so the launcher's --help text can never drift from this table
-# either.
 _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
     "profile": (
         "-p", "--profile", True, "PROFILE",
@@ -76,16 +67,11 @@ _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
         "path to the real agy binary (overrides config and PATH lookup)",
     ),
 }
-# Short spelling -> (canonical key, takes_value), derived once from the flag
-# table so the bundle path and the table can never disagree (DRY).
 _SHORT_TO_FLAG: Dict[str, Tuple[str, bool]] = {
     short: (key, takes_value)
     for key, (short, _long, takes_value, _metavar, _help) in _LAUNCH_FLAGS.items()
 }
 
-# Canonical subcommand vocabulary lives in vocab.py: the dispatcher and the
-# profile-name validator must share one table so a name that shadows a
-# subcommand can never be created in the first place.
 _CANONICAL = vocab.CANONICAL
 _SUBCOMMAND_ALIASES = vocab.SUBCOMMAND_ALIASES
 
@@ -101,9 +87,6 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=ColoredHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"agydra {__version__}")
-    # Generated from _LAUNCH_FLAGS (in its insertion order: -p, -r, -n, -b)
-    # so the launcher's --help text can never disagree with the extractor
-    # and the late-flag warning about what an agydra flag is.
     for _key, (short, long_, takes_value, metavar, help_text) in _LAUNCH_FLAGS.items():
         if takes_value:
             parser.add_argument(short, long_, metavar=metavar, help=help_text)
@@ -141,12 +124,9 @@ def _match_flag(token: str) -> Optional[List[Tuple[str, object, int]]]:
         for pos, char in enumerate(token[1:], start=1):
             hit = _SHORT_TO_FLAG.get("-" + char)
             if hit is None:
-                return None  # unknown letter: the whole token is agy's
+                return None
             key, takes_value = hit
             if key in seen:
-                # A letter repeated INSIDE one bundle (-rnr, -rr) must not be
-                # partially consumed AND forwarded: treat the whole token as
-                # opaque, same as an unknown letter, so it goes to agy whole.
                 return None
             seen.add(key)
             if takes_value:
@@ -154,7 +134,7 @@ def _match_flag(token: str) -> Optional[List[Tuple[str, object, int]]]:
                 if inline:
                     matches.append((key, inline, 1))
                 else:
-                    matches.append((key, None, 2))  # value in the next token
+                    matches.append((key, None, 2))
                 return matches
             matches.append((key, True, 1))
         return matches
@@ -179,7 +159,7 @@ def _consume_launch_flags(
         if token == "--":
             rest.extend(argv[i + 1:])
             break
-        start = i  # position of this token: a repeat forwards from here
+        start = i
         matched = _match_flag(token)
         if matched is None:
             rest.extend(argv[i:])
@@ -192,9 +172,6 @@ def _consume_launch_flags(
                 inline = argv[i]
                 i += 1
             if values[key] is not None:
-                # Repeat of an already-consumed flag: it is agy's now (agy
-                # itself uses -p for --print), so agydra's flag section ends
-                # here — the repeated token itself included.
                 rest.extend(argv[start:])
                 return values, rest
             values[key] = inline if inline is not None else True
@@ -213,19 +190,15 @@ def _warn_late_flags(values: Dict[str, object], raw: Sequence[str]) -> None:
     """
     for key, (short, long_, takes_value, _metavar, _help) in _LAUNCH_FLAGS.items():
         if not takes_value or values[key] is not None:
-            continue  # consumed by agydra, or a boolean: no confusion risk
+            continue
         for i, token in enumerate(raw):
             if token == "--":
-                return  # everything after -- is agy's by contract
+                return
             matched = _match_flag(token)
             if matched is None:
                 continue
             if not any(m[0] == key for m in matched):
                 continue
-            # Find which sub-match corresponds to `key` to render the
-            # offending spelling accurately (-pwork vs -rp work). A value
-            # always sits in the NEXT argv token, regardless of how many
-            # boolean flags precede it inside the bundle.
             for m in matched:
                 if m[0] != key:
                     continue
@@ -249,9 +222,6 @@ def _assert_free(store: Store, name: str) -> None:
         )
 
 
-# One source for the PROFILE column label: cmd_list's minimum-width guard
-# and its header literal must never drift apart (a renamed label would
-# silently re-fuse the header into "PROFILEEMAIL").
 _PROFILE_LABEL = "PROFILE"
 
 
@@ -262,9 +232,6 @@ def cmd_list(store: Store, _args) -> int:
         return 0
     default = store.default_name()
     width = max(len(p.name) for p in profiles)
-    # Columns must always hold their own label: a short longest-name (e.g.
-    # a single 4-char profile) would otherwise squeeze PROFILE below its
-    # own label length and fuse the header into "PROFILEEMAIL".
     width = max(width, len(_PROFILE_LABEL))
     header = (
         f"{'#':<3}{_PROFILE_LABEL:<{width + 2}}{'EMAIL':<34}{'AUTH':<20}"
@@ -272,12 +239,7 @@ def cmd_list(store: Store, _args) -> int:
     )
     print(paint(header, "bold"))
     for idx, profile in enumerate(profiles, start=1):
-        # ONE lock probe per row: a second probe could flip between the
-        # email decision and the BUSY column, contradicting itself.
         busy = locks.is_locked(store, profile.name)
-        # Only free profiles may be touched: a live session owns its
-        # profile.json (touch on launch) and a concurrent write would
-        # resurrect a stale last_used.
         if busy:
             email = profile.email or "-"
         else:
@@ -286,10 +248,6 @@ def cmd_list(store: Store, _args) -> int:
             store.profile_data_dir(profile.name), store, profile.name,
         )
         is_default = paint("*", "green", "bold") if profile.name == default else ""
-        # Column values carry semantic state: green when usable, yellow when
-        # busy, dim for absent data. Painted cells must be padded with
-        # ui.pad, never the f-string :<width spec — it counts the ANSI
-        # bytes as visible width and shifts every following column.
         state_color = (
             "green" if state == "authenticated"
             else "yellow" if state != "not-authenticated"
@@ -322,9 +280,6 @@ def cmd_login(store: Store, args) -> int:
         name = resolver.resolve(store).name
     else:
         name = store.resolve_ref(args.ref)
-    # Login writes this profile's credentials (and captures the shared macOS
-    # slot afterwards): mutating a profile with a live session would let the
-    # capture attribute another session's token to this profile.
     _assert_free(store, name)
     data_dir = store.profile_data_dir(name)
     state = account.auth_state(data_dir, store, name)
@@ -336,15 +291,6 @@ def cmd_login(store: Store, args) -> int:
         ):
             print("cancelled")
             return 1
-    # A login writes this profile's credentials into the macOS shared keychain
-    # slot; the launch_guard around runner.run uses capture=True so the exit
-    # path persists that fresh token as THIS profile's private slot instead of
-    # restoring over it (a plain restore would delete/replace the token before
-    # anyone could capture it).
-    # Interactive login needs the real TTY and the OAuth browser flow: run agy
-    # without arguments so it enters the auth flow under this profile's store.
-    # It runs as a waited child (not exec) so the guard's exit runs inside
-    # runner.run, right after agy exits.
     plan = runner.build_plan(store, [], flag_ref=name, launch_as_child=True)
     if not args.dry_run:
         print(f"launching agy for login under profile {plan.profile!r}...")
@@ -362,9 +308,6 @@ def cmd_status(store: Store, args) -> int:
         print(plan.describe())
         return 0
     data_dir = store.profile_data_dir(plan.profile)
-    # Cache-first: metadata answers instantly; the token files are only
-    # scanned when the cache is empty. Status stays strictly read-only —
-    # it never writes the cache back.
     profile = store.get(plan.profile)
     email = profile.email or account.detect_email(data_dir) or "-"
     state = account.auth_state(data_dir, store, plan.profile)
@@ -450,8 +393,6 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
 
 def cmd_share_config(store: Store, args) -> int:
     src = store.resolve_ref(args.src)
-    # A self-target is not an error but must not be silent: `share-config
-    # work work` skipping itself reads as "copied nothing" otherwise.
     self_targets = [
         t for t in args.targets if store.resolve_ref(t) == src
     ]
@@ -467,10 +408,6 @@ def cmd_share_config(store: Store, args) -> int:
 
 
 def cmd_import(store: Store, args) -> int:
-    # Friendly guard: a path-like arg almost always means the user typed
-    # `agydra import ~/.gemini` (or similar) — `import` takes the TARGET
-    # profile name and auto-detects the source. Detect it here and emit a
-    # corrective message instead of the cryptic "unknown profile".
     ref = args.ref
     looks_like_path = ref.startswith(("/", "~", ".", "\\")) or re.match(
         r"^[a-zA-Z]:[\\/]", ref
@@ -501,16 +438,8 @@ def cmd_import(store: Store, args) -> int:
             f"profile {name!r} already has data ({data_dir}); "
             "delete it first (agydra delete " + name + ") or pick an empty profile."
         )
-    # Windows ``os.rename`` raises FileExistsError if dst exists even when
-    # empty (POSIX rename overwrites an empty dst). ``store.create`` pre-
-    # creates data/ so the just-emptied check above leaves it standing —
-    # rmdir it now so the rename works on both OSes. Raises loud if a TOCTOU
-    # writer populated it between the guard and here.
     if data_dir.exists():
         data_dir.rmdir()
-    # Same atomic discipline as every other writer: land the copy in a
-    # sibling tmp dir, then swap it in with one rename. A crash mid-copy
-    # must never leave half-landed tokens that auth_state would read.
     platforms.ensure_dir(data_dir.parent)
     tmp = Path(tempfile.mkdtemp(prefix=f".import-{name}.", dir=data_dir.parent))
     try:
@@ -518,7 +447,7 @@ def cmd_import(store: Store, args) -> int:
             real, tmp, dirs_exist_ok=True,
             ignore=shutil.ignore_patterns(".DS_Store"),
         )
-        _rename_dir_with_retry(tmp, data_dir)
+        rename_dir_with_retry(tmp, data_dir)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -563,9 +492,6 @@ def cmd_setup(_store: Store, args) -> int:
     return bootstrap.run()
 
 
-# One-line description per canonical subcommand. Displayed by the top-level
-# help; keep in sync with vocab.SUBCOMMAND_ALIASES (a missing entry falls back
-# to the raw command list, an extra entry is ignored).
 _SUBCOMMAND_HELP: Dict[str, str] = {
     "list": "show all profiles (number, email, auth, busy)",
     "create": "create a profile store",
@@ -600,9 +526,6 @@ def _management_help() -> str:
     return "\n".join(lines)
 
 
-# Single source for the `examples:` block — same content rendered both by
-# `agydra help` and asserted by tests, so coverage is automatic and the
-# example set cannot drift from the documented commands.
 _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
     (
         "first run",
@@ -643,8 +566,6 @@ def _report_error(exc: BaseException) -> int:
         _error(str(exc))
         return 1
     if isinstance(exc, EOFError):
-        # `agydra delete x < /dev/null` (CI, pipes): treat as a declined
-        # confirmation instead of showing a raw traceback.
         _error("no input available to confirm; re-run with --force")
         return 1
     if isinstance(exc, OSError):
@@ -657,8 +578,6 @@ def _report_error(exc: BaseException) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    # Banner first, to stderr, at most once per process: interactive users
-    # see the logo; pipes/redirects (scripts, CI, tests) never do.
     banner.show()
     raw = list(sys.argv[1:] if argv is None else argv)
     store = Store()
@@ -777,7 +696,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ) as exc:
             return _report_error(exc)
 
-    # Default: launcher mode — everything else is forwarded to agy.
     try:
         values, agy_args = _consume_launch_flags(raw)
         if values["profile"] is not None and values["random"]:
@@ -796,5 +714,5 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return _report_error(exc)
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     raise SystemExit(main())

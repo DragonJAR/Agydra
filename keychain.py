@@ -32,26 +32,20 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import platforms
+from store import atomic_write_bytes
 from ui import warn
 
-# POSIX-only module: Windows has no fcntl and can never run this bridge
-# (supported() is macOS-only), but a hard top-level import would make the
-# whole package fail to import on Windows (runner/cli import this module).
 try:
     import fcntl
-except ImportError:  # pragma: no cover - Windows
-    fcntl = None  # type: ignore[assignment]
+except ImportError:
+    fcntl = None
 
-# The fixed slot agy 1.2.7 uses on macOS (service/account).
 SHARED_SERVICE = "gemini"
 SHARED_ACCOUNT = "antigravity"
 _SLOT_SERVICE_PREFIX = "gemini/agydra/"
 
-NOT_FOUND_CODES = {44, 45, 51, 128}  # item not found / security not available
+NOT_FOUND_CODES = {44, 45, 51, 128}
 
-# Written under the store's keychain dir when self-healing the target
-# keychain fails once (e.g. the user cancels the create-keychain password
-# prompt): its presence means "don't ask again this store", not "retry".
 _SKIP_MARKER_NAME = ".setup-skipped"
 
 
@@ -60,8 +54,6 @@ class KeychainError(RuntimeError):
 
 
 def supported() -> bool:
-    # AGYDRA_NO_KEYCHAIN mirrors the AGYDRA_* env kill-switch pattern: one
-    # variable disables the whole bridge (CI, broken Security Agents).
     if os.environ.get("AGYDRA_NO_KEYCHAIN"):
         return False
     return platforms.is_macos() and shutil.which("security") is not None
@@ -76,36 +68,31 @@ def shared_slot() -> str:
     return SHARED_SERVICE
 
 
-#: Seconds before a hung `security` child is killed. The Security Agent's
-#: grandchild can inherit the pipe write-ends and block `communicate()`
-#: forever, so stdout/stderr go to temp files (never pipes) and the whole
-#: process group is killed on timeout — a hung dialog must degrade to
-#: fail-open, not hang every launch.
 KEYCHAIN_TIMEOUT_S = 2.0
 
 
-def _run(args, input_bytes: Optional[bytes] = None) -> subprocess.CompletedProcess:
+def _run(args) -> subprocess.CompletedProcess:
     out_fh = tempfile.TemporaryFile()
     err_fh = tempfile.TemporaryFile()
     try:
         proc = subprocess.Popen(
             ["security", *args],
-            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
             stdout=out_fh,
             stderr=err_fh,
             start_new_session=True,
         )
         try:
-            proc.communicate(input_bytes, timeout=KEYCHAIN_TIMEOUT_S)
+            proc.communicate(timeout=KEYCHAIN_TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            # The child spawned its own session: kill the group, not just the
-            # direct child, or the Security Agent grandchild survives.
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except OSError:
                 proc.kill()
             proc.communicate()
-            return subprocess.CompletedProcess(args, returncode=-1)
+            return subprocess.CompletedProcess(
+                args, returncode=-1, stdout=b"", stderr=b"security timed out"
+            )
         out_fh.seek(0)
         err_fh.seek(0)
         return subprocess.CompletedProcess(args, proc.returncode, out_fh.read(), err_fh.read())
@@ -138,7 +125,6 @@ def read_slot(service: str, keychain_path: Optional[Path] = None) -> Optional[by
 
 
 def write_slot(service: str, data: bytes, keychain_path: Optional[Path] = None) -> None:
-    # -U updates the item when it already exists, so this is idempotent.
     args = [
         "add-generic-password",
         "-U",
@@ -178,9 +164,7 @@ def slot_backup_path(store, name: str) -> Path:
 
 
 def save_profile_slot(store, name: str, data: bytes) -> None:
-    path = slot_backup_path(store, name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
+    atomic_write_bytes(slot_backup_path(store, name), data)
 
 
 def load_profile_slot(store, name: str) -> Optional[bytes]:
@@ -254,8 +238,6 @@ def _ensure_target_keychain(store) -> Optional[Path]:
         listed = _run(["list-keychains", "-d", "user"])
         existing = _parse_keychain_list(listed.stdout) if listed.returncode == 0 else []
         if str(target) not in existing:
-            # -s SETS the search list, it does not append: the existing
-            # entries must be passed through or they'd be dropped.
             _run(["list-keychains", "-d", "user", "-s", *existing, str(target)])
 
         _run(["default-keychain", "-d", "user", "-s", str(target)])
@@ -297,15 +279,8 @@ def launch_guard(store, profile: str, capture: bool = False):
             self._keychain_path: Optional[Path] = None
             try:
                 self._lock = _serialize_lock(store)
-                # Resolved ONCE per launch (not per read/write/delete call):
-                # each agydra invocation is its own process (execvpe), so a
-                # module-level cache would never survive to the next launch
-                # anyway — this is the right granularity, not a shortcut.
                 self._keychain_path = _ensure_target_keychain(store)
                 if self._keychain_path is None:
-                    # Resolution already warned (or is deliberately silent
-                    # because a prior attempt was marked skip-once); either
-                    # way, no safe target exists to swap into.
                     return self
                 self._had_shared = read_slot(shared_slot(), self._keychain_path)
                 slot = load_profile_slot(store, profile)
@@ -323,36 +298,22 @@ def launch_guard(store, profile: str, capture: bool = False):
             try:
                 if self._keychain_path is None:
                     return False
-                # Persist whatever agy left in the shared slot as this
-                # profile's private slot BEFORE restoring the shared slot,
-                # but ONLY when we actually swapped this profile's token in.
-                # Without this, a token refresh during the session (e.g. agy
-                # rotated the OAuth token mid-launch) would be overwritten on
-                # exit by the stale pre-launch snapshot, making the keychain
-                # item look "lost" the next time the profile is opened.
                 if self._swapped:
                     current = read_slot(shared_slot(), self._keychain_path)
                     if current is not None:
                         save_profile_slot(store, profile, current)
 
                 if capture:
-                    # Login flow: agy just wrote THIS profile's fresh token
-                    # into the shared slot. Persist it to the profile slot
-                    # and keep the shared slot pointing at it.
                     self._capture_and_keep()
                 else:
                     if self._had_shared is not None:
                         write_slot(shared_slot(), self._had_shared, self._keychain_path)
                     elif self._swapped and read_slot(shared_slot(), self._keychain_path) is not None:
-                        # No previous shared token and a profile slot was swapped
-                        # in: remove it again so we leave no shared state behind.
                         try:
                             delete_slot(shared_slot(), self._keychain_path)
                         except KeychainError:
                             pass
             except KeychainError as exc:
-                # Fail-open contract: a keychain failure on exit must never
-                # turn a successful session into a raw traceback.
                 warn(f"keychain restore failed ({exc}); shared slot left as-is")
             finally:
                 if self._lock is not None:
@@ -372,13 +333,21 @@ def launch_guard(store, profile: str, capture: bool = False):
 
 
 def rename_profile_slot(store, old_name: str, new_name: str) -> None:
-    """Rename a profile's keychain slot file (rename keeps the token)."""
-    old = slot_backup_path(store, old_name)
-    if not old.exists():
-        return
-    new = slot_backup_path(store, new_name)
-    new.parent.mkdir(parents=True, exist_ok=True)
-    old.replace(new)
+    """Rename a profile's keychain slot file (rename keeps the token).
+
+    Fail-open like ``purge_profile_slot``: the profile rename itself already
+    committed by the time this runs, so an OSError here must warn and
+    continue, not report the whole rename as failed.
+    """
+    try:
+        old = slot_backup_path(store, old_name)
+        if not old.exists():
+            return
+        new = slot_backup_path(store, new_name)
+        new.parent.mkdir(parents=True, exist_ok=True)
+        old.replace(new)
+    except OSError as exc:
+        warn(f"could not rename keychain slot for {old_name!r} ({exc})")
 
 
 def purge_profile_slot(store, name: str) -> None:
@@ -405,7 +374,8 @@ def describe(store, names: Optional[List[str]] = None) -> Dict[str, object]:
         except OSError:
             slots[name] = False
     try:
-        shared = read_slot(shared_slot()) is not None
+        keychain_path = _ensure_target_keychain(store) if store is not None else None
+        shared = read_slot(shared_slot(), keychain_path) is not None
     except KeychainError:
         shared = None
     return {"supported": True, "shared": shared, "profile_slots": slots}

@@ -49,9 +49,6 @@ def _marker_resolution(store: Store, cwd: Path) -> Optional[Resolution]:
     if marker is None:
         return None
     try:
-        # utf-8-sig transparently strips the BOM Notepad leaves behind;
-        # PowerShell 5.1 `>` writes UTF-16LE, whose decode must degrade to
-        # an actionable error instead of a raw traceback on every launch.
         ref = marker.read_text(encoding="utf-8-sig").strip()
     except (OSError, UnicodeDecodeError) as exc:
         raise StoreError(
@@ -59,7 +56,9 @@ def _marker_resolution(store: Store, cwd: Path) -> Optional[Resolution]:
             f"(PowerShell `>` writes UTF-16; re-save as UTF-8): {exc}"
         ) from exc
     if not ref:
-        return None
+        raise StoreError(
+            f"project marker {marker} is empty; write a profile name or delete the file"
+        )
     return Resolution(store.resolve_ref(ref), f"project marker {marker}")
 
 
@@ -73,7 +72,7 @@ def resolve(
     env = env if env is not None else os.environ
     cwd = cwd or Path.cwd()
 
-    if flag_ref:
+    if flag_ref is not None:
         return Resolution(store.resolve_ref(flag_ref), f"flag --profile={flag_ref}")
 
     env_ref = env.get(PROFILE_ENV)
@@ -89,9 +88,6 @@ def resolve(
         try:
             return Resolution(store.resolve_ref(default), "default profile")
         except StoreError:
-            # Dangling default (profile deleted behind agydra's back, or a
-            # lost-update on concurrent config writes): warn and fall through
-            # to "first profile" instead of bricking every launch.
             warn(
                 f"default profile {default!r} does not exist; falling back to "
                 "the first profile (fix with: agydra default <name>)"
@@ -107,8 +103,6 @@ def resolve(
     )
 
 
-# One message per failure mode of the -r / --random selection. All error
-# paths end with an actionable command so the CLI never needs a second copy.
 MIN_PROFILES = 2
 
 _NO_PROFILES = (
@@ -142,9 +136,6 @@ def pick_free_profile(store, cwd: Optional[Path] = None) -> Resolution:
     4. skip unauthenticated profiles;
     5. prefer the least-recently-used, break ties by seq (creation order).
     """
-    # Single scan, single pass: `list()` and `names()` both glob+parse the
-    # whole store, so derive `names` from `profiles` and reuse it. Same
-    # pattern as doctor.commit's two-for-one: pay the scan cost once.
     profiles = store.list()
     names = [p.name for p in profiles]
     if not names:

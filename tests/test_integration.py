@@ -7,10 +7,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import account, locks, platforms, runner  # noqa: E402
-from store import Store  # noqa: E402
+import account, locks, platforms
+from store import Store
 
-from conftest import BaseCase  # noqa: E402
+from conftest import BaseCase
 
 
 class TestIntegration(BaseCase):
@@ -28,10 +28,8 @@ class TestIntegration(BaseCase):
         result = self._run_cli("-p", "work")
         self.assertEqual(result.returncode, 0, result.stderr)
 
-        # The fake agy wrote into the PROFILE store, not the generic one.
         wrote = self.store.profile_data_dir("work") / "fake-agy-wrote"
         self.assertTrue(wrote.exists(), "agy did not write to the profile store")
-        # The generic store is byte-identical: R2 invariant.
         self.assertEqual(marker.read_text(encoding="utf-8"), before)
         self.assertIn("PROFILE=work", result.stdout)
         self.assertIn(str((self.store.root / "overlays" / "work")), result.stdout)
@@ -45,7 +43,6 @@ class TestIntegration(BaseCase):
         work_wrote = self.store.profile_data_dir("work") / "fake-agy-wrote"
         lab_wrote = self.store.profile_data_dir("lab") / "fake-agy-wrote"
         self.assertTrue(work_wrote.exists() and lab_wrote.exists())
-        # generic marker untouched by both
         self.assertTrue(
             (self.fake_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").exists()
         )
@@ -53,11 +50,9 @@ class TestIntegration(BaseCase):
     def test_dry_run_prints_plan_and_executes_nothing(self):
         result = self._run_cli("-p", "work", "--dry-run", "anything")
         self.assertEqual(result.returncode, 0, result.stderr)
-        # Plan: profile, binary, argv, overlay, HOME redirect, sandbox
         self.assertIn("profile : work", result.stdout)
         self.assertIn("binary", result.stdout)
         self.assertIn("overlay :", result.stdout)
-        # env line: HOME=<overlay> on POSIX, USERPROFILE=<overlay> on Windows
         var = "USERPROFILE" if sys.platform.startswith("win") else "HOME"
         self.assertIn(f"env     : {var}=", result.stdout)
         self.assertIn("sandbox : off", result.stdout)
@@ -77,9 +72,6 @@ class TestIntegration(BaseCase):
         self.assertIn("PROFILE=second", result.stdout)
 
     def test_launch_propagates_child_exit_code(self):
-        # POSIX: launch() exec-replaces; Windows: subprocess.run returns the
-        # child's code. Either way a failing child must surface as the CLI's
-        # exit code, never as a traceback.
         self.store.create("err")
         if platforms.is_windows():
             bad = self.bin_dir / "agy-fail.cmd"
@@ -93,8 +85,6 @@ class TestIntegration(BaseCase):
         self.assertNotIn("Traceback", result.stderr)
 
     def test_create_second_profile_copies_settings(self):
-        # Regression: _share_config referenced an undefined target_dir
-        # (NameError), breaking `create` from the second profile on.
         (self.store.profile_data_dir("work") / "settings.json").write_text(
             '{"theme": "dark"}', encoding="utf-8"
         )
@@ -124,8 +114,6 @@ class TestIntegration(BaseCase):
         )
 
     def test_readonly_commands_create_nothing(self):
-        # status/--dry-run must have zero filesystem side effects; Store() is
-        # lazy, so even a fresh AGYDRA_HOME stays untouched.
         empty_root = self._tmp / "empty-store"
         os.environ["AGYDRA_HOME"] = str(empty_root)
         try:
@@ -165,7 +153,6 @@ class TestRandomProfileSelection(BaseCase):
         self.store = Store()
         self.store.create("work")
         self.store.create("lab")
-        # Both authenticated so -r has a free pool.
         for name in ("work", "lab"):
             cli_dir = self.store.profile_data_dir(name) / "antigravity-cli"
             cli_dir.mkdir(parents=True, exist_ok=True)
@@ -190,7 +177,6 @@ class TestRandomProfileSelection(BaseCase):
         self.assertIn("mutually exclusive", result.stderr)
 
     def test_r_skips_authenticated_only(self):
-        # lab is unauthenticated; -r must fall back to work.
         (
             self.store.profile_data_dir("lab") / "antigravity-cli" / "antigravity-oauth-token"
         ).unlink()
@@ -221,7 +207,6 @@ class TestRandomProfileSelection(BaseCase):
         self.assertIn("at least 2 profiles", result.stderr)
 
     def test_r_respects_live_session(self):
-        # Hold a live session on 'work'; -r must pick 'lab'.
         gate = self._tmp / "gate"
         env = dict(os.environ)
         env["FAKE_AGY_GATE"] = str(gate)
@@ -230,7 +215,6 @@ class TestRandomProfileSelection(BaseCase):
             env=env,
         )
         try:
-            # Wait until the lock is held.
             import time
 
             for _ in range(100):
@@ -295,13 +279,8 @@ class TestImportFlow(BaseCase):
         super().setUp()
         self.store = Store()
         self.store.create("work")
-        # BaseCase already provisions the fake home's generic ~/.gemini
-        # (antigravity-cli/antigravity-oauth-token), which auto-detect must
-        # find below.
 
     def test_path_as_ref_gets_corrective_error(self):
-        # `agydra import ~/.gemini` must explain the fix, not say
-        # "unknown profile".
         result = self._run_cli("import", str(self.fake_home / ".gemini"))
         self.assertEqual(result.returncode, 1)
         self.assertIn("TARGET profile name, not a path", result.stderr)
@@ -316,7 +295,6 @@ class TestImportFlow(BaseCase):
         )
         self.assertTrue(imported.exists(), "generic data must land in the profile")
         self.assertEqual(result.returncode, 0)
-        # Source must remain untouched (copy, never move).
         self.assertTrue(
             (self.fake_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").exists()
         )
@@ -354,7 +332,6 @@ class TestAliasesAndFlagTable(BaseCase):
                 self.assertEqual(_CANONICAL[alias], canonical)
 
     def test_alias_dispatch_list(self):
-        # list/ls/l must all reach the list handler (no crash, prints header).
         from cli import _CANONICAL
 
         self.assertEqual(_CANONICAL.get("ls"), "list")
@@ -377,8 +354,6 @@ class TestAliasesAndFlagTable(BaseCase):
         self.assertIsNone(_CANONICAL.get(""))
 
     def test_help_documents_every_subcommand(self):
-        # Every canonical subcommand must appear in the top-level help with
-        # a one-line description; every cmd_ handler must be in the table.
         import cli
         from cli import _SUBCOMMAND_ALIASES, _SUBCOMMAND_HELP
 
@@ -388,10 +363,8 @@ class TestAliasesAndFlagTable(BaseCase):
             for name in dir(cli)
             if name.startswith("cmd_")
         }
-        # Subcommands handled inline in main() (not as cmd_*): version, help.
         expected = set(_SUBCOMMAND_ALIASES) - {"version", "help"}
         self.assertEqual(handlers, expected)
-        # Every alias must appear in the help block (display ordering).
         order = list(_SUBCOMMAND_ALIASES)
         self.assertLess(order.index("create"), order.index("list"))
         self.assertLess(order.index("list"), order.index("rename"))
@@ -411,8 +384,6 @@ class TestAliasesAndFlagTable(BaseCase):
             self.assertIn(token, out)
 
     def test_help_is_plain_in_captured_pipes(self):
-        # StringIO is not a TTY, so captured help (tests, logs, `| less`)
-        # must carry zero ANSI escapes.
         import io
         from contextlib import redirect_stdout
 
@@ -443,7 +414,6 @@ class TestAliasesAndFlagTable(BaseCase):
                 os.environ["FORCE_COLOR"] = old
         out = buf.getvalue()
         self.assertIn("\x1b[", out)
-        # Stripped output equals the plain rendering (layout invariant).
         from ui import strip_ansi
         self.assertEqual(strip_ansi(out), strip_ansi(out))
         self.assertIn("management:", strip_ansi(out))
@@ -485,10 +455,14 @@ class TestAliasesAndFlagTable(BaseCase):
     def test_flag_table_shape_and_extractor(self):
         from cli import _LAUNCH_FLAGS, _consume_launch_flags
 
-        # Table completeness: every flag has both spellings and a value flag.
-        for key, (short, long_, takes_value) in _LAUNCH_FLAGS.items():
+        for key, (short, long_, takes_value, metavar, help_text) in _LAUNCH_FLAGS.items():
             self.assertTrue(short.startswith("-"))
             self.assertTrue(long_.startswith("--"))
+            self.assertTrue(help_text)
+            if takes_value:
+                self.assertIsNotNone(metavar)
+            else:
+                self.assertIsNone(metavar)
 
         values, rest = _consume_launch_flags(["-p", "work", "-r", "chat"])
         self.assertEqual(values["profile"], "work")
@@ -508,7 +482,6 @@ class TestAliasesAndFlagTable(BaseCase):
         self.assertEqual(values["binary"], "/opt/agy")
         self.assertEqual(rest, ["--version"])
 
-        # A late -r (agy's own?) must not be consumed after a non-flag token.
         values, rest = _consume_launch_flags(["chat", "-r"])
         self.assertIsNone(values["random"])
         self.assertEqual(rest, ["chat", "-r"])
@@ -521,7 +494,6 @@ class TestAliasesAndFlagTable(BaseCase):
             capture_output=True, text=True, timeout=60,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        # Fresh store: the friendly empty-state message, same handler as list.
         self.assertIn("no profiles", result.stdout)
 
 
@@ -529,9 +501,7 @@ class TestLauncherFlagExtraction(unittest.TestCase):
     def test_extracts_all_flag_forms(self):
         from cli import _consume_launch_flags
 
-        # argv -> (expected flag values, expected args forwarded to agy)
         cases = {
-            # First -p / --profile wins; later -p is passed to agy.
             ("--profile", "work", "--version"):
                 ({"profile": "work"}, ["--version"]),
             ("-p", "work", "--version"):
@@ -540,21 +510,14 @@ class TestLauncherFlagExtraction(unittest.TestCase):
                 ({"profile": "work"}, ["--version"]),
             ("--profile=work", "-p", "text"):
                 ({"profile": "work"}, ["-p", "text"]),
-            # -p first, then --binary: both captured, later args go to agy.
             ("-p", "lab", "--binary", "/opt/agy", "--version"):
                 ({"profile": "lab", "binary": "/opt/agy"}, ["--version"]),
-            # --binary first (no -p before it): only --binary captured; -p after
-            # is agy's own flag. This is the documented "agy intercepts -p"
-            # behavior and is intentional.
             ("--binary", "/opt/agy", "--version"):
                 ({"profile": None, "binary": "/opt/agy"}, ["--version"]),
-            # -p FIRST then --binary, then a repeat -p: the repeat is agy's.
             ("-p", "lab", "--binary", "/opt/agy", "-p", "hello"):
                 ({"profile": "lab", "binary": "/opt/agy"}, ["-p", "hello"]),
-            # --dry-run alone: no profile yet (resolver errors later, that's OK).
             ("--dry-run", "--version"):
                 ({"profile": None, "dry-run": True}, ["--version"]),
-            # New short forms.
             ("-n", "--version"): ({"dry-run": True}, ["--version"]),
             ("-b/opt/agy", "--version"): ({"binary": "/opt/agy"}, ["--version"]),
             ("--binary=/opt/agy", "--version"):
@@ -570,8 +533,6 @@ class TestLauncherFlagExtraction(unittest.TestCase):
     def test_first_occurrence_wins_and_rest_forwarded(self):
         from cli import _consume_launch_flags
 
-        # A repeated flag ends agydra's section: the repeat and everything
-        # after it belongs to agy (agy itself uses -p for --print).
         values, rest = _consume_launch_flags(
             ["-p", "lab", "--binary", "/opt/agy", "-p", "hello"]
         )
@@ -579,12 +540,10 @@ class TestLauncherFlagExtraction(unittest.TestCase):
         self.assertEqual(values["binary"], "/opt/agy")
         self.assertEqual(rest, ["-p", "hello"])
 
-        # "--" stops the parser, everything after is forwarded verbatim.
         values, rest = _consume_launch_flags(["--", "-p", "after-separator"])
         self.assertIsNone(values["profile"])
         self.assertEqual(rest, ["-p", "after-separator"])
 
-        # A non-flag token before any flag ends the scan: everything is agy's.
         values, rest = _consume_launch_flags(["chat", "-p", "work"])
         self.assertIsNone(values["profile"])
         self.assertEqual(rest, ["chat", "-p", "work"])
@@ -616,7 +575,6 @@ class TestLateProfileFlagWarning(unittest.TestCase):
         self.assertIn("must come first", out)
 
     def test_attached_p_dash_pwork_warns(self):
-        # Regression: attached form was silently forwarded before.
         out = self._capture(["chat", "-pwork"])
         self.assertIn("must come first", out)
         self.assertIn("-pwork", out)
@@ -631,7 +589,6 @@ class TestLateProfileFlagWarning(unittest.TestCase):
         self.assertIn("-b /opt/agy", out)
 
     def test_double_dash_terminates_scan(self):
-        # Anything after ``--`` belongs to agy; no warning should be raised.
         out = self._capture(["chat", "--", "-p", "work"])
         self.assertEqual(out, "")
 

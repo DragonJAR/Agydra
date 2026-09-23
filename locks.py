@@ -18,14 +18,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import platforms
 
 LOCK_DIR_NAME = "locks"
 LOCK_SUFFIX = ".lock"
 
-if platforms.is_windows():  # pragma: no cover - exercised only on Windows
+if platforms.is_windows():
     import msvcrt
 
     def _try_lock_fd(fd: int) -> bool:
@@ -41,7 +41,7 @@ if platforms.is_windows():  # pragma: no cover - exercised only on Windows
             os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         except OSError:
-            pass  # closing the fd releases the region anyway
+            pass
 else:
     import fcntl
 
@@ -56,7 +56,7 @@ else:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
-            pass  # closing the fd releases the lock anyway
+            pass
 
 
 class LockError(OSError):
@@ -113,15 +113,11 @@ def try_lock(store, name: str) -> LockHandle | None:
         raise LockError(f"cannot create session lock {path} ({exc})") from exc
     try:
         if os.fstat(fd).st_size == 0:
-            # Windows byte-range locks are happiest locking real bytes; one
-            # NUL is enough and harmless on POSIX.
             os.write(fd, b"\0")
         if not _try_lock_fd(fd):
             os.close(fd)
             return None
         if not platforms.is_windows():
-            # POSIX: survive execvpe so the launched agy keeps holding the
-            # lock for its whole lifetime.
             os.set_inheritable(fd, True)
     except OSError as exc:
         try:
@@ -139,16 +135,14 @@ def is_locked(store, name: str) -> bool:
     "cannot tell" must err on the side of "do not reuse / do not delete".
     """
     path = lock_path(store, name)
+    flags = os.O_RDWR if platforms.is_windows() else os.O_RDONLY
     try:
-        fd = os.open(path, os.O_RDWR)
+        fd = os.open(path, flags)
     except FileNotFoundError:
         return False
     except OSError:
         return True
     try:
-        # If we can take it, nobody held it; release immediately and report
-        # free. flock/msvcrt locks are per open-file-description, so this
-        # probe can never steal a lock another session (or fd) holds.
         locked = not _try_lock_fd(fd)
         if not locked:
             _unlock_fd(fd)

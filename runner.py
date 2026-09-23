@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 import isolation, keychain, locks, platforms, resolver
-from resolver import PROFILE_ENV
 from store import Store, StoreError
 from ui import warn
 
@@ -33,15 +32,9 @@ class LaunchPlan:
     env_home_var: str
     env_home_value: Path
     use_sandbox: bool
-    # Login runs agy as a waited child instead of exec-replacing the process,
-    # so the caller can snapshot the refreshed keychain slot after agy exits.
     launch_as_child: bool = False
-    # Provenance needed to re-resolve after a lost -r race; the override must
-    # survive into the rebuilt plan or --binary would silently stop applying.
     random_pick: bool = False
     binary_override: Optional[str] = None
-    # Snapshot of the config setting run() needs, taken at plan time so run()
-    # never re-reads agydra.json (one disk hit per launch, not two).
     windows_redirect_home: bool = False
 
     def describe(self) -> str:
@@ -111,12 +104,6 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
 
     store = store or Store()
 
-    # Acquire the session lock. For -r, losing the race is expected under
-    # concurrency: re-pick once from the profiles that are STILL free and
-    # retry — repeated losers converge because each attempt removes at least
-    # one candidate from the free set. The bound is computed lazily (only
-    # after the first lost race) so the single-profile path never globs
-    # the store just to count.
     handle = None
     attempts = 0
     max_attempts: Optional[int] = None
@@ -124,7 +111,7 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
         handle = locks.try_lock(store, plan.profile)
         if handle is not None:
             break
-        if not plan.random_pick:
+        if not plan.random_pick or (plan.reason and plan.reason.startswith("project marker")):
             raise StoreError(
                 f"profile {plan.profile!r} is busy: another live session is "
                 "using it (agydra -r picks a free one automatically)"
@@ -150,40 +137,23 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
     overlay = isolation.build_overlay(plan.profile, data_dir, store.root)
     env = isolation.isolated_env(
         overlay,
-        extra={PROFILE_ENV: plan.profile},
+        extra={resolver.PROFILE_ENV: plan.profile},
         config_windows_redirect_home=plan.windows_redirect_home,
     )
 
     argv = [str(plan.binary), *plan.args]
     if plan.use_sandbox:
         argv = isolation.sandbox_wrap(argv)
-    # Swap the shared macOS keychain slot to this profile's token for the
-    # duration of the launch; no-op (null context) on Linux/Windows, where the
-    # overlay file is already the isolated store. ``capture`` is set only by
-    # the login flow (plan.launch_as_child), which needs the fresh token
-    # persisted as this profile's private slot instead of restored-over.
-    with keychain.launch_guard(
-        store, plan.profile, capture=plan.launch_as_child
-    ):
-        if platforms.is_windows():
-            # Windows launch waits for the child; the parent holds the lock
-            # for the session and must release it when the child exits —
-            # including on a failing launch, or cmd_login would never be
-            # able to re-lock the profile for its capture step.
-            try:
-                return platforms.launch(plan.binary, plan.args, env)
-            finally:
-                handle.release()
-        if plan.use_sandbox or plan.launch_as_child:
-            # Child + wait so `agydra login` can observe exit and snapshot the
-            # refreshed keychain slot. The lock must be released in the parent
-            # too: the fd the child inherited dies with it, but a parent that
-            # keeps running after the wait (login capture steps, tests)
-            # would otherwise hold the profile busy.
-            try:
+    release_after_guard = platforms.is_windows() or plan.use_sandbox or plan.launch_as_child
+    try:
+        with keychain.launch_guard(
+            store, plan.profile, capture=plan.launch_as_child
+        ):
+            if platforms.is_windows():
+                return platforms.launch_argv(argv, env)
+            if plan.use_sandbox or plan.launch_as_child:
                 return platforms.run_wait(argv, env)
-            finally:
-                handle.release()
-        # Default: exec replaces this process; the inheritable lock fd
-        # survives the exec and the kernel releases it when agy exits.
-        return platforms.launch_argv(argv, env)
+            return platforms.launch_argv(argv, env)
+    finally:
+        if release_after_guard:
+            handle.release()

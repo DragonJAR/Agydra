@@ -16,18 +16,16 @@ import contextlib
 import io
 import os
 import sys
-import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from store import Store, StoreError  # noqa: E402
+from store import Store, StoreError
 
-from ui import strip_ansi  # noqa: E402
+import ui
+from ui import strip_ansi
 
-import ui  # noqa: E402
-
-from conftest import BaseCase  # noqa: E402
+from conftest import BaseCase
 
 
 class TestListColumnsAlignWithColor(BaseCase):
@@ -43,13 +41,10 @@ class TestListColumnsAlignWithColor(BaseCase):
     def setUp(self):
         super().setUp()
         self.store = Store()
-        os.environ["FORCE_COLOR"] = "1"  # paint() activates without a TTY
+        os.environ["FORCE_COLOR"] = "1"
 
     def test_row_columns_align_with_header_under_color(self):
         self.store.create("work")
-        # Force the painted-state path: a token in the profile's data dir
-        # makes auth_state return "authenticated" (green) — the exact cell
-        # shape that used to shift the columns.
         data_dir = self.store.profile_data_dir("work") / "antigravity-cli"
         data_dir.mkdir(parents=True)
         (data_dir / "antigravity-oauth-token").write_text(
@@ -57,8 +52,6 @@ class TestListColumnsAlignWithColor(BaseCase):
         )
         lines = self.capture_list()
         plain_header, plain_row = strip_ansi(lines[0]), strip_ansi(lines[1])
-        # Column offsets come from the header; the row's visible values
-        # must land on exactly the same offsets.
         auth_at = plain_header.index("AUTH")
         default_at = plain_header.index("DEFAULT")
         busy_at = plain_header.index("BUSY")
@@ -72,13 +65,10 @@ class TestListColumnsAlignWithColor(BaseCase):
         self.assertEqual(plain_row[last_at], "-")
 
     def test_ansi_padding_moves_filler_outside_color_span(self):
-        # Green cell padded to 20 visible chars: the filler must trail the
-        # color reset (no invisible colored spaces), and the next column
-        # starts exactly at offset 20.
         cell = ui.pad(ui.paint("authenticated", "green"), 20)
         self.assertTrue(cell.endswith(ui.RESET))
         self.assertEqual(len(ui.strip_ansi(cell)), 20)
-        self.assertLess(cell.index(ui.RESET), len(cell) - 1)  # filler after reset
+        self.assertLess(cell.index(ui.RESET), len(cell) - 1)
 
     def capture_list(self):
         import cli
@@ -99,16 +89,12 @@ class TestListHeaderNeverFusesColumns(BaseCase):
         self.store.create("work")
         lines = self.capture_list()
         header = lines[0]
-        # The EMAIL column must start as its own token, not fused onto
-        # PROFILE ("PROFILEEMAIL" was the regression).
         self.assertIn("PROFILE  EMAIL", header)
 
     def test_long_profile_name_still_aligned(self):
         self.store.create("a" * 30)
         lines = self.capture_list()
         header = lines[0]
-        # Rows must share the header's column offsets: the EMAIL column
-        # starts at the same index in both (the width variable is shared).
         row = lines[1]
         self.assertEqual(header.index("EMAIL"), row.index("-"))
         self.assertLess(header.index("EMAIL"), header.index("AUTH"))
@@ -145,10 +131,8 @@ class TestImportGuards(BaseCase):
 
         with self.assertRaises(StoreError) as ctx:
             cli.cmd_import(self.store, Args())
-        # Actionable message names the profile and the escape hatch.
         self.assertIn("already has data", str(ctx.exception))
         self.assertIn("agydra delete populated", str(ctx.exception))
-        # Rejection happens before mkdtemp: no tmp litter in profiles/.
         parent = data.parent
         self.assertFalse(
             [p for p in parent.iterdir() if p.name.startswith(".import-")],
@@ -156,10 +140,6 @@ class TestImportGuards(BaseCase):
         )
 
     def test_import_onto_locked_profile_reports_the_live_session(self):
-        # Lock precedence: a profile with BOTH a live lock and data must
-        # fail on the lock (session owns the profile), not on the data
-        # guard — the data message suggests `delete`, which would also be
-        # refused while locked.
         import cli, locks
 
         self.store.create("held")
@@ -193,7 +173,6 @@ class TestImportGuards(BaseCase):
             rc = cli.cmd_import(self.store, Args())
         self.assertEqual(rc, 0)
         self.assertTrue((data / "settings.json").is_file())
-        # The empty pre-created data/ was rmdir'd before the rename swap.
         self.assertFalse(
             [p for p in data.parent.iterdir() if p.name.startswith(".import-")],
             "completed import left temp litter",

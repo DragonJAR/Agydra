@@ -15,12 +15,8 @@ from typing import Mapping, Optional, Sequence
 
 APP_NAME = "agydra"
 
-#: Environment variable that overrides the agydra data directory (used by
-#: tests and CI to isolate the store from the real user data).
 BASE_DIR_ENV = "AGYDRA_HOME"
-#: Environment variable that overrides the resolved agy binary.
 AGY_BIN_ENV = "AGYDRA_AGY_BIN"
-#: Name of agy's data directory, relative to the user home.
 AGY_DATA_DIR_NAME = ".gemini"
 
 
@@ -56,7 +52,6 @@ def base_dir() -> Path:
         return Path.home() / "Library" / "Application Support" / APP_NAME
     xdg = os.environ.get("XDG_DATA_HOME")
     if xdg:
-        # XDG spec: a relative value is invalid and must be ignored.
         p = Path(xdg).expanduser()
         if p.is_absolute():
             return p / APP_NAME
@@ -87,11 +82,6 @@ def resolve_agy_binary(explicit: Optional[str] = None) -> Optional[Path]:
     candidate = explicit or os.environ.get(AGY_BIN_ENV)
     if candidate:
         p = Path(candidate).expanduser()
-        # Three rejections must be silent (returns None): not a path at all,
-        # a directory (launch would fail with IsADirectoryError/EISDIR), or a
-        # non-executable file (launch would fail with exit 126 while doctor
-        # would otherwise report it healthy). ``shutil.which`` already enforces
-        # is_file + X_OK for the PATH fallback; we mirror that here.
         if p.is_file() and (is_windows() or os.access(p, os.X_OK)):
             return p
         return None
@@ -104,9 +94,7 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
-# venv layout (pip-installed interpreter + console scripts) per OS: the
-# single source of truth shared by bootstrap.py and the repo-root agydra.py.
-if is_windows():  # pragma: no cover - exercised only on Windows
+if is_windows():
     VENV_BIN_SUBDIR = "Scripts"
     _EXE_SUFFIX = ".exe"
 else:
@@ -145,10 +133,9 @@ def launch_argv(argv: Sequence[str], env: Mapping[str, str]) -> int:
         print(f"agydra: cannot execute {argv[0]}: not found", file=sys.stderr)
         return 127
     except OSError as exc:
-        # POSIX convention: 126 = exists but not executable.
         print(f"agydra: cannot execute {argv[0]}: {exc}", file=sys.stderr)
         return 126
-    return 127  # pragma: no cover - execvpe never returns on success
+    return 127
 
 
 def run_wait(argv: Sequence[str], env: Mapping[str, str]) -> int:
@@ -156,8 +143,6 @@ def run_wait(argv: Sequence[str], env: Mapping[str, str]) -> int:
     try:
         return subprocess.run(list(argv), env=dict(env), shell=False).returncode
     except KeyboardInterrupt:
-        # Agy was interrupted: never let the wrapper turn that into a
-        # Python traceback.
         return 130
     except FileNotFoundError:
         print(f"agydra: cannot execute {argv[0]}: not found", file=sys.stderr)

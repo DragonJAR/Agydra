@@ -20,14 +20,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cli import (  # noqa: E402
+from cli import (
     _consume_launch_flags,
     _match_flag,
     _warn_late_flags,
 )
-from store import Store, StoreError  # noqa: E402
+from store import Store, StoreError
 
-from conftest import BaseCase  # noqa: E402
+from conftest import BaseCase
 
 
 class TestShortFlagBundles(unittest.TestCase):
@@ -46,8 +46,6 @@ class TestShortFlagBundles(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertEqual(len(m), 2)
         self.assertEqual(m[0], ("random", True, 1))
-        # The value flag at the tail of the bundle demands the next argv
-        # token (width 2, inline None).
         self.assertEqual(m[1], ("profile", None, 2))
 
     def test_value_flag_inline_still_works(self):
@@ -55,9 +53,7 @@ class TestShortFlagBundles(unittest.TestCase):
         self.assertEqual(m, [("profile", "work", 1)])
 
     def test_unknown_letter_rejects_whole_token(self):
-        # A bundle we don't own is forwarded to agy verbatim; never partial.
         self.assertIsNone(_match_flag("-rx"))
-        # Even a familiar letter followed by an unknown one rejects the lot.
         self.assertIsNone(_match_flag("-nrx"))
 
     def test_dash_alone_is_not_a_bundle(self):
@@ -88,8 +84,6 @@ class TestConsumeBundles(unittest.TestCase):
         self.assertEqual(rest, ["-x", "foo"])
 
     def test_repeat_of_bundle_flag_forwards_whole_token(self):
-        # First -p consumes; the repeated -p inside a bundle forwards the
-        # bundle token and everything after to agy.
         values, rest = _consume_launch_flags(["-p", "lab", "-np", "x"])
         self.assertEqual(values["profile"], "lab")
         self.assertEqual(rest, ["-np", "x"])
@@ -97,6 +91,14 @@ class TestConsumeBundles(unittest.TestCase):
     def test_bundle_missing_value_raises(self):
         with self.assertRaises(StoreError):
             _consume_launch_flags(["-np"])
+
+    def test_letter_repeated_inside_one_bundle_is_opaque(self):
+        self.assertIsNone(_match_flag("-rnr"))
+        self.assertIsNone(_match_flag("-rr"))
+        values, rest = _consume_launch_flags(["-rnr", "chat"])
+        self.assertEqual(values["random"], None)
+        self.assertEqual(values["dry-run"], None)
+        self.assertEqual(rest, ["-rnr", "chat"])
 
 
 class TestLateBundleWarning(unittest.TestCase):
@@ -124,8 +126,6 @@ class TestLateBundleWarning(unittest.TestCase):
         self.assertIn("-rp work", out)
 
     def test_late_unknown_bundle_stays_silent(self):
-        # The warning only triggers for flags the matcher knows; agy-only
-        # bundles like ``-x`` are agy's business.
         self.assertEqual(self._warn(["chat", "-xfoo"]), "")
 
 
@@ -157,17 +157,39 @@ class TestReservedProfileNames(BaseCase):
             self.store.rename("work", "status")
 
     def test_unrelated_names_still_pass(self):
-        # Regression guard: the regex check must run first; the reserved
-        # check must not regress on valid, non-shadowing names.
         self.store.create("personal")
         self.store.create("work-lab_2")
 
     def test_create_refuses_reserved_subcommand_name(self):
-        # Reserved names collide with the dispatcher (bare `agydra <name>`
-        # always runs the subcommand, so the profile would be unreachable);
-        # refuse at create.
         with self.assertRaises(StoreError):
             self.store.create("status")
+
+
+class TestWindowsReservedDeviceNames(BaseCase):
+    """A store must stay portable: Windows reserved device names (con, prn,
+    aux, nul, com1-9, lpt1-9) pass NAME_RE but break mkdir/open on Windows,
+    so they are refused on every platform, not just when running on
+    Windows."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+
+    def test_device_names_are_refused(self):
+        for name in ("con", "prn", "aux", "nul", "com1", "com9", "lpt1", "lpt9"):
+            with self.subTest(name=name):
+                with self.assertRaises(StoreError) as cm:
+                    self.store.create(name)
+                self.assertIn("reserved Windows device name", str(cm.exception))
+
+    def test_similar_but_distinct_names_still_pass(self):
+        self.store.create("console")
+        self.store.create("com10")
+
+    def test_rename_into_device_name_is_refused(self):
+        self.store.create("work")
+        with self.assertRaises(StoreError):
+            self.store.rename("work", "nul")
 
 
 class TestRuntimeBundleLaunch(BaseCase):
@@ -203,7 +225,6 @@ class TestRuntimeCreateRefusesReservedName(BaseCase):
         result = self._run("create", "status")
         self.assertEqual(result.returncode, 1)
         self.assertIn("reserved profile name", result.stderr)
-        # And the profile was not created.
         self.assertFalse((self.store_root / "profiles" / "status").exists())
 
     def test_create_alias_is_actionable(self):
@@ -212,5 +233,5 @@ class TestRuntimeCreateRefusesReservedName(BaseCase):
         self.assertIn("reserved profile name", result.stderr)
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     unittest.main()

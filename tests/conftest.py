@@ -24,7 +24,6 @@ def write_fake_agy(path: Path) -> Path:
     - prints the profile env var so tests can assert redirection happened.
     """
     if sys.platform.startswith("win"):
-        # .cmd batch file (agy on Windows is commonly agy.cmd via PATHEXT)
         script = path.with_suffix(".cmd")
         script.write_text(
             "@echo off\r\n"
@@ -83,8 +82,6 @@ class BaseCase(unittest.TestCase):
         if sys.platform.startswith("win"):
             os.environ["USERPROFILE"] = str(self.fake_home)
 
-        # Seed a generic ~/.gemini like a real logged-in user would have,
-        # in agy 1.2.7's actual layout (token inside antigravity-cli/).
         generic = self.fake_home / ".gemini" / "antigravity-cli"
         generic.mkdir(parents=True)
         (generic / "antigravity-oauth-token").write_text(
@@ -94,12 +91,9 @@ class BaseCase(unittest.TestCase):
         (self.fake_home / ".gemini" / "google_accounts.json").write_text(
             '{"active": "generic@example.com"}', encoding="utf-8"
         )
-        # Unrelated home entry that must be mirrored into overlays.
         (self.fake_home / ".gitconfig").write_text("[user]\n", encoding="utf-8")
 
         self.agy_bin = write_fake_agy(self.bin_dir / "agy")
-        # Point the override at the artifact that actually exists on this OS
-        # (agy.cmd on Windows), not the extensionless POSIX path.
         os.environ["AGYDRA_AGY_BIN"] = str(self.agy_bin)
 
     def tearDown(self) -> None:

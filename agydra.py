@@ -34,8 +34,6 @@ def _fail(msg: str, hint: str = "") -> int:
 
 
 def _venv_script(repo: str) -> str:
-    # Layout duplicated from platforms on purpose: this file runs
-    # BEFORE the modules can be imported, so it must stay self-contained.
     win = sys.platform.startswith("win")
     return os.path.join(
         repo, ".venv", "Scripts" if win else "bin", "agydra.exe" if win else "agydra"
@@ -51,11 +49,9 @@ def main() -> int:
             "install Python 3.9 or newer and re-run this file",
         )
 
-    # Prefer the installed console script; fall back to venv python -m agydra.
     script = _venv_script(repo)
 
     if not os.path.isfile(script):
-        # Bootstrap path: import the bootstrap module from the repo (no install yet).
         sys.path.insert(0, str(repo))
         try:
             import bootstrap
@@ -71,15 +67,16 @@ def main() -> int:
                 f"expected it at {script}",
             )
 
-    # Re-execute the installed command so subprocess semantics (exit codes,
-    # signals, TTY) match a native invocation. os.exec* never returns.
     argv = [script, *sys.argv[1:]]
     if sys.platform.startswith("win"):
         import subprocess
 
-        return subprocess.run(argv).returncode
-    os.execv(script, argv)  # type: ignore[call-overload]
-    return 127  # pragma: no cover — execv never returns on success
+        try:
+            return subprocess.run(argv).returncode
+        except KeyboardInterrupt:
+            return 130
+    os.execv(script, argv)
+    return 127
 
 
 if __name__ == "__main__":

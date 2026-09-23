@@ -18,7 +18,7 @@ from typing import Optional
 import platforms
 
 AGY_CLI_DIR = "antigravity-cli"
-TOKEN_FILE = "antigravity-oauth-token"  # current (and only) layout
+TOKEN_FILE = "antigravity-oauth-token"
 
 
 def _read_json(path: Path):
@@ -37,9 +37,6 @@ def _decode_jwt_payload(token: str) -> dict:
         decoded = json.loads(base64.urlsafe_b64decode(parts[1] + padding))
     except (binascii.Error, ValueError):
         return {}
-    # A valid-JSON but non-object payload (hand-edited or a future agy
-    # format) must degrade like any other unreadable claim set, never
-    # explode later at claims.get("email").
     return decoded if isinstance(decoded, dict) else {}
 
 
@@ -52,7 +49,6 @@ def _oauth_obj(data_dir: Path):
     if isinstance(raw, dict):
         yield raw
     elif raw is not None:
-        # Token-file holding the token itself (older alias shape).
         yield {"token": raw}
 
 
@@ -90,7 +86,7 @@ def _macos_keychain_authenticated(store, name) -> Optional[bool]:
         if name and keychain.load_profile_slot(store, name) is not None:
             return True
         return False
-    except Exception:  # defensive: detection must never break listing
+    except Exception:
         return None
 
 
@@ -129,7 +125,7 @@ def sync_profile_email(store, name: str) -> Optional[str]:
     email = detect_email(store.profile_data_dir(name))
     if email:
         if locks.is_locked(store, name):
-            return email  # a live session owns the metadata now
+            return email
         profile.email = email
         store.save(profile)
     return email

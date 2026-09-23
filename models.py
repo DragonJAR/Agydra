@@ -12,8 +12,6 @@ from typing import Any, Dict, Optional
 def _utcnow_iso() -> str:
     from datetime import datetime, timezone
 
-    # Millisecond precision: creation timestamps must order profiles even when
-    # several are created within the same second.
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
@@ -46,9 +44,6 @@ class Profile:
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "Profile":
-        # last_used/email are coerced like every other field: hand-edited
-        # metadata with a non-string value must not detonate later inside
-        # resolver's min() key (int vs str TypeError) with a traceback.
         last_used = raw.get("last_used")
         email = raw.get("email")
         return cls(

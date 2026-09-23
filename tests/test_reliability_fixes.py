@@ -35,7 +35,7 @@ class TestDeleteSlotCodes(unittest.TestCase):
 
         keychain._run = fake_run
         try:
-            keychain.delete_slot("gemini")  # must not raise
+            keychain.delete_slot("gemini")
         finally:
             keychain._run = real_run
 
@@ -57,7 +57,6 @@ class TestDeleteSlotCodes(unittest.TestCase):
             keychain._run = real_run
 
     def test_not_found_codes_are_a_plain_set(self):
-        # (0,) | set raised TypeError before the fix; guard the operator use.
         self.assertIsInstance(keychain.NOT_FOUND_CODES, set)
 
 
@@ -70,8 +69,6 @@ class TestMarkerEncoding(unittest.TestCase):
     def test_bom_marker_resolves_cleanly(self):
         with isolated_store_env() as root:
             store, tmp = self._store_with_profile(root)
-            # Editors like Notepad write UTF-8 with BOM; the marker must
-            # resolve through the BOM-aware decode, not crash or miss.
             (tmp / ".agydra").write_bytes(b"\xef\xbb\xbf" + "work\n".encode("utf-8"))
             res = resolver.resolve(store, cwd=tmp, env={})
             self.assertEqual(res.name, "work")
@@ -79,7 +76,6 @@ class TestMarkerEncoding(unittest.TestCase):
     def test_utf16_marker_raises_actionable_storeerror(self):
         with isolated_store_env() as root:
             store, tmp = self._store_with_profile(root)
-            # PowerShell 5.1 `> .agydra` writes UTF-16LE with BOM.
             (tmp / ".agydra").write_bytes("work\n".encode("utf-16"))
             with self.assertRaises(StoreError) as ctx:
                 resolver.resolve(store, cwd=tmp, env={})
@@ -91,8 +87,6 @@ class TestCreateAtomicReserve(unittest.TestCase):
         with isolated_store_env():
             store = Store()
             store.create("alpha")
-            # Simulate the lost race: the dir exists but metadata was
-            # never written (the pre-fix check-then-act window).
             meta = store.profile_meta_path("alpha")
             meta.unlink()
             with self.assertRaises(StoreError) as ctx:
@@ -123,7 +117,6 @@ class TestScanSinglePass(unittest.TestCase):
         with isolated_store_env():
             store = Store()
             store.create("alpha")
-            # Corrupt metadata must land in unreadable, not crash scan.
             meta = store.profile_meta_path("alpha")
             meta.write_text("{ not json", encoding="utf-8")
             profiles, unreadable = store.scan()
@@ -132,7 +125,7 @@ class TestScanSinglePass(unittest.TestCase):
 
 
 class TestDeleteVerifiesRemoval(unittest.TestCase):
-    """F2: _rmtree must never silently swallow a failed removal — a dir that
+    """F2: rmtree must never silently swallow a failed removal — a dir that
     survives `delete()` must fail loud, not fake success and brick `create`."""
 
     def test_delete_raises_when_dir_survives(self):
@@ -143,8 +136,7 @@ class TestDeleteVerifiesRemoval(unittest.TestCase):
         with isolated_store_env():
             store = Store()
             store.create("alpha")
-            with mock.patch.object(store_mod, "_rmtree"):
-                # Pretend rmtree did nothing: the dir is still there.
+            with mock.patch.object(store_mod, "rmtree"):
                 with self.assertRaises(StoreError):
                     store.delete("alpha")
             self.assertTrue(store.exists("alpha"))
@@ -158,8 +150,6 @@ class TestKeychainLoginCapture(unittest.TestCase):
     profile's private slot and leaves the shared slot pointing at it."""
 
     def test_capture_keeps_fresh_token(self):
-        # Stub the keychain calls so the test stays macOS-free.
-        import os as _os
         from unittest import mock
 
         with isolated_store_env():
@@ -231,12 +221,38 @@ class TestKeychainRunHardening(unittest.TestCase):
             result = keychain._run(["list-keychains"])
         self.assertEqual(result.returncode, -1)
 
+    def test_read_slot_after_timeout_raises_keychainerror_not_attributeerror(self):
+        """A `security` call that hangs used to return CompletedProcess with
+        stdout/stderr=None; read_slot's `result.stderr.decode(...)` then blew
+        up with AttributeError instead of the intended KeychainError."""
+        import subprocess
+        from unittest import mock
+
+        class FakeProc:
+            pid = 4343
+
+            def __init__(self):
+                self._calls = 0
+
+            def communicate(self, *args, **kwargs):
+                self._calls += 1
+                if self._calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="security", timeout=0.01)
+                return None, None
+
+            def kill(self):
+                pass
+
+        with mock.patch.object(
+            keychain.subprocess, "Popen", return_value=FakeProc()
+        ), mock.patch.object(keychain.os, "killpg", side_effect=OSError):
+            with self.assertRaises(keychain.KeychainError):
+                keychain.read_slot("gemini")
+
     def test_supported_gates_on_kill_switch_env(self):
         import os
         from unittest import mock
 
-        # The host machine has `security` on PATH and is_macos is the default,
-        # so both probes must be stubbed to keep the assertion deterministic.
         with mock.patch.object(keychain.platforms, "is_macos", return_value=True), \
                 mock.patch.object(keychain.shutil, "which", return_value="/usr/bin/security"):
             self.assertTrue(keychain.supported())
@@ -263,7 +279,7 @@ class TestProfileSlotLifecycle(unittest.TestCase):
     def test_rename_without_slot_is_noop(self):
         with isolated_store_env():
             store = Store()
-            keychain.rename_profile_slot(store, "ghost", "new")  # must not raise
+            keychain.rename_profile_slot(store, "ghost", "new")
 
     def test_purge_removes_and_tolerates_missing(self):
         with isolated_store_env():
@@ -271,7 +287,7 @@ class TestProfileSlotLifecycle(unittest.TestCase):
             keychain.save_profile_slot(store, "gone", b"tok")
             keychain.purge_profile_slot(store, "gone")
             self.assertIsNone(keychain.load_profile_slot(store, "gone"))
-            keychain.purge_profile_slot(store, "gone")  # idempotent
+            keychain.purge_profile_slot(store, "gone")
 
 
 class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
@@ -304,6 +320,51 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
                 self.assertFalse(locks.is_locked(store, "work"))
             finally:
                 os.environ.pop("AGYDRA_NO_KEYCHAIN", None)
+                os.environ.pop("AGYDRA_AGY_BIN", None)
+
+    def test_lock_released_after_keychain_guard_exits(self):
+        """The lock must release only AFTER the keychain guard's __exit__
+        finishes (capture/restore), not before it: releasing first lets a
+        concurrent delete/rename race the shared-slot write."""
+        import os
+        import sys
+        from unittest import mock
+
+        import locks, platforms
+
+        order = []
+
+        class _RecordingGuard:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                order.append("guard-exit")
+                return False
+
+        def recording_release(self):
+            order.append("lock-release")
+            self._released = True
+
+        with isolated_store_env():
+            os.environ["AGYDRA_AGY_BIN"] = sys.executable
+            try:
+                store = Store()
+                store.create("work")
+                plan = runner.build_plan(
+                    store, [], flag_ref="work", launch_as_child=True
+                )
+                with mock.patch.object(
+                    platforms, "run_wait", return_value=0
+                ), mock.patch.object(
+                    keychain, "launch_guard", return_value=_RecordingGuard()
+                ), mock.patch.object(
+                    locks.LockHandle, "release", recording_release
+                ):
+                    rc = runner.run(plan, store=store)
+                self.assertEqual(rc, 0)
+                self.assertEqual(order, ["guard-exit", "lock-release"])
+            finally:
                 os.environ.pop("AGYDRA_AGY_BIN", None)
 
 

@@ -5,7 +5,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from agydra import __version__
 import account, isolation, keychain, platforms
@@ -41,8 +41,6 @@ def _check_binary(store: Store, _ctx: "_DoctorContext"):
 def _check_store(store: Store, _ctx: "_DoctorContext"):
     try:
         store.root.mkdir(parents=True, exist_ok=True)
-        # Unique probe name: two concurrent `agydra doctor` runs must not
-        # unlink each other's probe and report a phantom "not writable".
         import tempfile as _tempfile
 
         fd, probe_name = _tempfile.mkstemp(
@@ -62,8 +60,6 @@ def _check_profiles(store: Store, ctx: "_DoctorContext"):
     for p in profiles:
         data_dir = store.profile_data_dir(p.name)
         if not data_dir.is_dir():
-            # Distinguish "never logged in" from "data dir vanished": the
-            # profile cannot be used until restored from backups/ or recreated.
             problems.append(f"{p.name}: data dir missing ({data_dir})")
             lines.append(f"  - {p.name}: DATA DIR MISSING")
             continue
@@ -72,7 +68,7 @@ def _check_profiles(store: Store, ctx: "_DoctorContext"):
         )
         lines.append(f"  - {p.name}: {state}")
     default = store.default_name()
-    if default and default not in [p.name for p in profiles]:
+    if default and default not in ctx.names:
         problems.append(
             f"default profile {default!r} does not exist "
             "(fix with: agydra default <name>)"
@@ -125,12 +121,7 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
             continue
         overlay = store.overlays_dir / name
         gemini_link = overlay / platforms.AGY_DATA_DIR_NAME
-        # _is_link (not exists/is_symlink): on Windows a junction whose
-        # target vanished reports exists()=False AND is_symlink()=False,
-        # which would misclassify a launched profile as "never launched".
         if not gemini_link.exists() and not isolation._is_link(gemini_link):
-            # Never launched: runner.build_overlay creates it on first use,
-            # so there is nothing to break yet.
             pending.append(name)
             continue
         if not isolation.link_points_to(gemini_link, data_dir):
@@ -206,7 +197,6 @@ def _check_bootstrap(_store: Store, _ctx: "_DoctorContext"):
     parts = []
     status = OK
     if platforms.is_windows():
-        # Windows: no shim; the venv Scripts dir itself must be on PATH.
         if not state["venv"]:
             return WARN, (
                 "install: venv missing — run `python3 agydra.py` (repo root) "
@@ -265,7 +255,6 @@ def run_checks(store: Store) -> int:
         + paint("[!!]", "yellow", "bold") + paint("=warn ", "dim")
         + paint("[XX]", "red", "bold") + paint("=fail", "dim")
     )
-    # Single scan shared by every check (see _DoctorContext).
     scan = store.scan()
     ctx = _DoctorContext(
         scan=scan, names=[p.name for p in scan[0]],
@@ -275,7 +264,7 @@ def run_checks(store: Store) -> int:
     for label, check in CHECKS:
         try:
             status, message = check(store, ctx)
-        except Exception as exc:  # defensive: doctor must always complete
+        except Exception as exc:
             status, message = FAIL, f"{label}: unexpected error: {exc}"
         symbol_color = {OK: "green", WARN: "yellow", FAIL: "red"}[status]
         symbol = paint({OK: "[ok]", WARN: "[!!]", FAIL: "[XX]"}[status], symbol_color, "bold")

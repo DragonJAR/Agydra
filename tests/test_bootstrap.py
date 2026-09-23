@@ -17,11 +17,11 @@ in the end-to-end shell smoke test, not here.
 from __future__ import annotations
 
 import os
-import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import bootstrap
 
@@ -30,7 +30,6 @@ def _make_fake_project(tmp: Path, *, with_console: bool) -> Path:
     proj = tmp / "proj"
     proj.mkdir()
     (proj / "pyproject.toml").write_text("[project]\nname = 'fake'\n", encoding="utf-8")
-    # Flat layout: VERSION lives in agydra.py at the repo root.
     (proj / "agydra.py").write_text("VERSION = '9.9.9'\n", encoding="utf-8")
     if with_console:
         vpy = bootstrap.venv_python(proj)
@@ -101,7 +100,6 @@ class VersionAttrGuard(unittest.TestCase):
         )
 
     def test_root_bootstrap_module_has_version_constant(self):
-        # Flat layout invariant: agydra.py owns the VERSION constant.
         root = Path(__file__).resolve().parent.parent
         module = (root / "agydra.py").read_text(encoding="utf-8")
         self.assertIn("VERSION =", module)
@@ -121,9 +119,6 @@ class Helpers(unittest.TestCase):
             self.assertEqual(bootstrap.project_root(proj).resolve(), proj.resolve())
 
     def test_project_root_falls_back_to_package_repo(self):
-        # When cwd has no pyproject.toml, project_root still resolves the
-        # module's own repo — that is the designed fallback for `agydra setup`
-        # invoked from anywhere.
         with tempfile.TemporaryDirectory() as td:
             out = bootstrap.project_root(Path(td))
             self.assertEqual(
@@ -207,9 +202,6 @@ class EnsureVenvRecreate(unittest.TestCase):
     """ensure_venv recreate path: half-broken dir (no interpreter) is wiped."""
 
     def test_ensure_venv_handles_missing_interpreter(self):
-        # We don't call real `python3 -m venv`; we instead simulate the broken
-        # state by pre-creating the venv dir without an interpreter and stubbing
-        # the venv-creating subprocess command via monkey-patching _run.
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=False)
             vdir = bootstrap.venv_dir(proj)
@@ -221,12 +213,10 @@ class EnsureVenvRecreate(unittest.TestCase):
 
             def fake_run(argv):
                 calls.append(list(argv))
-                # Lay down a fake interpreter so the post-check passes.
                 vpy = bootstrap.venv_python(proj)
                 vpy.parent.mkdir(parents=True, exist_ok=True)
                 vpy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
                 vpy.chmod(0o755)
-                import subprocess
                 class _R:
                     returncode = 0
                     stdout = ""
@@ -240,7 +230,7 @@ class EnsureVenvRecreate(unittest.TestCase):
             finally:
                 bootstrap._run = real_run
             self.assertTrue(vpy.exists())
-            self.assertFalse((vdir / "leftover.txt").exists())  # recreated
+            self.assertFalse((vdir / "leftover.txt").exists())
             self.assertTrue(calls, "_run should have been invoked once")
             self.assertTrue(any("creating venv" in line for line in logs))
 
@@ -383,7 +373,6 @@ class ShimInstall(unittest.TestCase):
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)) as expected:
                 bootstrap.ensure_path_shim(proj, lambda _l: None)
-                # re-invocation must not raise and must return the same path
                 shim2 = bootstrap.ensure_path_shim(proj, lambda _l: None)
                 self.assertEqual(shim2, expected)
 
@@ -408,6 +397,19 @@ class RunDispatch(unittest.TestCase):
                 bootstrap.ensure_venv = real_ensure
             self.assertEqual(code, 1)
             self.assertTrue(any("synthetic failure" in line for line in captured))
+
+
+class RunHelperOSError(unittest.TestCase):
+    """bootstrap._run wraps any OSError from subprocess.run (not just
+    FileNotFoundError) into a BootstrapError — e.g. PermissionError on a
+    non-executable interpreter/pip."""
+
+    def test_permission_error_becomes_bootstrap_error(self):
+        with mock.patch.object(
+            bootstrap.subprocess, "run", side_effect=PermissionError("denied")
+        ):
+            with self.assertRaises(bootstrap.BootstrapError):
+                bootstrap._run(["some", "argv"])
 
 
 if __name__ == "__main__":

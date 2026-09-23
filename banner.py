@@ -23,9 +23,6 @@ from typing import Optional
 
 from ui import RESET, color_enabled
 
-# Palette sampled from logo.png: key -> (RGB, ASCII fallback glyph).
-# "K" is the black outline; it is drawn in color mode and left blank in
-# ASCII mode, where the terminal background already provides contrast.
 _PALETTE: dict[str, tuple[tuple[int, int, int], str]] = {
     "K": ((0, 0, 0), " "),
     "G": ((121, 238, 97), "#"),
@@ -38,7 +35,6 @@ _PALETTE: dict[str, tuple[tuple[int, int, int], str]] = {
     "W": ((245, 245, 230), "o"),
 }
 
-# 57x58 pixels; rows are consumed in pairs (upper/lower half of a cell).
 _ART: tuple[str, ...] = (
     "...........................KKK...........................",
     "..........................KKYKK..........................",
@@ -107,7 +103,7 @@ _UPPER, _LOWER = "\u2580", "\u2584"
 def _truecolor() -> bool:
     if os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit"):
         return True
-    return bool(os.environ.get("WT_SESSION"))  # Windows Terminal
+    return bool(os.environ.get("WT_SESSION"))
 
 
 def _xterm256(rgb: tuple[int, int, int]) -> int:
@@ -155,9 +151,6 @@ def _cell(top: str, bottom: str, truecolor: bool) -> str:
         return _sgr(top, background=False, truecolor=truecolor) + _UPPER + RESET
     if top == ".":
         return _sgr(bottom, background=False, truecolor=truecolor) + _LOWER + RESET
-    # Two colors: whatever part of the cell the glyph fails to cover shows
-    # the background, so give it the darker pixel. Gaps then read as part
-    # of the black outline or as shading, never as a bright stripe.
     if _luma(top) <= _luma(bottom):
         glyph, ink, paper = _LOWER, bottom, top
     else:
@@ -203,7 +196,6 @@ def print_banner(stream: Optional[object] = None) -> None:
     """Print the banner unconditionally (manual preview: python -m agydra.banner)."""
     if stream is None:
         stream = sys.stdout
-    # Flush explicitly: the default launch path exec()s agy right after.
     print(render(stream) + "\n", file=stream, flush=True)
 
 
@@ -214,7 +206,7 @@ def _columns(stream) -> int:
     try:
         return os.get_terminal_size(stream.fileno()).columns
     except (AttributeError, ValueError, OSError):
-        return shutil.get_terminal_size().columns  # honors $COLUMNS
+        return shutil.get_terminal_size().columns
 
 
 def show(stream: Optional[object] = None) -> None:

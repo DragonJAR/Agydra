@@ -6,9 +6,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from store import Store, StoreError  # noqa: E402
+from store import Store, StoreError
 
-from conftest import BaseCase  # noqa: E402
+from conftest import BaseCase
 
 
 class TestStore(BaseCase):
@@ -41,7 +41,6 @@ class TestStore(BaseCase):
         store = Store()
         for name in ("zeta", "alpha", "mid"):
             store.create(name)
-        # Numbering follows insertion order (seq), independent of the clock.
         self.assertEqual(store.names(), ["zeta", "alpha", "mid"])
         seqs = {p.name: p.seq for p in store.list()}
         self.assertLess(seqs["zeta"], seqs["alpha"])
@@ -93,8 +92,6 @@ class TestStore(BaseCase):
         self.assertFalse(store.config_path.with_name("agydra.json.tmp").exists())
 
     def test_construction_has_no_filesystem_side_effects(self):
-        # Read-only commands (status, --dry-run) construct Store first; a
-        # fresh root must stay untouched until a mutating call happens.
         fresh = self._tmp / "fresh-root"
         store = Store(root=fresh)
         self.assertFalse(fresh.exists())
@@ -113,23 +110,19 @@ class TestStore(BaseCase):
         zips have a remainder starting with a digit that doesn't match the
         timestamp shape, so they are excluded from ``work``'s prune pool.
         """
-        from store import _backup_stamp  # noqa: E402
+        from store import _backup_stamp
 
         fresh = self._tmp / "fresh-root"
         store = Store(root=fresh)
         store.create("work")
         store.create("work-2")
-        # The stamp comes from the real producer helper, so this test cannot
-        # drift from the format _write_backup actually emits.
         stamp = _backup_stamp()
-        # Two distinct zips for ``work`` (old + new) and one for ``work-2``.
         old = store.backups_dir / f"work-{stamp}.zip"
         new = store.backups_dir / f"work-{stamp}.2.zip"
         other = store.backups_dir / f"work-2-{stamp}.zip"
         for p in (old, new, other):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(b"x")
-        # Bump mtimes deterministically.
         old.touch()
         import os as _os
 
@@ -159,7 +152,6 @@ class TestStore(BaseCase):
         store = Store(root=fresh)
         config = store.load_config()
         self.assertIsInstance(config, _Config)
-        # The default must be None, not raise — degraded defaults.
 
     def test_load_config_degrades_on_valid_json_non_object_root(self):
         """Bug guard: a JSON list/str/int root is corruption, not a crash —
@@ -170,10 +162,8 @@ class TestStore(BaseCase):
         fresh.mkdir(parents=True, exist_ok=True)
         (fresh / "agydra.json").write_text("[1, 2]", encoding="utf-8")
         store = Store(root=fresh)
-        # Must degrade with the same path as broken JSON, never raise.
         config = store.load_config()
         self.assertIsNone(config.default_profile)
-        # And the write guard must see it as corrupt too.
         with self.assertRaises(_StoreError):
             store.save_config(store.load_config())
 

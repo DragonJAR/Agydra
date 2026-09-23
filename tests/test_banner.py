@@ -10,10 +10,10 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import banner, cli  # noqa: E402
-from ui import strip_ansi  # noqa: E402
+import banner, cli
+from ui import strip_ansi
 
-from conftest import BaseCase  # noqa: E402
+from conftest import BaseCase
 
 
 class _Stream(io.StringIO):
@@ -23,7 +23,7 @@ class _Stream(io.StringIO):
         self._tty = tty
 
     @property
-    def encoding(self) -> str:  # type: ignore[override]
+    def encoding(self) -> str:
         return self._encoding
 
     def isatty(self) -> bool:
@@ -38,7 +38,7 @@ class BannerRenderTest(unittest.TestCase):
     def test_ascii_fallback_without_color(self):
         with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
             text = banner.render(_Stream("utf-8", tty=True))
-        text.encode("ascii")  # must be pure 7-bit
+        text.encode("ascii")
         self.assertNotIn("\x1b", text)
         self.assertLessEqual(max(len(line) for line in text.splitlines()), banner.WIDTH)
 
@@ -70,7 +70,7 @@ class ShowBannerTest(BaseCase):
     """Every invocation shows the banner on an interactive stderr, once."""
 
     def setUp(self):
-        super().setUp()  # isolated HOME/store: `list` must not touch the real one
+        super().setUp()
         banner._shown = False
         self.addCleanup(setattr, banner, "_shown", False)
 
@@ -94,7 +94,7 @@ class ShowBannerTest(BaseCase):
                 code, out, err = self._run(argv, tty=True)
                 self.assertEqual(code, 0)
                 self.assertTrue(err.startswith(self._expected()))
-                self.assertNotIn(self._expected(), out)  # stdout stays data-only
+                self.assertNotIn(self._expected(), out)
 
     def test_banner_omitted_when_not_a_tty(self):
         _code, out, err = self._run(["--version"], tty=False)
