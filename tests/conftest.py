@@ -101,13 +101,17 @@ class BaseCase(unittest.TestCase):
         os.environ.update(self._old_env)
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def _run_cli(self, *args):
+    def _run_cli(self, *args, cwd=None):
         """Run agydra's CLI in a subprocess (execvpe replaces the process)."""
         import subprocess
 
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
         return subprocess.run(
             [sys.executable, "-m", "agydra", *args],
             capture_output=True, text=True, timeout=60,
+            cwd=str(cwd or self._tmp),
+            env=env,
         )
 
 

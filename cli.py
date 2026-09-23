@@ -283,7 +283,7 @@ def cmd_login(store: Store, args) -> int:
     _assert_free(store, name)
     data_dir = store.profile_data_dir(name)
     state = account.auth_state(data_dir, store, name)
-    if state == "authenticated":
+    if state == "authenticated" and not args.dry_run and not getattr(args, "force", False):
         email = account.detect_email(data_dir)
         if not _confirm(
             f"profile {name!r} already authenticated as {email or '?'} — re-login?",
@@ -624,6 +624,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif sub == "login":
             parser.add_argument(
                 "ref", nargs="?", help="profile name or number (default: resolved profile)"
+            )
+            parser.add_argument(
+                "-f", "--force", action="store_true",
+                help="re-login without asking for confirmation",
             )
             parser.add_argument(
                 "-n", "--dry-run", action="store_true",
