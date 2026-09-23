@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agydra.store import Store, StoreError  # noqa: E402
+from store import Store, StoreError  # noqa: E402
 
 from conftest import BaseCase  # noqa: E402
 
@@ -49,7 +49,7 @@ class TestListHeaderNeverFusesColumns(BaseCase):
         self.assertLess(header.index("EMAIL"), header.index("AUTH"))
 
     def capture_list(self):
-        from agydra import cli
+        import cli
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -67,7 +67,7 @@ class TestImportGuards(BaseCase):
         (self.source / "settings.json").write_text("{}", encoding="utf-8")
 
     def test_import_onto_populated_profile_is_actionable(self):
-        from agydra import cli
+        import cli
 
         self.store.create("populated")
         data = self.store.profile_data_dir("populated")
@@ -95,7 +95,7 @@ class TestImportGuards(BaseCase):
         # fail on the lock (session owns the profile), not on the data
         # guard — the data message suggests `delete`, which would also be
         # refused while locked.
-        from agydra import cli, locks
+        import cli, locks
 
         self.store.create("held")
         data = self.store.profile_data_dir("held")
@@ -114,7 +114,7 @@ class TestImportGuards(BaseCase):
         self.assertNotIn("already has data", str(ctx.exception))
 
     def test_import_onto_empty_profile_succeeds(self):
-        from agydra import cli
+        import cli
 
         self.store.create("fresh")
         data = self.store.profile_data_dir("fresh")

@@ -7,8 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agydra import account, locks, platforms, runner  # noqa: E402
-from agydra.store import Store  # noqa: E402
+import account, locks, platforms, runner  # noqa: E402
+from store import Store  # noqa: E402
 
 from conftest import BaseCase  # noqa: E402
 
@@ -346,7 +346,7 @@ class TestImportFlow(BaseCase):
 
 class TestAliasesAndFlagTable(BaseCase):
     def test_all_canonical_aliases_resolve(self):
-        from agydra.cli import _CANONICAL, _SUBCOMMAND_ALIASES
+        from cli import _CANONICAL, _SUBCOMMAND_ALIASES
 
         for canonical, aliases in _SUBCOMMAND_ALIASES.items():
             self.assertEqual(_CANONICAL[canonical], canonical)
@@ -355,7 +355,7 @@ class TestAliasesAndFlagTable(BaseCase):
 
     def test_alias_dispatch_list(self):
         # list/ls/l must all reach the list handler (no crash, prints header).
-        from agydra.cli import _CANONICAL
+        from cli import _CANONICAL
 
         self.assertEqual(_CANONICAL.get("ls"), "list")
         self.assertEqual(_CANONICAL.get("l"), "list")
@@ -371,7 +371,7 @@ class TestAliasesAndFlagTable(BaseCase):
         self.assertEqual(_CANONICAL.get("imp"), "import")
 
     def test_unknown_token_is_not_a_subcommand(self):
-        from agydra.cli import _CANONICAL
+        from cli import _CANONICAL
 
         self.assertIsNone(_CANONICAL.get("totally-not-a-subcommand"))
         self.assertIsNone(_CANONICAL.get(""))
@@ -379,8 +379,8 @@ class TestAliasesAndFlagTable(BaseCase):
     def test_help_documents_every_subcommand(self):
         # Every canonical subcommand must appear in the top-level help with
         # a one-line description; every cmd_ handler must be in the table.
-        from agydra import cli
-        from agydra.cli import _SUBCOMMAND_ALIASES, _SUBCOMMAND_HELP
+        import cli
+        from cli import _SUBCOMMAND_ALIASES, _SUBCOMMAND_HELP
 
         self.assertEqual(set(_SUBCOMMAND_HELP), set(_SUBCOMMAND_ALIASES))
         handlers = {
@@ -400,7 +400,7 @@ class TestAliasesAndFlagTable(BaseCase):
         import io
         from contextlib import redirect_stdout
 
-        from agydra.cli import main
+        from cli import main
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -416,7 +416,7 @@ class TestAliasesAndFlagTable(BaseCase):
         import io
         from contextlib import redirect_stdout
 
-        from agydra.cli import main
+        from cli import main
 
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -428,7 +428,7 @@ class TestAliasesAndFlagTable(BaseCase):
         import os
         from contextlib import redirect_stdout
 
-        from agydra.cli import main
+        from cli import main
 
         old = os.environ.get("FORCE_COLOR")
         os.environ["FORCE_COLOR"] = "1"
@@ -444,14 +444,14 @@ class TestAliasesAndFlagTable(BaseCase):
         out = buf.getvalue()
         self.assertIn("\x1b[", out)
         # Stripped output equals the plain rendering (layout invariant).
-        from agydra.ui import strip_ansi
+        from ui import strip_ansi
         self.assertEqual(strip_ansi(out), strip_ansi(out))
         self.assertIn("management:", strip_ansi(out))
 
     def test_no_color_wins_over_force_color(self):
         import os
 
-        from agydra import ui
+        import ui
 
         old_f = os.environ.get("FORCE_COLOR")
         old_n = os.environ.get("NO_COLOR")
@@ -469,7 +469,7 @@ class TestAliasesAndFlagTable(BaseCase):
     def test_paint_unknown_style_raises(self):
         import os
 
-        from agydra import ui
+        import ui
 
         old = os.environ.get("FORCE_COLOR")
         os.environ["FORCE_COLOR"] = "1"
@@ -483,7 +483,7 @@ class TestAliasesAndFlagTable(BaseCase):
                 os.environ["FORCE_COLOR"] = old
 
     def test_flag_table_shape_and_extractor(self):
-        from agydra.cli import _LAUNCH_FLAGS, _consume_launch_flags
+        from cli import _LAUNCH_FLAGS, _consume_launch_flags
 
         # Table completeness: every flag has both spellings and a value flag.
         for key, (short, long_, takes_value) in _LAUNCH_FLAGS.items():
@@ -527,7 +527,7 @@ class TestAliasesAndFlagTable(BaseCase):
 
 class TestLauncherFlagExtraction(unittest.TestCase):
     def test_extracts_all_flag_forms(self):
-        from agydra.cli import _consume_launch_flags
+        from cli import _consume_launch_flags
 
         # argv -> (expected flag values, expected args forwarded to agy)
         cases = {
@@ -568,7 +568,7 @@ class TestLauncherFlagExtraction(unittest.TestCase):
                     self.assertEqual(values[key], expected, key)
 
     def test_first_occurrence_wins_and_rest_forwarded(self):
-        from agydra.cli import _consume_launch_flags
+        from cli import _consume_launch_flags
 
         # A repeated flag ends agydra's section: the repeat and everything
         # after it belongs to agy (agy itself uses -p for --print).
@@ -598,7 +598,7 @@ class TestLateProfileFlagWarning(unittest.TestCase):
         import io
         from contextlib import redirect_stderr
 
-        from agydra.cli import _consume_launch_flags, _warn_late_flags
+        from cli import _consume_launch_flags, _warn_late_flags
 
         values, _rest = _consume_launch_flags(consumed if consumed is not None else [])
         buf = io.StringIO()

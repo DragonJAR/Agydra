@@ -237,23 +237,22 @@ copied: personal/mcp.json
 ## 🔧 Estructura del proyecto
 
 ```
-agydra/
-├── __init__.py      # versión del paquete
-├── __main__.py      # python -m agydra → cli.main()
-├── models.py        # dataclasses Profile / Config + DEFAULT_SETTINGS
-├── platforms.py     # rutas por OS, variable de home, resolución del binario, lanzamiento
-├── store.py         # CRUD de perfiles, config, escrituras atómicas, backups
-├── locks.py         # locks de sesión kernel-held (flock / msvcrt)
-├── resolver.py      # cascada de resolución, perfil libre -r, marcador .agydra
-├── account.py       # detección de auth/email desde los datos del perfil
-├── keychain.py      # puente de llavero macOS (slot compartido ↔ privado por perfil)
-├── isolation.py     # overlay home, enlaces (symlink+junction), env, bwrap
-├── runner.py        # build_plan (puro) + run (lock → overlay → keychain → exec)
-├── doctor.py        # 8 checks de diagnóstico; exit 1 si alguno FALLA
-└── cli.py           # CLI argparse; el lanzador es el modo por defecto
+agydra/                  # raíz del repo — layout plano, sin subdirectorio de paquete
+├── agydra.py            # VERSION + bootstrap de un comando (python3 agydra.py)
+├── models.py            # dataclasses Profile / Config + DEFAULT_SETTINGS
+├── platforms.py         # rutas por OS, variable de home, resolución del binario, lanzamiento
+├── store.py             # CRUD de perfiles, config, escrituras atómicas, backups
+├── locks.py             # locks de sesión kernel-held (flock / msvcrt)
+├── resolver.py          # cascada de resolución, perfil libre -r, marcador .agydra
+├── account.py           # detección de auth/email desde los datos del perfil
+├── keychain.py          # puente de llavero macOS (slot compartido ↔ privado por perfil)
+├── isolation.py         # overlay home, enlaces (symlink+junction), env, bwrap
+├── runner.py            # build_plan (puro) + run (lock → overlay → keychain → exec)
+├── doctor.py            # 8 checks de diagnóstico; exit 1 si alguno FALLA
+├── cli.py               # CLI argparse; el lanzador es el modo por defecto
 tests/
-├── conftest.py      # home falso + binario agy falso + AGYDRA_HOME aislado
-└── test_*.py        # ~105 tests (102 pasan + 3 skips de plataforma en macOS)
+├── conftest.py          # home falso + binario agy falso + AGYDRA_HOME aislado
+└── test_*.py            # ~196 tests (193 pasan + 3 skips de plataforma en macOS)
 README.md
 README.es.md
 AGENTS.md

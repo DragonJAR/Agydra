@@ -21,7 +21,7 @@ import shutil
 import sys
 from typing import Optional
 
-from .ui import RESET, color_enabled
+from ui import RESET, color_enabled
 
 # Palette sampled from logo.png: key -> (RGB, ASCII fallback glyph).
 # "K" is the black outline; it is drawn in color mode and left blank in

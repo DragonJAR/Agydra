@@ -10,8 +10,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agydra import banner, cli  # noqa: E402
-from agydra.ui import strip_ansi  # noqa: E402
+import banner, cli  # noqa: E402
+from ui import strip_ansi  # noqa: E402
 
 from conftest import BaseCase  # noqa: E402
 

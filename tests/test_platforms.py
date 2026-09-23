@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agydra import platforms
+import platforms
 
 
 class TestBaseDir(unittest.TestCase):

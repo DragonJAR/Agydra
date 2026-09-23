@@ -7,8 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agydra import doctor  # noqa: E402
-from agydra.store import Store  # noqa: E402
+import doctor  # noqa: E402
+from store import Store  # noqa: E402
 
 from conftest import BaseCase  # noqa: E402
 
@@ -57,7 +57,7 @@ class TestDoctor(BaseCase):
         self.assertTrue(st.st_mode & stat.S_IXUSR)
 
     def test_locks_check_reports_live_session(self):
-        from agydra import locks
+        import locks
 
         self.store.create("work")
         handle = locks.try_lock(self.store, "work")

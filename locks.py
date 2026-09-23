@@ -20,7 +20,7 @@ import os
 from pathlib import Path
 from typing import List
 
-from . import platforms
+import platforms
 
 LOCK_DIR_NAME = "locks"
 LOCK_SUFFIX = ".lock"

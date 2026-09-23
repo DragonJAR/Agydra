@@ -1,30 +1,27 @@
 #!/usr/bin/env python3
-"""agydra.py — one-command install from a fresh clone.
+"""agydra — multi-profile launcher for the agy CLI (flat layout root module).
 
-Run this file with any Python >= 3.9 from the repository root:
+This single file is the repo-root entry point AND the package identity:
 
-    python3 agydra.py            # install: venv + editable package + PATH shim
-    python3 agydra.py doctor     # after install: full environment checkup
-    python3 agydra.py --help     # everything else
+- ``python3 agydra.py`` (any Python >= 3.9, stdlib-only) installs the
+  project: venv + editable package + PATH shim, then re-executes the
+  installed ``agydra`` command with the remaining arguments.
+- ``VERSION``/``__version__`` are the single source of truth setuptools
+  reads for the package version (pyproject: ``attr = "VERSION"``).
 
-What it does (all idempotent — safe to re-run anytime):
- 1. validates the running Python is >= 3.9
- 2. creates <repo>/.venv (recreating it only if broken)
- 3. installs agydra into that venv (editable, no PyPI fetch)
- 4. writes a managed shim to ~/.local/bin/agydra so `agydra` works anywhere
- 5. verifies the install by running `agydra --version` through the shim
- 6. forwards any extra CLI args to the installed command
-
-This file intentionally contains NO install logic; it delegates to
-``agydra.bootstrap`` so the root file and the ``agydra setup`` subcommand
-share one implementation (DRY). It must stay stdlib-only and dependency-free
-because it runs before the venv exists.
+The implementation lives in the sibling top-level modules (``cli``,
+``runner``, ``store``, ...); ``agydra setup`` shares this bootstrap via
+``bootstrap.py`` so there is exactly one installer (DRY). This file must
+stay stdlib-only because it runs before the venv exists.
 """
 from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
+
+VERSION = "1.2.0"
+__version__ = VERSION
 
 MIN_PYTHON = (3, 9)
 
@@ -37,8 +34,8 @@ def _fail(msg: str, hint: str = "") -> int:
 
 
 def _venv_script(repo: str) -> str:
-    # Layout duplicated from agydra.platforms on purpose: this file runs
-    # BEFORE the package can be imported, so it must stay self-contained.
+    # Layout duplicated from platforms on purpose: this file runs
+    # BEFORE the modules can be imported, so it must stay self-contained.
     win = sys.platform.startswith("win")
     return os.path.join(
         repo, ".venv", "Scripts" if win else "bin", "agydra.exe" if win else "agydra"
@@ -58,12 +55,12 @@ def main() -> int:
     script = _venv_script(repo)
 
     if not os.path.isfile(script):
-        # Bootstrap path: import the package from the repo (no install yet).
+        # Bootstrap path: import the bootstrap module from the repo (no install yet).
         sys.path.insert(0, str(repo))
         try:
-            from agydra import bootstrap
+            import bootstrap
         except ImportError as exc:
-            return _fail(f"cannot import agydra from {repo}: {exc}")
+            return _fail(f"cannot import bootstrap from {repo}: {exc}")
         print("agydra.py: no installation detected — running setup...")
         code = bootstrap.run()
         if code != 0:

@@ -17,7 +17,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List
 
-from . import platforms
+import platforms
 
 
 class IsolationError(Exception):

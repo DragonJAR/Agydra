@@ -9,11 +9,12 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import __version__, account, banner, keychain, locks, platforms, resolver, runner, vocab
-from .bootstrap import BootstrapError
-from .isolation import IsolationError
-from .store import Store, StoreError, _rename_dir_with_retry, atomic_copy
-from .ui import error as _error, note as _note, paint, paint_each
+from agydra import __version__
+import account, banner, keychain, locks, platforms, resolver, runner, vocab
+from bootstrap import BootstrapError
+from isolation import IsolationError
+from store import Store, StoreError, _rename_dir_with_retry, atomic_copy
+from ui import error as _error, note as _note, paint, paint_each
 
 
 class ColoredHelpFormatter(argparse.HelpFormatter):
@@ -524,7 +525,7 @@ def cmd_use(store: Store, args) -> int:
 
 
 def cmd_doctor(store: Store, _args) -> int:
-    from .doctor import run_checks
+    from doctor import run_checks
 
     return run_checks(store)
 
@@ -536,7 +537,7 @@ def cmd_setup(_store: Store, args) -> int:
     from a fresh clone with no installation at all. ``-n/--dry-run`` reports
     the current install state without touching anything.
     """
-    from . import bootstrap
+    import bootstrap
 
     if getattr(args, "dry_run", False):
         state = bootstrap.check_state(bootstrap.project_root())

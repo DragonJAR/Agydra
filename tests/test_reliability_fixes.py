@@ -14,8 +14,8 @@ from pathlib import Path
 
 from conftest import isolated_store_env
 
-from agydra import keychain, models, resolver, runner
-from agydra.store import Store, StoreError
+import keychain, models, resolver, runner
+from store import Store, StoreError
 
 
 class _FakeCompleted:
@@ -138,7 +138,7 @@ class TestDeleteVerifiesRemoval(unittest.TestCase):
     def test_delete_raises_when_dir_survives(self):
         from unittest import mock
 
-        from agydra import store as store_mod
+        import store as store_mod
 
         with isolated_store_env():
             store = Store()
@@ -284,7 +284,7 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
         import sys
         from unittest import mock
 
-        from agydra import locks, platforms
+        import locks, platforms
 
         with isolated_store_env():
             os.environ["AGYDRA_NO_KEYCHAIN"] = "1"

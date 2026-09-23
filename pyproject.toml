@@ -20,13 +20,32 @@ classifiers = [
 ]
 
 [project.scripts]
-agydra = "agydra.cli:main"
+agydra = "cli:main"
 
-[tool.setuptools.packages.find]
-include = ["agydra*"]
+# Flat layout: every module lives at the repo root next to pyproject.toml.
+# py-modules (not packages.find) is what setuptools uses for this shape.
+[tool.setuptools]
+py-modules = [
+    "account",
+    "agydra",
+    "banner",
+    "bootstrap",
+    "cli",
+    "doctor",
+    "isolation",
+    "keychain",
+    "locks",
+    "models",
+    "platforms",
+    "resolver",
+    "runner",
+    "store",
+    "ui",
+    "vocab",
+]
 
 [tool.setuptools.dynamic]
-# Fully qualified past the root bootstrap module: setuptools' static version
-# reader tries <name>.py before <name>/__init__.py, so a bare package-level
-# attr would resolve to agydra.py and break the editable build.
-version = { attr = "agydra.__init__.__version__" }
+# agydra.py holds VERSION at the root of this flat layout; setuptools'
+# static reader resolves py-modules from the project root, so a bare
+# ``attr = "VERSION"`` here would look in a module that does not exist.
+version = { attr = "agydra.VERSION" }

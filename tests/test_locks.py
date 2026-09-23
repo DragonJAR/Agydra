@@ -6,8 +6,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agydra import locks  # noqa: E402
-from agydra.store import Store  # noqa: E402
+import locks  # noqa: E402
+from store import Store  # noqa: E402
 
 from conftest import BaseCase  # noqa: E402
 

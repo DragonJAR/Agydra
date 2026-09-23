@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from . import platforms
+import platforms
 
 MIN_PYTHON = (3, 9)
 #: venv directory inside the project root.
@@ -53,13 +53,13 @@ def python_ok(version_info: Sequence[int]) -> bool:
 
 
 def project_root(cwd: Optional[Path] = None) -> Path:
-    """Locate the project root (dir holding pyproject.toml + agydra/).
+    """Locate the project root (dir holding pyproject.toml + agydra.py).
 
     Candidates, in order: explicit cwd, the directory that contains this
-    package, then the process CWD. Returns the first candidate that looks
+    module, then the process CWD. Returns the first candidate that looks
     like the project; otherwise the first candidate so callers can report it.
     """
-    here = Path(__file__).resolve().parent.parent
+    here = Path(__file__).resolve().parent
     candidates: list[Path] = []
     if cwd is not None:
         candidates.append(Path(cwd).resolve())
@@ -68,7 +68,7 @@ def project_root(cwd: Optional[Path] = None) -> Path:
     if process_cwd not in candidates:
         candidates.append(process_cwd)
     for cand in candidates:
-        if (cand / "pyproject.toml").is_file() and (cand / "agydra").is_dir():
+        if (cand / "pyproject.toml").is_file() and (cand / "agydra.py").is_file():
             return cand
     return candidates[0]
 

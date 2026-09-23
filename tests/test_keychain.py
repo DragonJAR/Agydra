@@ -4,8 +4,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agydra import keychain
-from agydra.store import Store
+import keychain
+from store import Store
 
 
 def _rc(code, out: bytes = b""):

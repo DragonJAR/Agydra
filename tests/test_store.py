@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agydra.store import Store, StoreError  # noqa: E402
+from store import Store, StoreError  # noqa: E402
 
 from conftest import BaseCase  # noqa: E402
 
@@ -113,7 +113,7 @@ class TestStore(BaseCase):
         zips have a remainder starting with a digit that doesn't match the
         timestamp shape, so they are excluded from ``work``'s prune pool.
         """
-        from agydra.store import _backup_stamp  # noqa: E402
+        from store import _backup_stamp  # noqa: E402
 
         fresh = self._tmp / "fresh-root"
         store = Store(root=fresh)
@@ -141,7 +141,7 @@ class TestStore(BaseCase):
 
     def test_save_config_refuses_to_overwrite_corrupt_config(self):
         """Bug guard: the corrupt-config guard must precede the write."""
-        from agydra.store import StoreError as _StoreError
+        from store import StoreError as _StoreError
 
         fresh = self._tmp / "fresh-root"
         store = Store(root=fresh)
@@ -151,7 +151,7 @@ class TestStore(BaseCase):
             store.save_config(store.load_config())
 
     def test_load_config_degrades_with_warning_under_corrupt(self):
-        from agydra.store import Config as _Config
+        from store import Config as _Config
 
         fresh = self._tmp / "fresh-root"
         fresh.mkdir(parents=True, exist_ok=True)
@@ -164,7 +164,7 @@ class TestStore(BaseCase):
     def test_load_config_degrades_on_valid_json_non_object_root(self):
         """Bug guard: a JSON list/str/int root is corruption, not a crash —
         and save_config must refuse to overwrite it."""
-        from agydra.store import StoreError as _StoreError
+        from store import StoreError as _StoreError
 
         fresh = self._tmp / "fresh-root"
         fresh.mkdir(parents=True, exist_ok=True)
@@ -178,7 +178,7 @@ class TestStore(BaseCase):
             store.save_config(store.load_config())
 
     def test_config_rejects_non_object_settings(self):
-        from agydra.models import Config
+        from models import Config
 
         with self.assertRaises(ValueError):
             Config.from_dict({"settings": ["not", "an", "object"]})

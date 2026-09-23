@@ -20,12 +20,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agydra.cli import (  # noqa: E402
+from cli import (  # noqa: E402
     _consume_launch_flags,
     _match_flag,
     _warn_late_flags,
 )
-from agydra.store import Store, StoreError  # noqa: E402
+from store import Store, StoreError  # noqa: E402
 
 from conftest import BaseCase  # noqa: E402
 

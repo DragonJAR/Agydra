@@ -23,15 +23,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agydra import bootstrap
+import bootstrap
 
 
 def _make_fake_project(tmp: Path, *, with_console: bool) -> Path:
     proj = tmp / "proj"
     proj.mkdir()
     (proj / "pyproject.toml").write_text("[project]\nname = 'fake'\n", encoding="utf-8")
-    (proj / "agydra").mkdir()
-    (proj / "agydra" / "__init__.py").write_text("__version__ = '9.9.9'\n", encoding="utf-8")
+    # Flat layout: VERSION lives in agydra.py at the repo root.
+    (proj / "agydra.py").write_text("VERSION = '9.9.9'\n", encoding="utf-8")
     if with_console:
         vpy = bootstrap.venv_python(proj)
         vpy.parent.mkdir(parents=True, exist_ok=True)
@@ -77,16 +77,12 @@ def _sandbox_home(base: Path) -> _HomeSandbox:
 
 
 class VersionAttrGuard(unittest.TestCase):
-    """The dynamic-version attr must resolve to agydra/__init__.py even though
-    a root bootstrap module named agydra.py exists in the project root.
-
-    setuptools' static reader (config/expand.py::_find_module) tries
-    ``<name>.py`` before ``<name>/__init__.py``, so ``attr = "agydra.__version__"``
-    reads the root module instead of the package and the editable install
-    fails with ``AttributeError: module 'agydra' has no attribute '__version__'``.
+    """The dynamic-version attr must point at the flat root module so
+    setuptools' static reader (config/expand.py::_find_module) finds the
+    VERSION constant in ``agydra.py`` rather than guessing an ``__init__``.
     """
 
-    def test_pyproject_version_attr_is_shadow_proof(self):
+    def test_pyproject_version_attr_is_agydra_VERSION(self):
         import re
 
         root = Path(__file__).resolve().parent.parent
@@ -99,20 +95,17 @@ class VersionAttrGuard(unittest.TestCase):
             "",
         )
         self.assertIn(
-            '"agydra.__init__.__version__"',
+            '"agydra.VERSION"',
             directive,
-            "pyproject.toml must keep the fully-qualified attr so the root "
-            "agydra.py bootstrap module cannot shadow the package during "
-            "setuptools' static version resolution",
+            "pyproject.toml must reference agydra.VERSION in the flat layout",
         )
 
-    def test_root_bootstrap_module_has_no_version_literal(self):
-        # Belt-and-suspenders: if someone ever adds __version__ to agydra.py,
-        # a plain-attr regression would fail confusingly later; assert the
-        # invariant directly at the source instead.
+    def test_root_bootstrap_module_has_version_constant(self):
+        # Flat layout invariant: agydra.py owns the VERSION constant.
         root = Path(__file__).resolve().parent.parent
         module = (root / "agydra.py").read_text(encoding="utf-8")
-        self.assertNotIn("__version__", module)
+        self.assertIn("VERSION =", module)
+        self.assertIn("__version__ = VERSION", module)
 
 
 class Helpers(unittest.TestCase):

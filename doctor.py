@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from . import __version__, account, isolation, keychain, platforms
-from .store import Store
-from .ui import paint
+from agydra import __version__
+import account, isolation, keychain, platforms
+from store import Store
+from ui import paint
 
 OK = "ok"
 WARN = "warn"
@@ -96,7 +97,7 @@ def _check_locks(store: Store, ctx: "_DoctorContext"):
     kernel-held, so a crash releases it and the file is just an unlocked
     sentinel). Anything but an explicit pass is a warning: doctor's job is
     to flag, never to guess."""
-    from . import locks
+    import locks
 
     if not ctx.names:
         return WARN, "locks: no profiles to check"
@@ -198,7 +199,7 @@ def _check_sandbox(_store: Store, _ctx: "_DoctorContext"):
 
 def _check_bootstrap(_store: Store, _ctx: "_DoctorContext"):
     """Report the one-command install state (venv, shim, PATH)."""
-    from . import bootstrap
+    import bootstrap
 
     root = bootstrap.project_root()
     state = bootstrap.check_state(root)

@@ -17,9 +17,9 @@ import zipfile
 from pathlib import Path
 from typing import List, Optional
 
-from . import platforms, vocab
-from .models import Config, Profile, _utcnow_iso
-from .ui import warn
+import platforms, vocab
+from models import Config, Profile, _utcnow_iso
+from ui import warn
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 

@@ -17,10 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from . import isolation, keychain, locks, platforms, resolver
-from .resolver import PROFILE_ENV
-from .store import Store, StoreError
-from .ui import warn
+import isolation, keychain, locks, platforms, resolver
+from resolver import PROFILE_ENV
+from store import Store, StoreError
+from ui import warn
 
 
 @dataclass

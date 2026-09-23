@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from . import platforms
+import platforms
 
 AGY_CLI_DIR = "antigravity-cli"
 TOKEN_FILE = "antigravity-oauth-token"  # current (and only) layout
@@ -83,7 +83,7 @@ def _macos_keychain_authenticated(store, name) -> Optional[bool]:
     if not platforms.is_macos():
         return None
     try:
-        from . import keychain
+        import keychain
 
         if not keychain.supported():
             return None
@@ -123,7 +123,7 @@ def sync_profile_email(store, name: str) -> Optional[str]:
     its fresh last_used (written by runner) clobbered by a full-profile
     save based on the stale pre-launch snapshot.
     """
-    from . import locks
+    import locks
 
     profile = store.get(name)
     email = detect_email(store.profile_data_dir(name))

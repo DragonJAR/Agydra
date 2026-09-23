@@ -16,9 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from . import account, locks
-from .store import Store, StoreError
-from .ui import warn
+import account, locks
+from store import Store, StoreError
+from ui import warn
 
 PROFILE_ENV = "AGYDRA_PROFILE"
 MARKER_FILE = ".agydra"

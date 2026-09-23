@@ -31,8 +31,8 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from . import platforms
-from .ui import warn
+import platforms
+from ui import warn
 
 # POSIX-only module: Windows has no fcntl and can never run this bridge
 # (supported() is macOS-only), but a hard top-level import would make the

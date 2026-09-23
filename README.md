@@ -219,26 +219,25 @@ executable · `127` not found · `130` Ctrl-C.
 ## 🔧 Project Structure
 
 ```text
-agydra/
-├── agydra/
-│   ├── __main__.py     # python -m agydra entry point
-│   ├── models.py       # Profile/Config dataclasses, explicit (de)serialization
-│   ├── platforms.py    # OS paths, binary discovery, exec/launch per platform
-│   ├── store.py        # Profile store: CRUD, atomic JSON writes, backups
-│   ├── locks.py        # Kernel-held per-profile session locks
-│   ├── resolver.py     # Profile resolution cascade with human-readable reasons
-│   ├── account.py      # Email/auth detection from a profile's data directory
-│   ├── keychain.py     # macOS per-profile keychain slot bridge
-│   ├── isolation.py    # Home-overlay construction and environment redirection
-│   ├── runner.py       # Launch orchestration: resolve → plan → overlay → run
-│   ├── doctor.py       # Diagnostics: binary, permissions, isolation, canary
-│   └── cli.py          # argparse CLI: launcher + management subcommands
-├── tests/              # ~105 tests (fake home + fake agy binary fixtures)
+agydra/                     # repo root — flat layout, no package subdir
+├── agydra.py           # VERSION + one-command bootstrap (python3 agydra.py)
+├── models.py           # Profile/Config dataclasses, explicit (de)serialization
+├── platforms.py        # OS paths, binary discovery, exec/launch per platform
+├── store.py            # Profile store: CRUD, atomic JSON writes, backups
+├── locks.py            # Kernel-held per-profile session locks
+├── resolver.py         # Profile resolution cascade with human-readable reasons
+├── account.py          # Email/auth detection from a profile's data directory
+├── keychain.py         # macOS per-profile keychain slot bridge
+├── isolation.py        # Home-overlay construction and environment redirection
+├── runner.py           # Launch orchestration: resolve → plan → overlay → run
+├── doctor.py           # Diagnostics: binary, permissions, isolation, canary
+├── cli.py              # argparse CLI: launcher + management subcommands
+├── tests/              # ~196 tests (fake home + fake agy binary fixtures)
 ├── README.md           # This document (English)
 ├── README.es.md        # Spanish version
 ├── AGENTS.md           # Development conventions
 ├── LICENSE             # MIT
-└── pyproject.toml      # Packaging metadata
+└── pyproject.toml      # Packaging metadata (py-modules flat layout)
 ```
 
 ## ⚙️ Configuration
