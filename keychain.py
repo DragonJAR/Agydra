@@ -17,6 +17,13 @@ Empirical layout of agy 1.2.7 credentials:
       shared <- profile slot   (launch agy: it sees this profile's token)
       profile slot <- shared   (restore on exit)
 
+  A profile with no private slot yet (never completed a keychain-backed
+  login) gets the shared slot CLEARED instead of left alone: agy reads that
+  fixed slot regardless of which profile's overlay HOME it was launched
+  under, so leaving a previous profile's credential in place would make a
+  brand-new profile appear already authenticated as someone else — no OAuth
+  prompt, no isolation.
+
 This module is the ONLY place that shells out to ``security``. Everything is
 best-effort with fail-open semantics: a keychain failure degrades to the
 pre-bridge behavior (no swap) with a loud warning, it never breaks a launch.
@@ -265,6 +272,14 @@ def launch_guard(store, profile: str, capture: bool = False):
     exit running BEFORE cmd_login's capture step (see runner.run's launch
     ordering), so a plain restore there would overwrite/delete the very
     token capture needs to read — the capture would always see None.
+
+    When ``profile`` has no private slot yet but the shared slot is not
+    empty (see the module docstring), entry clears the shared slot instead
+    of swapping a profile secret into it, so it does not set the internal
+    "swapped" flag either: nothing of this profile's own was injected, so
+    the exit path must not save that cleared value as this profile's
+    private slot — it only restores or deletes the shared slot, per the
+    state entry recorded.
     """
     if not supported():
         import contextlib
@@ -287,6 +302,8 @@ def launch_guard(store, profile: str, capture: bool = False):
                 if slot is not None:
                     write_slot(shared_slot(), slot, self._keychain_path)
                     self._swapped = True
+                elif self._had_shared is not None:
+                    delete_slot(shared_slot(), self._keychain_path)
             except (KeychainError, OSError) as exc:
                 warn(
                     f"keychain swap skipped ({exc}); continuing without "

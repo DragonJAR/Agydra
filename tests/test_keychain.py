@@ -108,6 +108,64 @@ class TestLaunchGuardRestore(unittest.TestCase):
         self.assertIsNone(kc.shared)
         self.assertIn(("delete", None), kc.calls)
 
+    def test_enter_clears_shared_slot_for_profile_without_saved_slot(self):
+        """A profile that has never completed a keychain-backed login has no
+        ``<store>/keychain/<name>.secret`` backup yet. Before the fix, the
+        guard only swapped the shared slot when ``load_profile_slot()``
+        returned a value, so a brand-new profile left the shared slot
+        UNTOUCHED -- agy then saw whatever the previous profile's launch had
+        left there and behaved as already authenticated, with no OAuth
+        prompt at all. The guard must instead clear the shared slot so a
+        never-authenticated profile always starts from a clean slate. A
+        normal (non-login) launch must still restore what it found on
+        exit, exactly as before this fix -- only the entry behavior
+        changes.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = _StoreStub(Path(tmp.name))
+        kc = _MemoryKeychain(b"default-profile-token")
+        with mock.patch.object(keychain, "_run", kc.run), \
+                mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                ):
+            self.assertIsNone(keychain.load_profile_slot(store, "parce"))
+            guard = keychain.launch_guard(store, "parce")
+            state = guard.__enter__()
+            self.assertIsNone(kc.shared, "shared slot still holds a foreign token")
+            self.assertIn(("delete", None), kc.calls)
+            state.__exit__(None, None, None)
+        self.assertEqual(kc.shared, b"default-profile-token")
+
+    def test_login_on_new_profile_does_not_adopt_leftover_shared_token(self):
+        """The reported bug, end to end: `agydra login <new-profile>` must
+        never let the new profile's private slot end up holding whatever
+        credential was left in the shared slot by a previous profile's
+        launch. Before the fix, the guard left the shared slot untouched on
+        entry, so if agy (seeing existing credentials) skipped its OAuth
+        flow entirely, the login capture step would persist that FOREIGN
+        token as the new profile's own -- silently "logging in" the new
+        profile as whichever account was last active, no URL prompt shown.
+        agy runs between ``__enter__`` and ``__exit__``; it must see an
+        empty shared slot (asserted in the sibling test above), so this
+        simulates the worst case where it does nothing at all with it
+        (e.g. it was mid-crash or the user closed the browser tab).
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = _StoreStub(Path(tmp.name))
+        kc = _MemoryKeychain(b"default-profile-token")
+        with mock.patch.object(keychain, "_run", kc.run), \
+                mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                ):
+            guard = keychain.launch_guard(store, "parce", capture=True)
+            state = guard.__enter__()
+            state.__exit__(None, None, None)
+        self.assertIsNone(keychain.load_profile_slot(store, "parce"))
+
     def test_failure_to_swap_never_persists_foreign_token(self):
         """Fail-open swap: exit must not save the untouched shared token."""
         tmp = tempfile.TemporaryDirectory()
