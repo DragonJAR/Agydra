@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+os.environ["AGYDRA_NO_KEYCHAIN"] = "1"
+
 
 def write_fake_agy(path: Path) -> Path:
     """Create a fake `agy` that mimics the real one's home-derived data dir.

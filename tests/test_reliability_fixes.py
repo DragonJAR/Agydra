@@ -157,6 +157,8 @@ class TestKeychainLoginCapture(unittest.TestCase):
             store.create("work")
             fresh = b"fresh-token"
             with mock.patch.object(
+                keychain, "supported", return_value=True
+            ), mock.patch.object(
                 keychain, "_serialize_lock", return_value=mock.MagicMock()
             ), mock.patch.object(
                 keychain, "_ensure_target_keychain",
@@ -254,13 +256,11 @@ class TestKeychainRunHardening(unittest.TestCase):
         from unittest import mock
 
         with mock.patch.object(keychain.platforms, "is_macos", return_value=True), \
-                mock.patch.object(keychain.shutil, "which", return_value="/usr/bin/security"):
-            self.assertTrue(keychain.supported())
+                mock.patch.object(keychain.shutil, "which", return_value="/usr/bin/security"), \
+                mock.patch.dict(os.environ):
             os.environ["AGYDRA_NO_KEYCHAIN"] = "1"
-            try:
-                self.assertFalse(keychain.supported())
-            finally:
-                os.environ.pop("AGYDRA_NO_KEYCHAIN", None)
+            self.assertFalse(keychain.supported())
+            os.environ.pop("AGYDRA_NO_KEYCHAIN")
             self.assertTrue(keychain.supported())
 
 
@@ -302,25 +302,21 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
 
         import locks, platforms
 
-        with isolated_store_env():
-            os.environ["AGYDRA_NO_KEYCHAIN"] = "1"
-            os.environ["AGYDRA_AGY_BIN"] = sys.executable
-            try:
-                store = Store()
-                store.create("work")
-                plan = runner.build_plan(
-                    store, [], flag_ref="work", launch_as_child=True
-                )
-                with mock.patch.object(
-                    platforms, "run_wait", return_value=0
-                ) as run_wait:
-                    rc = runner.run(plan, store=store)
-                self.assertEqual(rc, 0)
-                run_wait.assert_called_once()
-                self.assertFalse(locks.is_locked(store, "work"))
-            finally:
-                os.environ.pop("AGYDRA_NO_KEYCHAIN", None)
-                os.environ.pop("AGYDRA_AGY_BIN", None)
+        with isolated_store_env(), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
+        ):
+            store = Store()
+            store.create("work")
+            plan = runner.build_plan(
+                store, [], flag_ref="work", launch_as_child=True
+            )
+            with mock.patch.object(
+                platforms, "run_wait", return_value=0
+            ) as run_wait:
+                rc = runner.run(plan, store=store)
+            self.assertEqual(rc, 0)
+            run_wait.assert_called_once()
+            self.assertFalse(locks.is_locked(store, "work"))
 
     def test_lock_released_after_keychain_guard_exits(self):
         """The lock must release only AFTER the keychain guard's __exit__
