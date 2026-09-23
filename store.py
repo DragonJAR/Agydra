@@ -313,15 +313,22 @@ class Store:
         """One pass over metadata: (parsed profiles sorted by seq, unreadable names)."""
         profiles: List[Profile] = []
         unreadable: List[str] = []
-        for meta in sorted(self.profiles_dir.glob("*/profile.json")):
-            try:
-                profile = Profile.from_dict(_read_json(meta))
-                self.validate_name(profile.name)
-                if profile.name != meta.parent.name:
-                    raise ValueError("metadata name does not match its directory")
-                profiles.append(profile)
-            except (OSError, ValueError, KeyError, TypeError, StoreError):
-                unreadable.append(meta.parent.name)
+        if self.profiles_dir.is_dir():
+            for pdir in sorted(self.profiles_dir.iterdir()):
+                if not pdir.is_dir():
+                    continue
+                meta = pdir / "profile.json"
+                if not meta.is_file():
+                    unreadable.append(pdir.name)
+                    continue
+                try:
+                    profile = Profile.from_dict(_read_json(meta))
+                    self.validate_name(profile.name)
+                    if profile.name != pdir.name:
+                        raise ValueError("metadata name does not match its directory")
+                    profiles.append(profile)
+                except (OSError, ValueError, KeyError, TypeError, StoreError):
+                    unreadable.append(pdir.name)
         profiles.sort(key=lambda p: (p.seq, p.name))
         return profiles, unreadable
 
@@ -376,11 +383,14 @@ class Store:
         return profile
 
     def delete(self, name: str, backup: bool = True) -> Optional[Path]:
-        self.get(name)
-        backup_path: Optional[Path] = None
-        if backup:
-            backup_path = self._write_backup(name)
         profile_dir = self.profile_dir(name)
+        if not profile_dir.exists():
+            raise StoreError(
+                f"profile {name!r} does not exist (see: agydra list)"
+            )
+        backup_path: Optional[Path] = None
+        if backup and (profile_dir / "profile.json").is_file():
+            backup_path = self._write_backup(name)
         rmtree(profile_dir)
         self._remove_overlay(name)
         if profile_dir.exists():

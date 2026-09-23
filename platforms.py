@@ -84,6 +84,10 @@ def resolve_agy_binary(explicit: Optional[str] = None) -> Optional[Path]:
         p = Path(candidate).expanduser()
         if p.is_file() and (is_windows() or os.access(p, os.X_OK)):
             return p
+        if is_windows():
+            which_p = shutil.which(str(p))
+            if which_p:
+                return Path(which_p)
         return None
     found = shutil.which("agy")
     return Path(found) if found else None

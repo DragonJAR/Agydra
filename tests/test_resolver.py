@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import resolver
+import resolver, runner
 from store import Store, StoreError
 
 from conftest import BaseCase
@@ -47,6 +47,14 @@ class TestResolver(BaseCase):
         res = self._resolve(cwd=project)
         self.assertEqual(res.name, "lab")
         self.assertIn("marker", res.reason)
+
+    def test_build_plan_forwards_cwd(self):
+        project = self._tmp / "project" / "sub"
+        project.mkdir(parents=True)
+        (self._tmp / "project" / ".agydra").write_text("lab", encoding="utf-8")
+        plan = runner.build_plan(self.store, [], cwd=project)
+        self.assertEqual(plan.profile, "lab")
+        self.assertIn("marker", plan.reason)
 
     def test_empty_marker_file_raises_actionable_error(self):
         project = self._tmp / "project" / "empty_marker"

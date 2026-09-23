@@ -115,6 +115,14 @@ class TestResolveAgyBinary(unittest.TestCase):
         self.assertIsNone(platforms.resolve_agy_binary())
         self.assertIsNone(platforms.resolve_agy_binary(str(d)))
 
+    def test_windows_pathext_resolution(self):
+        from unittest import mock
+
+        with mock.patch.object(platforms, "is_windows", return_value=True), \
+                mock.patch.object(platforms.shutil, "which", return_value="C:\\bin\\agy.cmd"):
+            res = platforms.resolve_agy_binary("C:\\bin\\agy")
+            self.assertEqual(res, Path("C:\\bin\\agy.cmd"))
+
 
 class TestBaseDirXDG(unittest.TestCase):
     """Bug guard for the XDG branch: relative values must be ignored and

@@ -56,12 +56,13 @@ def build_plan(
     binary_override: Optional[str] = None,
     random_pick: bool = False,
     launch_as_child: bool = False,
+    cwd: Optional[Path] = None,
 ) -> LaunchPlan:
     """Resolve everything needed to launch agy without mutating anything."""
     if random_pick:
-        resolution = resolver.pick_free_profile(store)
+        resolution = resolver.pick_free_profile(store, cwd=cwd)
     else:
-        resolution = resolver.resolve(store, flag_ref=flag_ref)
+        resolution = resolver.resolve(store, flag_ref=flag_ref, cwd=cwd)
     profile = store.get(resolution.name)
 
     config = store.load_config()

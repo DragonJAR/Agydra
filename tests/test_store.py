@@ -70,6 +70,18 @@ class TestStore(BaseCase):
         backup = store.delete("solo", backup=False)
         self.assertIsNone(backup)
 
+    def test_scan_detects_directory_missing_profile_json_as_unreadable(self):
+        store = Store()
+        store.profile_dir("broken").mkdir(parents=True)
+        self.assertIn("broken", store.unreadable_profiles())
+
+    def test_delete_recovers_corrupt_profile_directory(self):
+        store = Store()
+        store.profile_dir("halfcreated").mkdir(parents=True)
+        backup = store.delete("halfcreated")
+        self.assertIsNone(backup)
+        self.assertFalse(store.profile_dir("halfcreated").exists())
+
     def test_resolve_ref_by_name_and_number(self):
         store = Store()
         store.create("alpha")

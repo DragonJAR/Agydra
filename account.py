@@ -121,11 +121,13 @@ def sync_profile_email(store, name: str) -> Optional[str]:
     """
     import locks
 
-    profile = store.get(name)
     email = detect_email(store.profile_data_dir(name))
-    if email:
-        if locks.is_locked(store, name):
-            return email
+    if not email:
+        return None
+    if locks.is_locked(store, name):
+        return email
+    profile = store.get(name)
+    if profile.email != email:
         profile.email = email
         store.save(profile)
     return email
