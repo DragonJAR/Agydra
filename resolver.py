@@ -123,7 +123,9 @@ _NOT_AUTHENTICATED = (
 )
 
 
-def pick_free_profile(store, cwd: Optional[Path] = None) -> Resolution:
+def pick_free_profile(
+    store, cwd: Optional[Path] = None, force: bool = False,
+) -> Resolution:
     """Pick the free-est authenticated profile for ``-r``/``--random``.
 
     Deterministic and side-effect-free (the caller takes the lock later, in
@@ -135,23 +137,30 @@ def pick_free_profile(store, cwd: Optional[Path] = None) -> Resolution:
     3. skip profiles with a live session (advisory lock held);
     4. skip unauthenticated profiles;
     5. prefer the least-recently-used, break ties by seq (creation order).
+
+    With ``force=True`` (launcher ``-f`` mode), the busy filter is skipped
+    so an authenticated profile can be re-used even while another
+    session holds its lock. The auth filter and the marker precedence
+    are preserved — a marker or "no tokens yet" profile still refuses.
     """
     profiles = store.list()
     names = [p.name for p in profiles]
     if not names:
         raise StoreError(_NO_PROFILES)
-    if len(names) < MIN_PROFILES:
+    if not force and len(names) < MIN_PROFILES:
         raise StoreError(_TOO_FEW)
 
     marker = _marker_resolution(store, cwd or Path.cwd())
     if marker is not None:
         return marker
 
-    free = [p for p in profiles if not locks.is_locked(store, p.name)]
-    if not free:
+    candidates = profiles if force else [
+        p for p in profiles if not locks.is_locked(store, p.name)
+    ]
+    if not candidates:
         raise StoreError(_NO_FREE)
     usable = [
-        p for p in free
+        p for p in candidates
         if account.auth_state(
             store.profile_data_dir(p.name), store, p.name,
         )
@@ -162,4 +171,9 @@ def pick_free_profile(store, cwd: Optional[Path] = None) -> Resolution:
     best = min(
         usable, key=lambda p: (p.last_used or "", p.seq)
     )
-    return Resolution(best.name, "least-recently-used free profile (-r)")
+    reason = (
+        "least-recently-used profile (-r, forced)"
+        if force
+        else "least-recently-used free profile (-r)"
+    )
+    return Resolution(best.name, reason)

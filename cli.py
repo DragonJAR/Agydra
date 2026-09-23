@@ -66,6 +66,11 @@ _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
         "-b", "--binary", True, "PATH",
         "path to the real agy binary (overrides config and PATH lookup)",
     ),
+    "force": (
+        "-f", "--force", False, None,
+        "force-launch without taking the session lock; concurrent "
+        "sessions on the same profile may corrupt OAuth tokens",
+    ),
 }
 _SHORT_TO_FLAG: Dict[str, Tuple[str, bool]] = {
     short: (key, takes_value)
@@ -712,6 +717,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             flag_ref=values["profile"],
             binary_override=values["binary"],
             random_pick=bool(values["random"]),
+            force=bool(values["force"]),
         )
         return runner.run(plan, store=store, dry_run=bool(values["dry-run"]))
     except (StoreError, IsolationError, OSError, KeyboardInterrupt) as exc:

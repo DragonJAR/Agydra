@@ -188,7 +188,7 @@ OAuth tokens are never copied
 
 | Command | Description |
 |---|---|
-| `agydra [-p PROFILE\|#] [-r] [-n] [-b PATH] <agy args...>` | Launch `agy` with the resolved profile. Flags must come **before** agy args (a late `-p` is passed to agy with a warning). Short flags bundle: `-nr -p work` == `-n -r -p work`. `-r` picks a free profile, `-n` dry-run, `-b` binary override. Profile names may not collide with a subcommand or alias (`status`, `ls`, `mv`, ...) — the dispatcher would shadow them |
+| `agydra [-p PROFILE\|#] [-r] [-n] [-b PATH] [-f] <agy args...>` | Launch `agy` with the resolved profile. Flags must come **before** agy args (a late `-p` is passed to agy with a warning). Short flags bundle: `-nr -p work` == `-n -r -p work`. `-r` picks a free profile, `-n` dry-run, `-b` binary override, `-f` skips the session lock. Profile names may not collide with a subcommand or alias (`status`, `ls`, `mv`, ...) — the dispatcher would shadow them |
 | `agydra list` · `ls` · `l` | Table: number, email, default, auth state, busy, last use |
 | `agydra create NAME [-d DESC]` · `c` | Create a profile store |
 | `agydra login NAME\|#` · `in` | Run agy's OAuth flow isolated to that profile |
@@ -208,10 +208,13 @@ OAuth tokens are never copied
 | `-r` | `--random` | Least-recently-used **free authenticated** profile (needs 2+); mutually exclusive with `-p` |
 | `-n` | `--dry-run` | Print the launch plan, execute nothing |
 | `-b PATH` | `--binary` | Override the `agy` binary for this launch |
+| `-f` | `--force` | Launch without taking the session lock, even against an already-busy profile; concurrent sessions on the same profile may corrupt OAuth tokens |
 
 **Resolution cascade** (launch without `-p`): `--profile` flag → `AGYDRA_PROFILE`
 env var → `.agydra` marker file (nearest ancestor of CWD, written by
 `agydra use`; overrides `-r`) → configured `default_profile` → first profile.
+`-r` normally requires 2+ profiles and skips busy/unauthenticated ones;
+`-f` lifts both restrictions for `-r -f`.
 
 **Exit codes:** `0` ok · `1` errors · `2` `-p` + `-r` conflict · `126` not
 executable · `127` not found · `130` Ctrl-C.

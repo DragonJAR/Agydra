@@ -111,6 +111,34 @@ class TestCliParameterMatrix(BaseCase):
                 for needle in needles:
                     self.assertIn(needle, res.stdout)
 
+    def test_launcher_force_flag_variants(self):
+        """``-f/--force`` skips session lock acquisition; appears in
+        ``describe`` and emits its warning to stderr at dry-run time."""
+        for flag in ("-f", "--force"):
+            with self.subTest(flag=flag):
+                res = self._run_cli(flag, "-n")
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertIn("force   : on", res.stdout)
+                self.assertIn("profile : alpha", res.stdout)
+
+    def test_launcher_force_combined_with_profile_and_random(self):
+        cases = [
+            (["-p", "alpha", "-f", "-n"], "profile : alpha"),
+            (["-f", "-p", "alpha", "-n"], "profile : alpha"),
+            (["-fpalpha", "-n"], "profile : alpha"),
+            (["-fp", "alpha", "-n"], "profile : alpha"),
+            (["-r", "-f", "-n"], "(-r, forced)"),
+            (["-fr", "-n"], "(-r, forced)"),
+            (["-rf", "-n"], "(-r, forced)"),
+            (["-nrf"], "(-r, forced)"),
+        ]
+        for args, needle in cases:
+            with self.subTest(args=args):
+                res = self._run_cli(*args)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertIn(needle, res.stdout)
+                self.assertIn("force   : on", res.stdout)
+
     def test_forwarding_and_delimiters(self):
         res = self._run_cli("-n", "-p", "alpha", "chat", "--foo", "bar")
         self.assertEqual(res.returncode, 0, res.stderr)

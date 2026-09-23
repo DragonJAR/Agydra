@@ -35,16 +35,18 @@ class LaunchPlan:
     launch_as_child: bool = False
     random_pick: bool = False
     binary_override: Optional[str] = None
+    force: bool = False
     windows_redirect_home: bool = False
 
     def describe(self) -> str:
         lines = [
             f"profile : {self.profile} ({self.reason})",
-            f"binary : {self.binary}",
+            f"binary  : {self.binary}",
             f"argv    : {self.binary} {' '.join(self.args)}".rstrip(),
             f"overlay : {self.overlay}",
             f"env     : {self.env_home_var}={self.env_home_value}",
             f"sandbox : {'bwrap' if self.use_sandbox else 'off'}",
+            f"force   : {'on' if self.force else 'off'}",
         ]
         return "\n".join(lines)
 
@@ -57,10 +59,11 @@ def build_plan(
     random_pick: bool = False,
     launch_as_child: bool = False,
     cwd: Optional[Path] = None,
+    force: bool = False,
 ) -> LaunchPlan:
     """Resolve everything needed to launch agy without mutating anything."""
     if random_pick:
-        resolution = resolver.pick_free_profile(store, cwd=cwd)
+        resolution = resolver.pick_free_profile(store, cwd=cwd, force=force)
     else:
         resolution = resolver.resolve(store, flag_ref=flag_ref, cwd=cwd)
     profile = store.get(resolution.name)
@@ -94,6 +97,7 @@ def build_plan(
         launch_as_child=launch_as_child,
         random_pick=random_pick,
         binary_override=binary_override,
+        force=force,
         windows_redirect_home=bool(config.settings.get("windows_redirect_home")),
     )
 
@@ -105,30 +109,36 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
 
     store = store or Store()
 
-    handle = None
-    attempts = 0
-    max_attempts: Optional[int] = None
-    while True:
-        handle = locks.try_lock(store, plan.profile)
-        if handle is not None:
-            break
-        if not plan.random_pick or (plan.reason and plan.reason.startswith("project marker")):
-            raise StoreError(
-                f"profile {plan.profile!r} is busy: another live session is "
-                "using it (agydra -r picks a free one automatically)"
-            )
-        if max_attempts is None:
-            max_attempts = len(store.names())
-        attempts += 1
-        if attempts > max_attempts:
-            raise StoreError(
-                "no free authenticated profile left after concurrent picks"
-            )
-        plan = build_plan(
-            store, plan.args,
-            binary_override=plan.binary_override, random_pick=True,
-            launch_as_child=plan.launch_as_child,
+    handle: Optional[locks.LockHandle] = None
+    if plan.force:
+        warn(
+            f"forcing launch on profile {plan.profile!r}: another live "
+            "session may be writing to the same data dir (--force opt-in)"
         )
+    else:
+        attempts = 0
+        max_attempts: Optional[int] = None
+        while True:
+            handle = locks.try_lock(store, plan.profile)
+            if handle is not None:
+                break
+            if not plan.random_pick or (plan.reason and plan.reason.startswith("project marker")):
+                raise StoreError(
+                    f"profile {plan.profile!r} is busy: another live session is "
+                    "using it (agydra -r picks a free one automatically)"
+                )
+            if max_attempts is None:
+                max_attempts = len(store.names())
+            attempts += 1
+            if attempts > max_attempts:
+                raise StoreError(
+                    "no free authenticated profile left after concurrent picks"
+                )
+            plan = build_plan(
+                store, plan.args,
+                binary_override=plan.binary_override, random_pick=True,
+                launch_as_child=plan.launch_as_child,
+            )
 
     profile = store.get(plan.profile)
     profile.touch()
@@ -156,5 +166,5 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
                 return platforms.run_wait(argv, env)
             return platforms.launch_argv(argv, env)
     finally:
-        if release_after_guard:
+        if release_after_guard and handle is not None:
             handle.release()

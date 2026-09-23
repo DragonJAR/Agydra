@@ -203,7 +203,7 @@ copied: personal/mcp.json
 
 | Comando | Alias | Descripción |
 |---|---|---|
-| `agydra [-p PERFIL\|#] [-r] [-n] [-b RUTA] <args de agy...>` | — | Lanza `agy` con la sesión aislada del perfil resuelto. Los flags de agydra van **antes** de los args de agy; un `-p` tardío va a `agy` y se imprime un aviso. Los flags cortos se agrupan estilo getopt: `-nr -p work` == `-n -r -p work`. Los nombres de perfil no pueden chocar con un subcomando o alias (`status`, `ls`, `mv`, ...) — el dispatcher los opacaría. |
+| `agydra [-p PERFIL\|#] [-r] [-n] [-b RUTA] [-f] <args de agy...>` | — | Lanza `agy` con la sesión aislada del perfil resuelto. Los flags de agydra van **antes** de los args de agy; un `-p` tardío va a `agy` y se imprime un aviso. Los flags cortos se agrupan estilo getopt: `-nr -p work` == `-n -r -p work`. `-f` omite el lock de sesión. Los nombres de perfil no pueden chocar con un subcomando o alias (`status`, `ls`, `mv`, ...) — el dispatcher los opacaría. |
 | `list` | `ls`, `l` | Tabla de perfiles: número, email, default, estado de auth, ocupado, último uso. |
 | `create NOMBRE [-d DESC]` | `c` | Crea el almacén de un perfil. |
 | `login NOMBRE\|#` | `in` | Corre el OAuth de `agy` aislado a ese perfil. |
@@ -223,8 +223,9 @@ copied: personal/mcp.json
 | `-r` | `--random` | Perfil libre autenticado menos usado (requiere 2+). |
 | `-n` | `--dry-run` | Imprime el plan de lanzamiento sin ejecutar nada. |
 | `-b RUTA` | `--binary RUTA` | Sobreescribe el binario `agy`. |
+| `-f` | `--force` | Lanza sin tomar el lock de sesión, incluso contra un perfil ya ocupado; sesiones concurrentes sobre el mismo perfil pueden corromper los tokens OAuth. |
 
-`-p` y `-r` son mutuamente excluyentes. Sin `-p`, la resolución sigue una cascada determinista (gana el primer match): flag `--profile` → variable de entorno `AGYDRA_PROFILE` → archivo marcador `.agydra` (el ancestro más cercano del CWD; lo escribe `agydra use`) → default configurado → primer perfil. El marcador pisa a `-r`. `status` siempre muestra qué perfil se usará desde el directorio actual y por qué.
+`-p` y `-r` son mutuamente excluyentes. Sin `-p`, la resolución sigue una cascada determinista (gana el primer match): flag `--profile` → variable de entorno `AGYDRA_PROFILE` → archivo marcador `.agydra` (el ancestro más cercano del CWD; lo escribe `agydra use`) → default configurado → primer perfil. El marcador pisa a `-r`. `status` siempre muestra qué perfil se usará desde el directorio actual y por qué. `-r` normalmente requiere 2+ perfiles y descarta los ocupados o sin autenticar; `-f` levanta ambas restricciones para `-r -f`.
 
 | Código de salida | Significado |
 |:-:|---|
