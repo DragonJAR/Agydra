@@ -114,11 +114,12 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
     # Acquire the session lock. For -r, losing the race is expected under
     # concurrency: re-pick once from the profiles that are STILL free and
     # retry — repeated losers converge because each attempt removes at least
-    # one candidate from the free set. The profile count is captured once
-    # (the retry loop must not re-glob the store on every busy cycle).
+    # one candidate from the free set. The bound is computed lazily (only
+    # after the first lost race) so the single-profile path never globs
+    # the store just to count.
     handle = None
     attempts = 0
-    max_attempts = len(store.names())
+    max_attempts: Optional[int] = None
     while True:
         handle = locks.try_lock(store, plan.profile)
         if handle is not None:
@@ -128,6 +129,8 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
                 f"profile {plan.profile!r} is busy: another live session is "
                 "using it (agydra -r picks a free one automatically)"
             )
+        if max_attempts is None:
+            max_attempts = len(store.names())
         attempts += 1
         if attempts > max_attempts:
             raise StoreError(
@@ -164,16 +167,23 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
     ):
         if platforms.is_windows():
             # Windows launch waits for the child; the parent holds the lock
-            # for the session and must release it when the child exits.
+            # for the session and must release it when the child exits —
+            # including on a failing launch, or cmd_login would never be
+            # able to re-lock the profile for its capture step.
             try:
                 return platforms.launch(plan.binary, plan.args, env)
             finally:
                 handle.release()
         if plan.use_sandbox or plan.launch_as_child:
             # Child + wait so `agydra login` can observe exit and snapshot the
-            # refreshed keychain slot; the session lock fd is inherited and
-            # the kernel releases it when the (single) child exits.
-            return platforms.run_wait(argv, env)
+            # refreshed keychain slot. The lock must be released in the parent
+            # too: the fd the child inherited dies with it, but a parent that
+            # keeps running after the wait (login capture steps, tests)
+            # would otherwise hold the profile busy.
+            try:
+                return platforms.run_wait(argv, env)
+            finally:
+                handle.release()
         # Default: exec replaces this process; the inheritable lock fd
         # survives the exec and the kernel releases it when agy exits.
         return platforms.launch_argv(argv, env)

@@ -40,6 +40,5 @@ for _canonical, _aliases in SUBCOMMAND_ALIASES.items():
 del _canonical, _alias
 
 # Profile names the dispatcher would shadow in launcher mode: bare
-# ``agydra <name> ...`` always runs the subcommand, never the profile (the
-# escape hatch ``agydra -p <name> ...`` still works for pre-existing ones).
+# ``agydra <name> ...`` always runs the subcommand, never the profile.
 RESERVED_NAMES = frozenset(CANONICAL)

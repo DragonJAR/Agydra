@@ -14,7 +14,7 @@ from pathlib import Path
 
 from conftest import isolated_store_env
 
-from agydra import keychain, models, resolver
+from agydra import keychain, models, resolver, runner
 from agydra.store import Store, StoreError
 
 
@@ -183,6 +183,128 @@ class TestKeychainLoginCapture(unittest.TestCase):
                 with keychain.launch_guard(store, "work", capture=True):
                     pass
             save.assert_called_once_with(store, "work", fresh)
+
+
+class TestKeychainRunHardening(unittest.TestCase):
+    """_run must never hang: stdout/stderr go to temp files (the Security
+    Agent's grandchild inherits pipe write-ends and blocks communicate()
+    forever), the whole process group is killed on timeout, and any failure
+    degrades to a CompletedProcess(rc=-1) the caller can fail-open on."""
+
+    def test_timeout_kills_group_and_returns_negative_rc(self):
+        import subprocess
+        from unittest import mock
+
+        class FakeProc:
+            pid = 4242
+
+            def __init__(self):
+                self._calls = 0
+
+            def communicate(self, *args, **kwargs):
+                self._calls += 1
+                if self._calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="security", timeout=0.01)
+                return None, None
+
+            def kill(self):
+                pass
+
+        proc = FakeProc()
+        killed = []
+        with mock.patch.object(
+            keychain.subprocess, "Popen", return_value=proc
+        ), mock.patch.object(
+            keychain.os, "killpg", side_effect=lambda pid, sig: killed.append(pid)
+        ):
+            result = keychain._run(["find-generic-password", "-s", "x"])
+        self.assertIsInstance(result, subprocess.CompletedProcess)
+        self.assertEqual(result.returncode, -1)
+        self.assertEqual(killed, [4242])
+
+    def test_popen_failure_degrades_to_negative_rc(self):
+        from unittest import mock
+
+        with mock.patch.object(
+            keychain.subprocess, "Popen", side_effect=OSError("boom")
+        ):
+            result = keychain._run(["list-keychains"])
+        self.assertEqual(result.returncode, -1)
+
+    def test_supported_gates_on_kill_switch_env(self):
+        import os
+        from unittest import mock
+
+        # The host machine has `security` on PATH and is_macos is the default,
+        # so both probes must be stubbed to keep the assertion deterministic.
+        with mock.patch.object(keychain.platforms, "is_macos", return_value=True), \
+                mock.patch.object(keychain.shutil, "which", return_value="/usr/bin/security"):
+            self.assertTrue(keychain.supported())
+            os.environ["AGYDRA_NO_KEYCHAIN"] = "1"
+            try:
+                self.assertFalse(keychain.supported())
+            finally:
+                os.environ.pop("AGYDRA_NO_KEYCHAIN", None)
+            self.assertTrue(keychain.supported())
+
+
+class TestProfileSlotLifecycle(unittest.TestCase):
+    """rename/delete must move/remove the profile's keychain slot backup,
+    or a renamed profile loses its token and a deleted one leaks it."""
+
+    def test_rename_moves_slot_file(self):
+        with isolated_store_env():
+            store = Store()
+            keychain.save_profile_slot(store, "old", b"tok")
+            keychain.rename_profile_slot(store, "old", "new")
+            self.assertIsNone(keychain.load_profile_slot(store, "old"))
+            self.assertEqual(keychain.load_profile_slot(store, "new"), b"tok")
+
+    def test_rename_without_slot_is_noop(self):
+        with isolated_store_env():
+            store = Store()
+            keychain.rename_profile_slot(store, "ghost", "new")  # must not raise
+
+    def test_purge_removes_and_tolerates_missing(self):
+        with isolated_store_env():
+            store = Store()
+            keychain.save_profile_slot(store, "gone", b"tok")
+            keychain.purge_profile_slot(store, "gone")
+            self.assertIsNone(keychain.load_profile_slot(store, "gone"))
+            keychain.purge_profile_slot(store, "gone")  # idempotent
+
+
+class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
+    """The waited-child path (login/sandbox) must release the session lock
+    in the parent: the child's inherited fd dies with it, but a parent that
+    keeps running would leave the profile looking busy."""
+
+    def test_lock_released_after_waited_child(self):
+        import os
+        import sys
+        from unittest import mock
+
+        from agydra import locks, platforms
+
+        with isolated_store_env():
+            os.environ["AGYDRA_NO_KEYCHAIN"] = "1"
+            os.environ["AGYDRA_AGY_BIN"] = sys.executable
+            try:
+                store = Store()
+                store.create("work")
+                plan = runner.build_plan(
+                    store, [], flag_ref="work", launch_as_child=True
+                )
+                with mock.patch.object(
+                    platforms, "run_wait", return_value=0
+                ) as run_wait:
+                    rc = runner.run(plan, store=store)
+                self.assertEqual(rc, 0)
+                run_wait.assert_called_once()
+                self.assertFalse(locks.is_locked(store, "work"))
+            finally:
+                os.environ.pop("AGYDRA_NO_KEYCHAIN", None)
+                os.environ.pop("AGYDRA_AGY_BIN", None)
 
 
 if __name__ == "__main__":

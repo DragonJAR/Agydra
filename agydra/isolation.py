@@ -49,9 +49,8 @@ def _link(target: Path, link: Path) -> None:
     POSIX: ``os.symlink`` (works for files and directories, no privileges).
     Windows (admin / Dev Mode): ``os.symlink`` same as POSIX.
     Windows (no privileges, directory target): ``mklink /J`` junction.
-    Windows (no privileges, file target): ``os.link`` hardlink within the
-        same NTFS volume (HOME and APPDATA usually share one); raises
-        ``OSError`` when the target is on a different volume.
+    Windows (no privileges, file target): ``shutil.copy2`` — a hardlink
+        shares the inode and would break per-profile isolation.
     """
     if not platforms.is_windows():
         os.symlink(target, link)
@@ -77,8 +76,10 @@ def _link(target: Path, link: Path) -> None:
                 f"(rc={result.returncode}): {detail}"
             )
         return
-    # File target: try a hardlink (no privileges needed, same NTFS volume).
-    os.link(target, link)
+    # File target: copy instead of hardlinking — a hardlink shares the
+    # inode, so a write through one profile's HOME would mutate the other
+    # profile's copy (isolation break).
+    shutil.copy2(target, link)
 
 
 def link_points_to(link: Path, target: Path) -> bool:

@@ -162,25 +162,10 @@ class TestReservedProfileNames(BaseCase):
         self.store.create("personal")
         self.store.create("work-lab_2")
 
-    def test_legacy_profile_reachable_via_p_flag(self):
-        # Pre-existing reserved names are NOT retroactively refused: seed
-        # a `status` profile on disk (as an older agydra would have left)
-        # and verify it stays visible, resolvable and creatable-never.
-        import json
-
-        legacy = self.store.profiles_dir / "status"
-        legacy.mkdir(parents=True, exist_ok=True)
-        (legacy / "data").mkdir(exist_ok=True)
-        (legacy / "profile.json").write_text(
-            json.dumps({"name": "status", "seq": 1, "created": "2026-01-01T00:00:00Z"}),
-            encoding="utf-8",
-        )
-        # Visible in list() / names() — not silently dropped as unreadable.
-        self.assertIn("status", self.store.names())
-        self.assertEqual(self.store.unreadable_profiles(), [])
-        # Resolvable: the -p escape hatch keeps the profile usable.
-        self.assertEqual(self.store.resolve_ref("status"), "status")
-        # But creating a NEW one with the same (still reserved) name fails.
+    def test_create_refuses_reserved_subcommand_name(self):
+        # Reserved names collide with the dispatcher (bare `agydra <name>`
+        # always runs the subcommand, so the profile would be unreachable);
+        # refuse at create.
         with self.assertRaises(StoreError):
             self.store.create("status")
 

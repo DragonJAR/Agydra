@@ -3,10 +3,9 @@
 The authoritative on-disk token file for agy 1.2.7 is
 ``<data>/antigravity-cli/antigravity-oauth-token`` (JSON:
 ``{"auth_method": str, "token": {access_token, refresh_token, expiry, ...}}``).
-The older ``oauth_creds.json`` layout is kept as a legacy alias.
 
-On macOS the token file can be stale while the live copy sits in the Keychain
-(shared fixed slot), so ``auth_state`` falls back to the keychain bridge.
+On macOS the live token can sit in the profile's Keychain slot while the
+on-disk file is stale, so ``auth_state`` falls back to the keychain bridge.
 """
 from __future__ import annotations
 
@@ -19,8 +18,7 @@ from typing import Optional
 from . import platforms
 
 AGY_CLI_DIR = "antigravity-cli"
-OAUTH_FILE = "oauth_creds.json"  # legacy layout
-TOKEN_FILE = "antigravity-oauth-token"  # current layout
+TOKEN_FILE = "antigravity-oauth-token"  # current (and only) layout
 
 
 def _read_json(path: Path):
@@ -47,15 +45,15 @@ def _decode_jwt_payload(token: str) -> dict:
 
 def _oauth_obj(data_dir: Path):
     """Token JSON among the known layouts, or None."""
-    for path in (data_dir / AGY_CLI_DIR / TOKEN_FILE, data_dir / OAUTH_FILE):
-        if not path.is_file():
-            continue
-        raw = _read_json(path)
-        if isinstance(raw, dict):
-            yield raw
-        elif raw is not None:
-            # oauth_creds.json-style file holding the token itself
-            yield {"token": raw}
+    path = data_dir / AGY_CLI_DIR / TOKEN_FILE
+    if not path.is_file():
+        return
+    raw = _read_json(path)
+    if isinstance(raw, dict):
+        yield raw
+    elif raw is not None:
+        # Token-file holding the token itself (older alias shape).
+        yield {"token": raw}
 
 
 def detect_email(data_dir: Path) -> Optional[str]:
@@ -76,15 +74,12 @@ def detect_email(data_dir: Path) -> Optional[str]:
     return None
 
 
-def _macos_keychain_authenticated(
-    store, name, profile_count: Optional[int] = None
-) -> Optional[bool]:
-    """macOS fallback: the profile's keychain slot (or, for a single-profile
-    store created before the bridge existed, the shared slot) is present.
+def _macos_keychain_authenticated(store, name) -> Optional[bool]:
+    """macOS fallback: the profile's keychain slot is present.
 
-    ``profile_count`` lets callers that already scanned the store (list,
-    doctor, resolver) pass the cardinality in; without it the single-profile
-    fallback would re-glob the whole store once per listed row."""
+    Legacy single-profile stores (pre-bridge) are not special-cased anymore:
+    the shared-slot fallback could attribute another profile's token to a
+    store that had never used the bridge."""
     if not platforms.is_macos():
         return None
     try:
@@ -94,10 +89,6 @@ def _macos_keychain_authenticated(
             return None
         if name and keychain.load_profile_slot(store, name) is not None:
             return True
-        if profile_count is None and store is not None:
-            profile_count = len(store.names())
-        if store is not None and profile_count == 1:
-            return keychain.read_slot(keychain.shared_slot()) is not None
         return False
     except Exception:  # defensive: detection must never break listing
         return None
@@ -107,14 +98,11 @@ def auth_state(
     data_dir: Path,
     store=None,
     name: Optional[str] = None,
-    profile_count: Optional[int] = None,
 ) -> str:
     """'authenticated' | 'not-authenticated' from whichever backend is live.
 
     ``store``/``name`` enable the precise per-profile keychain lookup on
     macOS; without them only the on-disk token file is consulted.
-    ``profile_count`` is the store's profile cardinality, so callers holding
-    a scan can spare the fallback a re-glob.
     """
     for raw in _oauth_obj(data_dir):
         token = raw.get("token") if isinstance(raw.get("token"), dict) else raw
@@ -122,7 +110,7 @@ def auth_state(
             token.get("access_token") or token.get("refresh_token")
         ):
             return "authenticated"
-    if _macos_keychain_authenticated(store, name, profile_count):
+    if _macos_keychain_authenticated(store, name):
         return "authenticated"
     return "not-authenticated"
 
@@ -139,7 +127,7 @@ def sync_profile_email(store, name: str) -> Optional[str]:
 
     profile = store.get(name)
     email = detect_email(store.profile_data_dir(name))
-    if email and email != profile.email:
+    if email:
         if locks.is_locked(store, name):
             return email  # a live session owns the metadata now
         profile.email = email

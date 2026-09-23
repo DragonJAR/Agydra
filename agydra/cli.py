@@ -9,11 +9,11 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import __version__, account, keychain, locks, platforms, resolver, runner, vocab
+from . import __version__, account, banner, keychain, locks, platforms, resolver, runner, vocab
 from .bootstrap import BootstrapError
 from .isolation import IsolationError
 from .store import Store, StoreError, _rename_dir_with_retry, atomic_copy
-from .ui import error as _error, note as _note, paint, paint_each, strip_ansi
+from .ui import error as _error, note as _note, paint, paint_each
 
 
 class ColoredHelpFormatter(argparse.HelpFormatter):
@@ -273,7 +273,6 @@ def cmd_list(store: Store, _args) -> int:
             email = account.sync_profile_email(store, profile.name) or "-"
         state = account.auth_state(
             store.profile_data_dir(profile.name), store, profile.name,
-            profile_count=len(profiles),
         )
         is_default = paint("*", "green", "bold") if profile.name == default else ""
         # Column values carry semantic state: green when usable, yellow when
@@ -307,10 +306,8 @@ def cmd_create(store: Store, args) -> int:
 
 
 def cmd_login(store: Store, args) -> int:
-    from . import resolver as _resolver
-
     if args.ref is None:
-        name = _resolver.resolve(store).name
+        name = resolver.resolve(store).name
     else:
         name = store.resolve_ref(args.ref)
     # Login writes this profile's credentials (and captures the shared macOS
@@ -352,7 +349,11 @@ def cmd_status(store: Store, args) -> int:
         print(plan.describe())
         return 0
     data_dir = store.profile_data_dir(plan.profile)
-    email = account.detect_email(data_dir) or "-"
+    # Cache-first: metadata answers instantly; the token files are only
+    # scanned when the cache is empty. Status stays strictly read-only —
+    # it never writes the cache back.
+    profile = store.get(plan.profile)
+    email = profile.email or account.detect_email(data_dir) or "-"
     state = account.auth_state(data_dir, store, plan.profile)
     print(f"profile   : {plan.profile}")
     print(f"reason    : {plan.reason}")
@@ -380,6 +381,7 @@ def cmd_rename(store: Store, args) -> int:
     _assert_free(store, old)
     profile = store.rename(old, args.new)
     locks.forget(store, old)
+    keychain.rename_profile_slot(store, old, profile.name)
     print(f"renamed {old!r} -> {profile.name!r}")
     return 0
 
@@ -400,6 +402,7 @@ def cmd_delete(store: Store, args) -> int:
         return 1
     backup = store.delete(name, backup=not args.no_backup)
     locks.forget(store, name)
+    keychain.purge_profile_slot(store, name)
     if backup:
         print(f"backup saved: {backup}")
     print(f"deleted profile: {name}")
@@ -434,11 +437,18 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
 
 def cmd_share_config(store: Store, args) -> int:
     src = store.resolve_ref(args.src)
+    # A self-target is not an error but must not be silent: `share-config
+    # work work` skipping itself reads as "copied nothing" otherwise.
+    self_targets = [
+        t for t in args.targets if store.resolve_ref(t) == src
+    ]
+    if self_targets:
+        print(f"skipped: {src} is both source and target (nothing to copy)")
     copied = _share_config(store, src, args.targets)
     if copied:
         for entry in copied:
             print(f"copied: {entry}")
-    else:
+    elif not self_targets:
         print("nothing to copy (missing settings.json/mcp.json in source)")
     return 0
 
@@ -634,6 +644,9 @@ def _report_error(exc: BaseException) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # Banner first, to stderr, at most once per process: interactive users
+    # see the logo; pipes/redirects (scripts, CI, tests) never do.
+    banner.show()
     raw = list(sys.argv[1:] if argv is None else argv)
     store = Store()
 

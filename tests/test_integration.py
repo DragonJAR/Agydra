@@ -46,7 +46,9 @@ class TestIntegration(BaseCase):
         lab_wrote = self.store.profile_data_dir("lab") / "fake-agy-wrote"
         self.assertTrue(work_wrote.exists() and lab_wrote.exists())
         # generic marker untouched by both
-        self.assertTrue((self.fake_home / ".gemini" / "oauth_creds.json").exists())
+        self.assertTrue(
+            (self.fake_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").exists()
+        )
 
     def test_dry_run_prints_plan_and_executes_nothing(self):
         result = self._run_cli("-p", "work", "--dry-run", "anything")
@@ -107,14 +109,18 @@ class TestIntegration(BaseCase):
         src = self.store.profile_data_dir("work")
         (src / "settings.json").write_text('{"a": 1}', encoding="utf-8")
         (src / "mcp.json").write_text('{"b": 2}', encoding="utf-8")
-        (src / "oauth_creds.json").write_text('{"c": 3}', encoding="utf-8")
+        (src / "antigravity-cli").mkdir(parents=True, exist_ok=True)
+        (src / "antigravity-cli" / "antigravity-oauth-token").write_text(
+            '{"c": 3}', encoding="utf-8"
+        )
         result = self._run_cli("share-config", "work", "lab")
         self.assertEqual(result.returncode, 0, result.stderr)
         lab = self.store.profile_data_dir("lab")
         self.assertTrue((lab / "settings.json").exists())
         self.assertTrue((lab / "mcp.json").exists())
         self.assertFalse(
-            (lab / "oauth_creds.json").exists(), "credentials must never be shared"
+            (lab / "antigravity-cli" / "antigravity-oauth-token").exists(),
+            "credentials must never be shared",
         )
 
     def test_readonly_commands_create_nothing(self):
@@ -161,7 +167,9 @@ class TestRandomProfileSelection(BaseCase):
         self.store.create("lab")
         # Both authenticated so -r has a free pool.
         for name in ("work", "lab"):
-            (self.store.profile_data_dir(name) / "oauth_creds.json").write_text(
+            cli_dir = self.store.profile_data_dir(name) / "antigravity-cli"
+            cli_dir.mkdir(parents=True, exist_ok=True)
+            (cli_dir / "antigravity-oauth-token").write_text(
                 '{"access_token": "tok"}', encoding="utf-8"
             )
 
@@ -183,14 +191,18 @@ class TestRandomProfileSelection(BaseCase):
 
     def test_r_skips_authenticated_only(self):
         # lab is unauthenticated; -r must fall back to work.
-        (self.store.profile_data_dir("lab") / "oauth_creds.json").unlink()
+        (
+            self.store.profile_data_dir("lab") / "antigravity-cli" / "antigravity-oauth-token"
+        ).unlink()
         result = self._run_cli("-r")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("PROFILE=work", result.stdout)
 
     def test_r_errors_when_none_authenticated(self):
         for name in ("work", "lab"):
-            (self.store.profile_data_dir(name) / "oauth_creds.json").unlink()
+            (
+                self.store.profile_data_dir(name) / "antigravity-cli" / "antigravity-oauth-token"
+            ).unlink()
         result = self._run_cli("-r")
         self.assertEqual(result.returncode, 1)
         self.assertIn("authenticate one with", result.stderr)
@@ -284,7 +296,8 @@ class TestImportFlow(BaseCase):
         self.store = Store()
         self.store.create("work")
         # BaseCase already provisions the fake home's generic ~/.gemini
-        # (oauth_creds.json), which auto-detect must find below.
+        # (antigravity-cli/antigravity-oauth-token), which auto-detect must
+        # find below.
 
     def test_path_as_ref_gets_corrective_error(self):
         # `agydra import ~/.gemini` must explain the fix, not say
@@ -298,11 +311,15 @@ class TestImportFlow(BaseCase):
     def test_import_copies_generic_into_profile(self):
         result = self._run_cli("import", "work")
         self.assertEqual(result.returncode, 0, result.stderr)
-        imported = self.store.profile_data_dir("work") / "oauth_creds.json"
+        imported = (
+            self.store.profile_data_dir("work") / "antigravity-cli" / "antigravity-oauth-token"
+        )
         self.assertTrue(imported.exists(), "generic data must land in the profile")
         self.assertEqual(result.returncode, 0)
         # Source must remain untouched (copy, never move).
-        self.assertTrue((self.fake_home / ".gemini" / "oauth_creds.json").exists())
+        self.assertTrue(
+            (self.fake_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").exists()
+        )
 
     def test_import_custom_source_flag(self):
         custom = self._tmp / "custom-src"

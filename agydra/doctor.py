@@ -67,7 +67,7 @@ def _check_profiles(store: Store, ctx: "_DoctorContext"):
             lines.append(f"  - {p.name}: DATA DIR MISSING")
             continue
         state = account.auth_state(
-            data_dir, store, p.name, profile_count=ctx.profile_count
+            data_dir, store, p.name,
         )
         lines.append(f"  - {p.name}: {state}")
     default = store.default_name()
@@ -152,13 +152,12 @@ def _check_schema_canary(store: Store, ctx: "_DoctorContext"):
     """Confirm profiles actually contain agy's data layout (schema unchanged).
 
     The authoritative on-disk layout is ``<data>/antigravity-cli/`` (the token
-    file lives inside it); ``oauth_creds.json`` is the legacy alias. Consumes
-    the doctor-wide scan — no re-glob of the store here.
+    file lives inside it). Consumes the doctor-wide scan — no re-glob of
+    the store here.
     """
     names = ctx.names
     any_data = any(
-        (store.profile_data_dir(n) / account.AGY_CLI_DIR).exists() or
-        (store.profile_data_dir(n) / account.OAUTH_FILE).exists()
+        (store.profile_data_dir(n) / account.AGY_CLI_DIR).exists()
         for n in names
     )
     if not names:

@@ -83,10 +83,13 @@ class BaseCase(unittest.TestCase):
         if sys.platform.startswith("win"):
             os.environ["USERPROFILE"] = str(self.fake_home)
 
-        # Seed a generic ~/.gemini like a real logged-in user would have.
-        (self.fake_home / ".gemini").mkdir()
-        (self.fake_home / ".gemini" / "oauth_creds.json").write_text(
-            '{"access_token": "generic-token"}', encoding="utf-8"
+        # Seed a generic ~/.gemini like a real logged-in user would have,
+        # in agy 1.2.7's actual layout (token inside antigravity-cli/).
+        generic = self.fake_home / ".gemini" / "antigravity-cli"
+        generic.mkdir(parents=True)
+        (generic / "antigravity-oauth-token").write_text(
+            '{"access_token": "generic-token", "refresh_token": "generic-r"}',
+            encoding="utf-8",
         )
         (self.fake_home / ".gemini" / "google_accounts.json").write_text(
             '{"active": "generic@example.com"}', encoding="utf-8"

@@ -163,7 +163,6 @@ def pick_free_profile(store, cwd: Optional[Path] = None) -> Resolution:
         p for p in free
         if account.auth_state(
             store.profile_data_dir(p.name), store, p.name,
-            profile_count=len(profiles),
         )
         == "authenticated"
     ]

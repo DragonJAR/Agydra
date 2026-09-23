@@ -23,8 +23,11 @@ pre-bridge behavior (no swap) with a loud warning, it never breaks a launch.
 """
 from __future__ import annotations
 
+import os
 import shutil
+import signal
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -57,6 +60,10 @@ class KeychainError(RuntimeError):
 
 
 def supported() -> bool:
+    # AGYDRA_NO_KEYCHAIN mirrors the AGYDRA_* env kill-switch pattern: one
+    # variable disables the whole bridge (CI, broken Security Agents).
+    if os.environ.get("AGYDRA_NO_KEYCHAIN"):
+        return False
     return platforms.is_macos() and shutil.which("security") is not None
 
 
@@ -69,12 +76,44 @@ def shared_slot() -> str:
     return SHARED_SERVICE
 
 
+#: Seconds before a hung `security` child is killed. The Security Agent's
+#: grandchild can inherit the pipe write-ends and block `communicate()`
+#: forever, so stdout/stderr go to temp files (never pipes) and the whole
+#: process group is killed on timeout — a hung dialog must degrade to
+#: fail-open, not hang every launch.
+KEYCHAIN_TIMEOUT_S = 2.0
+
+
 def _run(args, input_bytes: Optional[bytes] = None) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["security", *args],
-        input=input_bytes,
-        capture_output=True,
-    )
+    out_fh = tempfile.TemporaryFile()
+    err_fh = tempfile.TemporaryFile()
+    try:
+        proc = subprocess.Popen(
+            ["security", *args],
+            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+            stdout=out_fh,
+            stderr=err_fh,
+            start_new_session=True,
+        )
+        try:
+            proc.communicate(input_bytes, timeout=KEYCHAIN_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            # The child spawned its own session: kill the group, not just the
+            # direct child, or the Security Agent grandchild survives.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            proc.communicate()
+            return subprocess.CompletedProcess(args, returncode=-1)
+        out_fh.seek(0)
+        err_fh.seek(0)
+        return subprocess.CompletedProcess(args, proc.returncode, out_fh.read(), err_fh.read())
+    except OSError as exc:
+        return subprocess.CompletedProcess(args, returncode=-1, stderr=str(exc).encode())
+    finally:
+        out_fh.close()
+        err_fh.close()
 
 
 def read_slot(service: str, keychain_path: Optional[Path] = None) -> Optional[bytes]:
@@ -332,35 +371,22 @@ def launch_guard(store, profile: str, capture: bool = False):
     return _Guard()
 
 
-def capture_shared_slot(store, name: str) -> bool:
-    """Persist the current shared slot as ``name``'s profile slot.
-
-    Called right after a successful login: whatever agy just wrote into the
-    shared slot belongs to this profile. Returns True when a slot was saved.
-    """
-    keychain_path = _ensure_target_keychain(store)
-    data = read_slot(shared_slot(), keychain_path)
-    if data is None:
-        return False
-    save_profile_slot(store, name, data)
-    return True
-
-
-def clear_shared_slot(store) -> None:
-    """Delete the shared slot when no live session depends on it."""
-    if not supported():
+def rename_profile_slot(store, old_name: str, new_name: str) -> None:
+    """Rename a profile's keychain slot file (rename keeps the token)."""
+    old = slot_backup_path(store, old_name)
+    if not old.exists():
         return
-    from . import locks
+    new = slot_backup_path(store, new_name)
+    new.parent.mkdir(parents=True, exist_ok=True)
+    old.replace(new)
 
-    if locks.in_use_names(store):
-        return
+
+def purge_profile_slot(store, name: str) -> None:
+    """Delete a profile's keychain slot file (delete must not leak it)."""
     try:
-        with _serialize_lock(store):
-            keychain_path = _ensure_target_keychain(store)
-            if keychain_path is not None:
-                delete_slot(shared_slot(), keychain_path)
-    except (KeychainError, OSError) as exc:
-        warn(f"could not clear shared keychain slot ({exc})")
+        slot_backup_path(store, name).unlink(missing_ok=True)
+    except OSError as exc:
+        warn(f"could not purge keychain slot for {name!r} ({exc})")
 
 
 def describe(store, names: Optional[List[str]] = None) -> Dict[str, object]:
