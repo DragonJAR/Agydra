@@ -13,8 +13,8 @@ from agydra import __version__
 import account, banner, keychain, locks, platforms, resolver, runner, vocab
 from bootstrap import BootstrapError
 from isolation import IsolationError
-from store import Store, StoreError, _rename_dir_with_retry, atomic_copy
-from ui import error as _error, note as _note, paint, paint_each
+from store import Store, StoreError, _rename_dir_with_retry, atomic_copy, atomic_write_bytes
+from ui import error as _error, note as _note, pad, paint, paint_each
 
 
 class ColoredHelpFormatter(argparse.HelpFormatter):
@@ -55,17 +55,32 @@ class ColoredHelpFormatter(argparse.HelpFormatter):
 # what an agydra flag is. Only flags appearing BEFORE the first non-flag
 # token are consumed; later ones belong to agy (agy itself uses -p/--print).
 # ---------------------------------------------------------------------------
-_LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool]] = {
-    "profile": ("-p", "--profile", True),
-    "random": ("-r", "--random", False),
-    "dry-run": ("-n", "--dry-run", False),
-    "binary": ("-b", "--binary", True),
+# The trailing (metavar, help) pair also feeds build_parser's add_argument
+# calls, so the launcher's --help text can never drift from this table
+# either.
+_LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
+    "profile": (
+        "-p", "--profile", True, "PROFILE",
+        "profile name or 1-based number (see: agydra list)",
+    ),
+    "random": (
+        "-r", "--random", False, None,
+        "pick a free authenticated profile automatically (needs 2+ profiles)",
+    ),
+    "dry-run": (
+        "-n", "--dry-run", False, None,
+        "print the launch plan (argv + env) without executing anything",
+    ),
+    "binary": (
+        "-b", "--binary", True, "PATH",
+        "path to the real agy binary (overrides config and PATH lookup)",
+    ),
 }
 # Short spelling -> (canonical key, takes_value), derived once from the flag
 # table so the bundle path and the table can never disagree (DRY).
 _SHORT_TO_FLAG: Dict[str, Tuple[str, bool]] = {
     short: (key, takes_value)
-    for key, (short, _long, takes_value) in _LAUNCH_FLAGS.items()
+    for key, (short, _long, takes_value, _metavar, _help) in _LAUNCH_FLAGS.items()
 }
 
 # Canonical subcommand vocabulary lives in vocab.py: the dispatcher and the
@@ -86,26 +101,14 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=ColoredHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"agydra {__version__}")
-    parser.add_argument(
-        "-p", "--profile",
-        metavar="PROFILE",
-        help="profile name or 1-based number (see: agydra list)",
-    )
-    parser.add_argument(
-        "-r", "--random",
-        action="store_true",
-        help="pick a free authenticated profile automatically (needs 2+ profiles)",
-    )
-    parser.add_argument(
-        "-n", "--dry-run",
-        action="store_true",
-        help="print the launch plan (argv + env) without executing anything",
-    )
-    parser.add_argument(
-        "-b", "--binary",
-        metavar="PATH",
-        help="path to the real agy binary (overrides config and PATH lookup)",
-    )
+    # Generated from _LAUNCH_FLAGS (in its insertion order: -p, -r, -n, -b)
+    # so the launcher's --help text can never disagree with the extractor
+    # and the late-flag warning about what an agydra flag is.
+    for _key, (short, long_, takes_value, metavar, help_text) in _LAUNCH_FLAGS.items():
+        if takes_value:
+            parser.add_argument(short, long_, metavar=metavar, help=help_text)
+        else:
+            parser.add_argument(short, long_, action="store_true", help=help_text)
     return parser
 
 
@@ -122,7 +125,7 @@ def _match_flag(token: str) -> Optional[List[Tuple[str, object, int]]]:
     anywhere rejects the WHOLE token, so an unrelated bundle like ``-rx``
     is never partially consumed — it is simply agy's.
     """
-    for key, (short, long_, takes_value) in _LAUNCH_FLAGS.items():
+    for key, (short, long_, takes_value, _metavar, _help) in _LAUNCH_FLAGS.items():
         if takes_value:
             if token == short or token == long_:
                 return [(key, None, 2)]
@@ -134,11 +137,18 @@ def _match_flag(token: str) -> Optional[List[Tuple[str, object, int]]]:
             return [(key, True, 1)]
     if token.startswith("-") and not token.startswith("--") and len(token) >= 3:
         matches: List[Tuple[str, object, int]] = []
+        seen: set = set()
         for pos, char in enumerate(token[1:], start=1):
             hit = _SHORT_TO_FLAG.get("-" + char)
             if hit is None:
                 return None  # unknown letter: the whole token is agy's
             key, takes_value = hit
+            if key in seen:
+                # A letter repeated INSIDE one bundle (-rnr, -rr) must not be
+                # partially consumed AND forwarded: treat the whole token as
+                # opaque, same as an unknown letter, so it goes to agy whole.
+                return None
+            seen.add(key)
             if takes_value:
                 inline = token[pos + 1:]
                 if inline:
@@ -201,7 +211,7 @@ def _warn_late_flags(values: Dict[str, object], raw: Sequence[str]) -> None:
     every spelling (attached ``-pwork``, ``--profile=x``, separated ``-p x``,
     bundled ``-rp work``).
     """
-    for key, (short, long_, takes_value) in _LAUNCH_FLAGS.items():
+    for key, (short, long_, takes_value, _metavar, _help) in _LAUNCH_FLAGS.items():
         if not takes_value or values[key] is not None:
             continue  # consumed by agydra, or a boolean: no confusion risk
         for i, token in enumerate(raw):
@@ -277,8 +287,9 @@ def cmd_list(store: Store, _args) -> int:
         )
         is_default = paint("*", "green", "bold") if profile.name == default else ""
         # Column values carry semantic state: green when usable, yellow when
-        # busy, dim for absent data. Alignment is preserved by painting AFTER
-        # the f-string layout is computed.
+        # busy, dim for absent data. Painted cells must be padded with
+        # ui.pad, never the f-string :<width spec — it counts the ANSI
+        # bytes as visible width and shifts every following column.
         state_color = (
             "green" if state == "authenticated"
             else "yellow" if state != "not-authenticated"
@@ -288,8 +299,8 @@ def cmd_list(store: Store, _args) -> int:
         busy_shown = paint("yes", "yellow", "bold") if busy else "-"
         last = paint(profile.last_used or "-", "dim")
         print(
-            f"{idx:<3}{profile.name:<{width + 2}}{email:<34}{state_shown:<20}"
-            f"{is_default:<9}{busy_shown:<6}{last}"
+            f"{idx:<3}{profile.name:<{width + 2}}{email:<34}"
+            f"{pad(state_shown, 20)}{pad(is_default, 9)}{pad(busy_shown, 6)}{last}"
         )
     return 0
 
@@ -335,8 +346,9 @@ def cmd_login(store: Store, args) -> int:
     # It runs as a waited child (not exec) so the guard's exit runs inside
     # runner.run, right after agy exits.
     plan = runner.build_plan(store, [], flag_ref=name, launch_as_child=True)
-    print(f"launching agy for login under profile {plan.profile!r}...")
-    print("complete the OAuth flow in the browser; tokens land in the profile store")
+    if not args.dry_run:
+        print(f"launching agy for login under profile {plan.profile!r}...")
+        print("complete the OAuth flow in the browser; tokens land in the profile store")
     return runner.run(plan, store=store, dry_run=args.dry_run)
 
 
@@ -518,7 +530,7 @@ def cmd_use(store: Store, args) -> int:
     """Write the project marker ``.agydra`` so this directory pins a profile."""
     name = store.resolve_ref(args.ref)
     marker = Path.cwd() / resolver.MARKER_FILE
-    marker.write_text(name + "\n", encoding="utf-8")
+    atomic_write_bytes(marker, (name + "\n").encode("utf-8"))
     print(f"pinned {marker} -> profile {name!r}")
     print(f"agy launches in this directory will use {name!r} automatically")
     return 0
@@ -759,7 +771,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args = parser.parse_args(rest)
         try:
             return args.func(store, args)
-        except (StoreError, IsolationError, EOFError, OSError, KeyboardInterrupt) as exc:
+        except (
+            StoreError, IsolationError, BootstrapError, EOFError, OSError,
+            KeyboardInterrupt,
+        ) as exc:
             return _report_error(exc)
 
     # Default: launcher mode — everything else is forwarded to agy.

@@ -98,11 +98,34 @@ def paint_each(
     return separator.join(chunks)
 
 
+def pad(painted: str, width: int) -> str:
+    """Left-align a possibly painted cell to a visible width of ``width``.
+
+    ``paint`` wraps text in ANSI codes whose bytes an f-string ``:<width``
+    spec counts as content, silently shifting every following column. This
+    is its companion: pad by visible width (``strip_ansi``) and, when the
+    cell ends in a reset code, move the filler outside the color span so
+    no invisible trailing spaces are emitted.
+    """
+    visible = len(strip_ansi(painted))
+    filler = " " * max(width - visible, 0)
+    if painted.endswith(RESET):
+        return painted[:-len(RESET)] + filler + RESET
+    return painted + filler
+
+
 _vt_done = False
 
 
 def _enable_windows_vt() -> None:
-    """Enable ANSI translation on legacy Windows consoles (idempotent)."""
+    """Enable ANSI translation on legacy Windows consoles (idempotent).
+
+    banner/warn/error/note all write to stderr, not just stdout: enabling VT
+    only on STD_OUTPUT_HANDLE left stderr emitting raw escape codes on
+    legacy conhost whenever stdout was redirected (piped/captured) but
+    stderr stayed attached to the console. Both handles share the one-shot
+    latch, so this still runs at most once per process.
+    """
     global _vt_done
     if _vt_done:
         return
@@ -111,10 +134,11 @@ def _enable_windows_vt() -> None:
         import ctypes
 
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-        mode = ctypes.c_uint32()
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        for std_handle in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(std_handle)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
     except Exception:
         pass  # Windows Terminal / CI: ANSI already pass-through
 

@@ -14,6 +14,7 @@ shim (see cmd_list / cmd_import):
 """
 import contextlib
 import io
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -22,7 +23,71 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from store import Store, StoreError  # noqa: E402
 
+from ui import strip_ansi  # noqa: E402
+
+import ui  # noqa: E402
+
 from conftest import BaseCase  # noqa: E402
+
+
+class TestListColumnsAlignWithColor(BaseCase):
+    """Colorized list must keep columns aligned.
+
+    Painted cells embed ANSI bytes that an f-string ``:<width`` spec counts
+    as visible width, so a green ``authenticated`` cell rendered with 20
+    bytes of padding and 13 visible chars shifted every following column.
+    The fix pads by visible width (``ui.pad``) and moves the filler outside
+    the color span.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        os.environ["FORCE_COLOR"] = "1"  # paint() activates without a TTY
+
+    def test_row_columns_align_with_header_under_color(self):
+        self.store.create("work")
+        # Force the painted-state path: a token in the profile's data dir
+        # makes auth_state return "authenticated" (green) — the exact cell
+        # shape that used to shift the columns.
+        data_dir = self.store.profile_data_dir("work") / "antigravity-cli"
+        data_dir.mkdir(parents=True)
+        (data_dir / "antigravity-oauth-token").write_text(
+            '{"access_token": "t"}', encoding="utf-8"
+        )
+        lines = self.capture_list()
+        plain_header, plain_row = strip_ansi(lines[0]), strip_ansi(lines[1])
+        # Column offsets come from the header; the row's visible values
+        # must land on exactly the same offsets.
+        auth_at = plain_header.index("AUTH")
+        default_at = plain_header.index("DEFAULT")
+        busy_at = plain_header.index("BUSY")
+        last_at = plain_header.index("LAST USED")
+        self.assertEqual(
+            plain_row.index("authenticated"), auth_at,
+            "AUTH column misaligned under color",
+        )
+        self.assertEqual(plain_row[default_at], "*")
+        self.assertEqual(plain_row[busy_at], "-")
+        self.assertEqual(plain_row[last_at], "-")
+
+    def test_ansi_padding_moves_filler_outside_color_span(self):
+        # Green cell padded to 20 visible chars: the filler must trail the
+        # color reset (no invisible colored spaces), and the next column
+        # starts exactly at offset 20.
+        cell = ui.pad(ui.paint("authenticated", "green"), 20)
+        self.assertTrue(cell.endswith(ui.RESET))
+        self.assertEqual(len(ui.strip_ansi(cell)), 20)
+        self.assertLess(cell.index(ui.RESET), len(cell) - 1)  # filler after reset
+
+    def capture_list(self):
+        import cli
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.cmd_list(self.store, None)
+        self.assertEqual(rc, 0)
+        return buf.getvalue().splitlines()
 
 
 class TestListHeaderNeverFusesColumns(BaseCase):
