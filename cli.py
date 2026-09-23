@@ -164,11 +164,13 @@ def _consume_launch_flags(
         if token == "--":
             rest.extend(argv[i + 1:])
             break
-        start = i
         matched = _match_flag(token)
         if matched is None:
             rest.extend(argv[i:])
             break
+        if any(values[key] is not None for key, _inline, _width in matched):
+            rest.extend(argv[i:])
+            return values, rest
         i += 1
         for key, inline, width in matched:
             if width == 2:
@@ -176,9 +178,6 @@ def _consume_launch_flags(
                     raise StoreError(f"{token} requires a value")
                 inline = argv[i]
                 i += 1
-            if values[key] is not None:
-                rest.extend(argv[start:])
-                return values, rest
             values[key] = inline if inline is not None else True
     return values, rest
 

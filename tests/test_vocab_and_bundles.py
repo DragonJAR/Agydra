@@ -86,7 +86,28 @@ class TestConsumeBundles(unittest.TestCase):
     def test_repeat_of_bundle_flag_forwards_whole_token(self):
         values, rest = _consume_launch_flags(["-p", "lab", "-np", "x"])
         self.assertEqual(values["profile"], "lab")
+        self.assertEqual(values["dry-run"], None)
         self.assertEqual(rest, ["-np", "x"])
+
+    def test_repeat_as_second_letter_leaks_no_earlier_mutation(self):
+        """``-fr`` repeats ``random`` (already consumed by a prior ``-r``) as
+        its SECOND letter; the whole token must forward untouched, so
+        ``force`` (its first letter) must stay unset rather than leaking a
+        partial mutation applied before the repeat was detected."""
+        values, rest = _consume_launch_flags(["-r", "-fr", "-n"])
+        self.assertEqual(values["random"], True)
+        self.assertEqual(values["force"], None)
+        self.assertEqual(values["dry-run"], None)
+        self.assertEqual(rest, ["-fr", "-n"])
+
+    def test_repeat_as_first_letter_forwards_whole_token(self):
+        """Symmetric case: ``-rf`` repeats ``random`` as its FIRST letter;
+        ``force`` (its second letter) must also stay unset."""
+        values, rest = _consume_launch_flags(["-r", "-rf", "-n"])
+        self.assertEqual(values["random"], True)
+        self.assertEqual(values["force"], None)
+        self.assertEqual(values["dry-run"], None)
+        self.assertEqual(rest, ["-rf", "-n"])
 
     def test_bundle_missing_value_raises(self):
         with self.assertRaises(StoreError):
