@@ -2,11 +2,17 @@
 
 The overlay is a directory that looks like the user's home to agy, except that
 ``<overlay>/.gemini`` links to the profile's private data directory. Every
-other top-level entry of the real home is mirrored as a link so agy keeps
-seeing ``.gitconfig``, ``.ssh`` and friends without copying anything.
+other real-home entry is mirrored so agy keeps seeing ``.gitconfig``, ``.ssh``
+and friends without copying anything: entries unrelated to the store are
+linked whole, while entries that sit on the ancestor chain leading to the
+store root (e.g. ``~/Library`` and ``~/Library/Application Support`` on
+macOS, when the store lives under one of them) get a REAL overlay directory
+instead, recursively mirrored one level deeper, so the store itself is never
+reachable through the overlay while unrelated siblings under that ancestor
+(``~/Library/Keychains``, other apps' data, ...) still are.
 
 Building the overlay is idempotent: each launch only adds missing links and
-repairs links that point to the wrong place.
+repairs links/ancestor directories that point to the wrong place.
 """
 from __future__ import annotations
 
@@ -15,9 +21,11 @@ import shutil
 import stat
 import subprocess
 from pathlib import Path
-from typing import Dict, List
+from typing import List, NamedTuple, Optional, Tuple
 
 import platforms
+
+_Identity = Optional[Tuple[int, int]]
 
 
 class IsolationError(Exception):
@@ -84,45 +92,157 @@ def link_points_to(link: Path, target: Path) -> bool:
         return False
 
 
-def _mirrorable_home_entries(real_home: Path, store_root: Path) -> Dict[Path, Path]:
-    """Single guarded pass over the real home: ``{resolved_path: entry}``.
+def _identity(path: Path) -> _Identity:
+    """Filesystem identity of ``path`` (follows symlinks), or ``None``.
 
-    Skips agy's real data dir, the store root and every home entry that is an
-    ancestor of the store root: with the default layouts the store lives under
-    ~/Library, ~/.local or LOCALAPPDATA, and mirroring those would give the
-    launched agy (and any subprocess it spawns) read/write access to every
-    other profile's credentials — breaking cross-profile isolation.
+    ``(st_dev, st_ino)`` is stable across case-insensitive spellings of the
+    same path (macOS APFS, Windows NTFS) and across symlink indirection,
+    unlike string comparison of ``Path.resolve()`` results — which does not
+    canonicalize case and would otherwise treat two differently-cased
+    spellings of the same directory as unrelated.
     """
-    store_resolved = store_root.resolve()
-    agy_data_resolved = platforms.agy_data_dir(real_home).resolve()
-    entries: Dict[Path, Path] = {}
     try:
-        children = list(real_home.iterdir())
+        st = os.stat(path)
     except OSError:
-        return entries
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _ancestor_chain(real_home: Path, store_root: Path) -> List[Path]:
+    """Ordered ancestors from ``real_home`` down to ``store_root`` inclusive.
+
+    Walks upward from ``store_root`` via ``.parent``, comparing filesystem
+    identity (not string equality) at each step against ``real_home`` — so a
+    differently-cased ``AGYDRA_HOME`` on a case-insensitive filesystem still
+    resolves to the correct chain. Empty when the store does not live under
+    the real home at all (nothing to protect via ancestor mirroring then).
+    """
+    home_identity = _identity(real_home)
+    if home_identity is None:
+        return []
+    chain = [store_root]
+    current = store_root
+    while _identity(current) != home_identity:
+        parent = current.parent
+        if parent == current:
+            return []
+        current = parent
+        chain.append(current)
+    chain.reverse()
+    return chain
+
+
+class _MirrorContext(NamedTuple):
+    chain_identities: List[_Identity]
+    store_resolved: Path
+    store_identity: _Identity
+    agy_data_identity: _Identity
+
+
+def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorContext) -> None:
+    """Mirror one level of ``real_dir`` into ``overlay_dir``, recursing only
+    along the ancestor chain that leads to the store root.
+
+    For each child of ``real_dir`` (identified by filesystem identity, i.e.
+    ``(st_dev, st_ino)``, never by string comparison — see ``_identity``):
+    - agy's real data dir or the store root itself: skipped — never linked,
+      never entered.
+    - the next ancestor in the chain (the entry that leads to the store
+      root): the overlay counterpart is forced to be a REAL directory
+      (created if missing; a stale link there is removed first since a link
+      would expose the store), then this routine recurses into it so every
+      level down to (but not including) the store root is a real directory
+      rather than a link. A real FILE sitting there, or a stale link that
+      cannot be removed, raises ``IsolationError`` instead of silently
+      leaking the store or writing into the real ancestor directory.
+    - any OTHER chain member (a symlink loop or alias pointing back at an
+      ancestor already on the chain, e.g. back at the real home itself):
+      skipped entirely — never linked, never recursed into. This also rules
+      out infinite recursion on symlink cycles.
+    - anything else: linked whole via ``_link``, reusing the existing
+      stale-link repair and "leave pre-existing real entries alone"
+      semantics, guarded by one extra string-based check that the resolved
+      target does not sit inside the store (defense in depth).
+
+    Only entries on the ancestor chain are ever recursed into — every other
+    subtree is linked at the shallowest safe level, so this is at most as
+    deep as the store root sits under the real home, with exactly one
+    ``iterdir()`` call per level and one ``stat()`` per entry.
+    """
+    try:
+        children = list(real_dir.iterdir())
+    except OSError:
+        return
+    next_identity = (
+        ctx.chain_identities[level + 1] if level + 1 < len(ctx.chain_identities) else None
+    )
     for entry in children:
+        identity = _identity(entry)
+        if identity is None:
+            continue
+        if identity == ctx.agy_data_identity or identity == ctx.store_identity:
+            continue
+        link = overlay_dir / entry.name
+        if next_identity is not None and identity == next_identity:
+            if _is_link(link):
+                try:
+                    link.unlink()
+                except OSError as exc:
+                    raise IsolationError(
+                        f"could not remove stale overlay link {link} to "
+                        f"mirror the real ancestor directory {entry}: {exc}"
+                    ) from exc
+            if link.exists() and not link.is_dir():
+                raise IsolationError(
+                    f"overlay entry {link} is a real file, not the "
+                    "expected mirrored directory; refusing to break "
+                    "isolation — remove it manually or recreate the profile"
+                )
+            platforms.ensure_dir(link)
+            _mirror_dir(entry, link, level + 1, ctx)
+            continue
+        if identity in ctx.chain_identities:
+            continue
         try:
             resolved = entry.resolve()
         except OSError:
             continue
-        if resolved == agy_data_resolved:
+        if resolved.is_relative_to(ctx.store_resolved):
             continue
-        if store_resolved == resolved or store_resolved.is_relative_to(resolved):
+        if _is_link(link):
+            if link.exists():
+                continue
+            try:
+                link.unlink()
+            except OSError:
+                continue
+        elif link.exists():
             continue
-        entries[resolved] = entry
-    return entries
+        try:
+            _link(entry, link)
+        except OSError:
+            continue
 
 
 def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
     """(Re)build the overlay for a profile and return its path.
 
     - ``<overlay>/.gemini`` links to ``data_dir`` (the profile store).
-    - Every other mirrorable top-level entry of the real home is linked,
-      except agy's real data dir, the store root and its ancestors.
+    - Every other real-home entry is mirrored: agy's real data dir and the
+      store root are skipped, entries on the ancestor chain to the store
+      root become real directories (recursively mirrored, see
+      ``_mirror_dir``), everything else is linked whole.
     """
     real_home = platforms.real_home()
     overlay = platforms.ensure_dir(store_root / "overlays" / name)
-    entries = _mirrorable_home_entries(real_home, store_root)
+    store_resolved = store_root.resolve()
+    chain = _ancestor_chain(real_home, store_root)
+    ctx = _MirrorContext(
+        chain_identities=[_identity(p) for p in chain],
+        store_resolved=store_resolved,
+        store_identity=_identity(store_root),
+        agy_data_identity=_identity(platforms.agy_data_dir(real_home)),
+    )
 
     gemini_link = overlay / platforms.AGY_DATA_DIR_NAME
     if _is_link(gemini_link) and not link_points_to(gemini_link, data_dir):
@@ -140,21 +260,7 @@ def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
             if not link_points_to(gemini_link, data_dir):
                 raise
 
-    for entry in entries.values():
-        link = overlay / entry.name
-        if _is_link(link):
-            if link.exists():
-                continue
-            try:
-                link.unlink()
-            except OSError:
-                continue
-        elif link.exists():
-            continue
-        try:
-            _link(entry, link)
-        except OSError:
-            continue
+    _mirror_dir(real_home, overlay, 0, ctx)
     return overlay
 
 

@@ -170,7 +170,7 @@ OAuth tokens are never copied
 
 | Mechanism | Description |
 |---|---|
-| Home overlay | `<overlay>/.gemini` → profile store; rest of home mirrored by links |
+| Home overlay | `<overlay>/.gemini` → profile store; unrelated home entries mirrored by links, entries that are ancestors of the store root (e.g. `~/Library` on macOS) mirrored as real directories so the store stays unreachable |
 | Real `~/.gemini` | NEVER touched by agydra |
 | No interception | `agy` is launched as-is, only with redirected home |
 | Session locks | Kernel-held (flock fd into exec / msvcrt byte-range); no stale locks |

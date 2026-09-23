@@ -184,7 +184,7 @@ copied: personal/mcp.json
 
 | Capacidad | Detalle |
 |---|---|
-| Home overlay por perfil | `<overlay>/.gemini` enlaza al almacén privado; el resto del home real se refleja con enlaces. |
+| Home overlay por perfil | `<overlay>/.gemini` enlaza al almacén privado; las entradas del home no relacionadas se reflejan con enlaces, y las que son ancestras del store (p. ej. `~/Library` en macOS) se reflejan como directorios reales para que el store nunca quede accesible. |
 | `~/.gemini` real intacto | `agydra` nunca escribe en el directorio de datos genérico ni intercepta `agy`. |
 | Locks kernel-held | POSIX `flock` con fd heredable llevado en `execvpe` / Windows `msvcrt` byte-range: sin locks huérfanos; `delete`/`rename` rechazan perfiles ocupados. |
 | Escrituras atómicas | Toda escritura de JSON/config usa tmp + fsync + `os.replace`. |
