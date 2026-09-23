@@ -1,4 +1,6 @@
 """Lightweight checks for the keychain bridge naming and descriptor shape."""
+import base64
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,6 +27,42 @@ class TestKeychainNames(unittest.TestCase):
         report = keychain.describe(None)
         self.assertIn("supported", report)
         self.assertIsInstance(report["supported"], bool)
+
+
+class TestDecodeGoKeyringSecret(unittest.TestCase):
+    """The private keychain slot backup is go-keyring-encoded; this decode
+    is the ONE place that knows that format (keychain.py owns it)."""
+
+    def test_go_keyring_base64_prefixed_form_is_decoded(self):
+        payload = json.dumps({"id_token": "x", "auth_method": "consumer"}).encode()
+        data = b"go-keyring-base64:" + base64.b64encode(payload)
+        self.assertEqual(
+            keychain.decode_go_keyring_secret(data),
+            {"id_token": "x", "auth_method": "consumer"},
+        )
+
+    def test_plain_json_bytes_is_decoded(self):
+        data = json.dumps({"a": 1}).encode()
+        self.assertEqual(keychain.decode_go_keyring_secret(data), {"a": 1})
+
+    def test_garbage_bytes_return_none(self):
+        self.assertIsNone(keychain.decode_go_keyring_secret(b"not json at all"))
+
+    def test_garbage_after_go_keyring_prefix_returns_none(self):
+        self.assertIsNone(
+            keychain.decode_go_keyring_secret(b"go-keyring-base64:!!!not-base64!!!")
+        )
+
+    def test_base64_of_non_json_returns_none(self):
+        data = b"go-keyring-base64:" + base64.b64encode(b"not json")
+        self.assertIsNone(keychain.decode_go_keyring_secret(data))
+
+    def test_non_dict_json_returns_none(self):
+        data = json.dumps(["a", "list", "not", "a", "dict"]).encode()
+        self.assertIsNone(keychain.decode_go_keyring_secret(data))
+
+    def test_none_input_returns_none(self):
+        self.assertIsNone(keychain.decode_go_keyring_secret(None))
 
 
 class _StoreStub:

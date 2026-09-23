@@ -30,6 +30,9 @@ pre-bridge behavior (no swap) with a loud warning, it never breaks a launch.
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import os
 import shutil
 import signal
@@ -180,6 +183,35 @@ def load_profile_slot(store, name: str) -> Optional[bytes]:
         return path.read_bytes()
     except OSError:
         return None
+
+
+_GO_KEYRING_PREFIX = b"go-keyring-base64:"
+
+
+def decode_go_keyring_secret(data: Optional[bytes]) -> Optional[dict]:
+    """Decode a private keychain slot backup into its token JSON.
+
+    The macOS keychain bridge (``keyring``/go-keyring, used by `agy`'s
+    login flow) stores secrets as ``b"go-keyring-base64:" + base64(json)``;
+    a plain JSON byte string is accepted too, for forward compatibility.
+    Never raises -- any unrecognized shape or decode failure returns None
+    so callers can treat it as "no token here" instead of crashing a
+    read-only path like `list`/`status`.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    payload = bytes(data)
+    if payload.startswith(_GO_KEYRING_PREFIX):
+        payload = payload[len(_GO_KEYRING_PREFIX):]
+        try:
+            payload = base64.b64decode(payload, validate=False)
+        except (binascii.Error, ValueError):
+            return None
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
 
 
 def _serialize_lock(store):

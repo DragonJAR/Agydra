@@ -1,4 +1,6 @@
 """Integration: agydra launches agy with the overlay; the generic store is never touched."""
+import base64
+import json
 import os
 import subprocess
 import sys
@@ -11,6 +13,14 @@ import account, locks, platforms
 from store import Store
 
 from conftest import BaseCase
+
+
+def _make_jwt(claims: dict) -> str:
+    """Minimal unsigned JWT: only the payload segment is ever decoded."""
+    def seg(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    return f"{seg({'alg': 'none', 'typ': 'JWT'})}.{seg(claims)}.sig"
 
 
 class TestIntegration(BaseCase):
@@ -145,6 +155,47 @@ class TestIntegration(BaseCase):
         )
         self.assertEqual(account.sync_profile_email(self.store, "work"), None)
         self.assertEqual(self.store.get("work").email, None)
+
+    def test_list_shows_email_for_keychain_only_profile(self):
+        """A profile created through the macOS keychain bridge (e.g. after
+        `agydra login`) can have NO on-disk token file at all -- its email
+        must still show up in `agydra list`, sourced from the private
+        keychain slot backup (`<store>/keychain/<name>.secret`).
+
+        `conftest.py` sets `AGYDRA_NO_KEYCHAIN=1` for every test (so no
+        BaseCase test touches a real `security` call by accident); this one
+        opts back in, since the code path under test never shells out to
+        `security` at all -- it only reads the `.secret` backup file."""
+        if not platforms.is_macos():
+            self.skipTest("macOS-only keychain bridge")
+        import keychain
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"AGYDRA_NO_KEYCHAIN": ""}):
+            if not keychain.supported():
+                self.skipTest("keychain bridge not available on this machine")
+            self._assert_list_shows_keychain_email()
+
+    def _assert_list_shows_keychain_email(self):
+        import keychain
+
+        self.store.create("kc")
+        data_dir = self.store.profile_data_dir("kc")
+        self.assertFalse((data_dir / account.AGY_CLI_DIR).exists())
+
+        jwt = _make_jwt({"email": "kc@example.com"})
+        token_json = json.dumps({
+            "token": {"access_token": "a", "refresh_token": "r"},
+            "auth_method": "consumer",
+            "id_token": jwt,
+        }).encode("utf-8")
+        secret = b"go-keyring-base64:" + base64.b64encode(token_json)
+        keychain.save_profile_slot(self.store, "kc", secret)
+
+        result = self._run_cli("list")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kc@example.com", result.stdout)
+        self.assertEqual(self.store.get("kc").email, "kc@example.com")
 
 
 class TestRandomProfileSelection(BaseCase):

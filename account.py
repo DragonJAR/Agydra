@@ -52,17 +52,82 @@ def _oauth_obj(data_dir: Path):
         yield {"token": raw}
 
 
-def detect_email(data_dir: Path) -> Optional[str]:
+def _keychain_obj(store, name: Optional[str]):
+    """Token JSON decoded from the profile's private keychain slot backup.
+
+    macOS-only, and only when the bridge is available. Profiles created
+    through the keychain bridge can have NO on-disk token file at all --
+    their live credential exists only as the private slot backup
+    ``<store>/keychain/<name>.secret`` (go-keyring-encoded). Only that
+    backup FILE is read here (no `security` subprocess call), so this
+    stays cheap and non-mutating for `list`/`status`. Any error degrades
+    to "nothing found" rather than raising.
+    """
+    if store is None or not name or not platforms.is_macos():
+        return
+    try:
+        import keychain
+
+        if not keychain.supported():
+            return
+        raw = keychain.load_profile_slot(store, name)
+        if raw is None:
+            return
+        decoded = keychain.decode_go_keyring_secret(raw)
+        if decoded is not None:
+            yield decoded
+    except Exception:
+        return
+
+
+def _iter_tokens(data_dir: Path, store=None, name: Optional[str] = None):
+    """Yield every known token dict for a profile, on-disk file(s) first.
+
+    Single source of truth for "where could this profile's token be" --
+    ``detect_email`` and ``auth_state`` both walk this instead of
+    duplicating the on-disk-then-keychain fallback logic.
+    """
+    yield from _oauth_obj(data_dir)
+    yield from _keychain_obj(store, name)
+
+
+def _id_token(raw: dict, token) -> Optional[str]:
+    """Locate the id_token JWT among the known layouts.
+
+    Verified against a real agy 1.2.7 session file: ``id_token`` sits
+    ALONGSIDE ``token`` at the top level of the file, not nested inside it.
+    An older/alternate layout that nests it inside ``token`` is still
+    supported as a fallback.
+    """
+    top_level = raw.get("id_token")
+    if isinstance(top_level, str):
+        return top_level
+    if isinstance(token, dict):
+        nested = token.get("id_token")
+        if isinstance(nested, str):
+            return nested
+    return None
+
+
+def detect_email(
+    data_dir: Path,
+    store=None,
+    name: Optional[str] = None,
+) -> Optional[str]:
     """Best-effort email for the authenticated identity of a profile.
 
-    Emails only appear in id_token JWTs; the current file layout does not
-    carry one, so this returns None there and the caller keeps whatever is
-    already cached in profile metadata.
+    The email only appears inside the id_token JWT; if a given layout
+    carries no id_token at all, this returns None and the caller keeps
+    whatever is already cached in profile metadata.
+
+    ``store``/``name`` (optional, like ``auth_state``) also enable the
+    macOS keychain-slot fallback for profiles that have no on-disk token
+    file at all -- see ``_keychain_obj``.
     """
-    for raw in _oauth_obj(data_dir):
+    for raw in _iter_tokens(data_dir, store, name):
         token = raw.get("token") if isinstance(raw.get("token"), dict) else raw
-        id_token = token.get("id_token")
-        if isinstance(id_token, str):
+        id_token = _id_token(raw, token)
+        if id_token is not None:
             claims = _decode_jwt_payload(id_token)
             email = claims.get("email")
             if isinstance(email, str) and email:
@@ -100,7 +165,7 @@ def auth_state(
     ``store``/``name`` enable the precise per-profile keychain lookup on
     macOS; without them only the on-disk token file is consulted.
     """
-    for raw in _oauth_obj(data_dir):
+    for raw in _iter_tokens(data_dir, store, name):
         token = raw.get("token") if isinstance(raw.get("token"), dict) else raw
         if isinstance(token, dict) and (
             token.get("access_token") or token.get("refresh_token")
@@ -121,7 +186,7 @@ def sync_profile_email(store, name: str) -> Optional[str]:
     """
     import locks
 
-    email = detect_email(store.profile_data_dir(name))
+    email = detect_email(store.profile_data_dir(name), store, name)
     if not email:
         return None
     if locks.is_locked(store, name):

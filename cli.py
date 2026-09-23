@@ -248,7 +248,7 @@ def cmd_list(store: Store, _args) -> int:
         if busy:
             email = profile.email or "-"
         else:
-            email = account.sync_profile_email(store, profile.name) or "-"
+            email = account.sync_profile_email(store, profile.name) or profile.email or "-"
         state = account.auth_state(
             store.profile_data_dir(profile.name), store, profile.name,
         )
@@ -289,7 +289,7 @@ def cmd_login(store: Store, args) -> int:
     data_dir = store.profile_data_dir(name)
     state = account.auth_state(data_dir, store, name)
     if state == "authenticated" and not args.dry_run and not getattr(args, "force", False):
-        email = account.detect_email(data_dir)
+        email = account.detect_email(data_dir, store, name)
         if not _confirm(
             f"profile {name!r} already authenticated as {email or '?'} — re-login?",
             False,
@@ -314,7 +314,7 @@ def cmd_status(store: Store, args) -> int:
         return 0
     data_dir = store.profile_data_dir(plan.profile)
     profile = store.get(plan.profile)
-    email = profile.email or account.detect_email(data_dir) or "-"
+    email = profile.email or account.detect_email(data_dir, store, plan.profile) or "-"
     state = account.auth_state(data_dir, store, plan.profile)
     print(f"profile   : {plan.profile}")
     print(f"reason    : {plan.reason}")
@@ -357,7 +357,7 @@ def cmd_delete(store: Store, args) -> int:
     name = store.resolve_ref(args.ref)
     _assert_free(store, name)
     profile = store.get(name)
-    email = profile.email or account.detect_email(store.profile_data_dir(name)) or "?"
+    email = profile.email or account.detect_email(store.profile_data_dir(name), store, name) or "?"
     if not _confirm(f"delete profile {name!r} ({email})?", args.force):
         print("cancelled")
         return 1
