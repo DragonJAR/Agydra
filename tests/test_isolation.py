@@ -93,6 +93,101 @@ def _walk_no_follow(root: Path):
             yield from _walk_no_follow(entry)
 
 
+class TestMigrateRealDir(BaseCase):
+    """Recovery for the alpha-class breakage: a real directory sitting at
+    ``overlay/<name>/.gemini`` (created by processes that ran with a
+    redirected HOME before build_overlay could place the symlink)."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("alpha")
+        self.data_dir = self.store.profile_data_dir("alpha")
+
+    def test_migrate_real_dir_to_store_merges_then_unlinks(self):
+        """Merging into the profile data dir must unblock the guard: the
+        next ``build_overlay`` relinks without refusing."""
+        isolation.build_overlay("alpha", self.data_dir, self.store.root)
+        link = self.store.overlays_dir / "alpha" / platforms.AGY_DATA_DIR_NAME
+        self.assertTrue(isolation._is_link(link))
+
+        # Replace the symlink with a real directory containing real data
+        link.unlink()
+        real_dir = link
+        real_dir.mkdir()
+        (real_dir / "antigravity-cli").mkdir()
+        (real_dir / "antigravity-cli" / "token.json").write_text("{}", encoding="utf-8")
+        (real_dir / "history.jsonl").write_text("line\n", encoding="utf-8")
+
+        isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
+        self.assertTrue((self.data_dir / "antigravity-cli" / "token.json").exists())
+        self.assertTrue((self.data_dir / "history.jsonl").exists())
+        self.assertFalse(real_dir.exists(), "real dir must be gone after migrate")
+
+        isolation.build_overlay("alpha", self.data_dir, self.store.root)
+        self.assertTrue(isolation._is_link(link))
+        self.assertEqual(link.resolve(), self.data_dir.resolve())
+
+    def test_migrate_refuses_missing_data_dir(self):
+        """The guard exists to prevent destroying real data: if the target
+        data dir is missing, migrating would invent state — refuse instead."""
+        with self.assertRaises(isolation.IsolationError):
+            isolation.migrate_real_dir_to_store(
+                self.fake_home / "nope", self.store.root / "no-data-here"
+            )
+
+    def test_migrate_refuses_when_source_is_already_a_link(self):
+        """A symlink is what the system expects; migrating from one would
+        touch a real link and silently break redirection. Reject early."""
+        isolation.build_overlay("alpha", self.data_dir, self.store.root)
+        link = self.store.overlays_dir / "alpha" / platforms.AGY_DATA_DIR_NAME
+        with self.assertRaises(isolation.IsolationError):
+            isolation.migrate_real_dir_to_store(link, self.data_dir)
+
+    def test_migrate_refuses_file_vs_directory_collision(self):
+        """A plain file in ``real_dir`` whose name collides with an
+        existing DIRECTORY in ``data_dir`` must not be silently nested one
+        level deeper by ``shutil.move`` -- refuse instead, and leave the
+        existing directory's content untouched."""
+        real_dir = self.fake_home / "real-dir"
+        real_dir.mkdir()
+        (real_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        target_dir = self.data_dir / "config.json"
+        target_dir.mkdir()
+        (target_dir / "inner.txt").write_text("keep me", encoding="utf-8")
+
+        with self.assertRaises(isolation.IsolationError):
+            isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
+
+        self.assertTrue(target_dir.is_dir(), "existing directory must survive")
+        self.assertTrue((target_dir / "inner.txt").exists())
+        self.assertFalse(
+            (target_dir / "config.json").exists(),
+            "file must not have been nested inside the existing directory",
+        )
+
+    def test_migrate_refuses_symlink_inside_real_dir(self):
+        """A symlink inside ``real_dir`` must never be moved verbatim into
+        the permanent profile store -- that would create a durable escape
+        from isolation that ``build_overlay`` never re-checks."""
+        real_dir = self.fake_home / "real-dir"
+        real_dir.mkdir()
+        outside = self.fake_home / "scratch-outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("outside data", encoding="utf-8")
+        link = real_dir / "escape"
+        link.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaises(isolation.IsolationError):
+            isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
+
+        self.assertFalse(
+            (self.data_dir / "escape").exists(),
+            "the symlink must not have been moved into the profile store",
+        )
+
+
 class TestIsolationAncestorMirroring(BaseCase):
     """Store root lives INSIDE the real home (default macOS/Linux layout):
     ``~/Library/Application Support/agydra`` or ``~/.local/share/agydra``.

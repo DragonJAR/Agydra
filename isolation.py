@@ -196,7 +196,8 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
                 raise IsolationError(
                     f"overlay entry {link} is a real file, not the "
                     "expected mirrored directory; refusing to break "
-                    "isolation — remove it manually or recreate the profile"
+                    "isolation — remove it manually, recreate the profile, "
+                    "or run `agydra doctor --fix`"
                 )
             platforms.ensure_dir(link)
             _mirror_dir(entry, link, level + 1, ctx)
@@ -224,6 +225,63 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
             continue
 
 
+def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
+    """Merge a real directory that replaced the overlay ``.gemini`` link
+    into the profile data dir, then remove it so ``build_overlay`` can
+    relink (see ``doctor --fix``).
+
+    Recovers the "refusing to break isolation" state without data loss:
+    entries are moved into ``data_dir`` (overlay data is the live one), a
+    pre-existing same-named file is overwritten by its overlay version,
+    same-named directories are merged. Refuses when ``real_dir`` is a link
+    (nothing to recover), ``data_dir`` does not exist (no profile store to
+    receive the data), an entry is itself a symlink (a real-dir recovery
+    should never legitimately contain one, and moving it verbatim would
+    become a permanent, unchecked escape from isolation), or a plain-file
+    entry collides with an existing DIRECTORY at the target (a type
+    mismatch that ``shutil.move`` would otherwise silently nest one level
+    deeper instead of raising).
+    """
+    if _is_link(real_dir) or not real_dir.is_dir():
+        raise IsolationError(
+            f"cannot migrate {real_dir}: expected a real directory "
+            "(a link there means nothing needs recovering)"
+        )
+    if not data_dir.is_dir():
+        raise IsolationError(
+            f"cannot migrate {real_dir}: profile data dir {data_dir} does "
+            "not exist yet (create the profile first)"
+        )
+    import shutil
+
+    try:
+        for entry in real_dir.iterdir():
+            target = data_dir / entry.name
+            if entry.is_symlink():
+                raise IsolationError(
+                    f"cannot migrate {entry}: real_dir must not contain "
+                    "symlinks (isolation invariant); remove it manually "
+                    "and re-run `agydra doctor --fix`"
+                )
+            if entry.is_dir() and target.exists():
+                shutil.copytree(entry, target, dirs_exist_ok=True)
+            elif target.is_dir():
+                raise IsolationError(
+                    f"cannot migrate {entry}: a directory already exists "
+                    f"at {target} (type mismatch); resolve manually and "
+                    "re-run `agydra doctor --fix`"
+                )
+            else:
+                shutil.move(str(entry), str(target))
+        shutil.rmtree(real_dir)
+    except OSError as exc:
+        raise IsolationError(
+            f"could not migrate overlay data from {real_dir} into the "
+            f"profile store ({exc}); nothing was deleted — fix the cause "
+            "and re-run `agydra doctor --fix`"
+        ) from exc
+
+
 def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
     """(Re)build the overlay for a profile and return its path.
 
@@ -234,7 +292,7 @@ def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
       ``_mirror_dir``), everything else is linked whole.
     """
     real_home = platforms.real_home()
-    overlay = platforms.ensure_dir(store_root / "overlays" / name)
+    overlay = platforms.ensure_dir(store_root / platforms.OVERLAYS_DIRNAME / name)
     store_resolved = store_root.resolve()
     chain = _ancestor_chain(real_home, store_root)
     ctx = _MirrorContext(
@@ -251,7 +309,9 @@ def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
         raise IsolationError(
             f"overlay entry {gemini_link} is a real directory/file, not the "
             "expected link to the profile store; refusing to break "
-            "isolation — remove it manually or recreate the profile"
+            "isolation — remove it manually, recreate the profile, "
+            "or run `agydra doctor --fix` to migrate its contents into "
+            "the profile store and relink automatically"
         )
     if not _is_link(gemini_link):
         try:
