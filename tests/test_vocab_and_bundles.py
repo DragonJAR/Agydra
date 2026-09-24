@@ -121,6 +121,40 @@ class TestConsumeBundles(unittest.TestCase):
         self.assertEqual(values["dry-run"], None)
         self.assertEqual(rest, ["-rnr", "chat"])
 
+    def test_repeat_swallowing_later_flag_warns_on_stderr(self):
+        """Regression: ``-p alpha -p beta -n`` — the second ``-p`` is a
+        repeat of an already-consumed flag, so (by contract) everything
+        from that token onward, including the later ``-n``, is dumped into
+        ``rest`` untouched. Without a diagnostic this is silent and
+        order-dependent: the user asked for a dry run and got a real
+        launch instead. The extractor must warn on stderr that ``-n`` was
+        forwarded to agy instead of being consumed."""
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            values, rest = _consume_launch_flags(
+                ["-p", "alpha", "-p", "beta", "-n", "chat"]
+            )
+        self.assertEqual(values["profile"], "alpha")
+        self.assertIsNone(values["dry-run"])
+        self.assertEqual(rest, ["-p", "beta", "-n", "chat"])
+        out = buf.getvalue()
+        self.assertIn("-n", out)
+        self.assertIn("must come first", out)
+
+    def test_reverse_order_control_still_consumes_dry_run(self):
+        """Control case: same flags, ``-n`` placed BEFORE the repeat. This
+        already worked (order-independence was the bug) and must keep
+        working, with no spurious warning since nothing is swallowed."""
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            values, rest = _consume_launch_flags(
+                ["-n", "-p", "alpha", "-p", "beta"]
+            )
+        self.assertTrue(values["dry-run"])
+        self.assertEqual(values["profile"], "alpha")
+        self.assertEqual(rest, ["-p", "beta"])
+        self.assertEqual(buf.getvalue(), "")
+
 
 class TestLateBundleWarning(unittest.TestCase):
     """Late value flags (after a non-flag token) must be surfaced with the

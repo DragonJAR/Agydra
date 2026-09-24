@@ -169,7 +169,9 @@ def _consume_launch_flags(
             rest.extend(argv[i:])
             break
         if any(values[key] is not None for key, _inline, _width in matched):
-            rest.extend(argv[i:])
+            swallowed = argv[i:]
+            rest.extend(swallowed)
+            _warn_late_flags(values, swallowed, include_booleans=True)
             return values, rest
         i += 1
         for key, inline, width in matched:
@@ -182,7 +184,12 @@ def _consume_launch_flags(
     return values, rest
 
 
-def _warn_late_flags(values: Dict[str, object], raw: Sequence[str]) -> None:
+def _warn_late_flags(
+    values: Dict[str, object],
+    raw: Sequence[str],
+    *,
+    include_booleans: bool = False,
+) -> None:
     """Detect value flags that slipped past the extractor into agy's argv.
 
     agy itself accepts ``-p`` (print), so ``agydra "chat" -p work`` would
@@ -191,9 +198,20 @@ def _warn_late_flags(values: Dict[str, object], raw: Sequence[str]) -> None:
     Driven by the same ``_LAUNCH_FLAGS`` table the extractor consumes, in
     every spelling (attached ``-pwork``, ``--profile=x``, separated ``-p x``,
     bundled ``-rp work``).
+
+    ``include_booleans=True`` also checks the boolean flags (``-n``/``-r``/
+    ``-f``), not just the value flags. Used exclusively by
+    ``_consume_launch_flags`` when a repeat of an already-consumed flag
+    dumps the rest of argv into agy's args: that swallow is order-dependent
+    and silent on its own (e.g. ``-p alpha -p beta -n`` would drop ``-n``
+    on the floor with no diagnostic, launching for real instead of dry-run),
+    so any known agydra flag caught in the swallowed tail must be surfaced
+    too. The general "flag after a non-flag token" case intentionally
+    leaves booleans unchecked — that ordering rule is already documented
+    and a late boolean there is not silently discarded, it's just agy's.
     """
     for key, (short, long_, takes_value, _metavar, _help) in _LAUNCH_FLAGS.items():
-        if not takes_value or values[key] is not None:
+        if (not takes_value and not include_booleans) or values[key] is not None:
             continue
         for i, token in enumerate(raw):
             if token == "--":
@@ -510,14 +528,23 @@ def cmd_doctor(store: Store, args) -> int:
     now-stale WARN for what is about to be fixed). The returned exit code
     reflects POST-fix state, computed silently (no reprint) via
     ``doctor._post_fix_exit_code``.
+
+    ``ctx`` is built exactly once here and threaded into both
+    ``run_checks`` and ``_preview_fixables`` -- they used to each build
+    their own, paying for a redundant extra store scan between the check
+    pass and the fix preview for no informational gain (state has not
+    changed yet at that point). ``_apply_fixes`` still re-resolves fresh
+    names of its own right before actually purging anything, since by
+    then the confirmation pause may have let state drift -- see its
+    docstring.
     """
     import doctor
 
-    exit_code = doctor.run_checks(store)
+    ctx = doctor._build_ctx(store)
+    exit_code = doctor.run_checks(store, ctx=ctx)
     if not getattr(args, "fix", False):
         return exit_code
 
-    ctx = doctor._build_ctx(store)
     preview = doctor._preview_fixables(store, ctx)
     if not preview:
         print("no fixable items")
