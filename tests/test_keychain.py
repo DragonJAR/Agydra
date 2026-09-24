@@ -358,7 +358,10 @@ class TestLaunchGuardEntrySelfRepair(unittest.TestCase):
                 state = guard.__enter__()
 
             self.assertTrue(state._swapped)
-            self.assertEqual(kc.shared, own_secret)
+            # The shared keychain slot stores plain JSON (agy reads it as
+            # JSON; see ``token_payload_for_slot``). The ``.secret`` file
+            # backup keeps the envelope for the identity guard's decode.
+            self.assertEqual(kc.shared, keychain.token_payload_for_slot(own_secret))
 
     def test_no_cached_identity_skips_the_check(self):
         """A profile whose email was never synced (created before this
@@ -380,7 +383,9 @@ class TestLaunchGuardEntrySelfRepair(unittest.TestCase):
                 state = guard.__enter__()
 
             self.assertTrue(state._swapped)
-            self.assertEqual(kc.shared, unverified_secret)
+            self.assertEqual(
+                kc.shared, keychain.token_payload_for_slot(unverified_secret)
+            )
 
 
 class TestCaptureSharedSlotForImport(unittest.TestCase):
@@ -742,6 +747,133 @@ class TestOrphanSlots(BaseCase):
         with mock.patch.object(keychain, "supported", return_value=False), \
                 mock.patch.object(keychain, "_run", exploding_run):
             self.assertEqual(keychain.orphan_slots(self.store, known_names=[]), [])
+
+
+class TestKeychainSlotFormat(BaseCase):
+    """The shared keychain slot (where agy reads) and the per-profile
+    ``.secret`` file backup are TWO formats. Swap must always land plain JSON
+    in the keychain (agy parses it as JSON; the envelope triggers
+    ``invalid character 'f' after top-level value``); ``.secret`` must keep
+    the envelope format the identity guard already decodes.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.store = _StoreStub(Path(self._tmp) / "store")
+        # Realistic shape: a captured login produces this exact envelope.
+        import base64 as _b64
+
+        payload = {
+            "token": {
+                "access_token": "ya29.aa",
+                "refresh_token": "rt",
+                "token_type": "Bearer",
+                "expiry": "2099-01-01T00:00:00Z",
+            },
+            "auth_method": "consumer",
+            "id_token": "id",
+        }
+        self._payload = payload
+        self._envelope = b"go-keyring-base64:" + _b64.b64encode(
+            (b'{"token":{"access_token":"ya29.aa","refresh_token":"rt",'
+             b'"token_type":"Bearer","expiry":"2099-01-01T00:00:00Z"},'
+             b'"auth_method":"consumer","id_token":"id"}')
+        )
+
+    def test_token_payload_for_slot_unwraps_envelope_to_json(self):
+        out = keychain.token_payload_for_slot(self._envelope)
+        self.assertNotIn(b"go-keyring-base64", out)
+        import json as _json
+
+        self.assertEqual(_json.loads(out), self._payload)
+
+    def test_token_payload_for_slot_passes_through_plain_json(self):
+        """A profile whose backup happens to be plain JSON must round-trip
+        unchanged; if it isn't parseable JSON either, leave it alone rather
+        than corrupting it on the way to agy."""
+        import json as _json
+
+        plain = _json.dumps(self._payload, separators=(",", ":")).encode()
+        self.assertEqual(keychain.token_payload_for_slot(plain), plain)
+        garbage = b"\x00\x01\x02 not json"
+        self.assertEqual(keychain.token_payload_for_slot(garbage), garbage)
+
+    def test_envelope_token_bytes_wraps_plain_json(self):
+        """The ``.secret`` writer must keep the envelope format, otherwise
+        the identity guard's decode starts returning None and quarantines
+        the slot."""
+        import json as _json
+
+        plain = _json.dumps(self._payload, separators=(",", ":")).encode()
+        out = keychain.envelope_token_bytes(plain)
+        self.assertEqual(keychain.decode_go_keyring_secret(out), self._payload)
+        # Already-envelope bytes stay envelope (re-wrap would corrupt base64).
+        self.assertEqual(keychain.envelope_token_bytes(self._envelope), self._envelope)
+
+    def test_launch_guard_writes_plain_json_to_shared_keychain(self):
+        """Reproduces the real bug: launch_guard.__enter__ must unwrap the
+        envelope before writing the shared slot, or agy fails to parse the
+        keychain value and re-prompts login (see cli.log:
+        "Failed to load stored token from keyring, falling back to file:
+         invalid character 'f' after top-level value")."""
+        import json as _json
+
+        # Provide the per-profile slot in envelope form (the real-world state).
+        slots = keychain._slots_dir(self.store)
+        slots.mkdir(parents=True, exist_ok=True)
+        self.backup = keychain.slot_backup_path(self.store, "work")
+        self.backup.write_bytes(self._envelope)
+        # No known identity cached → identity-guard branch skipped (genuine first login).
+        write_calls = []
+
+        def fake_run(args, input_bytes=None):
+            write_calls.append(args)
+            if args[0] == "delete-generic-password":
+                return _rc(0)
+            return _rc(0)
+
+        # Replace network-touching helpers, including the swap lock so the
+        # test does not leave flock files lying around.
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(keychain, "_run", fake_run), \
+                mock.patch.object(
+                    keychain, "_ensure_target_keychain",
+                    return_value=Path("/tmp/fake-keychain"),
+                ), \
+                mock.patch.object(keychain, "_serialize_lock", return_value=None):
+            with keychain.launch_guard(self.store, "work") as guard:
+                # Shared slot starts empty (security returns b'' on missing).
+                self.assertFalse(guard._had_shared)
+        # Find the write to the shared slot whose payload is the swap
+        # (the guard's exit-time restore also writes, but with the empty
+        # `_had_shared` value, not the profile's token).
+        swaps = [
+            args for args in write_calls
+            if args[0] == "add-generic-password"
+            and args.count("-w") and args[args.index("-w") + 1] != ""
+        ]
+        self.assertEqual(len(swaps), 1, f"expected one swap write, got {write_calls}")
+        written_bytes = list(swaps[0])[list(swaps[0]).index("-w") + 1]
+        written_str = written_bytes if isinstance(written_bytes, str) else written_bytes.decode()
+        self.assertNotIn("go-keyring-base64", written_str,
+                         "shared keychain slot must NOT carry the envelope")
+        # Must parse as JSON (agy reads it as JSON and rejects on parse failure).
+        self.assertEqual(_json.loads(written_str), self._payload)
+
+    def test_persist_if_trusted_writes_envelope_to_file(self):
+        """Even though the live keychain slot is plain JSON, the ``.secret``
+        file backup must remain envelope-formatted so the identity guard
+        keeps decoding it."""
+        import json as _json
+
+        slots = keychain._slots_dir(self.store)
+        slots.mkdir(parents=True, exist_ok=True)
+        self.backup = keychain.slot_backup_path(self.store, "work")
+        plain = _json.dumps(self._payload, separators=(",", ":")).encode()
+        keychain._persist_if_trusted(self.store, "work", plain)
+        on_disk = self.backup.read_bytes()
+        self.assertIn(b"go-keyring-base64", on_disk)
+        self.assertEqual(keychain.decode_go_keyring_secret(on_disk), self._payload)
 
 
 if __name__ == "__main__":

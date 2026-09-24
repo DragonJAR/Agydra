@@ -60,6 +60,13 @@ NOT_FOUND_CODES = {44, 45, 51, 128}
 
 _SKIP_MARKER_NAME = ".setup-skipped"
 
+SECRET_SUFFIX = ".secret"
+"""Filename suffix of a profile's keychain slot backup: ``<name>.secret``."""
+
+QUARANTINE_INFIX = f"{SECRET_SUFFIX}.corrupt-"
+"""Infix a quarantined slot backup is renamed to:
+``<name>.secret.corrupt-<stamp>`` (see ``_quarantine_profile_slot``)."""
+
 
 class KeychainError(RuntimeError):
     pass
@@ -172,7 +179,7 @@ def _slots_dir(store) -> Path:
 
 
 def slot_backup_path(store, name: str) -> Path:
-    return _slots_dir(store) / f"{name}.secret"
+    return _slots_dir(store) / f"{name}{SECRET_SUFFIX}"
 
 
 def save_profile_slot(store, name: str, data: bytes) -> None:
@@ -188,6 +195,46 @@ def load_profile_slot(store, name: str) -> Optional[bytes]:
 
 
 _GO_KEYRING_PREFIX = b"go-keyring-base64:"
+
+
+def token_payload_for_slot(data: bytes) -> bytes:
+    """Plain-JSON bytes suitable for the shared keychain slot.
+
+    agy reads the shared slot as JSON; writing the ``go-keyring-base64:``
+    envelope (the format used by the per-profile ``.secret`` file backup)
+    to the live keychain makes agy raise ``invalid character 'f' after
+    top-level value`` and fall back to the on-disk token file -- which a
+    keychain-only profile does not have, so the user is asked to log in
+    again. Unwrap the envelope here so the swap lands parseable JSON.
+
+    Plain JSON (or any other bytes) passes through unchanged: callers
+    upstream may already hold the parsed payload, and a non-JSON shape is
+    a stronger signal than we can synthesize here (agy will reject it too,
+    but at least we won't have mangled it).
+    """
+    payload = decode_go_keyring_secret(data)
+    if payload is not None:
+        return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return data
+
+
+def envelope_token_bytes(data: bytes) -> bytes:
+    """Inverse of :func:`token_payload_for_slot`: wrap plain JSON in the
+    ``go-keyring-base64:`` envelope the ``.secret`` file backup uses, so
+    the identity guard keeps decoding it after the live-slot format change.
+
+    Idempotent: already-envelope bytes (or any non-JSON bytes) are returned
+    unchanged rather than re-wrapped -- double-encoding would corrupt the
+    base64 payload."""
+    if data.startswith(_GO_KEYRING_PREFIX):
+        return data
+    try:
+        parsed = json.loads(data)
+    except (ValueError, TypeError):
+        return data
+    if not isinstance(parsed, dict):
+        return data
+    return _GO_KEYRING_PREFIX + base64.b64encode(data)
 
 
 def decode_go_keyring_secret(data: Optional[bytes]) -> Optional[dict]:
@@ -292,10 +339,10 @@ def _quarantine_profile_slot(store, name: str) -> Optional[Path]:
     if not path.exists():
         return None
     stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
-    target = path.with_name(f"{path.name}.corrupt-{stamp}")
+    target = path.with_name(f"{name}{QUARANTINE_INFIX}{stamp}")
     counter = 2
     while target.exists():
-        target = path.with_name(f"{path.name}.corrupt-{stamp}.{counter}")
+        target = path.with_name(f"{name}{QUARANTINE_INFIX}{stamp}.{counter}")
         counter += 1
     try:
         path.replace(target)
@@ -317,14 +364,20 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
     could otherwise be captured as this profile's own secret. A profile
     with no known identity yet is a genuine first login: nothing to
     compare against, so it is trusted.
+
+    The shared keychain slot now carries plain JSON (see
+    :func:`token_payload_for_slot`); this entry re-envelopes the payload
+    before writing the ``.secret`` file backup so the identity guard keeps
+    decoding it.
     """
     known = _known_identity(store, name)
+    serialized = envelope_token_bytes(data)
     if known is None:
-        save_profile_slot(store, name, data)
+        save_profile_slot(store, name, serialized)
         return
-    candidate = _secret_identity(data)
+    candidate = _secret_identity(serialized)
     if candidate == known:
-        save_profile_slot(store, name, data)
+        save_profile_slot(store, name, serialized)
     else:
         seen = repr(candidate) if candidate else "undecodable"
         warn(
@@ -483,7 +536,15 @@ def launch_guard(store, profile: str, capture: bool = False):
                             )
                             slot = None
                 if slot is not None:
-                    write_slot(shared_slot(), slot, self._keychain_path)
+                    # Slot is bytes from the ``.secret`` file backup (envelope
+                    # or whatever the file holds). Unwrap so the live shared
+                    # slot carries plain JSON -- agy parses it; see the
+                    # ``token_payload_for_slot`` docstring.
+                    write_slot(
+                        shared_slot(),
+                        token_payload_for_slot(slot),
+                        self._keychain_path,
+                    )
                     self._swapped = True
                 elif self._had_shared is not None:
                     delete_slot(shared_slot(), self._keychain_path)

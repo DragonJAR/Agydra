@@ -44,8 +44,8 @@ import keychain
 import locks
 import store as store_mod
 
-_QUARANTINE_INFIX = ".secret.corrupt-"
-_SECRET_SUFFIX = ".secret"
+_QUARANTINE_INFIX = keychain.QUARANTINE_INFIX
+_SECRET_SUFFIX = keychain.SECRET_SUFFIX
 
 
 @dataclass

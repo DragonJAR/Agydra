@@ -503,7 +503,7 @@ class Store:
 
                 secret = keychain.slot_backup_path(self, name)
                 if secret.is_file():
-                    zf.write(secret, f"_keychain/{name}.secret")
+                    zf.write(secret, f"_keychain/{name}{keychain.SECRET_SUFFIX}")
 
         def verify(tmp: Path) -> None:
             with zipfile.ZipFile(tmp) as zf:

@@ -176,6 +176,57 @@ class TestDoctor(BaseCase):
         self.assertIn("ghost", message)
         self.assertIn("doctor --fix", message)
 
+    def test_apply_fixes_purges_orphan_keychain_slots_with_fresh_names(self):
+        """Regression: ``_apply_fixes``'s keychain-orphan purge must re-derive
+        the current profile list at purge time, never reuse the STALE
+        pre-confirmation ``ctx.names`` snapshot -- the same fresh-scan guard
+        ``orphans.remove_orphans`` already applies to its file-based purge
+        (see ``test_orphans.py::
+        test_skips_an_overlay_and_secret_recreated_between_detect_and_fix``).
+
+        Scenario: "ghost" is flagged as an orphaned keychain slot before it
+        exists as a profile (``ctx`` captured then). During the (arbitrarily
+        long) confirmation pause a real profile named "ghost" is created,
+        with its own genuine keychain slot. ``_apply_fixes`` must not purge
+        that brand-new, now-legitimate slot just because it wasn't in the
+        stale ``ctx.names`` it was built from."""
+        ctx = self._ctx()
+        self.assertNotIn("ghost", ctx.names)
+
+        # Simulate the pause: "ghost" gets created for real, with its own
+        # genuine keychain slot -- after ``ctx`` was already captured.
+        self.store.create("ghost")
+        keychain.save_profile_slot(self.store, "ghost", b"real-secret")
+
+        deleted = []
+
+        def fake_orphan_slots(_store, known_names, keychain_path=None):
+            # The system keychain always has a "gemini/agydra/ghost"
+            # service; it is only reported as orphaned when "ghost" is
+            # absent from the names it is called with.
+            return sorted({"ghost"} - set(known_names))
+
+        def fake_delete_slot(service, keychain_path=None):
+            deleted.append(service)
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    doctor.keychain, "_ensure_target_keychain", return_value=None
+                ), \
+                mock.patch.object(doctor.keychain, "orphan_slots", fake_orphan_slots), \
+                mock.patch.object(doctor.keychain, "delete_slot", fake_delete_slot):
+            doctor._apply_fixes(self.store, ctx)
+
+        self.assertNotIn(
+            "gemini/agydra/ghost", deleted,
+            "the freshly-created profile's own keychain slot must survive "
+            "a purge driven by a stale pre-confirmation ctx",
+        )
+        self.assertEqual(
+            keychain.load_profile_slot(self.store, "ghost"), b"real-secret",
+            "ghost's own file-backed slot backup must be untouched",
+        )
+
 
 class TestIsolationRecovery(BaseCase):
     """``_check_isolation`` must distinguish the recoverable real-dir case

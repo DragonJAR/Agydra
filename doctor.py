@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from agydra import __version__
 import account, isolation, keychain, platforms
@@ -400,7 +400,13 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
             + f" cleared dangling default profile {default!r}"
         )
     keychain_path = keychain._ensure_target_keychain(store) if keychain.supported() else None
-    for orphan in keychain.orphan_slots(store, ctx.names, keychain_path=keychain_path):
+    # Fresh names at purge time, never the pre-confirmation ``ctx.names``
+    # snapshot: the confirmation prompt in ``cmd_doctor`` can pause for an
+    # arbitrary time, during which a name flagged as orphaned could be
+    # recreated with its own genuine keychain slot -- same fresh-scan guard
+    # ``orphans.remove_orphans`` already applies to its file-based purge.
+    current_names = store.names()
+    for orphan in keychain.orphan_slots(store, current_names, keychain_path=keychain_path):
         try:
             keychain.delete_slot(keychain.profile_slot(orphan), keychain_path)
         except (keychain.KeychainError, OSError) as exc:
@@ -459,7 +465,13 @@ def _post_fix_exit_code(store: Store) -> int:
     return _check_exit_code(_run_check_pass(store, _build_ctx(store)))
 
 
-def run_checks(store: Store, fix: bool = False) -> int:
+def run_checks(store: Store, fix: bool = False, ctx: Optional["_DoctorContext"] = None) -> int:
+    """Run the check-and-print pass and return its exit code.
+
+    ``ctx`` lets a caller that already built one (e.g. ``cmd_doctor``,
+    which needs the same ctx again afterward for the ``--fix`` preview)
+    pass it in instead of paying for another ``store.scan()`` here; omitted,
+    one is built fresh as before."""
     print(
         paint("agydra doctor", "cyan", "bold")
         + f" — agydra {__version__} on {sys.platform}"
@@ -470,7 +482,8 @@ def run_checks(store: Store, fix: bool = False) -> int:
         + paint("[!!]", "yellow", "bold") + paint("=warn ", "dim")
         + paint("[XX]", "red", "bold") + paint("=fail", "dim")
     )
-    ctx = _build_ctx(store)
+    if ctx is None:
+        ctx = _build_ctx(store)
     results = _run_check_pass(store, ctx)
     _print_check_pass(results)
     if fix:
