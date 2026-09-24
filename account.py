@@ -2,7 +2,9 @@
 
 The authoritative on-disk token file for agy 1.2.7 is
 ``<data>/antigravity-cli/antigravity-oauth-token`` (JSON:
-``{"auth_method": str, "token": {access_token, refresh_token, expiry, ...}}``).
+``{"auth_method": str, "token": {access_token, refresh_token, expiry, ...}}``,
+with ``id_token`` ALONGSIDE ``token`` at the top level — verified against a
+real 1.2.7 session file; no other layout is detected or migrated).
 
 On macOS the live token can sit in the profile's Keychain slot while the
 on-disk file is stale, so ``auth_state`` falls back to the keychain bridge.
@@ -15,17 +17,10 @@ import json
 from pathlib import Path
 from typing import Optional
 
-import platforms
+import platforms, store
 
 AGY_CLI_DIR = "antigravity-cli"
 TOKEN_FILE = "antigravity-oauth-token"
-
-
-def _read_json(path: Path):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
 
 
 def _decode_jwt_payload(token: str) -> dict:
@@ -41,15 +36,13 @@ def _decode_jwt_payload(token: str) -> dict:
 
 
 def _oauth_obj(data_dir: Path):
-    """Token JSON among the known layouts, or None."""
+    """Token JSON from the on-disk layout, or None when missing/malformed."""
     path = data_dir / AGY_CLI_DIR / TOKEN_FILE
     if not path.is_file():
         return
-    raw = _read_json(path)
-    if isinstance(raw, dict):
+    raw = store.read_json_object(path, tolerant=True)
+    if raw is not None:
         yield raw
-    elif raw is not None:
-        yield {"token": raw}
 
 
 def _keychain_obj(store, name: Optional[str]):
@@ -80,33 +73,88 @@ def _keychain_obj(store, name: Optional[str]):
         return
 
 
+_SOURCE_DISK = "disk"
+_SOURCE_KEYCHAIN = "keychain"
+
+
 def _iter_tokens(data_dir: Path, store=None, name: Optional[str] = None):
-    """Yield every known token dict for a profile, on-disk file(s) first.
+    """Yield ``(token_dict, source)`` pairs for a profile, on-disk file(s)
+    first. ``source`` is ``"disk"`` for the profile's own on-disk token
+    file and ``"keychain"`` for its private keychain slot backup -- callers
+    that need to weigh how trustworthy a hit is (``sync_profile_email``'s
+    passive persist) use it instead of treating every hit the same.
 
     Single source of truth for "where could this profile's token be" --
-    ``detect_email`` and ``auth_state`` both walk this instead of
-    duplicating the on-disk-then-keychain fallback logic.
+    ``detect_email``/``detect_email_source`` and ``auth_state`` both walk
+    this instead of duplicating the on-disk-then-keychain fallback logic.
     """
-    yield from _oauth_obj(data_dir)
-    yield from _keychain_obj(store, name)
+    for raw in _oauth_obj(data_dir):
+        yield raw, _SOURCE_DISK
+    for raw in _keychain_obj(store, name):
+        yield raw, _SOURCE_KEYCHAIN
 
 
-def _id_token(raw: dict, token) -> Optional[str]:
-    """Locate the id_token JWT among the known layouts.
+def _token_payload(raw: dict) -> dict:
+    """Return the inner ``token`` sub-object of a decoded session file, or
+    ``raw`` itself when the file has no ``token`` wrapper.
 
-    Verified against a real agy 1.2.7 session file: ``id_token`` sits
-    ALONGSIDE ``token`` at the top level of the file, not nested inside it.
-    An older/alternate layout that nests it inside ``token`` is still
-    supported as a fallback.
+    Centralizes the one normalization every consumer needs so
+    ``detect_email`` and ``auth_state`` cannot drift.
+    """
+    inner = raw.get("token")
+    return inner if isinstance(inner, dict) else raw
+
+
+def _id_token(raw: dict) -> Optional[str]:
+    """Locate the id_token JWT in a real agy 1.2.7 session file.
+
+    Verified layout: ``id_token`` sits ALONGSIDE ``token`` at the top level
+    of the file, not nested inside it. Older/alternate layouts are not
+    supported — AGENTS.md declares no legacy detection or migration.
     """
     top_level = raw.get("id_token")
-    if isinstance(top_level, str):
-        return top_level
-    if isinstance(token, dict):
-        nested = token.get("id_token")
-        if isinstance(nested, str):
-            return nested
-    return None
+    return top_level if isinstance(top_level, str) else None
+
+
+def email_from_raw(raw: dict) -> Optional[str]:
+    """Email claim from a single decoded token dict, or None.
+
+    The one place that locates ``id_token`` and decodes its JWT payload for
+    an email claim -- ``detect_email``'s loop and keychain's identity checks
+    (persist/self-repair guards) both call this instead of each keeping
+    their own JWT parsing.
+    """
+    id_token = _id_token(raw)
+    if id_token is None:
+        return None
+    claims = _decode_jwt_payload(id_token)
+    email = claims.get("email")
+    return email if isinstance(email, str) and email else None
+
+
+def detect_email_source(
+    data_dir: Path,
+    store=None,
+    name: Optional[str] = None,
+) -> "tuple[Optional[str], Optional[str]]":
+    """Like ``detect_email``, but also reports where the email came from.
+
+    Returns ``(email, source)``, where ``source`` is ``"disk"`` (the
+    profile's own on-disk token file -- a real completed agy session) or
+    ``"keychain"`` (its private keychain slot backup, a bare `.secret`
+    read with no corroborating on-disk evidence). Both are ``None`` when
+    no token yields an email claim at all.
+
+    ``sync_profile_email`` uses the source to decide whether a freshly
+    detected email is trustworthy enough to overwrite an already-cached
+    one; plain ``detect_email`` callers that only need the email keep
+    calling that instead.
+    """
+    for raw, source in _iter_tokens(data_dir, store, name):
+        email = email_from_raw(raw)
+        if email:
+            return email, source
+    return None, None
 
 
 def detect_email(
@@ -124,15 +172,8 @@ def detect_email(
     macOS keychain-slot fallback for profiles that have no on-disk token
     file at all -- see ``_keychain_obj``.
     """
-    for raw in _iter_tokens(data_dir, store, name):
-        token = raw.get("token") if isinstance(raw.get("token"), dict) else raw
-        id_token = _id_token(raw, token)
-        if id_token is not None:
-            claims = _decode_jwt_payload(id_token)
-            email = claims.get("email")
-            if isinstance(email, str) and email:
-                return email
-    return None
+    email, _source = detect_email_source(data_dir, store, name)
+    return email
 
 
 def _macos_keychain_authenticated(store, name) -> Optional[bool]:
@@ -165,8 +206,8 @@ def auth_state(
     ``store``/``name`` enable the precise per-profile keychain lookup on
     macOS; without them only the on-disk token file is consulted.
     """
-    for raw in _iter_tokens(data_dir, store, name):
-        token = raw.get("token") if isinstance(raw.get("token"), dict) else raw
+    for raw, _source in _iter_tokens(data_dir, store, name):
+        token = _token_payload(raw)
         if isinstance(token, dict) and (
             token.get("access_token") or token.get("refresh_token")
         ):
@@ -183,15 +224,30 @@ def sync_profile_email(store, name: str) -> Optional[str]:
     lock between the caller's is_locked() probe and this write would have
     its fresh last_used (written by runner) clobbered by a full-profile
     save based on the stale pre-launch snapshot.
+
+    Refuses to overwrite an already-set, DIFFERENT cached email when the
+    newly detected one came from the keychain slot backup rather than a
+    genuine on-disk token file: a bare `.secret` read is a weaker signal
+    than a real completed agy session writing its own token file, and
+    trusting it here would let a corrupted `.secret` (e.g. profile
+    ``alice``'s slot swapped to hold ``bob``'s credential) launder itself
+    into ``alice.email`` on a passive `agydra list` scan -- which would
+    also poison ``keychain._known_identity``'s trust anchor for every
+    guard downstream of it. Still bootstraps a brand-new keychain-only
+    profile's email on its first sync (``profile.email`` was unset --
+    nothing to compare against, the correct first-detection case), and
+    still updates from a genuine on-disk token file exactly as before.
     """
     import locks
 
-    email = detect_email(store.profile_data_dir(name), store, name)
+    email, source = detect_email_source(store.profile_data_dir(name), store, name)
     if not email:
         return None
     if locks.is_locked(store, name):
         return email
     profile = store.get(name)
+    if profile.email and profile.email != email and source == _SOURCE_KEYCHAIN:
+        return None
     if profile.email != email:
         profile.email = email
         store.save(profile)

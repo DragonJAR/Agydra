@@ -11,16 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import account
 import keychain
-from conftest import isolated_store_env
+from conftest import _make_jwt, isolated_store_env
 from store import Store
-
-
-def _make_jwt(claims: dict) -> str:
-    """Minimal unsigned JWT: only the payload segment is ever decoded."""
-    def seg(obj: dict) -> str:
-        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
-
-    return f"{seg({'alg': 'none', 'typ': 'JWT'})}.{seg(claims)}.sig"
 
 
 class TestDetectEmail(unittest.TestCase):
@@ -47,10 +39,10 @@ class TestDetectEmail(unittest.TestCase):
             })
             self.assertEqual(account.detect_email(data_dir), "user@example.com")
 
-    def test_id_token_nested_inside_token_is_still_read(self):
-        """Alternate-shape compatibility: keep supporting id_token nested
-        inside the token sub-object too, in case another agy layout uses
-        that shape."""
+    def test_id_token_nested_inside_token_is_not_read(self):
+        """No legacy layouts: only the verified agy 1.2.7 top-level shape is
+        consulted. A session file that nests id_token inside ``token``
+        reports no email — nobody produces that shape today."""
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
             jwt = _make_jwt({"email": "nested@example.com"})
@@ -58,7 +50,7 @@ class TestDetectEmail(unittest.TestCase):
                 "token": {"access_token": "a", "refresh_token": "r", "id_token": jwt},
                 "auth_method": "consumer",
             })
-            self.assertEqual(account.detect_email(data_dir), "nested@example.com")
+            self.assertIsNone(account.detect_email(data_dir))
 
     def test_no_id_token_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -137,6 +129,84 @@ class TestDetectEmailKeychainFallback(unittest.TestCase):
             with mock.patch.object(account.platforms, "is_macos", return_value=True), \
                     mock.patch.object(keychain, "supported", return_value=True):
                 self.assertIsNone(account.detect_email(data_dir, store, "kc"))
+
+
+class TestSyncProfileEmailKeychainPoisoning(unittest.TestCase):
+    """`sync_profile_email` is the passive path `agydra list` calls for
+    every non-busy profile. A profile's `.secret` backup swapped to hold a
+    DIFFERENT identity's credential must never launder itself into
+    ``profile.email`` through this path -- that would also poison
+    ``keychain._known_identity``'s trust anchor, letting a corrupted
+    `.secret` masquerade as "already known" on the very next launch/doctor
+    check."""
+
+    def _write_secret(self, store, name, email):
+        jwt = _make_jwt({"email": email})
+        payload = json.dumps({
+            "token": {"access_token": "a", "refresh_token": "r"},
+            "auth_method": "consumer",
+            "id_token": jwt,
+        }).encode("utf-8")
+        secret = b"go-keyring-base64:" + base64.b64encode(payload)
+        keychain.save_profile_slot(store, name, secret)
+
+    def _write_stale_disk_token(self, store, name):
+        """A genuine on-disk token file with no id_token claim -- the
+        stale-file case account.py's module docstring already documents
+        (`auth_state` falls back to the keychain bridge for exactly this
+        reason)."""
+        data_dir = store.profile_data_dir(name)
+        cli_dir = data_dir / account.AGY_CLI_DIR
+        cli_dir.mkdir(parents=True, exist_ok=True)
+        (cli_dir / account.TOKEN_FILE).write_text(
+            json.dumps({
+                "token": {"access_token": "a", "refresh_token": "r"},
+                "auth_method": "consumer",
+            }),
+            encoding="utf-8",
+        )
+
+    def test_keychain_sourced_mismatch_does_not_overwrite_cached_email(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("alice")
+            profile = store.get("alice")
+            profile.email = "alice@example.com"
+            store.save(profile)
+            self._write_stale_disk_token(store, "alice")
+            self._write_secret(store, "alice", "bob@example.com")
+
+            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
+                    mock.patch.object(keychain, "supported", return_value=True):
+                result = account.sync_profile_email(store, "alice")
+
+            self.assertIsNone(result)
+            refreshed = store.get("alice")
+            self.assertEqual(refreshed.email, "alice@example.com")
+
+            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
+                    mock.patch.object(keychain, "supported", return_value=True):
+                known = keychain._known_identity(store, "alice", include_secret=False)
+                secret = keychain.load_profile_slot(store, "alice")
+                candidate = keychain._secret_identity(secret)
+
+            self.assertEqual(known, "alice@example.com")
+            self.assertEqual(candidate, "bob@example.com")
+            self.assertNotEqual(candidate, known)
+
+    def test_keychain_only_profile_bootstraps_email_on_first_sync(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("brandnew")
+            self._write_secret(store, "brandnew", "new@example.com")
+
+            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
+                    mock.patch.object(keychain, "supported", return_value=True):
+                result = account.sync_profile_email(store, "brandnew")
+
+            self.assertEqual(result, "new@example.com")
+            refreshed = store.get("brandnew")
+            self.assertEqual(refreshed.email, "new@example.com")
 
 
 if __name__ == "__main__":
