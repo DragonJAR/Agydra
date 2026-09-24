@@ -167,7 +167,7 @@ OAuth tokens are never copied
 | Isolated OAuth per profile | Each profile has a fully private `agy` data store |
 | Parallel sessions | Multiple authenticated accounts at once |
 | Import existing `~/.gemini` | Copies (never moves) into a profile |
-| Backup on delete | ZIP into `backups/`, last 5 kept |
+| Backup on delete | ZIP into `backups/`, last 5 kept — lives inside the store root, so back up the whole root, not just this folder |
 | Rename / default / per-dir pin | `rename` updates default refs; `use` writes `.agydra` |
 
 **Isolation & safety**
