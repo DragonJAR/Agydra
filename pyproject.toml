@@ -36,6 +36,7 @@ py-modules = [
     "keychain",
     "locks",
     "models",
+    "orphans",
     "platforms",
     "resolver",
     "runner",

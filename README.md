@@ -36,7 +36,11 @@
 - **Config sharing without secrets** — copy `settings.json` + `mcp.json`
   between profiles, never credentials.
 - **Diagnostics** — `agydra doctor` checks binary, store permissions, profiles,
-  locks, isolation, schema canary and sandbox in one pass.
+  locks, isolation, schema canary, orphaned store artifacts and sandbox in one
+  pass; `agydra doctor --fix` migrates a real-dir overlay into the profile
+  store and relinks it, clears a dangling default profile, purges orphaned
+  macOS-keychain slots, and removes orphaned overlays/locks/keychain
+  secrets/backups left behind by a manually deleted profile.
 
 ```
 agy                 → generic session, keeps using the real ~/.gemini (untouched)
@@ -180,7 +184,7 @@ OAuth tokens are never copied
 
 | Platform | Mechanism |
 |---|---|
-| macOS | Transparent keychain bridge: swaps the fixed shared keychain slot for a per-profile private slot around each launch, restores after; failures are non-fatal warnings |
+| macOS | Transparent keychain bridge: swaps the fixed shared keychain slot for a per-profile private slot around each launch, restores after; every persist/swap is identity-checked against what's already known about the profile, so a stale or foreign credential is quarantined/skipped (with a warning) instead of silently adopted; failures are non-fatal warnings |
 | Linux | Optional bwrap sandbox masking DBus/keyring sockets when `use_linux_sandbox=true`; degrades with a warning if bwrap is missing |
 | Windows | Directory links fall back to junctions (`mklink /J`), no admin rights needed |
 
@@ -200,7 +204,7 @@ OAuth tokens are never copied
 | `agydra delete NAME\|# [-f] [--no-backup]` · `rm` | Backup ZIP then delete (refuses busy) |
 | `agydra share-config SRC TARGET...` · `share` | Copy `settings.json` + `mcp.json` only |
 | `agydra setup [-n]` · `install` | One-command install: create the venv, install the console script, verify; `-n` prints the current install state. `python3 agydra.py` is the zero-install bootstrap from a fresh clone |
-| `agydra doctor` · `doc` | Diagnostics; exit 1 iff any check fails |
+| `agydra doctor [--fix] [-f]` · `doc` | Diagnostics; exit 1 iff any check fails. `--fix` migrates a real-dir overlay into the profile store and relinks it, clears a dangling default profile, purges orphaned macOS-keychain slots, and removes orphaned overlays/locks/keychain secrets/backups left behind by a manually deleted profile (asks for confirmation unless `-f`/`--force`) |
 
 | Flag | Long form | Description |
 |---|---|---|
@@ -233,9 +237,10 @@ agydra/                     # repo root — flat layout, no package subdir
 ├── keychain.py         # macOS per-profile keychain slot bridge
 ├── isolation.py        # Home-overlay construction and environment redirection
 ├── runner.py           # Launch orchestration: resolve → plan → overlay → run
-├── doctor.py           # Diagnostics: binary, permissions, isolation, canary
+├── doctor.py           # Diagnostics: binary, permissions, isolation, canary, orphans
 ├── cli.py              # argparse CLI: launcher + management subcommands
-├── tests/              # ~196 tests (fake home + fake agy binary fixtures)
+├── orphans.py          # Reverse scan + cleanup of orphaned store artifacts
+├── tests/              # ~349 tests (fake home + fake agy binary fixtures)
 ├── README.md           # This document (English)
 ├── README.es.md        # Spanish version
 ├── AGENTS.md           # Development conventions
