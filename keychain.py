@@ -34,10 +34,12 @@ import base64
 import binascii
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -193,20 +195,23 @@ def decode_go_keyring_secret(data: Optional[bytes]) -> Optional[dict]:
 
     The macOS keychain bridge (``keyring``/go-keyring, used by `agy`'s
     login flow) stores secrets as ``b"go-keyring-base64:" + base64(json)``;
-    a plain JSON byte string is accepted too, for forward compatibility.
-    Never raises -- any unrecognized shape or decode failure returns None
-    so callers can treat it as "no token here" instead of crashing a
-    read-only path like `list`/`status`.
+    that is the ONLY format recognized here. No alternate encodings, no
+    plain-JSON fallback: ``agy`` has never produced them and accepting
+    them would let unrelated bytes be misread as a token. Never raises
+    — any unrecognized shape or decode failure returns None so callers
+    can treat it as "no token here" instead of crashing a read-only
+    path like `list`/`status`.
     """
     if not isinstance(data, (bytes, bytearray)):
         return None
     payload = bytes(data)
-    if payload.startswith(_GO_KEYRING_PREFIX):
-        payload = payload[len(_GO_KEYRING_PREFIX):]
-        try:
-            payload = base64.b64decode(payload, validate=False)
-        except (binascii.Error, ValueError):
-            return None
+    if not payload.startswith(_GO_KEYRING_PREFIX):
+        return None
+    payload = payload[len(_GO_KEYRING_PREFIX):]
+    try:
+        payload = base64.b64decode(payload, validate=False)
+    except (binascii.Error, ValueError):
+        return None
     try:
         decoded = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -214,10 +219,125 @@ def decode_go_keyring_secret(data: Optional[bytes]) -> Optional[dict]:
     return decoded if isinstance(decoded, dict) else None
 
 
+def _secret_identity(data: Optional[bytes]) -> Optional[str]:
+    """Email claim of a go-keyring-encoded secret, or None when it decodes
+    to nothing (wrong format, no id_token, or no email claim)."""
+    decoded = decode_go_keyring_secret(data)
+    if decoded is None:
+        return None
+    import account
+
+    return account.email_from_raw(decoded)
+
+
+def _known_identity(store, name: str, *, include_secret: bool = True) -> Optional[str]:
+    """Best-effort email this profile is already known to belong to.
+
+    Checked, in order: the cached ``profile.email``, the profile's own
+    on-disk token file, then (unless ``include_secret`` is False) its
+    existing `.secret` backup. None means "no known identity yet" -- a
+    genuine first login, trusted as-is. Every lookup degrades to None on
+    error (missing methods on a test double, a corrupt file, ...) rather
+    than raising, since this only gates whether a fresh credential gets
+    persisted or swapped in, never a launch itself.
+
+    ``include_secret=False`` is for the entry-time self-repair check
+    (``launch_guard.__enter__``): comparing the `.secret` against its own
+    decoded identity would be circular, so that caller only trusts the
+    cached email and the on-disk token file.
+    """
+    import account
+
+    try:
+        profile = store.get(name)
+    except Exception:
+        profile = None
+    if profile is not None and getattr(profile, "email", None):
+        return profile.email
+    try:
+        data_dir = store.profile_data_dir(name)
+    except Exception:
+        data_dir = None
+    if data_dir is not None:
+        try:
+            for raw in account._oauth_obj(data_dir):
+                email = account.email_from_raw(raw)
+                if email:
+                    return email
+        except OSError:
+            pass
+    if not include_secret:
+        return None
+    try:
+        existing = load_profile_slot(store, name)
+    except OSError:
+        existing = None
+    email = _secret_identity(existing)
+    if email:
+        return email
+    return None
+
+
+def _quarantine_profile_slot(store, name: str) -> Optional[Path]:
+    """Rename a profile's `.secret` backup out of the way instead of
+    silently overwriting or discarding it, when entry finds it does not
+    match the profile's already-known identity.
+
+    One unique ``<name>.secret.corrupt-<stamp>`` per call (a counter breaks
+    ties within the same second); never touches a file that does not
+    exist. Fail-open like the rest of the module: an OSError here warns
+    and leaves the original file in place rather than raising.
+    """
+    path = slot_backup_path(store, name)
+    if not path.exists():
+        return None
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    target = path.with_name(f"{path.name}.corrupt-{stamp}")
+    counter = 2
+    while target.exists():
+        target = path.with_name(f"{path.name}.corrupt-{stamp}.{counter}")
+        counter += 1
+    try:
+        path.replace(target)
+        return target
+    except OSError as exc:
+        warn(f"could not quarantine keychain slot for {name!r} ({exc})")
+        return None
+
+
+def _persist_if_trusted(store, name: str, data: bytes) -> None:
+    """Save ``data`` as ``name``'s private slot backup, unless it is
+    identifiably a DIFFERENT known identity's credential.
+
+    Both exit-time persist paths (a normal swapped launch, and the login
+    flow's capture) funnel through here instead of saving the shared
+    slot's post-launch content blindly -- a keychain race, a stale ambient
+    value left by another profile's exec-path launch (see the module
+    docstring's known limit), or an account switch performed inside agy
+    could otherwise be captured as this profile's own secret. A profile
+    with no known identity yet is a genuine first login: nothing to
+    compare against, so it is trusted.
+    """
+    known = _known_identity(store, name)
+    if known is None:
+        save_profile_slot(store, name, data)
+        return
+    candidate = _secret_identity(data)
+    if candidate == known:
+        save_profile_slot(store, name, data)
+    else:
+        seen = repr(candidate) if candidate else "undecodable"
+        warn(
+            f"keychain slot for profile {name!r} looks like a different "
+            f"account ({seen} vs {known!r}); not overwriting its saved "
+            "credential"
+        )
+
+
 def _serialize_lock(store):
     """Cross-process mutex for shared-slot swaps (macOS/Linux only)."""
     path = _slots_dir(store) / "swap.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    platforms.ensure_dir(path.parent)
     handle = open(path, "a+")
     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     return handle
@@ -265,7 +385,7 @@ def _ensure_target_keychain(store) -> Optional[Path]:
         if not target.exists():
             created = _run(["create-keychain", str(target)])
             if created.returncode != 0:
-                marker.parent.mkdir(parents=True, exist_ok=True)
+                platforms.ensure_dir(marker.parent)
                 marker.touch()
                 warn(
                     "could not create a login keychain "
@@ -312,6 +432,24 @@ def launch_guard(store, profile: str, capture: bool = False):
     the exit path must not save that cleared value as this profile's
     private slot — it only restores or deletes the shared slot, per the
     state entry recorded.
+
+    Every persist onto ``profile``'s private slot (the swapped launch's
+    post-run snapshot, or the login flow's capture) is identity-guarded by
+    ``_persist_if_trusted``: whatever the shared slot holds at exit is only
+    trusted as this profile's own credential when its email claim matches
+    what is already known about the profile, or the profile has no known
+    identity yet. This is what stops a stale/foreign shared-slot value —
+    left by a race, another profile's exec-path launch, or an in-app
+    account switch — from silently overwriting a profile's saved secret.
+
+    Entry self-repairs the mirror image: when ``profile`` already has a
+    `.secret` AND a known identity (cached email or on-disk token), a
+    decoded mismatch means the backup itself went stale/foreign at some
+    point -- it is quarantined (renamed, never overwritten) instead of
+    being swapped into the shared slot, and the launch falls through to
+    whatever credential source the profile still has (its on-disk token,
+    or nothing, in which case the shared slot is cleared like any other
+    profile with no usable private slot).
     """
     if not supported():
         import contextlib
@@ -332,6 +470,19 @@ def launch_guard(store, profile: str, capture: bool = False):
                 self._had_shared = read_slot(shared_slot(), self._keychain_path)
                 slot = load_profile_slot(store, profile)
                 if slot is not None:
+                    known = _known_identity(store, profile, include_secret=False)
+                    if known is not None:
+                        candidate = _secret_identity(slot)
+                        if candidate != known:
+                            seen = repr(candidate) if candidate else "undecodable"
+                            _quarantine_profile_slot(store, profile)
+                            warn(
+                                f"keychain slot for profile {profile!r} looks "
+                                f"like a different account ({seen} vs "
+                                f"{known!r}); quarantined, not swapped in"
+                            )
+                            slot = None
+                if slot is not None:
                     write_slot(shared_slot(), slot, self._keychain_path)
                     self._swapped = True
                 elif self._had_shared is not None:
@@ -347,10 +498,10 @@ def launch_guard(store, profile: str, capture: bool = False):
             try:
                 if self._keychain_path is None:
                     return False
-                if self._swapped:
+                if self._swapped and not capture:
                     current = read_slot(shared_slot(), self._keychain_path)
                     if current is not None:
-                        save_profile_slot(store, profile, current)
+                        _persist_if_trusted(store, profile, current)
 
                 if capture:
                     self._capture_and_keep()
@@ -362,7 +513,7 @@ def launch_guard(store, profile: str, capture: bool = False):
                             delete_slot(shared_slot(), self._keychain_path)
                         except KeychainError:
                             pass
-            except KeychainError as exc:
+            except (KeychainError, OSError) as exc:
                 warn(f"keychain restore failed ({exc}); shared slot left as-is")
             finally:
                 if self._lock is not None:
@@ -376,13 +527,19 @@ def launch_guard(store, profile: str, capture: bool = False):
         def _capture_and_keep(self):
             data = read_slot(shared_slot(), self._keychain_path)
             if data is not None:
-                save_profile_slot(store, profile, data)
+                _persist_if_trusted(store, profile, data)
 
     return _Guard()
 
 
 def rename_profile_slot(store, old_name: str, new_name: str) -> None:
     """Rename a profile's keychain slot file (rename keeps the token).
+
+    A source with no `.secret` is not a no-op: the new name could be
+    reusing an earlier deleted profile's name, so any stale secret already
+    sitting at the target must be purged too -- otherwise the renamed
+    profile would silently inherit someone else's credential (same
+    invariant as ``Store.create``'s own purge on a fresh name).
 
     Fail-open like ``purge_profile_slot``: the profile rename itself already
     committed by the time this runs, so an OSError here must warn and
@@ -391,20 +548,133 @@ def rename_profile_slot(store, old_name: str, new_name: str) -> None:
     try:
         old = slot_backup_path(store, old_name)
         if not old.exists():
+            purge_profile_slot(store, new_name)
             return
         new = slot_backup_path(store, new_name)
-        new.parent.mkdir(parents=True, exist_ok=True)
+        platforms.ensure_dir(new.parent)
         old.replace(new)
     except OSError as exc:
         warn(f"could not rename keychain slot for {old_name!r} ({exc})")
 
 
 def purge_profile_slot(store, name: str) -> None:
-    """Delete a profile's keychain slot file (delete must not leak it)."""
+    """Delete a profile's keychain slot: file backup AND the real macOS
+    keychain entry. delete must not leak either — leaving the system keychain
+    entry behind after a profile wipe was a silent leak until now."""
     try:
         slot_backup_path(store, name).unlink(missing_ok=True)
     except OSError as exc:
         warn(f"could not purge keychain slot for {name!r} ({exc})")
+    if supported():
+        try:
+            delete_slot(profile_slot(name))
+        except (KeychainError, OSError) as exc:
+            warn(f"could not delete keychain entry for {name!r} ({exc})")
+
+
+_ORPHAN_SVC_RE = re.compile(r'"svce"\s*(?:<blob>)?\s*="(gemini/agydra/[A-Za-z0-9_-]+)"')
+"""Matches a ``gemini/agydra/<name>`` service in the dump-keychain attribute
+block, anchored to the actual ``"svce"`` attribute token (not just any place
+the literal substring appears). Both the quoted and the ``<blob>`` variant
+of that token appear in practice."""
+
+_UNRESOLVED_KEYCHAIN_PATH = object()
+
+
+def orphan_slots(store, known_names: List[str], keychain_path=_UNRESOLVED_KEYCHAIN_PATH) -> List[str]:
+    """Profile-slot services in the system keychain whose profile is gone.
+
+    Parses ``security dump-keychain`` for ``gemini/agydra/<name>`` services
+    and returns the names not in ``known_names``, sorted. The shared slot
+    (service ``gemini``, the real agy login) is never a candidate. Returns
+    ``[]`` when the keychain bridge is unsupported.
+
+    ``keychain_path``, when omitted, is resolved here via
+    ``_ensure_target_keychain(store)`` -- never the ambient default
+    keychain, same rule as every other read/write/delete in this module.
+    A caller that already resolved it for another step of the same
+    operation (``doctor --fix``'s purge, which also needs it for the
+    matching ``delete_slot`` calls) should pass it through explicitly
+    instead of paying for a second resolution.
+    """
+    if not supported():
+        return []
+    if keychain_path is _UNRESOLVED_KEYCHAIN_PATH:
+        keychain_path = _ensure_target_keychain(store)
+    args = ["dump-keychain"]
+    if keychain_path is not None:
+        args.append(str(keychain_path))
+    try:
+        result = _run(args)
+    except (KeychainError, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+    found = set(_ORPHAN_SVC_RE.findall(result.stdout.decode(errors="replace")))
+    names = {s[len(_SLOT_SERVICE_PREFIX):] for s in found}
+    return sorted(names - set(known_names))
+
+
+def capture_shared_slot_for_import(store, name: str, data_dir: Path) -> None:
+    """After ``agydra import``, capture the shared keychain slot as
+    ``name``'s private slot backup -- only when there is real signal that
+    it belongs to what was just imported.
+
+    Trust rule: when the just-imported on-disk token decodes an email
+    claim, the shared slot's secret must match it. When it has no email
+    claim to compare (no ``id_token`` at all), the shared secret's OWN
+    identity is checked next: if it decodes to some email on its own,
+    that alone is real signal it belongs to a different account, so it is
+    refused just like a known mismatch -- "no email claim to compare
+    against" is not the same as "nothing to compare against". Only when
+    the shared secret is genuinely undecodable (garbage/empty) does it
+    fall back to "captured because a fresh on-disk token file exists at
+    all"; an ambient keychain value with zero corroborating on-disk
+    evidence is never captured, since ``import`` gives no other identity
+    signal to check it against.
+    """
+    if not supported():
+        return
+    try:
+        keychain_path = _ensure_target_keychain(store)
+        current = read_slot(shared_slot(), keychain_path)
+    except (KeychainError, OSError) as exc:
+        warn(f"keychain import capture skipped ({exc}); continuing without it")
+        return
+    if current is None:
+        return
+
+    import account
+
+    has_token_file = (data_dir / account.AGY_CLI_DIR / account.TOKEN_FILE).is_file()
+    imported_email = account.detect_email(data_dir)
+    if imported_email is not None:
+        candidate = _secret_identity(current)
+        if candidate == imported_email:
+            save_profile_slot(store, name, current)
+        else:
+            seen = repr(candidate) if candidate else "undecodable"
+            warn(
+                f"keychain slot does not match the token just imported for "
+                f"profile {name!r} ({seen} vs {imported_email!r}); not "
+                "captured"
+            )
+        return
+    candidate = _secret_identity(current)
+    if candidate is not None:
+        warn(
+            f"keychain slot for profile {name!r} decodes to an unrelated "
+            f"account ({candidate!r}) and the just-imported token has no "
+            "email claim to corroborate it; not captured"
+        )
+        return
+    if has_token_file:
+        save_profile_slot(store, name, current)
+    else:
+        warn(
+            f"an ambient keychain value was found for profile {name!r} but "
+            "no on-disk token was imported to corroborate it; not captured"
+        )
 
 
 def describe(store, names: Optional[List[str]] = None) -> Dict[str, object]:

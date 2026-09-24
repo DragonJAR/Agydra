@@ -1,12 +1,17 @@
 """Lightweight checks for the keychain bridge naming and descriptor shape."""
 import base64
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import keychain
+from conftest import BaseCase, _make_jwt, isolated_store_env
+from store import Store
 
 
 def _rc(code, out: bytes = b""):
@@ -41,9 +46,12 @@ class TestDecodeGoKeyringSecret(unittest.TestCase):
             {"id_token": "x", "auth_method": "consumer"},
         )
 
-    def test_plain_json_bytes_is_decoded(self):
+    def test_plain_json_without_go_keyring_prefix_returns_none(self):
+        """No alternate encodings: the go-keyring-prefixed form is the only
+        one agy/go-keyring ever writes, so unprefixed bytes are treated as
+        "no token here" (None), never guessed into a token dict."""
         data = json.dumps({"a": 1}).encode()
-        self.assertEqual(keychain.decode_go_keyring_secret(data), {"a": 1})
+        self.assertIsNone(keychain.decode_go_keyring_secret(data))
 
     def test_garbage_bytes_return_none(self):
         self.assertIsNone(keychain.decode_go_keyring_secret(b"not json at all"))
@@ -229,6 +237,275 @@ class TestLaunchGuardRestore(unittest.TestCase):
         self.assertEqual(keychain.load_profile_slot(store, "alpha"), b"profile-token-v1")
 
 
+def _go_keyring_secret(email: str) -> bytes:
+    jwt = _make_jwt({"email": email})
+    payload = json.dumps({
+        "token": {"access_token": "a", "refresh_token": "r"},
+        "auth_method": "consumer",
+        "id_token": jwt,
+    }).encode("utf-8")
+    return b"go-keyring-base64:" + base64.b64encode(payload)
+
+
+class TestLaunchGuardIdentityGuard(unittest.TestCase):
+    """Exit must not blindly trust whatever landed in the shared slot after
+    a launch: only persist it as a profile's own `.secret` when its
+    identity matches what is already known about that profile (cached
+    `profile.email` here), or the profile has no known identity yet (a
+    genuine first login, covered by TestLaunchGuardRestore already)."""
+
+    def test_mismatched_identity_is_not_persisted(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            profile = store.get("alpha")
+            profile.email = "alpha@example.com"
+            store.save(profile)
+            own_secret = _go_keyring_secret("alpha@example.com")
+            keychain.save_profile_slot(store, "alpha", own_secret)
+
+            kc = _MemoryKeychain(None)
+            foreign_secret = _go_keyring_secret("mallory@example.com")
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                guard = keychain.launch_guard(store, "alpha")
+                state = guard.__enter__()
+                self.assertTrue(state._swapped)
+                kc.shared = foreign_secret
+                state.__exit__(None, None, None)
+
+            self.assertEqual(keychain.load_profile_slot(store, "alpha"), own_secret)
+
+    def test_matching_identity_is_persisted(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            profile = store.get("alpha")
+            profile.email = "alpha@example.com"
+            store.save(profile)
+            keychain.save_profile_slot(
+                store, "alpha", _go_keyring_secret("alpha@example.com")
+            )
+
+            kc = _MemoryKeychain(None)
+            refreshed_secret = _go_keyring_secret("alpha@example.com")
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                guard = keychain.launch_guard(store, "alpha")
+                state = guard.__enter__()
+                kc.shared = refreshed_secret
+                state.__exit__(None, None, None)
+
+            self.assertEqual(keychain.load_profile_slot(store, "alpha"), refreshed_secret)
+
+
+class TestLaunchGuardEntrySelfRepair(unittest.TestCase):
+    """Entry must not swap a `.secret` into the shared slot when it turns
+    out to belong to a different, already-known identity: it quarantines
+    the stale/foreign file instead of handing it to agy as this profile's
+    own credential (which would silently authenticate as someone else)."""
+
+    def test_mismatched_secret_is_quarantined_and_not_swapped_in(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            profile = store.get("alpha")
+            profile.email = "alpha@example.com"
+            store.save(profile)
+            foreign_secret = _go_keyring_secret("mallory@example.com")
+            keychain.save_profile_slot(store, "alpha", foreign_secret)
+
+            kc = _MemoryKeychain(b"whatever-was-shared")
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                guard = keychain.launch_guard(store, "alpha")
+                state = guard.__enter__()
+
+            self.assertFalse(state._swapped)
+            self.assertIsNone(kc.shared)
+            self.assertIn(("delete", None), kc.calls)
+            self.assertIsNone(keychain.load_profile_slot(store, "alpha"))
+            quarantined = list(keychain._slots_dir(store).glob("alpha.secret.corrupt-*"))
+            self.assertEqual(len(quarantined), 1)
+            self.assertEqual(quarantined[0].read_bytes(), foreign_secret)
+
+    def test_matching_secret_is_swapped_in_normally(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            profile = store.get("alpha")
+            profile.email = "alpha@example.com"
+            store.save(profile)
+            own_secret = _go_keyring_secret("alpha@example.com")
+            keychain.save_profile_slot(store, "alpha", own_secret)
+
+            kc = _MemoryKeychain(None)
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                guard = keychain.launch_guard(store, "alpha")
+                state = guard.__enter__()
+
+            self.assertTrue(state._swapped)
+            self.assertEqual(kc.shared, own_secret)
+
+    def test_no_cached_identity_skips_the_check(self):
+        """A profile whose email was never synced (created before this
+        feature, or never listed) must keep launching exactly as before --
+        nothing to compare the secret against, so it is trusted."""
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            unverified_secret = _go_keyring_secret("whoever@example.com")
+            keychain.save_profile_slot(store, "alpha", unverified_secret)
+
+            kc = _MemoryKeychain(None)
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                guard = keychain.launch_guard(store, "alpha")
+                state = guard.__enter__()
+
+            self.assertTrue(state._swapped)
+            self.assertEqual(kc.shared, unverified_secret)
+
+
+class TestCaptureSharedSlotForImport(unittest.TestCase):
+    """`agydra import` must never blind-trust an ambient shared-slot value
+    as the freshly imported profile's own credential -- it has to be
+    corroborated by what was just imported (its on-disk token's email, or
+    at minimum the mere presence of a fresh on-disk token)."""
+
+    def _write_token(self, data_dir: Path, claims=None):
+        cli_dir = data_dir / "antigravity-cli"
+        cli_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"token": {"access_token": "a", "refresh_token": "r"}}
+        if claims is not None:
+            payload["id_token"] = _make_jwt(claims)
+        (cli_dir / "antigravity-oauth-token").write_text(json.dumps(payload))
+
+    def test_matching_email_is_captured(self):
+        with isolated_store_env(), tempfile.TemporaryDirectory() as tmp:
+            store = Store()
+            store.create("kc")
+            data_dir = Path(tmp)
+            self._write_token(data_dir, {"email": "kc@example.com"})
+
+            kc = _MemoryKeychain(_go_keyring_secret("kc@example.com"))
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                keychain.capture_shared_slot_for_import(store, "kc", data_dir)
+
+            self.assertEqual(
+                keychain.load_profile_slot(store, "kc"), kc.shared
+            )
+
+    def test_mismatched_email_is_not_captured(self):
+        with isolated_store_env(), tempfile.TemporaryDirectory() as tmp:
+            store = Store()
+            store.create("kc")
+            data_dir = Path(tmp)
+            self._write_token(data_dir, {"email": "kc@example.com"})
+
+            kc = _MemoryKeychain(_go_keyring_secret("mallory@example.com"))
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                keychain.capture_shared_slot_for_import(store, "kc", data_dir)
+
+            self.assertIsNone(keychain.load_profile_slot(store, "kc"))
+
+    def test_fresh_token_with_no_email_claim_is_still_captured(self):
+        with isolated_store_env(), tempfile.TemporaryDirectory() as tmp:
+            store = Store()
+            store.create("kc")
+            data_dir = Path(tmp)
+            self._write_token(data_dir, claims=None)
+
+            kc = _MemoryKeychain(b"go-keyring-base64:not-decodable-but-present")
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                keychain.capture_shared_slot_for_import(store, "kc", data_dir)
+
+            self.assertEqual(keychain.load_profile_slot(store, "kc"), kc.shared)
+
+    def test_decodable_unrelated_ambient_value_is_not_captured_without_email_claim(self):
+        """No email claim to compare against is NOT the same as "nothing
+        to compare against": when the ambient shared secret decodes to
+        SOME email on its own, that is itself real signal it belongs to a
+        different account, and the mere presence of a fresh on-disk token
+        (with no email claim of its own) must not override it."""
+        with isolated_store_env(), tempfile.TemporaryDirectory() as tmp:
+            store = Store()
+            store.create("kc")
+            data_dir = Path(tmp)
+            self._write_token(data_dir, claims=None)
+
+            kc = _MemoryKeychain(_go_keyring_secret("someone-else@example.com"))
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                keychain.capture_shared_slot_for_import(store, "kc", data_dir)
+
+            self.assertIsNone(keychain.load_profile_slot(store, "kc"))
+
+    def test_no_on_disk_token_never_blind_trusts_ambient_value(self):
+        with isolated_store_env(), tempfile.TemporaryDirectory() as tmp:
+            store = Store()
+            store.create("kc")
+            data_dir = Path(tmp)
+
+            kc = _MemoryKeychain(_go_keyring_secret("whoever@example.com"))
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                keychain.capture_shared_slot_for_import(store, "kc", data_dir)
+
+            self.assertIsNone(keychain.load_profile_slot(store, "kc"))
+
+    def test_empty_shared_slot_is_a_noop(self):
+        with isolated_store_env(), tempfile.TemporaryDirectory() as tmp:
+            store = Store()
+            store.create("kc")
+            data_dir = Path(tmp)
+            self._write_token(data_dir, {"email": "kc@example.com"})
+
+            kc = _MemoryKeychain(None)
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                keychain.capture_shared_slot_for_import(store, "kc", data_dir)
+
+            self.assertIsNone(keychain.load_profile_slot(store, "kc"))
+
+
 class TestDescribeForwardsKeychainPath(unittest.TestCase):
     """describe() must resolve the target keychain once (via
     _ensure_target_keychain) and forward it into read_slot, never rely on the
@@ -331,6 +608,140 @@ class TestEnsureTargetKeychain(unittest.TestCase):
 
             with mock.patch.object(keychain, "_run", exploding_run):
                 self.assertIsNone(keychain._ensure_target_keychain(store))
+
+
+class TestPurgeProfileSlot(BaseCase):
+    """``purge_profile_slot`` must not leak the REAL macOS keychain entry:
+    deleting the file backup only left ``gemini/agydra/<name>`` behind in the
+    system keychain forever (observed after wipe-store cleanups)."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = _StoreStub(Path(self._tmp) / "store")
+        slots = keychain._slots_dir(self.store)
+        slots.mkdir(parents=True, exist_ok=True)
+        self.backup = keychain.slot_backup_path(self.store, "work")
+        self.backup.write_bytes(b"go-keyring-base64:e30=")
+
+    def test_purge_unlinks_backup_and_deletes_keychain_entry(self):
+        calls = []
+
+        def fake_run(args, input_bytes=None):
+            calls.append(args)
+            return _rc(0)
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(keychain, "_run", fake_run):
+            keychain.purge_profile_slot(self.store, "work")
+
+        self.assertFalse(self.backup.exists(), "file backup must be unlinked")
+        self.assertIn(
+            ["delete-generic-password", "-s", "gemini/agydra/work", "-a", "antigravity"],
+            calls,
+            "real keychain entry must be deleted via delete_slot",
+        )
+
+    def test_purge_without_keychain_bridge_only_unlinks_backup(self):
+        """AGYDRA_NO_KEYCHAIN / non-macOS: no `security` shell-out, file gone."""
+        calls = []
+
+        def exploding_run(args, input_bytes=None):
+            calls.append(args)
+            raise AssertionError("no keychain bridge expected here")
+
+        with mock.patch.object(keychain, "supported", return_value=False), \
+                mock.patch.object(keychain, "_run", exploding_run):
+            keychain.purge_profile_slot(self.store, "work")
+        self.assertFalse(calls)
+        self.assertFalse(self.backup.exists())
+
+    def test_purge_swallows_keychain_error(self):
+        """A failing `security` delete must not abort profile deletion."""
+        def failing_run(args, input_bytes=None):
+            return _rc(45)
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(keychain, "_run", failing_run):
+            keychain.purge_profile_slot(self.store, "work")  # must not raise
+        self.assertFalse(self.backup.exists())
+
+
+class TestOrphanSlots(BaseCase):
+    """``orphan_slots`` finds ``gemini/agydra/*`` services whose profile is
+    gone, so `doctor --fix` can purge them. The shared ``gemini`` slot (the
+    real agy login) is NEVER a candidate. It must also target the resolved
+    keychain explicitly, same rule as every other read/write/delete in the
+    module -- never the ambient default keychain."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+
+    def _patch_dump(self, services, seen_args):
+        dump = "\n".join(
+            f'    "svce"<blob>="{s}"\n' for s in services
+        )
+        def fake_run(args, input_bytes=None):
+            seen_args.append(args)
+            assert args[0] == "dump-keychain", args
+            return _rc(0, dump.encode())
+        return mock.patch.object(keychain, "supported", return_value=True), \
+            mock.patch.object(keychain, "_run", fake_run), \
+            mock.patch.object(
+                keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+            )
+
+    def test_orphans_parsed_and_shared_never_listed(self):
+        seen_args = []
+        p1, p2, p3 = self._patch_dump(
+            ["gemini/agydra/stale", "gemini/agydra/live", "gemini", "something-else"],
+            seen_args,
+        )
+        with p1, p2, p3:
+            orphans = keychain.orphan_slots(self.store, known_names=["live"])
+        self.assertEqual(orphans, ["stale"])
+
+    def test_dump_keychain_targets_resolved_keychain_path(self):
+        """The pinned keychain path must be resolved once and appended to
+        the ``dump-keychain`` call, not left to the ambient default."""
+        seen_args = []
+        p1, p2, p3 = self._patch_dump([], seen_args)
+        with p1, p2, p3:
+            keychain.orphan_slots(self.store, known_names=[])
+        self.assertEqual(seen_args, [["dump-keychain", str(_FAKE_KEYCHAIN)]])
+
+    def test_explicit_keychain_path_skips_resolution(self):
+        """A caller that already resolved the keychain path (e.g. doctor's
+        fix pass, which reuses it for the matching ``delete_slot`` calls)
+        must not pay for a second resolution."""
+        seen_args = []
+        dump = '    "svce"<blob>="gemini/agydra/stale"\n'
+
+        def fake_run(args, input_bytes=None):
+            seen_args.append(args)
+            return _rc(0, dump.encode())
+
+        def exploding_resolve(_store):
+            raise AssertionError("must not resolve when a path is given")
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(keychain, "_run", fake_run), \
+                mock.patch.object(
+                    keychain, "_ensure_target_keychain", exploding_resolve
+                ):
+            orphans = keychain.orphan_slots(
+                self.store, known_names=[], keychain_path=_FAKE_KEYCHAIN
+            )
+        self.assertEqual(orphans, ["stale"])
+        self.assertEqual(seen_args, [["dump-keychain", str(_FAKE_KEYCHAIN)]])
+
+    def test_unsupported_bridge_returns_empty(self):
+        def exploding_run(args, input_bytes=None):
+            raise AssertionError("no bridge, no shell-out")
+
+        with mock.patch.object(keychain, "supported", return_value=False), \
+                mock.patch.object(keychain, "_run", exploding_run):
+            self.assertEqual(keychain.orphan_slots(self.store, known_names=[]), [])
 
 
 if __name__ == "__main__":
