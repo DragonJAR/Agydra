@@ -218,8 +218,18 @@ def _warn_late_flags(values: Dict[str, object], raw: Sequence[str]) -> None:
 
 
 def _assert_free(store: Store, name: str) -> None:
-    """Refuse to mutate a profile that a live session is using."""
+    """Refuse to mutate a profile that a live session is using.
+
+    When the holder's PID can be read back from the lock file (POSIX
+    only — see ``locks.lock_holder_pid``), name it so the user has an
+    actionable next step instead of a dead end."""
     if locks.is_locked(store, name):
+        pid = locks.lock_holder_pid(store, name)
+        if pid:
+            raise StoreError(
+                f"profile {name!r} has a live session (agy PID {pid}); end it "
+                f"(or: kill {pid}) before deleting or renaming the profile"
+            )
         raise StoreError(
             f"profile {name!r} has a live session; end it before deleting "
             "or renaming the profile"
@@ -352,21 +362,39 @@ def _confirm(prompt: str, assume_yes: bool) -> bool:
     return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
 
 
-def cmd_delete(store: Store, args) -> int:
-    name = store.resolve_ref(args.ref)
-    _assert_free(store, name)
-    profile = store.get(name)
-    email = profile.email or account.detect_email(store.profile_data_dir(name), store, name) or "?"
-    if not _confirm(f"delete profile {name!r} ({email})?", args.force):
-        print("cancelled")
-        return 1
-    backup = store.delete(name, backup=not args.no_backup)
+def _finish_delete(store: Store, name: str, no_backup: bool) -> int:
+    """Shared tail for both the normal and the corrupt-profile delete paths."""
+    backup = store.delete(name, backup=not no_backup)
     locks.forget(store, name)
     keychain.purge_profile_slot(store, name)
     if backup:
         print(f"backup saved: {backup}")
     print(f"deleted profile: {name}")
     return 0
+
+
+def cmd_delete(store: Store, args) -> int:
+    try:
+        name = store.resolve_ref(args.ref)
+    except StoreError:
+        if args.ref not in store.unreadable_profiles():
+            raise
+        _assert_free(store, args.ref)
+        if not _confirm(
+            f"delete unreadable profile {args.ref!r} (corrupt or incomplete "
+            "metadata)?",
+            args.force,
+        ):
+            print("cancelled")
+            return 1
+        return _finish_delete(store, args.ref, args.no_backup)
+    _assert_free(store, name)
+    profile = store.get(name)
+    email = profile.email or account.detect_email(store.profile_data_dir(name), store, name) or "?"
+    if not _confirm(f"delete profile {name!r} ({email})?", args.force):
+        print("cancelled")
+        return 1
+    return _finish_delete(store, name, args.no_backup)
 
 
 def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
@@ -455,6 +483,7 @@ def cmd_import(store: Store, args) -> int:
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
+    keychain.capture_shared_slot_for_import(store, name, data_dir)
     print(f"imported generic data into profile {name!r}: {data_dir}")
     return 0
 
@@ -469,10 +498,40 @@ def cmd_use(store: Store, args) -> int:
     return 0
 
 
-def cmd_doctor(store: Store, _args) -> int:
-    from doctor import run_checks
+def cmd_doctor(store: Store, args) -> int:
+    """Run the checks; ``--fix`` additionally repairs what they found.
 
-    return run_checks(store)
+    Confirmation is decided here (a CLI/UX concern) before anything is
+    ever fixed. The check-and-print pass runs exactly ONCE per invocation
+    -- ``doctor.run_checks(store)`` reports the single pre-fix pass; once
+    the user confirms, repairs are applied directly via
+    ``doctor._apply_fixes`` (never by calling ``run_checks`` a second
+    time, which would re-run and re-print every check line, including a
+    now-stale WARN for what is about to be fixed). The returned exit code
+    reflects POST-fix state, computed silently (no reprint) via
+    ``doctor._post_fix_exit_code``.
+    """
+    import doctor
+
+    exit_code = doctor.run_checks(store)
+    if not getattr(args, "fix", False):
+        return exit_code
+
+    ctx = doctor._build_ctx(store)
+    preview = doctor._preview_fixables(store, ctx)
+    if not preview:
+        print("no fixable items")
+        return exit_code
+    print()
+    print("fixable items:")
+    for line in preview:
+        print(f"  - {line}")
+    if not _confirm("apply these repairs?", getattr(args, "force", False)):
+        print("cancelled")
+        return exit_code
+    print()
+    doctor._apply_fixes(store, ctx)
+    return doctor._post_fix_exit_code(store)
 
 
 def cmd_setup(_store: Store, args) -> int:
@@ -507,7 +566,7 @@ _SUBCOMMAND_HELP: Dict[str, str] = {
     "rename": "rename a profile (refuses busy)",
     "delete": "backup ZIP then delete a profile (refuses busy)",
     "share-config": "copy settings.json + mcp.json between profiles",
-    "doctor": "diagnose the installation",
+    "doctor": "diagnose the installation (--fix removes orphaned artifacts)",
     "setup": "one-command install of the shim",
     "help": "show this help",
     "version": "print the version",
@@ -659,7 +718,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.add_argument("ref", help="profile name or 1-based number")
             parser.add_argument(
                 "-f", "--force", action="store_true",
-                help="delete without asking for confirmation"
+                help="skip the confirmation prompt only; never bypasses a "
+                "live session (delete still refuses a busy profile)"
             )
             parser.add_argument(
                 "--no-backup", action="store_true",
@@ -688,6 +748,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.add_argument("ref", help="profile name or 1-based number to pin here")
             parser.set_defaults(func=cmd_use)
         elif sub == "doctor":
+            parser.add_argument(
+                "--fix", action="store_true",
+                help="repair what the checks found: migrate a real-dir "
+                "overlay into the profile store and relink, clear a "
+                "dangling default profile, purge orphaned macOS-keychain "
+                "slots, and remove orphaned store artifacts "
+                "(overlays/locks/keychain/backups) left behind by a "
+                "manually deleted profile; asks for confirmation unless "
+                "-f/--force",
+            )
+            parser.add_argument(
+                "-f", "--force", action="store_true",
+                help="skip the --fix confirmation prompt only; never "
+                "removes a live lock or anything a current profile owns",
+            )
             parser.set_defaults(func=cmd_doctor)
         elif sub == "setup":
             parser.add_argument(

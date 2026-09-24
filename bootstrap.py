@@ -207,7 +207,7 @@ def ensure_path_shim(root: Path, out: Callable[[str], None]) -> Optional[Path]:
     if not target.exists():
         raise BootstrapError(f"console script missing: {target}")
     shim = shim_path()
-    shim.parent.mkdir(parents=True, exist_ok=True)
+    platforms.ensure_dir(shim.parent)
     if shim.exists():
         body = shim.read_text(encoding="utf-8", errors="replace")
         if str(target) not in body:

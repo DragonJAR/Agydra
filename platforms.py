@@ -18,6 +18,7 @@ APP_NAME = "agydra"
 BASE_DIR_ENV = "AGYDRA_HOME"
 AGY_BIN_ENV = "AGYDRA_AGY_BIN"
 AGY_DATA_DIR_NAME = ".gemini"
+OVERLAYS_DIRNAME = "overlays"
 
 
 def is_windows() -> bool:
@@ -73,6 +74,32 @@ def agy_data_dir(home: Optional[Path] = None) -> Path:
     return (home or real_home()) / AGY_DATA_DIR_NAME
 
 
+_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
+
+
+def _probe_pathext(p: Path) -> Optional[Path]:
+    """Probe PATHEXT-suffixed variants of an extension-less Windows path.
+
+    ``shutil.which`` on Python < 3.12 short-circuits to a literal existence
+    check as soon as the candidate has a directory component, skipping
+    PATHEXT entirely (verified against CPython's own ``shutil.which``
+    source: the pre-3.12 implementation returns right after
+    ``_access_check(cmd, mode)`` when ``os.path.dirname(cmd)`` is truthy;
+    3.12+ rewrote it to also try PATHEXT in that case). Reusing this one
+    helper wherever an explicit, extension-less agy path might need a
+    PATHEXT suffix keeps the probing DRY. Always splits on ``;`` — real
+    Windows PATHEXT is semicolon-delimited regardless of ``os.pathsep``.
+    """
+    pathext = os.environ.get("PATHEXT") or _DEFAULT_PATHEXT
+    for ext in pathext.split(";"):
+        if not ext:
+            continue
+        candidate = Path(str(p) + ext)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def resolve_agy_binary(explicit: Optional[str] = None) -> Optional[Path]:
     """Locate the real agy binary without fragile heuristics.
 
@@ -88,6 +115,10 @@ def resolve_agy_binary(explicit: Optional[str] = None) -> Optional[Path]:
             which_p = shutil.which(str(p))
             if which_p:
                 return Path(which_p)
+            if os.path.dirname(str(p)) and not p.suffix:
+                probed = _probe_pathext(p)
+                if probed:
+                    return probed
         return None
     found = shutil.which("agy")
     return Path(found) if found else None

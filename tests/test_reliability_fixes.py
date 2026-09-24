@@ -281,6 +281,18 @@ class TestProfileSlotLifecycle(unittest.TestCase):
             store = Store()
             keychain.rename_profile_slot(store, "ghost", "new")
 
+    def test_rename_without_source_slot_purges_stale_target_slot(self):
+        """A source with no `.secret` must not leave the TARGET's existing
+        secret untouched -- the rename target might be reusing a name from
+        an earlier deleted profile, and inheriting its stale credential
+        would be as wrong as a fresh `create` inheriting one (see
+        `Store.create`'s own purge)."""
+        with isolated_store_env():
+            store = Store()
+            keychain.save_profile_slot(store, "new", b"stale-from-a-past-profile")
+            keychain.rename_profile_slot(store, "old", "new")
+            self.assertIsNone(keychain.load_profile_slot(store, "new"))
+
     def test_purge_removes_and_tolerates_missing(self):
         with isolated_store_env():
             store = Store()
@@ -362,6 +374,95 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
                 self.assertEqual(order, ["guard-exit", "lock-release"])
             finally:
                 os.environ.pop("AGYDRA_AGY_BIN", None)
+
+
+class TestLockHolderPidExecPathOnly(unittest.TestCase):
+    """The lock file's PID hint must name the process that will ACTUALLY be
+    running once the launch completes, or not exist at all. Before this
+    fix, ``try_lock`` unconditionally recorded the agydra wrapper's own PID
+    -- correct only on the plain ``execvpe`` path, where the PID survives
+    the exec. On ``launch_as_child``/sandboxed launches the real ``agy``
+    runs as a NEW child process with a different PID, so naming the
+    wrapper's PID in the busy-profile message let a user `kill` the
+    waiting wrapper (dropping the flock, "freeing" the profile) while the
+    real spawned ``agy`` process kept running completely unprotected."""
+
+    def test_launch_as_child_path_never_records_a_pid(self):
+        import os
+        import sys
+        from unittest import mock
+
+        import locks, platforms
+
+        captured = {}
+
+        def fake_run_wait(argv, env):
+            captured["pid_while_held"] = locks.lock_holder_pid(store, "work")
+            return 0
+
+        with isolated_store_env(), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
+        ):
+            store = Store()
+            store.create("work")
+            plan = runner.build_plan(
+                store, [], flag_ref="work", launch_as_child=True
+            )
+            with mock.patch.object(
+                platforms, "run_wait", side_effect=fake_run_wait
+            ):
+                rc = runner.run(plan, store=store)
+            self.assertEqual(rc, 0)
+        self.assertIn("pid_while_held", captured)
+        self.assertIsNone(captured["pid_while_held"])
+        self.assertIsNone(locks.lock_holder_pid(store, "work"))
+
+    def test_plain_exec_path_still_records_a_real_pid(self):
+        import os
+        from unittest import mock
+
+        import locks, platforms
+
+        with isolated_store_env():
+            store = Store()
+            store.create("work")
+            plan = runner.build_plan(store, [], flag_ref="work")
+            with mock.patch.object(platforms, "is_windows", return_value=False), \
+                    mock.patch.object(
+                        platforms, "launch_argv", return_value=0
+                    ) as launch_argv:
+                rc = runner.run(plan, store=store)
+            self.assertEqual(rc, 0)
+            launch_argv.assert_called_once()
+            self.assertEqual(locks.lock_holder_pid(store, "work"), os.getpid())
+
+
+class TestRunnerReleasesLockOnSetupException(unittest.TestCase):
+    """The lock is acquired before the overlay/env setup runs; a failure in
+    that setup (e.g. ``isolation.build_overlay`` raising ``IsolationError``)
+    must still release the handle in-process instead of leaking it because
+    the failure happened outside the exec/keychain try/finally."""
+
+    def test_build_overlay_error_leaves_profile_unlocked(self):
+        import os
+        import sys
+        from unittest import mock
+
+        import isolation, locks
+
+        with isolated_store_env(), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
+        ):
+            store = Store()
+            store.create("work")
+            plan = runner.build_plan(store, [], flag_ref="work")
+            with mock.patch.object(
+                isolation, "build_overlay",
+                side_effect=isolation.IsolationError("boom"),
+            ):
+                with self.assertRaises(isolation.IsolationError):
+                    runner.run(plan, store=store)
+            self.assertFalse(locks.is_locked(store, "work"))
 
 
 if __name__ == "__main__":

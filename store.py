@@ -53,6 +53,24 @@ def _is_backup_stamp(token: str) -> bool:
 _BACKUP_STAMP_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{6}\.\d+Z\d{4}(?:\.\d+)?\Z"
 )
+
+
+def backup_owner(name: str, filename: str) -> bool:
+    """True iff ``filename`` (a ``backups/`` zip's name) was produced by
+    ``_write_backup`` for profile ``name``.
+
+    Single source of truth for "who does this backup belong to", shared by
+    ``_prune_backups`` (prune only ``name``'s own zips, never a same-prefix
+    namesake like ``work`` vs. ``work-2``) and the orphaned-backups scan in
+    ``orphans.py`` (flag a zip only when NO current profile owns it).
+    """
+    prefix = f"{name}-"
+    if not filename.startswith(prefix):
+        return False
+    remainder = filename.removesuffix(".zip")[len(prefix):]
+    return _is_backup_stamp(remainder)
+
+
 CONFIG_FILE = "agydra.json"
 
 
@@ -65,31 +83,48 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     atomic_write_bytes(path, payload)
 
 
-def atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write arbitrary bytes atomically: unique tmp in ``path``'s dir, fsync,
-    then ``os.replace``.
+def _atomic_replace(path: Path, write_payload, verify=None) -> None:
+    """Shared skeleton for every durable write in the store: unique tmp in
+    ``path``'s dir, payload written and fsync'd, then a Windows-backoff
+    ``os.replace``. ``write_payload(fh, tmp)`` fills the open tmp file; the
+    skeleton owns mkstemp, flush+fsync, replace and tmp cleanup on failure,
+    so the crash-atomicity discipline can never drift between writers.
+    ``verify(tmp)``, when given, runs after the tmp file is closed but before
+    the replace (backup zip integrity); a raise removes the tmp and
+    propagates so the final name never holds an unverified write.
 
-    Shared primitive for every non-JSON durable write (keychain credential
-    backups, the ``.agydra`` project marker): same discipline as
-    ``_atomic_write_json`` so a crash mid-write can never leave a
-    half-written file where a reader expects a complete one.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    The tmp keeps mkstemp's 0600 (never widened) because backups written
+    through this skeleton embed ``.secret`` material."""
+    platforms.ensure_dir(path.parent)
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
     )
+    tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
+            write_payload(fh, tmp)
             fh.flush()
             os.fsync(fh.fileno())
+        if verify is not None:
+            verify(tmp)
         _replace_with_retry(tmp_name, path)
     except BaseException:
         try:
-            os.unlink(tmp_name)
+            os.chmod(tmp, 0o600)
+            tmp.unlink()
         except OSError:
             pass
         raise
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write arbitrary bytes atomically (see ``_atomic_replace``).
+
+    Shared primitive for every non-JSON durable write (keychain credential
+    backups, the ``.agydra`` project marker): a crash mid-write can never
+    leave a half-written file where a reader expects a complete one.
+    """
+    _atomic_replace(path, lambda fh, tmp: fh.write(data))
 
 
 def _replace_with_retry(src: str, dst: Path, attempts: int = 3) -> None:
@@ -126,41 +161,48 @@ def _retry_backoff(attempts: int, op, delay: float = 0.05) -> None:
             time.sleep(delay * (attempt + 1))
 
 
-def _read_json(path: Path) -> dict:
-    data = json.loads(path.read_text(encoding="utf-8"))
+def read_json_object(path: Path, *, tolerant: bool = False):
+    """Read a JSON file as a dict — the shared reader across modules.
+
+    Default contract (``tolerant=False``) is strict: non-dict content or any
+    parse/read error raises so a corrupt store file is never silently
+    accepted. ``tolerant=True`` returns ``None`` on every failure (used by
+    read-only consumers like ``account._oauth_obj`` that probe for optional
+    foreign files and must never raise). Single owner of "JSON file ->
+    dict" semantics so tolerant and strict call sites can never diverge.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        if tolerant:
+            return None
+        raise
     if not isinstance(data, dict):
+        if tolerant:
+            return None
         raise ValueError(f"{path.name}: expected a JSON object, got {type(data).__name__}")
     return data
 
 
 def atomic_copy(source: Path, dest: Path) -> None:
-    """Copy a file atomically: unique tmp in dest's dir, then os.replace.
+    """Copy a file atomically (``_atomic_replace`` skeleton).
 
-    Streams through copyfileobj + fsync (the same write+fsync discipline as
-    ``_atomic_write_json``/``atomic_write_bytes``) instead of plain
-    ``shutil.copy2``, which never forces the copy to disk before returning —
-    without fsync a crash right after ``share-config``/``create`` could lose
-    the copy despite it looking committed. ``copystat`` restores the
-    source's mode/mtime (copy2 semantics) on the tmp file before the replace.
+    Streams through copyfileobj + fsync instead of plain ``shutil.copy2``,
+    which never forces the copy to disk before returning — without fsync a
+    crash right after ``share-config``/``create`` could lose the copy despite
+    it looking committed. ``copystat`` restores the source's mode/mtime
+    (copy2 semantics) on the tmp file before the replace.
     """
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(dest.parent), prefix=dest.name + ".", suffix=".tmp"
-    )
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "wb") as tmp_fh, open(source, "rb") as src_fh:
-            shutil.copyfileobj(src_fh, tmp_fh)
-            tmp_fh.flush()
-            os.fsync(tmp_fh.fileno())
+    def payload(fh, tmp: Path) -> None:
+        """Flush BEFORE copystat: the skeleton's own flush comes later and
+        would write buffered bytes after the utime, clobbering the source
+        mtime this function's docstring promises to preserve."""
+        with open(source, "rb") as src_fh:
+            shutil.copyfileobj(src_fh, fh)
+        fh.flush()
         shutil.copystat(source, tmp)
-        _replace_with_retry(str(tmp), dest)
-    except BaseException:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
+
+    _atomic_replace(dest, payload)
 
 
 def _rmtree_readonly_ok(function, path, _excinfo):
@@ -173,6 +215,30 @@ def _rmtree_readonly_ok(function, path, _excinfo):
         function(path)
     except OSError:
         pass
+
+
+def _has_backup_worthy_content(path: Path) -> bool:
+    """True iff there is anything under ``path`` worth zipping into a backup.
+
+    Covers both a normal profile (``profile.json`` + ``data/``) and the
+    unreadable-profile case where metadata is missing or corrupt but
+    ``data/`` survived with real credentials — either way, deleting
+    without a backup first would destroy real data silently. ``any()``
+    short-circuits on the first entry ``rglob`` yields, so an empty or
+    missing directory costs nothing extra.
+    """
+    return path.is_dir() and any(path.rglob("*"))
+
+
+def _unreadable_metadata_message(name: str) -> str:
+    """Shared wording for "this profile's metadata cannot be read" —
+    ``resolve_ref`` and ``Store.get`` must never drift apart here: both
+    point at ``agydra delete``, since ``agydra create`` on a name whose
+    directory still exists always fails with "already exists"."""
+    return (
+        f"profile {name!r} has unreadable metadata; remove it with: "
+        f"agydra delete {name}"
+    )
 
 
 def rmtree(path: Path) -> None:
@@ -199,7 +265,7 @@ class Store:
     def __init__(self, root: Optional[Path] = None) -> None:
         self.root = root or platforms.base_dir()
         self.profiles_dir = self.root / "profiles"
-        self.overlays_dir = self.root / "overlays"
+        self.overlays_dir = self.root / platforms.OVERLAYS_DIRNAME
         self.backups_dir = self.root / "backups"
 
     @property
@@ -209,7 +275,7 @@ class Store:
     def load_config(self) -> Config:
         if self.config_path.exists():
             try:
-                return Config.from_dict(_read_json(self.config_path))
+                return Config.from_dict(read_json_object(self.config_path))
             except (OSError, ValueError, TypeError, AttributeError) as exc:
                 if not getattr(self, "_config_warned", False):
                     warn(
@@ -237,7 +303,7 @@ class Store:
         the guard can never bless a file load_config degrades on.
         """
         try:
-            Config.from_dict(_read_json(self.config_path))
+            Config.from_dict(read_json_object(self.config_path))
             return True
         except (OSError, ValueError, TypeError, AttributeError):
             return False
@@ -278,10 +344,13 @@ class Store:
         profile_dir = self.profile_dir(name)
         data_dir = self.profile_data_dir(name)
         try:
-            self.profiles_dir.mkdir(parents=True, exist_ok=True)
+            platforms.ensure_dir(self.profiles_dir)
             profile_dir.mkdir()
         except FileExistsError:
             raise StoreError(f"profile {name!r} already exists") from None
+        import keychain
+
+        keychain.purge_profile_slot(self, name)
         existing = self.list()
         seq = (max((p.seq for p in existing), default=0)) + 1
         profile = Profile(name=name, seq=seq, description=description)
@@ -295,11 +364,13 @@ class Store:
 
     def get(self, name: str) -> Profile:
         if not self.exists(name):
+            if self.profile_dir(name).is_dir():
+                raise StoreError(_unreadable_metadata_message(name))
             raise StoreError(
                 f"profile {name!r} does not exist (create it with: agydra create {name})"
             )
         try:
-            return Profile.from_dict(_read_json(self.profile_meta_path(name)))
+            return Profile.from_dict(read_json_object(self.profile_meta_path(name)))
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise StoreError(
                 f"profile {name!r} metadata is corrupt ({exc}); "
@@ -322,7 +393,7 @@ class Store:
                     unreadable.append(pdir.name)
                     continue
                 try:
-                    profile = Profile.from_dict(_read_json(meta))
+                    profile = Profile.from_dict(read_json_object(meta))
                     self.validate_name(profile.name)
                     if profile.name != pdir.name:
                         raise ValueError("metadata name does not match its directory")
@@ -389,7 +460,7 @@ class Store:
                 f"profile {name!r} does not exist (see: agydra list)"
             )
         backup_path: Optional[Path] = None
-        if backup and (profile_dir / "profile.json").is_file():
+        if backup and _has_backup_worthy_content(profile_dir):
             backup_path = self._write_backup(name)
         rmtree(profile_dir)
         self._remove_overlay(name)
@@ -408,11 +479,11 @@ class Store:
     BACKUP_RETENTION = 5
 
     def _write_backup(self, name: str) -> Path:
-        """Zip the profile to a unique tmp, verify, then atomically rename.
+        """Zip the profile to a unique tmp, verify, then atomically rename
+        (``_atomic_replace`` skeleton plus a testzip() read check).
 
         A truncated zip must never sit at the final name: a later restore
-        would fail mid-way with data loss. Mirrors the _atomic_write_json
-        pattern (tmp + fsync + os.replace) plus a testzip() read check.
+        would fail mid-way with data loss.
         """
         platforms.ensure_dir(self.backups_dir)
         stamp = _backup_stamp()
@@ -421,48 +492,43 @@ class Store:
         while backup_path.exists():
             backup_path = self.backups_dir / f"{name}-{stamp}.{counter}.zip"
             counter += 1
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(self.backups_dir), prefix=backup_path.name + ".", suffix=".tmp"
-        )
-        os.close(fd)
-        tmp = Path(tmp_name)
-        try:
-            with open(tmp, "wb") as fh:
-                with zipfile.ZipFile(fh, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for file in self.profile_dir(name).rglob("*"):
-                        if file.is_file():
-                            zf.write(file, file.relative_to(self.profile_dir(name)))
-                fh.flush()
-                os.fsync(fh.fileno())
+        profile_dir = self.profile_dir(name)
+
+        def payload(fh, tmp: Path) -> None:
+            with zipfile.ZipFile(fh, "w", zipfile.ZIP_DEFLATED) as zf:
+                for file in profile_dir.rglob("*"):
+                    if file.is_file():
+                        zf.write(file, file.relative_to(profile_dir))
+                import keychain
+
+                secret = keychain.slot_backup_path(self, name)
+                if secret.is_file():
+                    zf.write(secret, f"_keychain/{name}.secret")
+
+        def verify(tmp: Path) -> None:
             with zipfile.ZipFile(tmp) as zf:
                 bad = zf.testzip()
                 if bad is not None:
                     raise StoreError(f"backup verification failed on {bad!r}")
-            _replace_with_retry(tmp, backup_path)
-        except BaseException:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-            raise
+
+        _atomic_replace(backup_path, payload, verify)
         self._prune_backups(name, keep=self.BACKUP_RETENTION)
         return backup_path
 
     def _prune_backups(self, name: str, keep: int) -> None:
         """Keep only the newest ``keep`` zips for a profile.
 
-        ``work-...`` is also the prefix of ``work-2-...``; we use the shared
-        ``_is_backup_stamp`` helper so producer and validator agree on what a
-        stamp looks like, and any other profile's name (lowercase-only) can
-        never forge the shape. ``stat`` is read inside a loop so a race
-        between the read and the unlink cannot delete the wrong file, and a
-        vanished file is silently skipped (best-effort retention).
+        ``work-...`` is also the prefix of ``work-2-...``; pruning uses the
+        shared ``backup_owner`` helper (also used by the orphaned-backups
+        scan in ``orphans.py``) so producer, pruner and orphan-detector all
+        agree on what "owns" a backup filename and can never drift apart.
+        ``stat`` is read inside a loop so a race between the read and the
+        unlink cannot delete the wrong file, and a vanished file is
+        silently skipped (best-effort retention).
         """
-        prefix = f"{name}-"
         stamped = []
-        for path in self.backups_dir.glob(prefix + "*.zip"):
-            remainder = path.name.removesuffix(".zip")[len(prefix):]
-            if not _is_backup_stamp(remainder):
+        for path in self.backups_dir.glob(f"{name}-*.zip"):
+            if not backup_owner(name, path.name):
                 continue
             try:
                 stamped.append((path.stat().st_mtime, path))
@@ -488,7 +554,8 @@ class Store:
 
     def resolve_ref(self, ref: str) -> str:
         """Resolve a profile reference (name or 1-based number) to a name."""
-        names = self.names()
+        profiles, unreadable = self.scan()
+        names = [p.name for p in profiles]
         if ref in names:
             return ref
         token = ref.lstrip("#")
@@ -500,6 +567,8 @@ class Store:
                 f"profile number {ref!r} out of range (have {len(names)} profile(s)); "
                 "see: agydra list"
             )
+        if ref in unreadable:
+            raise StoreError(_unreadable_metadata_message(ref))
         raise StoreError(
             f"unknown profile {ref!r}; existing: {', '.join(names) or '(none)'} "
             "— create it with: agydra create " + ref

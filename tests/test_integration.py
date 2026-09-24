@@ -12,15 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import account, locks, platforms
 from store import Store
 
-from conftest import BaseCase
-
-
-def _make_jwt(claims: dict) -> str:
-    """Minimal unsigned JWT: only the payload segment is ever decoded."""
-    def seg(obj: dict) -> str:
-        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
-
-    return f"{seg({'alg': 'none', 'typ': 'JWT'})}.{seg(claims)}.sig"
+from conftest import BaseCase, _make_jwt
 
 
 class TestIntegration(BaseCase):
@@ -297,6 +289,40 @@ class TestBusyGuards(BaseCase):
         finally:
             handle.release()
 
+    def test_delete_refuses_busy_profile_names_holder_pid(self):
+        """The busy message must name the holder's PID (and how to kill
+        it) on POSIX, when the lock was taken on the plain-exec launch
+        path that recorded it (``LockHandle.record_holder_pid()``) --
+        simulated here since this test acquires the lock directly rather
+        than through a real launch."""
+        if sys.platform.startswith("win"):
+            self.skipTest("PID recording is POSIX-only by design")
+        handle = locks.try_lock(self.store, "work")
+        handle.record_holder_pid()
+        try:
+            result = self._run_cli("delete", "work", "-f")
+            self.assertEqual(result.returncode, 1)
+            pid = os.getpid()
+            self.assertIn(f"agy PID {pid}", result.stderr)
+            self.assertIn(f"kill {pid}", result.stderr)
+        finally:
+            handle.release()
+
+    def test_delete_busy_message_falls_back_without_pid_on_bad_lock_content(self):
+        """If the lock file's content doesn't parse as a PID (corrupted,
+        truncated, written by an older agydra version), the message must
+        fall back to the generic wording instead of printing garbage."""
+        handle = locks.try_lock(self.store, "work")
+        try:
+            with open(locks.lock_path(self.store, "work"), "wb") as fh:
+                fh.write(b"not-a-pid")
+            result = self._run_cli("delete", "work", "-f")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("live session", result.stderr)
+            self.assertNotIn("PID", result.stderr)
+        finally:
+            handle.release()
+
     def test_delete_allowed_when_free(self):
         result = self._run_cli("delete", "work", "-f", "--no-backup")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -320,6 +346,42 @@ class TestBusyGuards(BaseCase):
             self.assertIn("yes", result.stdout)
         finally:
             handle.release()
+
+
+class TestDeleteRecoversCorruptProfile(BaseCase):
+    """A directory-only/corrupt profile used to be stuck: resolve_ref said
+    'unknown profile ... create it', and create then said 'already exists'.
+    cmd_delete must accept the literal name straight from
+    store.unreadable_profiles() so the user has a way out."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.profile_dir("broken").mkdir(parents=True)
+
+    def test_delete_removes_directory_only_profile(self):
+        result = self._run_cli("delete", "broken", "-f", "--no-backup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.store.profile_dir("broken").exists())
+
+    def test_delete_refuses_busy_corrupt_profile(self):
+        handle = locks.try_lock(self.store, "broken")
+        try:
+            result = self._run_cli("delete", "broken", "-f")
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("live session", result.stderr)
+            self.assertTrue(self.store.profile_dir("broken").exists())
+        finally:
+            handle.release()
+
+    def test_create_recovers_after_deleting_corrupt_profile(self):
+        """The original stuck-user scenario end to end: delete the corrupt
+        directory, then create a fresh profile with the same name."""
+        result = self._run_cli("delete", "broken", "-f", "--no-backup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self._run_cli("create", "broken")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.store.exists("broken"))
 
 
 class TestImportFlow(BaseCase):

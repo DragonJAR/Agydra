@@ -1,7 +1,9 @@
 """Shared test fixtures: fake home, fake agy binary, isolated store."""
 from __future__ import annotations
 
+import base64
 import contextlib
+import json
 import os
 import shutil
 import stat
@@ -11,6 +13,14 @@ import unittest
 from pathlib import Path
 
 os.environ["AGYDRA_NO_KEYCHAIN"] = "1"
+
+
+def _make_jwt(claims: dict) -> str:
+    """Minimal unsigned JWT: only the payload segment is ever decoded."""
+    def seg(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    return f"{seg({'alg': 'none', 'typ': 'JWT'})}.{seg(claims)}.sig"
 
 
 def write_fake_agy(path: Path) -> Path:

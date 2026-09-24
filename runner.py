@@ -142,19 +142,26 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
 
     profile = store.get(plan.profile)
     profile.touch()
-    store.save(profile)
 
-    data_dir = store.profile_data_dir(plan.profile)
-    overlay = isolation.build_overlay(plan.profile, data_dir, store.root)
-    env = isolation.isolated_env(
-        overlay,
-        extra={resolver.PROFILE_ENV: plan.profile},
-        config_windows_redirect_home=plan.windows_redirect_home,
-    )
+    try:
+        store.save(profile)
 
-    argv = [str(plan.binary), *plan.args]
-    if plan.use_sandbox:
-        argv = isolation.sandbox_wrap(argv)
+        data_dir = store.profile_data_dir(plan.profile)
+        overlay = isolation.build_overlay(plan.profile, data_dir, store.root)
+        env = isolation.isolated_env(
+            overlay,
+            extra={resolver.PROFILE_ENV: plan.profile},
+            config_windows_redirect_home=plan.windows_redirect_home,
+        )
+
+        argv = [str(plan.binary), *plan.args]
+        if plan.use_sandbox:
+            argv = isolation.sandbox_wrap(argv)
+    except BaseException:
+        if handle is not None:
+            handle.release()
+        raise
+
     release_after_guard = platforms.is_windows() or plan.use_sandbox or plan.launch_as_child
     try:
         with keychain.launch_guard(
@@ -164,6 +171,8 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
                 return platforms.launch_argv(argv, env)
             if plan.use_sandbox or plan.launch_as_child:
                 return platforms.run_wait(argv, env)
+            if handle is not None:
+                handle.record_holder_pid()
             return platforms.launch_argv(argv, env)
     finally:
         if release_after_guard and handle is not None:

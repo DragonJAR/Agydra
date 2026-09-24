@@ -109,6 +109,40 @@ class TestListHeaderNeverFusesColumns(BaseCase):
         return buf.getvalue().splitlines()
 
 
+class TestDeleteSkipsPurgeWhenBackupFails(BaseCase):
+    """``keychain.purge_profile_slot`` must only run once a requested
+    backup has actually landed on disk -- a disk-full/corrupt-zip failure
+    during the backup must not also purge a keychain-only profile's only
+    credential, or the failed delete would still lose it for good."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("kc")
+
+    def test_backup_failure_leaves_profile_and_secret_untouched(self):
+        import cli
+        import keychain
+        from unittest import mock
+
+        keychain.save_profile_slot(self.store, "kc", b"secret-bytes")
+
+        class Args:
+            ref = "kc"
+            force = True
+            no_backup = False
+
+        with mock.patch.object(
+            Store, "_write_backup", side_effect=OSError("disk full")
+        ), mock.patch.object(keychain, "purge_profile_slot") as purge:
+            with self.assertRaises(OSError):
+                cli.cmd_delete(self.store, Args())
+
+        purge.assert_not_called()
+        self.assertTrue(self.store.exists("kc"))
+        self.assertEqual(keychain.load_profile_slot(self.store, "kc"), b"secret-bytes")
+
+
 class TestImportGuards(BaseCase):
     def setUp(self):
         super().setUp()
@@ -158,6 +192,27 @@ class TestImportGuards(BaseCase):
             handle.release()
         self.assertNotIn("already has data", str(ctx.exception))
 
+    def test_import_calls_keychain_capture_after_copy(self):
+        """Wiring guard: `import` must ask the keychain module to consider
+        capturing the shared slot only AFTER the data is on disk (so the
+        identity check has a fresh on-disk token to compare against)."""
+        import cli
+        from unittest import mock
+
+        self.store.create("fresh2")
+        data = self.store.profile_data_dir("fresh2")
+
+        class Args:
+            ref = "fresh2"
+            source = None
+
+        with mock.patch.object(cli.keychain, "capture_shared_slot_for_import") as cap:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli.cmd_import(self.store, Args())
+        self.assertEqual(rc, 0)
+        cap.assert_called_once_with(self.store, "fresh2", data)
+
     def test_import_onto_empty_profile_succeeds(self):
         import cli
 
@@ -177,3 +232,26 @@ class TestImportGuards(BaseCase):
             [p for p in data.parent.iterdir() if p.name.startswith(".import-")],
             "completed import left temp litter",
         )
+
+
+class TestIsolationErrorPointsToDoctorFix(BaseCase):
+    """When login (or any launch) trips the real-dir isolation guard, the
+    user must be told the automatic recovery path, not just "remove it
+    manually"."""
+
+    def test_login_error_message_mentions_doctor_fix(self):
+        import isolation, platforms
+
+        self.store = Store()
+        self.store.create("alpha")
+        data_dir = self.store.profile_data_dir("alpha")
+        isolation.build_overlay("alpha", data_dir, self.store.root)
+        link = self.store.overlays_dir / "alpha" / platforms.AGY_DATA_DIR_NAME
+        link.unlink()
+        link.mkdir()  # the alpha-class breakage: real dir where link belongs
+
+        result = self._run_cli("login", "alpha")
+        combined = result.stdout + result.stderr
+        self.assertIn("doctor --fix", combined,
+                      "isolation guard must point to `agydra doctor --fix`")
+        self.assertNotEqual(result.returncode, 0)

@@ -24,6 +24,13 @@ VERSION = "1.2.0"
 __version__ = VERSION
 
 MIN_PYTHON = (3, 9)
+"""Deliberately duplicated from ``bootstrap.MIN_PYTHON``: the version check
+below must run before any sibling-module import is attempted, so it cannot
+depend on importing bootstrap (or platforms) to get this value -- on a
+too-old/broken interpreter that import could itself fail, skipping the
+graceful message this check exists to print. Keep this in sync with
+``bootstrap.MIN_PYTHON`` by hand; it is a one-constant, bootstrap-critical
+exception to the module's own DRY rule."""
 
 
 def _fail(msg: str, hint: str = "") -> int:
@@ -34,10 +41,9 @@ def _fail(msg: str, hint: str = "") -> int:
 
 
 def _venv_script(repo: str) -> str:
-    win = sys.platform.startswith("win")
-    return os.path.join(
-        repo, ".venv", "Scripts" if win else "bin", "agydra.exe" if win else "agydra"
-    )
+    import platforms
+
+    return str(platforms.console_script(Path(repo) / ".venv"))
 
 
 def main() -> int:
@@ -48,6 +54,8 @@ def main() -> int:
             f"{sys.version_info[0]}.{sys.version_info[1]}",
             "install Python 3.9 or newer and re-run this file",
         )
+
+    import platforms
 
     script = _venv_script(repo)
 
@@ -68,15 +76,7 @@ def main() -> int:
             )
 
     argv = [script, *sys.argv[1:]]
-    if sys.platform.startswith("win"):
-        import subprocess
-
-        try:
-            return subprocess.run(argv).returncode
-        except KeyboardInterrupt:
-            return 130
-    os.execv(script, argv)
-    return 127
+    return platforms.launch_argv(argv, os.environ)
 
 
 if __name__ == "__main__":

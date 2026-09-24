@@ -116,12 +116,40 @@ class TestResolveAgyBinary(unittest.TestCase):
         self.assertIsNone(platforms.resolve_agy_binary(str(d)))
 
     def test_windows_pathext_resolution(self):
+        """Real PATHEXT probing for an explicit, extension-less candidate
+        with a directory component: on Python <3.12, ``shutil.which``
+        short-circuits to a literal existence check once a candidate has a
+        directory part, skipping PATHEXT entirely (fixed upstream later),
+        so agydra probes PATHEXT-suffixed variants itself. Mocks only
+        ``is_windows`` — the file lookup itself is real, unlike the
+        previous version of this test which stubbed ``shutil.which`` to
+        always succeed and never exercised the probing at all."""
         from unittest import mock
 
-        with mock.patch.object(platforms, "is_windows", return_value=True), \
-                mock.patch.object(platforms.shutil, "which", return_value="C:\\bin\\agy.cmd"):
-            res = platforms.resolve_agy_binary("C:\\bin\\agy")
-            self.assertEqual(res, Path("C:\\bin\\agy.cmd"))
+        exe = self._touch("agy.EXE")
+        candidate = self._tmp / "agy"
+        with mock.patch.object(platforms, "is_windows", return_value=True):
+            res = platforms.resolve_agy_binary(str(candidate))
+        self.assertEqual(res, exe)
+
+    def test_windows_pathext_resolution_no_match_returns_none(self):
+        from unittest import mock
+
+        candidate = self._tmp / "agy"
+        with mock.patch.object(platforms, "is_windows", return_value=True):
+            res = platforms.resolve_agy_binary(str(candidate))
+        self.assertIsNone(res)
+
+    def test_windows_pathext_resolution_skipped_when_extension_present(self):
+        """An explicit candidate that already has an extension but doesn't
+        exist must not get PATHEXT-suffixed (that would produce a
+        nonsensical double extension like ``agy.exe.EXE``)."""
+        from unittest import mock
+
+        candidate = self._tmp / "agy.exe"
+        with mock.patch.object(platforms, "is_windows", return_value=True):
+            res = platforms.resolve_agy_binary(str(candidate))
+        self.assertIsNone(res)
 
 
 class TestBaseDirXDG(unittest.TestCase):
