@@ -14,7 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import doctor
-import isolation, keychain, platforms
+import isolation, keychain, platforms, ui
 from store import Store
 
 from conftest import BaseCase, _make_jwt
@@ -60,7 +60,6 @@ class TestDoctor(BaseCase):
         ctx = doctor._DoctorContext(
             scan=self.store.scan(),
             names=self.store.names(),
-            profile_count=len(self.store.names()),
         )
         status, message = doctor._check_profiles(self.store, ctx)
         self.assertEqual(status, doctor.WARN)
@@ -103,7 +102,6 @@ class TestDoctor(BaseCase):
     def _ctx(self):
         return doctor._DoctorContext(
             scan=self.store.scan(), names=self.store.names(),
-            profile_count=len(self.store.names()),
         )
 
     def test_keychain_check_flags_identity_mismatch(self):
@@ -176,6 +174,28 @@ class TestDoctor(BaseCase):
         self.assertIn("ghost", message)
         self.assertIn("doctor --fix", message)
 
+    def test_keychain_check_reports_bridge_disabled_via_env(self):
+        """When AGYDRA_NO_KEYCHAIN is active, doctor must report that the bridge
+        was disabled via the environment variable rather than falsely claiming
+        `security` binary was missing."""
+        with mock.patch.dict(os.environ, {"AGYDRA_NO_KEYCHAIN": "1"}):
+            status, message = doctor._check_keychain(self.store, self._ctx())
+        self.assertEqual(status, doctor.WARN)
+        self.assertIn("bridge disabled via AGYDRA_NO_KEYCHAIN", message)
+        self.assertNotIn("`security` not found", message)
+
+    def test_keychain_check_warns_on_setup_skipped_marker(self):
+        """When .setup-skipped marker exists, doctor must surface an explanatory
+        WARN explaining why it exists and instructing how to retry."""
+        marker = keychain._slots_dir(self.store) / getattr(keychain, "_SKIP_MARKER_NAME", ".setup-skipped")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        with mock.patch.object(keychain, "supported", return_value=True):
+            status, message = doctor._check_keychain(self.store, self._ctx())
+        self.assertEqual(status, doctor.WARN)
+        self.assertIn(".setup-skipped", message)
+        self.assertIn("delete", message.lower())
+
     def test_apply_fixes_purges_orphan_keychain_slots_with_fresh_names(self):
         """Regression: ``_apply_fixes``'s keychain-orphan purge must re-derive
         the current profile list at purge time, never reuse the STALE
@@ -247,7 +267,6 @@ class TestIsolationRecovery(BaseCase):
         self._ctx = lambda: doctor._DoctorContext(
             scan=self.store.scan(),
             names=self.store.names(),
-            profile_count=len(self.store.names()),
         )
 
     def test_real_dir_is_warn_with_fix_pointer(self):
@@ -343,6 +362,51 @@ class TestIsolationRecovery(BaseCase):
         )
         self.assertEqual(rc, 0)
         self.assertIsNone(self.store.default_name())
+
+    def test_apply_fixes_continues_when_build_overlay_fails(self):
+        """If build_overlay raises an error when relinking after migration,
+        _apply_fixes must warn and proceed with other repairs instead of aborting."""
+        config = self.store.load_config()
+        config.default_profile = "ghost"
+        self.store.save_config(config)
+
+        with mock.patch.object(isolation, "build_overlay", side_effect=isolation.IsolationError("symlink failed")), \
+                mock.patch.object(doctor, "warn") as mock_warn:
+            doctor._apply_fixes(self.store, self._ctx())
+
+        mock_warn.assert_called()
+        self.assertIsNone(self.store.default_name(), "dangling default profile must still be cleared")
+
+    def test_apply_fixes_uses_fresh_names_for_default_and_orphans(self):
+        """A profile created during the confirmation pause must not have its
+        default cleared or its artifacts treated as orphans."""
+        ctx = self._ctx()
+        self.store.create("fresh")
+        config = self.store.load_config()
+        config.default_profile = "fresh"
+        self.store.save_config(config)
+
+        self.store.overlays_dir.mkdir(parents=True, exist_ok=True)
+        fresh_overlay = self.store.overlays_dir / "fresh"
+        fresh_overlay.mkdir()
+
+        doctor._apply_fixes(self.store, ctx)
+
+        self.assertEqual(self.store.default_name(), "fresh")
+        self.assertTrue(fresh_overlay.exists())
+
+    def test_preview_fixables_describes_actions_with_type_and_path(self):
+        """Preview of fixable items must describe action + resource type + path."""
+        (self.store.overlays_dir / "ghost").mkdir(parents=True, exist_ok=True)
+        preview = doctor._preview_fixables(self.store, self._ctx())
+        self.assertIn("remove orphan overlay directory overlays/ghost", preview)
+
+
+class TestUiPaintValidation(unittest.TestCase):
+    def test_paint_invalid_style_raises_keyerror_with_color_disabled(self):
+        with mock.patch.object(ui, "color_enabled", return_value=False):
+            with self.assertRaises(KeyError):
+                ui.paint("hello", "invalid_style_name")
 
 
 if __name__ == "__main__":

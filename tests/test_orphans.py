@@ -57,6 +57,20 @@ class TestFindOrphans(BaseCase):
         self.assertEqual(scan.backups, [self.ghost_backup.name])
         self.assertFalse(scan.is_empty())
 
+        desc = scan.describe()
+        self.assertIn("overlay directories: overlays/ghost", desc)
+        self.assertIn("session lock files: locks/ghost.lock", desc)
+        self.assertIn("keychain secret backups: keychain/ghost.secret", desc)
+        self.assertIn(f"keychain quarantine files: keychain/{self.ghost_quarantine.name}", desc)
+        self.assertIn(f"backup archives: backups/{self.ghost_backup.name}", desc)
+
+        actions = scan.describe_actions()
+        self.assertIn("remove orphan overlay directory overlays/ghost", actions)
+        self.assertIn("remove orphan session lock file locks/ghost.lock", actions)
+        self.assertIn("remove orphan keychain secret backup keychain/ghost.secret", actions)
+        self.assertIn(f"remove orphan keychain quarantine file keychain/{self.ghost_quarantine.name}", actions)
+        self.assertIn(f"remove orphan backup archive backups/{self.ghost_backup.name}", actions)
+
     def test_never_flags_a_currently_locked_lock_file(self):
         """Safety invariant: even a lock file for a name with no matching
         profile must never be reported (let alone removed) while it is
@@ -75,6 +89,7 @@ class TestFindOrphans(BaseCase):
         scan = orphans.find_orphans(store, store.names())
         self.assertTrue(scan.is_empty())
         self.assertEqual(scan.describe(), [])
+        self.assertEqual(scan.describe_actions(), [])
 
 
 class TestRemoveOrphans(BaseCase):
@@ -129,12 +144,15 @@ class TestRemoveOrphans(BaseCase):
 
     def test_skips_an_overlay_and_secret_recreated_between_detect_and_fix(self):
         """A profile recreated during the confirmation pause (after the
-        scan was taken but before ``remove_orphans`` runs) must keep its
-        brand-new overlay and keychain secret -- name-only paths that CAN
-        collide with a freshly recreated same-named profile."""
+        scan was taken but before ``remove_orphans`` runs) must keep all its
+        artifacts -- overlays, locks, keychain secrets, quarantine files,
+        and backups belonging to the newly live profile."""
         scan = orphans.find_orphans(self.store, self.store.names())
         self.assertIn("ghost", scan.overlays)
+        self.assertIn("ghost", scan.locks)
         self.assertIn("ghost", scan.keychain_secrets)
+        self.assertIn(self.ghost_quarantine.name, scan.keychain_quarantine)
+        self.assertIn(self.ghost_backup.name, scan.backups)
 
         # Simulate the pause: "ghost" gets recreated with fresh artifacts.
         self.store.create("ghost")
@@ -150,15 +168,10 @@ class TestRemoveOrphans(BaseCase):
         self.assertEqual(
             keychain.load_profile_slot(self.store, "ghost"), b"fresh-secret"
         )
-        self.assertFalse(any("ghost" in line for line in removed if "overlay" in line))
-        self.assertFalse(
-            any("ghost" in line for line in removed if "keychain secret" in line)
-        )
-
-        # Other stale-scan categories are unaffected by this guard.
-        self.assertFalse(locks.lock_path(self.store, "ghost").exists())
-        self.assertFalse(self.ghost_quarantine.exists())
-        self.assertFalse(self.ghost_backup.exists())
+        self.assertTrue(locks.lock_path(self.store, "ghost").exists())
+        self.assertTrue(self.ghost_quarantine.exists())
+        self.assertTrue(self.ghost_backup.exists())
+        self.assertEqual(removed, [])
 
     def test_skips_a_lock_that_became_live_between_detect_and_fix(self):
         """Re-verified at fix time, not just detect time: a session must
@@ -174,6 +187,16 @@ class TestRemoveOrphans(BaseCase):
         self.assertTrue(locks.lock_path(self.store, "ghost").exists())
         self.assertFalse(any(line == "lock: ghost" for line in removed))
 
+    def test_overlay_not_reported_removed_if_rmtree_fails_silently(self):
+        """store_mod.rmtree never raises; if it fails to remove the path,
+        remove_orphans must not report it as removed."""
+        scan = orphans.find_orphans(self.store, self.store.names())
+        self.assertIn("ghost", scan.overlays)
+        with mock.patch.object(orphans.store_mod, "rmtree"):
+            removed = orphans.remove_orphans(self.store, scan)
+        self.assertTrue((self.store.overlays_dir / "ghost").exists())
+        self.assertFalse(any("overlay: ghost" in line for line in removed))
+
 
 class TestDoctorOrphansCheck(BaseCase):
     def setUp(self):
@@ -183,7 +206,6 @@ class TestDoctorOrphansCheck(BaseCase):
     def _ctx(self):
         return doctor._DoctorContext(
             scan=self.store.scan(), names=self.store.names(),
-            profile_count=len(self.store.names()),
         )
 
     def test_ok_when_nothing_orphaned(self):
@@ -242,7 +264,7 @@ class TestCmdDoctorFix(BaseCase):
 
         with mock.patch.object(cli, "_confirm", return_value=False):
             rc = cli.cmd_doctor(self.store, DeclineArgs())
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertTrue((self.store.overlays_dir / "ghost").exists())
 
     def test_no_fix_flag_only_reports(self):

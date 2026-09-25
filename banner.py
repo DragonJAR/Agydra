@@ -8,7 +8,7 @@ rendered at runtime with the best technique the target stream supports:
   * anything else: plain 7-bit ASCII, one glyph per palette color, so it
     survives legacy Windows code pages, pipes and NO_COLOR.
 
-Windows VT processing is enabled through :func:`agydra.ui.color_enabled`.
+Windows VT processing is enabled through :func:`ui.color_enabled`.
 
 :func:`show` is the single display policy, called once from ``cli.main``:
 the banner goes to stderr so stdout stays clean for data (``list``,

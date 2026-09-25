@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 from agydra import __version__
 import account, isolation, keychain, platforms
@@ -28,7 +28,6 @@ class _DoctorContext:
 
     scan: Tuple[List, List[str]]
     names: List[str]
-    profile_count: int
 
 
 def _check_binary(store: Store, _ctx: "_DoctorContext"):
@@ -198,7 +197,18 @@ def _check_keychain(store: Store, ctx: "_DoctorContext"):
     ``doctor --fix``'s preview.
     """
     report = keychain.describe(store, names=ctx.names)
+    skip_marker = keychain._slots_dir(store) / getattr(keychain, "_SKIP_MARKER_NAME", ".setup-skipped")
+    has_skip_marker = skip_marker.exists()
     if not report.get("supported"):
+        if os.environ.get("AGYDRA_NO_KEYCHAIN"):
+            msg = "keychain bridge: bridge disabled via AGYDRA_NO_KEYCHAIN"
+            if has_skip_marker:
+                msg += (
+                    f"\nkeychain setup skipped ({skip_marker.name} marker present at {skip_marker}): "
+                    "automatic login keychain creation previously failed or was cancelled; "
+                    "delete this marker file to retry keychain initialization"
+                )
+            return WARN, msg
         if platforms.is_macos():
             return WARN, "keychain bridge: `security` not found (swap disabled)"
         return OK, "keychain bridge: n/a (file-backed credentials on this OS)"
@@ -222,6 +232,12 @@ def _check_keychain(store: Store, ctx: "_DoctorContext"):
         f"shared slot {shared_txt}; per-profile slots: "
         f"{', '.join(with_slots) if with_slots else 'none yet'}"
     ]
+    if has_skip_marker:
+        lines.append(
+            f"keychain setup skipped ({skip_marker.name} marker present at {skip_marker}): "
+            "automatic login keychain creation previously failed or was cancelled; "
+            "delete this marker file to retry keychain initialization"
+        )
     if mismatches:
         lines.append("identity mismatch: " + "; ".join(mismatches))
     if orphans:
@@ -243,7 +259,7 @@ def _check_keychain(store: Store, ctx: "_DoctorContext"):
             "again; launching agy once through agydra self-heals it"
         )
         return WARN, "\n".join(lines)
-    if mismatches or orphans:
+    if mismatches or orphans or has_skip_marker:
         return WARN, "\n".join(lines)
     return OK, "\n".join(lines)
 
@@ -332,19 +348,19 @@ CHECKS = [
 ]
 
 
-def _fix_orphans(store: Store, ctx: "_DoctorContext") -> None:
+def _fix_orphans(store: Store, names_or_ctx: Union["_DoctorContext", Sequence[str]]) -> None:
     """Remove orphaned store artifacts found by ``_check_orphans``.
 
     Confirmation is a CLI concern, not a doctor one: ``cli.cmd_doctor``
-    shows the WARN listing and asks before ever calling
-    ``run_checks(store, fix=True)``. By the time ``fix`` is ``True`` here,
-    the removal is already approved -- this quietly performs it and
-    reports exactly what it removed, in the same style as the check
-    lines above it.
+    shows the preview listing and asks before ever calling
+    ``_apply_fixes``. By the time this runs, the removal is already
+    approved -- this quietly performs it and reports exactly what it
+    removed, in the same style as the check lines above it.
     """
     import orphans
 
-    scan = orphans.find_orphans(store, ctx.names)
+    names = names_or_ctx.names if isinstance(names_or_ctx, _DoctorContext) else names_or_ctx
+    scan = orphans.find_orphans(store, names)
     if scan.is_empty():
         return
     removed = orphans.remove_orphans(store, scan)
@@ -372,7 +388,7 @@ def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
 
     scan = orphans.find_orphans(store, ctx.names)
     if not scan.is_empty():
-        lines.extend(f"remove orphan: {line}" for line in scan.describe())
+        lines.extend(scan.describe_actions())
     return lines
 
 
@@ -396,16 +412,26 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
         if gemini_link.exists() and not isolation._is_link(gemini_link):
             try:
                 isolation.migrate_real_dir_to_store(gemini_link, data_dir)
-            except isolation.IsolationError as exc:
+            except (isolation.IsolationError, OSError) as exc:
                 warn(f"could not migrate overlay data for {name!r} ({exc})")
                 continue
-            isolation.build_overlay(name, data_dir, store.root)
+            try:
+                isolation.build_overlay(name, data_dir, store.root)
+            except (isolation.IsolationError, OSError) as exc:
+                warn(f"could not relink overlay for {name!r} ({exc})")
+                continue
             print(
                 paint("[fix]", "cyan", "bold")
                 + f" migrated overlay data for {name!r} and relinked .gemini"
             )
+    # Fresh names at purge time, never the pre-confirmation ``ctx.names``
+    # snapshot: the confirmation prompt in ``cmd_doctor`` can pause for an
+    # arbitrary time, during which a profile could be created -- using fresh
+    # names protects against falsely clearing a newly created default or
+    # treating its artifacts as orphans.
+    current_names = store.names()
     default = store.default_name()
-    if default and default not in ctx.names:
+    if default and default not in current_names:
         config = store.load_config()
         config.default_profile = None
         store.save_config(config)
@@ -414,12 +440,6 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
             + f" cleared dangling default profile {default!r}"
         )
     keychain_path = keychain._ensure_target_keychain(store) if keychain.supported() else None
-    # Fresh names at purge time, never the pre-confirmation ``ctx.names``
-    # snapshot: the confirmation prompt in ``cmd_doctor`` can pause for an
-    # arbitrary time, during which a name flagged as orphaned could be
-    # recreated with its own genuine keychain slot -- same fresh-scan guard
-    # ``orphans.remove_orphans`` already applies to its file-based purge.
-    current_names = store.names()
     for orphan in keychain.orphan_slots(store, current_names, keychain_path=keychain_path):
         try:
             keychain.delete_slot(keychain.profile_slot(orphan), keychain_path)
@@ -430,14 +450,13 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
             paint("[fix]", "cyan", "bold")
             + f" purged orphan keychain slot for {orphan!r}"
         )
-    _fix_orphans(store, ctx)
+    _fix_orphans(store, current_names)
 
 
 def _build_ctx(store: Store) -> "_DoctorContext":
     scan = store.scan()
     return _DoctorContext(
         scan=scan, names=[p.name for p in scan[0]],
-        profile_count=len(scan[0]),
     )
 
 
@@ -485,7 +504,13 @@ def run_checks(store: Store, fix: bool = False, ctx: Optional["_DoctorContext"] 
     ``ctx`` lets a caller that already built one (e.g. ``cmd_doctor``,
     which needs the same ctx again afterward for the ``--fix`` preview)
     pass it in instead of paying for another ``store.scan()`` here; omitted,
-    one is built fresh as before."""
+    one is built fresh as before.
+
+    ``fix=True`` is kept for test convenience (unit tests exercising
+    the combined check+fix flow in a single call); CLI production invocations
+    use ``cmd_doctor`` which calls ``_apply_fixes`` directly after user
+    confirmation.
+    """
     print(
         paint("agydra doctor", "cyan", "bold")
         + f" — agydra {__version__} on {sys.platform}"
