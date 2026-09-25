@@ -134,23 +134,37 @@ class TestLaunchGuardRestore(unittest.TestCase):
                 mock.patch.object(
                     keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
                 ):
-            keychain.save_profile_slot(store, "alpha", b"profile-token-v1")
+            # Post-fix shared slot carries plain JSON, the ``.secret`` file
+            # backup is envelope-wrapped.
+            keychain.save_profile_slot(
+                store, "alpha",
+                keychain.envelope_token_bytes(_slot_payload_json("alpha@example.com")),
+            )
             guard = keychain.launch_guard(store, "alpha")
             state = guard.__enter__()
             self.assertTrue(state._swapped)
-            kc.shared = b"profile-token-v2"
+            # Simulate agy refreshing the token mid-session: the shared slot
+            # is plain JSON, with the same identity claim so the identity
+            # guard keeps it.
+            kc.shared = _slot_payload_json("alpha@example.com")
             state.__exit__(None, None, None)
         return store, kc
 
     def test_refresh_kept_in_profile_slot_and_shared_restored(self):
         store, kc = self._cycle(b"stale")
-        self.assertEqual(keychain.load_profile_slot(store, "alpha"), b"profile-token-v2")
+        self.assertEqual(
+            keychain.load_profile_slot(store, "alpha"),
+            keychain.envelope_token_bytes(_slot_payload_json("alpha@example.com")),
+        )
         self.assertEqual(kc.shared, b"stale")
         self.assertIn(("write", b"stale"), kc.calls)
 
     def test_no_prior_shared_token_is_cleaned_up(self):
         store, kc = self._cycle(None)
-        self.assertEqual(keychain.load_profile_slot(store, "alpha"), b"profile-token-v2")
+        self.assertEqual(
+            keychain.load_profile_slot(store, "alpha"),
+            keychain.envelope_token_bytes(_slot_payload_json("alpha@example.com")),
+        )
         self.assertIsNone(kc.shared)
         self.assertIn(("delete", None), kc.calls)
 
@@ -229,12 +243,20 @@ class TestLaunchGuardRestore(unittest.TestCase):
                 mock.patch.object(
                     keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
                 ):
-            keychain.save_profile_slot(store, "alpha", b"profile-token-v1")
+            # Pre-existing ``.secret`` envelope (post-fix format).
+            pre_existing_envelope = keychain.envelope_token_bytes(
+                _slot_payload_json("alpha@example.com")
+            )
+            keychain.save_profile_slot(store, "alpha", pre_existing_envelope)
             guard = keychain.launch_guard(store, "alpha")
+            # ``add-generic-password`` returns NOT_FOUND via exploding_run, so
+            # the swap path raises inside KeychainError; the swallowed-failure
+            # branch in __enter__ leaves ``_swapped=False`` and slot=None.
             state = guard.__enter__()
             self.assertFalse(state._swapped)
             state.__exit__(None, None, None)
-        self.assertEqual(keychain.load_profile_slot(store, "alpha"), b"profile-token-v1")
+        # Fail-open: the pre-existing envelope is preserved untouched.
+        self.assertEqual(keychain.load_profile_slot(store, "alpha"), pre_existing_envelope)
 
 
 def _go_keyring_secret(email: str) -> bytes:
@@ -245,6 +267,17 @@ def _go_keyring_secret(email: str) -> bytes:
         "id_token": jwt,
     }).encode("utf-8")
     return b"go-keyring-base64:" + base64.b64encode(payload)
+
+
+def _slot_payload_json(email: str) -> bytes:
+    """Plain-JSON bytes as the live shared keychain slot holds them after the
+    fix (no envelope). Used to simulate the post-fix slot state in tests."""
+    jwt = _make_jwt({"email": email})
+    return json.dumps({
+        "token": {"access_token": "a", "refresh_token": "r"},
+        "auth_method": "consumer",
+        "id_token": jwt,
+    }, separators=(",", ":")).encode("utf-8")
 
 
 class TestLaunchGuardIdentityGuard(unittest.TestCase):
@@ -291,7 +324,7 @@ class TestLaunchGuardIdentityGuard(unittest.TestCase):
             )
 
             kc = _MemoryKeychain(None)
-            refreshed_secret = _go_keyring_secret("alpha@example.com")
+            refreshed_secret = _slot_payload_json("alpha@example.com")
             with mock.patch.object(keychain, "_run", kc.run), \
                     mock.patch.object(keychain, "supported", return_value=True), \
                     mock.patch.object(
@@ -302,7 +335,10 @@ class TestLaunchGuardIdentityGuard(unittest.TestCase):
                 kc.shared = refreshed_secret
                 state.__exit__(None, None, None)
 
-            self.assertEqual(keychain.load_profile_slot(store, "alpha"), refreshed_secret)
+            self.assertEqual(
+                keychain.load_profile_slot(store, "alpha"),
+                keychain.envelope_token_bytes(refreshed_secret),
+            )
 
 
 class TestLaunchGuardEntrySelfRepair(unittest.TestCase):
@@ -787,16 +823,21 @@ class TestKeychainSlotFormat(BaseCase):
 
         self.assertEqual(_json.loads(out), self._payload)
 
-    def test_token_payload_for_slot_passes_through_plain_json(self):
-        """A profile whose backup happens to be plain JSON must round-trip
-        unchanged; if it isn't parseable JSON either, leave it alone rather
-        than corrupting it on the way to agy."""
+    def test_token_payload_for_slot_strictly_requires_envelope(self):
+        """Strict contract: input must be the envelope form (the ``.secret``
+        backup format). Anything else -- plain JSON, garbage, empty --
+        raises so a contract violation surfaces loudly rather than getting
+        silently forwarded to agy and crashing as a JSON-parse warning.
+        """
         import json as _json
 
         plain = _json.dumps(self._payload, separators=(",", ":")).encode()
-        self.assertEqual(keychain.token_payload_for_slot(plain), plain)
-        garbage = b"\x00\x01\x02 not json"
-        self.assertEqual(keychain.token_payload_for_slot(garbage), garbage)
+        with self.assertRaises(ValueError):
+            keychain.token_payload_for_slot(plain)
+        with self.assertRaises(ValueError):
+            keychain.token_payload_for_slot(b"not envelope")
+        with self.assertRaises(ValueError):
+            keychain.token_payload_for_slot(b"")
 
     def test_envelope_token_bytes_wraps_plain_json(self):
         """The ``.secret`` writer must keep the envelope format, otherwise
@@ -806,9 +847,25 @@ class TestKeychainSlotFormat(BaseCase):
 
         plain = _json.dumps(self._payload, separators=(",", ":")).encode()
         out = keychain.envelope_token_bytes(plain)
+        self.assertTrue(out.startswith(b"go-keyring-base64:"))
         self.assertEqual(keychain.decode_go_keyring_secret(out), self._payload)
-        # Already-envelope bytes stay envelope (re-wrap would corrupt base64).
-        self.assertEqual(keychain.envelope_token_bytes(self._envelope), self._envelope)
+
+    def test_envelope_token_bytes_is_purely_constructive(self):
+        """The function is a pure transform: no idempotency, no inspection.
+        Passing already-envelope bytes produces a double envelope, and the
+        next decoder call fails (returns ``None``) because the inner
+        b64-decoded payload is a string starting with the envelope marker,
+        not valid JSON. That's the contract-violation signal; the strict
+        helper refuses to silently mask the caller's bug. This test pins
+        that no-back-compat intent against future regressions."""
+        once = keychain.envelope_token_bytes(
+            b'{"token":{"access_token":"x"}}'
+        )
+        twice = keychain.envelope_token_bytes(once)
+        self.assertNotEqual(once, twice)
+        # Outer decode fails: the b64-decoded inner payload is the original
+        # envelope string, not JSON, so the strict decoder returns None.
+        self.assertIsNone(keychain.decode_go_keyring_secret(twice))
 
     def test_launch_guard_writes_plain_json_to_shared_keychain(self):
         """Reproduces the real bug: launch_guard.__enter__ must unwrap the
@@ -874,6 +931,163 @@ class TestKeychainSlotFormat(BaseCase):
         on_disk = self.backup.read_bytes()
         self.assertIn(b"go-keyring-base64", on_disk)
         self.assertEqual(keychain.decode_go_keyring_secret(on_disk), self._payload)
+
+
+class TestDescribeSharedFormat(unittest.TestCase):
+    """``describe`` includes the shared slot payload's format verdict so
+    ``doctor`` can diagnose the "re-login loop" class of bugs in one run
+    instead of forcing the user to read agy's cli.log."""
+
+    def _kc_with_shared(self, payload):
+        import keychain as _kc
+
+        class _MemKc:
+            def __init__(self, payload):
+                self.shared = payload
+
+            def run(self, args, input_bytes=None):
+                if args[0] == "find-generic-password" and "-w" in args:
+                    if self.shared is None:
+                        return _rc(44)  # NOT_FOUND → read_slot returns None
+                    return _rc(0, self.shared)
+                return _rc(0)
+
+        return _MemKc(payload)
+
+    def test_describe_marks_valid_json_payload(self):
+        import keychain as _kc
+        from unittest import mock
+
+        with mock.patch.object(_kc, "supported", return_value=True), \
+                mock.patch.object(_kc, "_run", self._kc_with_shared(
+                    b'{"token":{"access_token":"x"}}'
+                ).run), \
+                mock.patch.object(_kc, "_ensure_target_keychain",
+                                  return_value=Path("/fake")):
+            report = _kc.describe(None, names=[])
+        self.assertEqual(report.get("shared_format"), "json")
+
+    def test_describe_marks_invalid_payload(self):
+        """A ``.secret`` (or any non-JSON bytes) leaked into the shared
+        slot — e.g. a leftover envelope from a pre-fix build — gets
+        flagged so ``doctor --fix`` can name the failure mode."""
+        import keychain as _kc
+        from unittest import mock
+
+        with mock.patch.object(_kc, "supported", return_value=True), \
+                mock.patch.object(_kc, "_run", self._kc_with_shared(
+                    b"go-keyring-base64:eyJ0b2tlbiI6e30="
+                ).run), \
+                mock.patch.object(_kc, "_ensure_target_keychain",
+                                  return_value=Path("/fake")):
+            report = _kc.describe(None, names=[])
+        self.assertEqual(report.get("shared_format"), "invalid")
+
+    def test_describe_marks_absent_shared_as_none(self):
+        import keychain as _kc
+        from unittest import mock
+
+        with mock.patch.object(_kc, "supported", return_value=True), \
+                mock.patch.object(_kc, "_run", self._kc_with_shared(None).run), \
+                mock.patch.object(_kc, "_ensure_target_keychain",
+                                  return_value=Path("/fake")):
+            report = _kc.describe(None, names=[])
+        self.assertEqual(report.get("shared_format"), None)
+
+    def test_describe_unsupported_omits_format(self):
+        """macOS-gated: on Linux/Windows the format key is simply absent
+        (no keychain slot to inspect) — the existing ``supported: False``
+        branch keeps its contract."""
+        import keychain as _kc
+        from unittest import mock
+
+        with mock.patch.object(_kc, "supported", return_value=False):
+            report = _kc.describe(None, names=[])
+            self.assertFalse(report["supported"])
+        self.assertNotIn("shared_format", report)
+
+
+class TestLaunchGuardFailOpenOnForeignSecret(unittest.TestCase):
+    """The guard's documented fail-open contract covers ANY swap failure —
+    including the strict unwrap rejecting a foreign-format ``.secret``."""
+
+    def test_undecodable_secret_fails_open_not_crash(self):
+        """A ``.secret`` in a foreign/undecodable format (e.g. plain JSON
+        written by a pre-fix build) must fail open like every other swap
+        error — warn, skip the swap, let the launch continue — never a raw
+        ``ValueError`` traceback."""
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            # No known identity (no email, no on-disk token) → the identity
+            # guard does not quarantine; the strict unwrap is the first
+            # thing to reject the payload.
+            keychain.save_profile_slot(store, "alpha", b'{"not":"envelope"}')
+
+            kc = _MemoryKeychain(None)
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                guard = keychain.launch_guard(store, "alpha")
+                state = guard.__enter__()  # must NOT raise ValueError
+            self.assertFalse(state._swapped, "undecodable slot must not be swapped")
+
+
+class TestKeychainCheckFlagsStaleSharedFormat(unittest.TestCase):
+    """``doctor --fix`` cannot blindly rewrite the shared slot (the user's
+    real agy login lives there; deleting it would force a re-login and
+    could lose state). But it MUST name the failure so the user knows
+    the issue and its self-healing path."""
+
+    def test_keychain_check_warns_when_shared_payload_is_not_json(self):
+        from unittest import mock
+        import keychain as _kc
+        import doctor
+
+        store = _StoreStub(Path(self.id().replace(" ", "_")[:80]) if False else Path("/tmp/nonexistent-store-audit"))
+        ctx = doctor._DoctorContext(
+            scan=(list([]), []), names=[], profile_count=0,
+        )
+        with mock.patch.object(_kc, "supported", return_value=True), \
+                mock.patch.object(doctor.keychain, "describe",
+                                  return_value={"supported": True,
+                                                "shared": True,
+                                                "shared_format": "invalid",
+                                                "profile_slots": {}}), \
+                mock.patch.object(doctor.keychain, "orphan_slots",
+                                  return_value=[]):
+            status, message = doctor._check_keychain(store, ctx)
+        self.assertEqual(status, doctor.WARN)
+        self.assertIn("not valid JSON", message)
+        self.assertIn("self-heals", message)
+
+
+
+        """A ``.secret`` in a foreign/undecodable format (e.g. plain JSON
+        written by a pre-fix build) must fail open like every other swap
+        error — warn, skip the swap, let the launch continue — never a raw
+        ``ValueError`` traceback (the guard's documented fail-open contract
+        covers ANY swap failure)."""
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            # No known identity (no email, no on-disk token) → the identity
+            # guard does not quarantine; the strict unwrap is the first
+            # thing to reject the payload.
+            keychain.save_profile_slot(store, "alpha", b'{"not":"envelope"}')
+
+            kc = _MemoryKeychain(None)
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                guard = keychain.launch_guard(store, "alpha")
+                state = guard.__enter__()  # must NOT raise ValueError
+            self.assertFalse(state._swapped, "undecodable slot must not be swapped")
+
 
 
 if __name__ == "__main__":

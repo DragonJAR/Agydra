@@ -198,42 +198,32 @@ _GO_KEYRING_PREFIX = b"go-keyring-base64:"
 
 
 def token_payload_for_slot(data: bytes) -> bytes:
-    """Plain-JSON bytes suitable for the shared keychain slot.
+    """Plain-JSON bytes for the shared keychain slot. Input must be the
+    ``.secret`` file backup (envelope form).
 
-    agy reads the shared slot as JSON; writing the ``go-keyring-base64:``
-    envelope (the format used by the per-profile ``.secret`` file backup)
-    to the live keychain makes agy raise ``invalid character 'f' after
-    top-level value`` and fall back to the on-disk token file -- which a
+    agy reads the shared slot as JSON. Writing the ``go-keyring-base64:``
+    envelope there makes agy raise ``invalid character 'f' after top-level
+    value`` and fall back to the on-disk token file -- which a
     keychain-only profile does not have, so the user is asked to log in
-    again. Unwrap the envelope here so the swap lands parseable JSON.
-
-    Plain JSON (or any other bytes) passes through unchanged: callers
-    upstream may already hold the parsed payload, and a non-JSON shape is
-    a stronger signal than we can synthesize here (agy will reject it too,
-    but at least we won't have mangled it).
+    again. Unwrap here so the swap lands parseable JSON.
     """
     payload = decode_go_keyring_secret(data)
-    if payload is not None:
-        return json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    return data
+    if payload is None:
+        raise ValueError(
+            f"token_payload_for_slot: expected envelope form, "
+            f"got {data[:60]!r}"
+        )
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
 def envelope_token_bytes(data: bytes) -> bytes:
-    """Inverse of :func:`token_payload_for_slot`: wrap plain JSON in the
-    ``go-keyring-base64:`` envelope the ``.secret`` file backup uses, so
-    the identity guard keeps decoding it after the live-slot format change.
+    """Envelope-wrapped bytes for the ``.secret`` file backup. Input is the
+    plain JSON read from the shared keychain slot.
 
-    Idempotent: already-envelope bytes (or any non-JSON bytes) are returned
-    unchanged rather than re-wrapped -- double-encoding would corrupt the
-    base64 payload."""
-    if data.startswith(_GO_KEYRING_PREFIX):
-        return data
-    try:
-        parsed = json.loads(data)
-    except (ValueError, TypeError):
-        return data
-    if not isinstance(parsed, dict):
-        return data
+    Pure transform, no negotiation: this does not inspect or normalize the
+    input, so passing already-enveloped bytes produces a double envelope
+    (caller's bug; the next decode would surface it via a wrong identity).
+    """
     return _GO_KEYRING_PREFIX + base64.b64encode(data)
 
 
@@ -548,7 +538,11 @@ def launch_guard(store, profile: str, capture: bool = False):
                     self._swapped = True
                 elif self._had_shared is not None:
                     delete_slot(shared_slot(), self._keychain_path)
-            except (KeychainError, OSError) as exc:
+            except (KeychainError, OSError, ValueError) as exc:
+                # ValueError covers the strict unwrap rejecting a
+                # non-envelope ``.secret`` (e.g. plain JSON from a pre-fix
+                # build) — the fail-open contract applies to ANY swap
+                # failure, not just security-tool ones.
                 warn(
                     f"keychain swap skipped ({exc}); continuing without "
                     "per-profile credential swap"
@@ -755,7 +749,25 @@ def describe(store, names: Optional[List[str]] = None) -> Dict[str, object]:
             slots[name] = False
     try:
         keychain_path = _ensure_target_keychain(store) if store is not None else None
-        shared = read_slot(shared_slot(), keychain_path) is not None
+        payload = read_slot(shared_slot(), keychain_path)
+        shared = payload is not None
+        # agy reads the shared slot as JSON; a non-JSON payload (e.g. the
+        # go-keyring envelope written by a pre-fix agydra build) is the
+        # exact condition behind the "re-login on every launch" failure
+        # mode. Surfaced here so doctor can name it in one run.
+        shared_format = None
+        if payload is not None:
+            try:
+                parsed = json.loads(payload)
+                shared_format = "json" if isinstance(parsed, dict) else "other"
+            except (ValueError, TypeError):
+                shared_format = "invalid"
     except KeychainError:
         shared = None
-    return {"supported": True, "shared": shared, "profile_slots": slots}
+        shared_format = None
+    return {
+        "supported": True,
+        "shared": shared,
+        "shared_format": shared_format,
+        "profile_slots": slots,
+    }

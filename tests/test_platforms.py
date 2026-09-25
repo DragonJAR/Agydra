@@ -213,5 +213,83 @@ class TestLaunch(unittest.TestCase):
         self.assertEqual(code, 126)
 
 
+class TestDrainTtyInput(unittest.TestCase):
+    """``drain_tty_input`` discards terminal query responses left in the TTY
+    input queue by TUI children (Bubble Tea apps like agy's login) that exit
+    before consuming them — otherwise the shell's ECHO prints them as garbage
+    (``^[[?1;2c``) after agydra's output. It must be a safe no-op everywhere
+    the precondition does not hold: never raises, never touches non-TTYs."""
+
+    def _fake_stdin(self, isatty: bool, fileno=0):
+        import types
+
+        return types.SimpleNamespace(isatty=lambda: isatty, fileno=lambda: fileno)
+
+    def test_noop_when_stdin_is_not_a_tty(self):
+        import sys as _sys
+        from unittest import mock
+
+        with mock.patch.object(_sys, "stdin", self._fake_stdin(False)), \
+                mock.patch.object(platforms, "is_windows", return_value=False), \
+                mock.patch("termios.tcflush") as flush:
+            platforms.drain_tty_input()
+        flush.assert_not_called()
+
+    def test_posix_flushes_input_queue(self):
+        import sys as _sys
+        import termios
+        from unittest import mock
+
+        with mock.patch.object(_sys, "stdin", self._fake_stdin(True, fileno=7)), \
+                mock.patch.object(platforms, "is_windows", return_value=False), \
+                mock.patch("termios.tcflush") as flush:
+            platforms.drain_tty_input()
+        # TCIFLUSH = input queue ONLY (never TCOFLUSH: output must survive).
+        flush.assert_called_once_with(7, termios.TCIFLUSH)
+
+    def test_windows_flushes_console_input_buffer(self):
+        import ctypes
+        import sys as _sys
+        from unittest import mock
+
+        kernel32 = mock.MagicMock()
+        kernel32.GetStdHandle.return_value = 1234
+        windll = mock.MagicMock()
+        windll.kernel32 = kernel32
+        with mock.patch.object(_sys, "stdin", self._fake_stdin(True)), \
+                mock.patch.object(platforms, "is_windows", return_value=True), \
+                mock.patch.object(ctypes, "windll", windll, create=True):
+            platforms.drain_tty_input()
+        kernel32.GetStdHandle.assert_called_once_with(-10)  # STD_INPUT_HANDLE
+        kernel32.FlushConsoleInputBuffer.assert_called_once_with(1234)
+
+    def test_never_raises_on_tty_errors(self):
+        import sys as _sys
+        from unittest import mock
+
+        def exploding_flush(*_a, **_k):
+            raise OSError("no tty for you")
+
+        with mock.patch.object(_sys, "stdin", self._fake_stdin(True)), \
+                mock.patch.object(platforms, "is_windows", return_value=False), \
+                mock.patch("termios.tcflush", exploding_flush):
+            platforms.drain_tty_input()  # must swallow, not raise
+
+    def test_fileneno_failure_is_swallowed(self):
+        import sys as _sys
+        from unittest import mock
+
+        def bad_fileno():
+            raise ValueError("io on closed file")
+
+        stdin = self._fake_stdin(True)
+        stdin.fileno = bad_fileno
+        with mock.patch.object(_sys, "stdin", stdin), \
+                mock.patch.object(platforms, "is_windows", return_value=False), \
+                mock.patch("termios.tcflush") as flush:
+            platforms.drain_tty_input()
+        flush.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

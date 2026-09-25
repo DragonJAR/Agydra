@@ -174,7 +174,9 @@ class TestKeychainLoginCapture(unittest.TestCase):
             ):
                 with keychain.launch_guard(store, "work", capture=True):
                     pass
-            save.assert_called_once_with(store, "work", fresh)
+            save.assert_called_once_with(
+                store, "work", keychain.envelope_token_bytes(fresh)
+            )
 
 
 class TestKeychainRunHardening(unittest.TestCase):
@@ -329,6 +331,56 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
             self.assertEqual(rc, 0)
             run_wait.assert_called_once()
             self.assertFalse(locks.is_locked(store, "work"))
+
+    def test_drain_tty_after_waited_child_exits(self):
+        """The waited-child path (login/sandbox/Windows) must drain the TTY
+        input queue after the child exits: a Bubble Tea TUI that exits before
+        consuming its Device-Attributes reply leaves ``ESC[?1;2c``-style
+        garbage in the input queue, which the next shell prompt echoes."""
+        import os
+        import sys
+        from unittest import mock
+
+        import locks, platforms
+
+        with isolated_store_env(), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
+        ):
+            store = Store()
+            store.create("work")
+            plan = runner.build_plan(
+                store, [], flag_ref="work", launch_as_child=True
+            )
+            with mock.patch.object(
+                platforms, "run_wait", return_value=0
+            ), mock.patch.object(platforms, "drain_tty_input") as drain:
+                rc = runner.run(plan, store=store)
+            self.assertEqual(rc, 0)
+            drain.assert_called_once()
+
+    def test_drain_not_run_when_child_not_waited(self):
+        """The exec path (POSIX interactive) cannot drain: ``launch_argv``
+        replaces the process. Asserting the non-call keeps the documented
+        limitation honest instead of a silent no-op that nobody maintains."""
+        import os
+        import sys
+        from unittest import mock
+
+        import locks, platforms
+
+        with isolated_store_env(), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
+        ):
+            if platforms.is_windows():
+                self.skipTest("Windows never uses the exec path")
+            store = Store()
+            store.create("work")
+            plan = runner.build_plan(store, [], flag_ref="work")
+            with mock.patch.object(
+                platforms, "launch_argv", return_value=0
+            ), mock.patch.object(platforms, "drain_tty_input") as drain:
+                runner.run(plan, store=store)
+            drain.assert_not_called()
 
     def test_lock_released_after_keychain_guard_exits(self):
         """The lock must release only AFTER the keychain guard's __exit__

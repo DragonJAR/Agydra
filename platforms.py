@@ -173,6 +173,43 @@ def launch_argv(argv: Sequence[str], env: Mapping[str, str]) -> int:
     return 127
 
 
+def drain_tty_input() -> None:
+    """Discard pending TTY input left by a child process.
+
+    TUI children (Bubble Tea apps like agy's login flow) query terminal
+    capabilities (Device Attributes, color, cursor style) and read the
+    replies from stdin. When the child exits before consuming a reply, the
+    response bytes stay in the TTY input queue and the shell's ECHO prints
+    them as garbage (``^[[?1;2c`` and friends) right after agydra's output.
+
+    One flush of the input queue discards exactly those orphans:
+    POSIX/BSD ``tcflush(TCIFLUSH)`` (macOS + Linux + any shell — zsh, bash,
+    fish — it operates on the TTY driver, not on the shell), and Windows
+    ``FlushConsoleInputBuffer`` (works for conhost/Windows Terminal under
+    cmd and PowerShell alike).
+
+    Fail-open by design: draining is cosmetic recovery, so every failure
+    (not a TTY, closed file, unsupported platform API) is swallowed — a
+    launch must never fail because a cleanup could not run. TCOFLUSH is
+    never touched: output written so far must survive.
+    """
+    try:
+        if not sys.stdin.isatty():
+            return
+        if is_windows():
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+            kernel32.FlushConsoleInputBuffer(handle)
+        else:
+            import termios
+
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 def run_wait(argv: Sequence[str], env: Mapping[str, str]) -> int:
     """Run argv as a waited child and propagate its exit code (all OSes)."""
     try:

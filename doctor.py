@@ -229,6 +229,20 @@ def _check_keychain(store: Store, ctx: "_DoctorContext"):
             "orphaned keychain slots: " + ", ".join(orphans)
             + " (run `agydra doctor --fix` to purge)"
         )
+    # agy reads the shared slot as JSON; any other payload shape is the
+    # "re-login on every launch" failure mode (pre-fix agydra builds wrote
+    # the file-backup envelope into the live slot). Detection only: doctor
+    # must never rewrite the shared slot — the user's real agy login lives
+    # there. It self-heals on the next launch (the swap unwraps the
+    # profile's own backup), so the advice is to launch once, not to delete.
+    shared_format = report.get("shared_format")
+    if shared and shared_format not in (None, "json"):
+        lines.append(
+            "shared slot payload is not valid JSON "
+            f"(format: {shared_format!r}) — agy may ask you to log in "
+            "again; launching agy once through agydra self-heals it"
+        )
+        return WARN, "\n".join(lines)
     if mismatches or orphans:
         return WARN, "\n".join(lines)
     return OK, "\n".join(lines)

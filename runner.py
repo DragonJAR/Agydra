@@ -168,9 +168,18 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
             store, plan.profile, capture=plan.launch_as_child
         ):
             if platforms.is_windows():
-                return platforms.launch_argv(argv, env)
+                rc = platforms.launch_argv(argv, env)
+                # Discard terminal-query replies the agy TUI left unread in
+                # the input queue on exit (e.g. ``ESC[?1;2c``); the next
+                # shell prompt would echo them otherwise. The POSIX execvpe
+                # path cannot drain: agydra is replaced by agy and has no
+                # post-exec hook.
+                platforms.drain_tty_input()
+                return rc
             if plan.use_sandbox or plan.launch_as_child:
-                return platforms.run_wait(argv, env)
+                rc = platforms.run_wait(argv, env)
+                platforms.drain_tty_input()
+                return rc
             if handle is not None:
                 handle.record_holder_pid()
             return platforms.launch_argv(argv, env)
