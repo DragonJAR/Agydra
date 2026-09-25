@@ -255,3 +255,41 @@ class TestIsolationErrorPointsToDoctorFix(BaseCase):
         self.assertIn("doctor --fix", combined,
                       "isolation guard must point to `agydra doctor --fix`")
         self.assertNotEqual(result.returncode, 0)
+
+
+class TestDashedSubcommandDispatch(BaseCase):
+    """``--help``/``-h`` and ``--version`` have long accepted a dashed form
+    alongside their bare subcommand name; every other subcommand did not,
+    so a natural guess like ``agydra --usage`` matched nothing and fell
+    through to launcher mode -- trying to resolve/launch a profile using
+    "--usage" as noise, which surfaced as an unrelated busy-profile error
+    instead of running the usage report."""
+
+    def test_dashed_form_dispatches_the_same_subcommand_as_the_bare_name(self):
+        self.store = Store()
+        self.store.create("alpha")
+        bare = self._run_cli("list")
+        dashed = self._run_cli("--list")
+        self.assertEqual(strip_ansi(bare.stdout), strip_ansi(dashed.stdout))
+        self.assertEqual(bare.returncode, dashed.returncode)
+
+    def test_dashed_usage_ignores_a_busy_profile_instead_of_falling_through_to_launcher_mode(self):
+        import locks
+
+        self.store = Store()
+        self.store.create("alpha")
+        handle = locks.try_lock(self.store, "alpha")
+        try:
+            result = self._run_cli("--usage")
+        finally:
+            handle.release()
+        combined = result.stdout + result.stderr
+        self.assertNotIn("is busy", combined)
+
+    def test_single_dash_launcher_flags_are_unaffected(self):
+        self.store = Store()
+        self.store.create("alpha")
+        self.store.create("beta")
+        result = self._run_cli("-n")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("profile", strip_ansi(result.stdout))

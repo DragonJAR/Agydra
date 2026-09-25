@@ -803,7 +803,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"agydra {__version__}")
         return 0
 
-    sub = _CANONICAL.get(raw[0])
+    dashed = raw[0][2:] if raw[0].startswith("--") else raw[0]
+    sub = _CANONICAL.get(dashed)
     if sub is not None:
         rest = raw[1:]
         parser = argparse.ArgumentParser(
