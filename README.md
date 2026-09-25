@@ -267,13 +267,15 @@ Stored at `<store root>/agydra.json`, where the store root is
 {
   "default_profile": "work",
   "settings": {
-    "use_linux_sandbox": true,
+    "use_linux_sandbox": false,
     "copy_settings_on_create": true,
-    "windows_redirect_home": true
+    "windows_redirect_home": false
   },
   "agy_binary": "/usr/local/bin/agy"
 }
 ```
+
+> `use_linux_sandbox` and `windows_redirect_home` are opt-in (`false` by default); set them to `true` to enable bwrap sandboxing (Linux) or `USERPROFILE` home redirection (Windows).
 
 A corrupt config degrades to defaults for reads but refuses writes.
 

@@ -280,13 +280,15 @@ fuerza a color.
 {
   "default_profile": "work",
   "settings": {
-    "use_linux_sandbox": true,
+    "use_linux_sandbox": false,
     "copy_settings_on_create": true,
     "windows_redirect_home": false
   },
   "agy_binary": "/absolute/path/to/agy"
 }
 ```
+
+> `use_linux_sandbox` y `windows_redirect_home` son opcionales (`false` por defecto); ponlos en `true` para activar el sandbox bwrap (Linux) o la redirección `USERPROFILE` (Windows).
 
 Orden de resolución del binario `agy`: flag `--binary` → `agy_binary` en `agydra.json` → variable de entorno `AGYDRA_AGY_BIN` → búsqueda en `PATH`.
 
