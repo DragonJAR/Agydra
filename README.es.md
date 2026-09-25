@@ -258,7 +258,7 @@ agydra/                  # raíz del repo — layout plano, sin subdirectorio de
 ├── orphans.py           # escaneo inverso + limpieza de artefactos huérfanos
 ├── usage.py             # `agydra usage`: consulta y parseo de cuotas de agy /usage
 ├── bootstrap.py         # instalador de un comando (venv + script de consola + shim en PATH)
-├── tests/               # 517 tests (fake home + binario agy falso)
+├── tests/               # 523 tests (fake home + binario agy falso)
 ├── README.md            # Este documento (inglés)
 ├── README.es.md         # Versión en español
 ├── AGENTS.md            # Convenciones de desarrollo
@@ -300,7 +300,7 @@ Orden de resolución del binario `agy`: flag `--binary` → `agy_binary` en `agy
 
 - **Solo stdlib.** Cero dependencias de terceros; Python ≥ 3.9. No añadas paquetes.
 - **Multiplataforma por construcción.** Cada diferencia de OS vive en `platforms.py` y en los helpers de enlaces de `isolation.py`; nunca ramifiques por SO fuera de esos límites.
-- **Tests antes de declarar listo.** Desde la raíz del repo: `python3 -m pytest -q` (517 pasan + 3 skips de plataforma en macOS).
+- **Tests antes de declarar listo.** Desde la raíz del repo: `python3 -m pytest -q` (523 pasan + 3 skips de plataforma en macOS).
 - Consulta `AGENTS.md` para las guías de invariantes, layout y convenciones del proyecto.
 
 ## 📄 Licencia
