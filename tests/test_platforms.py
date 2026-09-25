@@ -5,6 +5,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import platforms
@@ -365,6 +366,33 @@ class TestRunWithGroupKill(unittest.TestCase):
             self.assertTrue(kwargs.get("text"))
             self.assertEqual(kwargs.get("encoding"), "utf-8")
             self.assertEqual(kwargs.get("errors"), "replace")
+
+
+class TestNormalizeWindowsArgv(unittest.TestCase):
+    def test_wraps_cmd_and_bat_on_windows(self):
+        with mock.patch("platforms.is_windows", return_value=True):
+            self.assertEqual(
+                platforms._normalize_windows_argv(["C:\\bin\\agy.cmd", "-p", "alpha"]),
+                ["cmd", "/c", "C:\\bin\\agy.cmd", "-p", "alpha"],
+            )
+            self.assertEqual(
+                platforms._normalize_windows_argv(["agy.BAT", "login"]),
+                ["cmd", "/c", "agy.BAT", "login"],
+            )
+
+    def test_leaves_exe_unchanged_on_windows(self):
+        with mock.patch("platforms.is_windows", return_value=True):
+            self.assertEqual(
+                platforms._normalize_windows_argv(["C:\\bin\\agy.exe", "-p", "alpha"]),
+                ["C:\\bin\\agy.exe", "-p", "alpha"],
+            )
+
+    def test_leaves_all_unchanged_on_posix(self):
+        with mock.patch("platforms.is_windows", return_value=False):
+            self.assertEqual(
+                platforms._normalize_windows_argv(["agy.cmd", "login"]),
+                ["agy.cmd", "login"],
+            )
 
 
 if __name__ == "__main__":

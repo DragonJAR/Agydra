@@ -242,6 +242,17 @@ def _kill_process_group(proc: "subprocess.Popen") -> None:
             pass
 
 
+def _normalize_windows_argv(argv: Sequence[str]) -> list[str]:
+    """On Windows, batch files (.cmd / .bat) cannot be directly executed by
+    CreateProcessW with shell=False; cmd.exe /c must host them."""
+    cmd = [str(a) for a in argv]
+    if is_windows() and cmd:
+        target = cmd[0].lower()
+        if target.endswith((".cmd", ".bat")):
+            return ["cmd", "/c", *cmd]
+    return cmd
+
+
 def run_with_group_kill(
     argv: Sequence[str],
     *,
@@ -290,7 +301,7 @@ def run_with_group_kill(
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         popen_kwargs["start_new_session"] = True
-    proc = subprocess.Popen(list(argv), **popen_kwargs)
+    proc = subprocess.Popen(_normalize_windows_argv(argv), **popen_kwargs)
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -306,7 +317,7 @@ def run_with_group_kill(
 def run_wait(argv: Sequence[str], env: Mapping[str, str]) -> int:
     """Run argv as a waited child and propagate its exit code (all OSes)."""
     try:
-        return subprocess.run(list(argv), env=dict(env), shell=False).returncode
+        return subprocess.run(_normalize_windows_argv(argv), env=dict(env), shell=False).returncode
     except KeyboardInterrupt:
         return 130
     except FileNotFoundError:
