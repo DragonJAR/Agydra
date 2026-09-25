@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cli import (
+    _LAUNCH_FLAGS,
     _check_no_launcher_short_flag_collision,
     _consume_launch_flags,
     _is_all_launcher_letters,
@@ -170,7 +171,7 @@ class TestLateBundleWarning(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
             _warn_late_flags(
-                {k: None for k in ("profile", "random", "dry-run", "binary")},
+                {k: None for k in _LAUNCH_FLAGS},
                 raw,
             )
         return buf.getvalue()
