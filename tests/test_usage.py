@@ -214,6 +214,70 @@ class TestQueryProfileUsageFailureModes(_UsageBase):
         self.assertEqual(result.error, "not authenticated")
 
 
+class TestQueryProfileUsageOverlayRace(_UsageBase):
+    """isolation.build_overlay can raise a bare FileExistsError (an OSError
+    subclass, not isolation.IsolationError) on the TOCTOU race in `_link`'s
+    symlink-creation window -- exactly the scenario this module's docstring
+    names as the primary use case: `agydra usage` running concurrently
+    against a profile whose overlay a real launch is also building. This
+    must degrade to UsageResult(ok=False, ...), never propagate."""
+
+    def test_bare_file_exists_error_degrades_without_raising(self):
+        with mock.patch.object(
+            usage.isolation, "build_overlay",
+            side_effect=FileExistsError("race on .gemini link"),
+        ):
+            result = usage.query_profile_usage(self.store, "alpha")
+        self.assertFalse(result.ok)
+        self.assertIn("overlay error", result.error)
+
+
+class TestGatherUsageReportSurvivesPerProfileFailures(_UsageBase):
+    """A single profile's overlay-build race or any other unexpected
+    failure must never abort the whole multi-profile report -- see
+    usage.py's module docstring invariant."""
+
+    def test_overlay_race_on_one_profile_does_not_abort_the_report(self):
+        self.store.create("beta")
+        self._authenticate("beta")
+        self._write_response(REAL_USAGE_JSON)
+
+        real_build_overlay = usage.isolation.build_overlay
+
+        def flaky_build_overlay(name, *args, **kwargs):
+            if name == "alpha":
+                raise FileExistsError("race on .gemini link")
+            return real_build_overlay(name, *args, **kwargs)
+
+        with mock.patch.object(usage.isolation, "build_overlay", side_effect=flaky_build_overlay):
+            results = usage.gather_usage_report(self.store, ["alpha", "beta"])
+
+        self.assertEqual([r.name for r in results], ["alpha", "beta"])
+        self.assertFalse(results[0].ok)
+        self.assertIn("overlay error", results[0].error)
+        self.assertTrue(results[1].ok, results[1].error)
+
+    def test_unexpected_exception_from_query_does_not_abort_the_report(self):
+        self.store.create("beta")
+        self._authenticate("beta")
+        self._write_response(REAL_USAGE_JSON)
+
+        real_query = usage.query_profile_usage
+
+        def flaky_query(store, name, **kwargs):
+            if name == "alpha":
+                raise ValueError("boom")
+            return real_query(store, name, **kwargs)
+
+        with mock.patch.object(usage, "query_profile_usage", side_effect=flaky_query):
+            results = usage.gather_usage_report(self.store, ["alpha", "beta"])
+
+        self.assertEqual([r.name for r in results], ["alpha", "beta"])
+        self.assertFalse(results[0].ok)
+        self.assertIn("boom", results[0].error)
+        self.assertTrue(results[1].ok, results[1].error)
+
+
 class TestQueryProfileUsageTimeoutKillsProcessGroup(_UsageBase):
     """Regression: a timed-out ``/usage`` query must kill agy's WHOLE
     process group, not just the immediate `agy` child -- see
@@ -265,7 +329,9 @@ class TestQueryProfileUsageLaunchGuard(_UsageBase):
         guard.__exit__ = mock.Mock(return_value=False)
         with mock.patch.object(usage.keychain, "launch_guard", return_value=guard) as mock_guard:
             result = usage.query_profile_usage(self.store, "alpha")
-        mock_guard.assert_called_once_with(self.store, "alpha", capture=False)
+        mock_guard.assert_called_once_with(
+            self.store, "alpha", capture=False, persist_on_exit=False
+        )
         guard.__enter__.assert_called_once()
         guard.__exit__.assert_called_once()
         self.assertTrue(result.ok, result.error)

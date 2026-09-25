@@ -263,7 +263,11 @@ class TestDashedSubcommandDispatch(BaseCase):
     so a natural guess like ``agydra --usage`` matched nothing and fell
     through to launcher mode -- trying to resolve/launch a profile using
     "--usage" as noise, which surfaced as an unrelated busy-profile error
-    instead of running the usage report."""
+    instead of running the usage report.
+
+    The single-dash form (``agydra -usage``) had the same gap: it fell
+    through to launcher mode, where it was parsed as an unrecognized
+    short-flag bundle instead of dispatching."""
 
     def test_dashed_form_dispatches_the_same_subcommand_as_the_bare_name(self):
         self.store = Store()
@@ -286,10 +290,81 @@ class TestDashedSubcommandDispatch(BaseCase):
         combined = result.stdout + result.stderr
         self.assertNotIn("is busy", combined)
 
+    def test_single_dash_form_dispatches_the_same_subcommand_as_the_bare_name(self):
+        self.store = Store()
+        self.store.create("alpha")
+        bare = self._run_cli("list")
+        single_dashed = self._run_cli("-list")
+        self.assertEqual(strip_ansi(bare.stdout), strip_ansi(single_dashed.stdout))
+        self.assertEqual(bare.returncode, single_dashed.returncode)
+
+    def test_single_dash_usage_ignores_a_busy_profile_instead_of_falling_through_to_launcher_mode(self):
+        import locks
+
+        self.store = Store()
+        self.store.create("alpha")
+        handle = locks.try_lock(self.store, "alpha")
+        try:
+            result = self._run_cli("-usage")
+        finally:
+            handle.release()
+        combined = result.stdout + result.stderr
+        self.assertNotIn("is busy", combined)
+
+    def test_single_dash_dispatches_every_canonical_name_and_every_alias(self):
+        """Exhaustive over the real vocabulary table (DRY, self-updating):
+        every canonical subcommand name and every alias must dispatch
+        identically whether spelled bare, ``--<name>`` or ``-<name>``. Using
+        ``--help`` on each subcommand keeps this side-effect-free (no store
+        mutation, no real launch) while still exercising the exact same
+        dispatch path a real invocation would take."""
+        import vocab
+
+        self.store = Store()
+        self.store.create("alpha")
+        for canonical, aliases in vocab.SUBCOMMAND_ALIASES.items():
+            for name in (canonical, *aliases):
+                with self.subTest(name=name):
+                    bare = self._run_cli(name, "--help")
+                    single_dashed = self._run_cli("-" + name, "--help")
+                    double_dashed = self._run_cli("--" + name, "--help")
+                    self.assertEqual(
+                        strip_ansi(bare.stdout), strip_ansi(single_dashed.stdout)
+                    )
+                    self.assertEqual(bare.returncode, single_dashed.returncode)
+                    self.assertEqual(
+                        strip_ansi(bare.stdout), strip_ansi(double_dashed.stdout)
+                    )
+                    self.assertEqual(bare.returncode, double_dashed.returncode)
+
     def test_single_dash_launcher_flags_are_unaffected(self):
         self.store = Store()
         self.store.create("alpha")
         self.store.create("beta")
         result = self._run_cli("-n")
         self.assertEqual(result.returncode, 0)
+        self.assertIn("profile", strip_ansi(result.stdout))
+
+    def test_single_dash_launcher_bundles_are_never_resolved_as_subcommands(self):
+        """Single-dash launcher bundles (boolean-only, value-taking, or
+        mixed) must never resolve to a subcommand -- dispatch must defer to
+        launcher-mode bundle parsing for every one of them."""
+        import cli
+
+        for token in ("-n", "-r", "-nr", "-rp", "-rn", "-b/opt/agy", "-nrf"):
+            with self.subTest(token=token):
+                self.assertIsNone(cli._resolve_subcommand(token))
+
+    def test_single_dash_launcher_bundles_still_launch_end_to_end(self):
+        self.store = Store()
+        self.store.create("alpha")
+        self.store.create("beta")
+        for name in ("alpha", "beta"):
+            cli_dir = self.store.profile_data_dir(name) / "antigravity-cli"
+            cli_dir.mkdir(parents=True, exist_ok=True)
+            (cli_dir / "antigravity-oauth-token").write_text(
+                '{"access_token": "tok"}', encoding="utf-8"
+            )
+        result = self._run_cli("-nr")
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("profile", strip_ansi(result.stdout))

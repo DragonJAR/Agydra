@@ -517,5 +517,34 @@ class TestRunnerReleasesLockOnSetupException(unittest.TestCase):
             self.assertFalse(locks.is_locked(store, "work"))
 
 
+class TestRunnerReleasesLockOnExecFailure(unittest.TestCase):
+    """``platforms.launch_argv`` deliberately catches ``execvpe`` failures
+    (missing/non-executable binary) and returns 126/127 instead of raising,
+    for a clean CLI error. On the plain-exec path (no sandbox, not a waited
+    child, not Windows) that return must still release the just-acquired
+    lock: a genuinely successful ``execvpe`` never returns control to this
+    function at all, so releasing unconditionally after ``launch_argv``
+    returns is always safe."""
+
+    def test_launch_argv_failure_releases_the_lock(self):
+        import os
+        from unittest import mock
+
+        import locks, platforms
+
+        with isolated_store_env():
+            store = Store()
+            store.create("work")
+            plan = runner.build_plan(store, [], flag_ref="work")
+            with mock.patch.object(platforms, "is_windows", return_value=False), \
+                    mock.patch.object(
+                        platforms, "launch_argv", return_value=126
+                    ) as launch_argv:
+                rc = runner.run(plan, store=store)
+            self.assertEqual(rc, 126)
+            launch_argv.assert_called_once()
+            self.assertFalse(locks.is_locked(store, "work"))
+
+
 if __name__ == "__main__":
     unittest.main()

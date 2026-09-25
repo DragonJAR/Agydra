@@ -162,7 +162,6 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
             handle.release()
         raise
 
-    release_after_guard = platforms.is_windows() or plan.use_sandbox or plan.launch_as_child
     try:
         with keychain.launch_guard(
             store, plan.profile, capture=plan.launch_as_child
@@ -184,5 +183,13 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
                 handle.record_holder_pid()
             return platforms.launch_argv(argv, env)
     finally:
-        if release_after_guard and handle is not None:
+        # Unconditional release is always safe here: a genuinely successful
+        # execvpe on the plain-exec branch replaces this process image and
+        # never returns control to this line at all. Every path that DOES
+        # reach here -- Windows, sandboxed/waited-child, or a plain exec
+        # that failed (launch_argv deliberately catches FileNotFoundError/
+        # OSError and returns 126/127 instead of raising) -- must release
+        # the lock in-process or it leaks for the rest of this process's
+        # life, holding a stale holder PID.
+        if handle is not None:
             handle.release()

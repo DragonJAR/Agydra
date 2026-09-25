@@ -184,7 +184,11 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
 
     try:
         overlay = isolation.build_overlay(name, data_dir, store.root)
-    except isolation.IsolationError as exc:
+    except (isolation.IsolationError, OSError) as exc:
+        # OSError covers the overlay-build races that surface as raw
+        # filesystem errors (e.g. FileExistsError when a concurrent
+        # session recreates the .gemini link mid-build) instead of the
+        # typed IsolationError -- same failure point, same degradation.
         return UsageResult(name=name, ok=False, error=f"overlay error: {exc}")
 
     env = isolation.isolated_env(
@@ -195,7 +199,8 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
 
     argv = [str(binary), "--print", "/usage", "--output-format", "json"]
     try:
-        with keychain.launch_guard(store, name, capture=False):
+        with keychain.launch_guard(store, name, capture=False,
+                                  persist_on_exit=False):
             proc = platforms.run_with_group_kill(
                 argv, env=env, timeout=timeout, text=True,
             )
@@ -253,13 +258,26 @@ def gather_usage_report(
     BEFORE each profile's query starts (1-based ``index``), so a caller
     can render a "checking <name>... (i/N)" indicator while a report
     across several profiles is still in flight.
+
+    Per-profile failure isolation: ``query_profile_usage`` itself already
+    degrades every expected failure to a ``UsageResult(ok=False, error=..)``
+    (timeout, agy exit code, overlay race, ...). An UNEXPECTED exception
+    from one profile must degrade the same way instead of aborting the
+    whole report -- one broken profile never hides the other accounts'
+    data, mirroring the degradation pattern the single-query path uses.
     """
     results: List[UsageResult] = []
     total = len(names)
     for index, name in enumerate(names, start=1):
         if on_progress is not None:
             on_progress(index, total, name)
-        results.append(query_profile_usage(store, name, timeout=timeout))
+        try:
+            results.append(query_profile_usage(store, name, timeout=timeout))
+        except Exception as exc:  # noqa: BLE001 - degrade, never abort
+            results.append(
+                UsageResult(name=name, ok=False,
+                            error=f"unexpected error: {exc}")
+            )
     return results
 
 

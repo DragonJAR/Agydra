@@ -1310,5 +1310,138 @@ class TestKeychainCheckFlagsStaleSharedFormat(unittest.TestCase):
 
 
 
+class TestPersistClassification(unittest.TestCase):
+    """``_persist_if_trusted`` must distinguish THREE exit-persist cases:
+    (1) payload decodable but WITHOUT an identity claim — a mid-session
+    token refresh (Google drops id_token on refresh), benign: note and
+    keep the existing backup; (2) undecodable garbage — keep warning;
+    (3) a DIFFERENT email — keep warning (identity-laundering guard)."""
+
+    def setUp(self):
+        import base64 as _b64
+        import json as _json
+
+        self.store = _StoreStub(Path(self.id().replace(" ", "_")[:80]) if False else Path(tempfile.mkdtemp(prefix="persist-cls-")))
+        self.slots = keychain._slots_dir(self.store)
+        self.slots.mkdir(parents=True, exist_ok=True)
+        self.backup = keychain.slot_backup_path(self.store, "work")
+        self.backup.write_bytes(b"go-keyring-base64:Zm9v")
+
+        def jwt(email):
+            import base64 as _b
+            payload = _b.urlsafe_b64encode(_json.dumps({"email": email}).encode()).rstrip(b"=").decode()
+            return f"alg.{payload}.sig"
+
+        self.refresh_payload = _json.dumps({
+            "token": {"access_token": "fake-access-token", "refresh_token": "rt",
+                      "token_type": "Bearer", "expiry": "2099-01-01T00:00:00Z"},
+            "auth_method": "consumer",
+            # NO id_token: the refresh-response shape
+        }).encode()
+        self.different_payload = _json.dumps({
+            "token": {"access_token": "ya29.x", "refresh_token": "r",
+                      "token_type": "Bearer", "expiry": "2099-01-01T00:00:00Z"},
+            "auth_method": "consumer",
+            "id_token": jwt("mallory@evil.com"),
+        }).encode()
+        self.known_email = "known@example.com"
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.store.root, ignore_errors=True)
+
+    def _persist(self, data):
+        """Persist with a known identity; capture note/warn streams."""
+        import io
+        from unittest import mock
+
+        note_buf, warn_buf = io.StringIO(), io.StringIO()
+        with mock.patch.object(keychain, "note",
+                               lambda m: note_buf.write(m + "\n")), \
+                mock.patch.object(keychain, "warn",
+                                  lambda m: warn_buf.write(m + "\n")):
+            keychain._persist_if_trusted(self.store, "work", data)
+        return note_buf.getvalue(), warn_buf.getvalue()
+
+    def _known_identity_side_effect(self):
+        """Provide a deterministic known identity for the stub store."""
+        from unittest import mock
+
+        return mock.patch.object(
+            keychain, "_known_identity",
+            lambda *a, **k: self.known_email,
+        )
+
+    def test_refresh_without_identity_notes_and_keeps_backup(self):
+        # .secret baseline must survive: refreshed token has no id_token,
+        # so the identity cannot be confirmed and the backup is kept.
+        before = self.backup.read_bytes()
+        with self._known_identity_side_effect():
+            note_out, warn_out = self._persist(self.refresh_payload)
+        self.assertTrue(note_out.strip(), "expected a discrete note")
+        self.assertNotIn("different account", note_out)
+        self.assertEqual(warn_out, "", "refresh-shaped payload must not warn")
+        self.assertEqual(self.backup.read_bytes(), before,
+                         ".secret must not be overwritten by a refresh")
+
+    def test_garbage_payload_still_warns(self):
+        from unittest import mock
+
+        with self._known_identity_side_effect():
+            note_out, warn_out = self._persist(b"\x00\x01total-garbage")
+        self.assertIn("different account", warn_out)
+        self.assertEqual(note_out, "")
+
+    def test_different_email_still_warns(self):
+        from unittest import mock
+
+        with self._known_identity_side_effect():
+            note_out, warn_out = self._persist(self.different_payload)
+        self.assertIn("different account", warn_out)
+        self.assertEqual(note_out, "")
+
+
+class TestLaunchGuardPersistOnExit(unittest.TestCase):
+    """``launch_guard(persist_on_exit=False)`` is the query mode: the exit
+    path must not attempt a credential persist at all (usage is read-only —
+    it observes the slot, never rewrites the profile's backup)."""
+
+    def test_persist_block_skipped_and_restore_intact(self):
+        import sys as _sys
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _StoreStub(Path(tmp) / "store")
+            had = b'{"token":{"access_token":"prior"}}'
+            kc = _MemoryKeychain(had)
+
+            def fake_run(args, input_bytes=None):
+                return _rc(0)  # find/write/delete all succeed
+
+            # A .secret so the swap happens (non-empty slot → swapped).
+            slots = keychain._slots_dir(store)
+            slots.mkdir(parents=True, exist_ok=True)
+            keychain.slot_backup_path(store, "work").write_bytes(
+                keychain.envelope_token_bytes(had)
+            )
+
+            with mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(keychain, "_run", fake_run), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain",
+                        return_value=Path("/fake")), \
+                    mock.patch.object(keychain, "_serialize_lock",
+                                      return_value=None), \
+                    mock.patch.object(
+                        keychain, "_persist_if_trusted") as persist:
+                with keychain.launch_guard(store, "work",
+                                           persist_on_exit=False):
+                    pass  # simulate the agy query
+            persist.assert_not_called()
+            # Restore semantics untouched: shared slot back to had_shared.
+            self.assertEqual(kc.shared, had)
+
+
 if __name__ == "__main__":
     unittest.main()

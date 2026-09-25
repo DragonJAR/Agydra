@@ -21,12 +21,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cli import (
+    _check_no_launcher_short_flag_collision,
     _consume_launch_flags,
+    _is_all_launcher_letters,
+    _LAUNCHER_SHORT_LETTERS,
     _match_flag,
+    _resolve_subcommand,
     _warn_late_flags,
 )
 from store import Store, StoreError
 
+import vocab
 from conftest import BaseCase
 
 
@@ -264,6 +269,88 @@ class TestRuntimeBundleLaunch(BaseCase):
         result = self._run_cli("-n", "-p", "lab", "chat")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("profile : lab", result.stdout)
+
+
+class TestLauncherShortFlagCollisionGuard(unittest.TestCase):
+    """A single-dash subcommand token (``agydra -<name>``) is indistinguishable
+    from a launcher-mode short-flag bundle when every character of ``<name>``
+    is itself one of the launcher's own short-flag letters -- ``-nr`` must
+    always mean ``-n -r``, never a hypothetical subcommand named "nr". This
+    collision must never silently reappear as either vocabulary grows, so
+    it is checked at import time against the real tables AND unit-tested
+    here directly against crafted, hypothetical vocabularies -- not just
+    today's real data."""
+
+    def test_real_vocabulary_has_no_collision_today(self):
+        _check_no_launcher_short_flag_collision(
+            vocab.CANONICAL, _LAUNCHER_SHORT_LETTERS
+        )
+
+    def test_is_all_launcher_letters_true_for_full_overlap(self):
+        self.assertTrue(_is_all_launcher_letters("nr", {"n", "r"}))
+        self.assertTrue(_is_all_launcher_letters("prnbf", {"p", "r", "n", "b", "f"}))
+
+    def test_is_all_launcher_letters_false_for_partial_or_no_overlap(self):
+        self.assertFalse(_is_all_launcher_letters("rm", {"p", "r", "n", "b", "f"}))
+        self.assertFalse(_is_all_launcher_letters("us", {"p", "r", "n", "b", "f"}))
+
+    def test_is_all_launcher_letters_false_for_empty_token(self):
+        self.assertFalse(_is_all_launcher_letters("", {"p", "r", "n", "b", "f"}))
+
+    def test_guard_raises_for_a_hypothetical_colliding_alias(self):
+        hypothetical_canonical = {"list": "list", "nr": "list"}
+        with self.assertRaises(RuntimeError) as cm:
+            _check_no_launcher_short_flag_collision(
+                hypothetical_canonical, {"p", "r", "n", "b", "f"}
+            )
+        self.assertIn("nr", str(cm.exception))
+
+    def test_guard_passes_for_a_non_colliding_hypothetical_vocabulary(self):
+        hypothetical_canonical = {"list": "list", "status": "status"}
+        _check_no_launcher_short_flag_collision(
+            hypothetical_canonical, {"p", "r", "n", "b", "f"}
+        )
+
+    def test_guard_detects_collision_if_a_new_launcher_letter_is_added(self):
+        """Simulates the launcher vocabulary growing a new short flag that
+        happens to spell out an existing subcommand alias entirely."""
+        hypothetical_canonical = {"doctor": "doctor", "doc": "doctor"}
+        with self.assertRaises(RuntimeError):
+            _check_no_launcher_short_flag_collision(
+                hypothetical_canonical, {"d", "o", "c"}
+            )
+
+
+class TestResolveSubcommandSingleDash(unittest.TestCase):
+    """Direct unit coverage of the single-dash resolution rule, independent
+    of subprocess end-to-end tests."""
+
+    def test_single_dash_resolves_every_canonical_name_and_alias(self):
+        for canonical, aliases in vocab.SUBCOMMAND_ALIASES.items():
+            for name in (canonical, *aliases):
+                with self.subTest(name=name):
+                    self.assertEqual(_resolve_subcommand("-" + name), canonical)
+
+    def test_double_dash_still_resolves_every_canonical_name_and_alias(self):
+        for canonical, aliases in vocab.SUBCOMMAND_ALIASES.items():
+            for name in (canonical, *aliases):
+                with self.subTest(name=name):
+                    self.assertEqual(_resolve_subcommand("--" + name), canonical)
+
+    def test_bare_still_resolves_every_canonical_name_and_alias(self):
+        for canonical, aliases in vocab.SUBCOMMAND_ALIASES.items():
+            for name in (canonical, *aliases):
+                with self.subTest(name=name):
+                    self.assertEqual(_resolve_subcommand(name), canonical)
+
+    def test_launcher_bundles_never_resolve_to_a_subcommand(self):
+        for token in ("-n", "-r", "-nr", "-rp", "-rn", "-b/opt/agy", "-nrf", "-", "--"):
+            with self.subTest(token=token):
+                self.assertIsNone(_resolve_subcommand(token))
+
+    def test_unrelated_dashed_token_resolves_to_none(self):
+        self.assertIsNone(_resolve_subcommand("-xyz"))
+        self.assertIsNone(_resolve_subcommand("--xyz"))
 
 
 class TestRuntimeCreateRefusesReservedName(BaseCase):

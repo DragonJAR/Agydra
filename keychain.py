@@ -44,7 +44,7 @@ from typing import Dict, List, Optional
 
 import platforms
 from store import atomic_write_bytes
-from ui import warn
+from ui import note, warn
 
 try:
     import fcntl
@@ -439,6 +439,18 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
     :func:`token_payload_for_slot`); this entry re-envelopes the payload
     before writing the ``.secret`` file backup so the identity guard keeps
     decoding it.
+
+    Distinguishes THREE cases so the "looks like a different account"
+    alarm is reserved for cases where identity laundering is actually
+    possible, not for the harmless mid-session token refresh (Google
+    strips ``id_token`` from refresh responses, so the refreshed payload
+    decodes fine but carries no email claim to compare against):
+
+    1. payload decodes AND identity matches known    -> save.
+    2. payload decodes BUT has no identity claim     -> mid-session
+       refresh; keep the existing backup (honest, lowered to ``note``).
+    3. payload does NOT decode, OR identity differs -> possible
+       laundering; ``warn`` and keep the existing backup.
     """
     known = _known_identity(store, name)
     serialized = envelope_token_bytes(data)
@@ -448,13 +460,22 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
     candidate = _secret_identity(serialized)
     if candidate == known:
         save_profile_slot(store, name, serialized)
-    else:
-        seen = repr(candidate) if candidate else "undecodable"
-        warn(
-            f"keychain slot for profile {name!r} looks like a different "
-            f"account ({seen} vs {known!r}); not overwriting its saved "
-            "credential"
+        return
+    if candidate is None and decode_go_keyring_secret(serialized) is not None:
+        # Case 2: refreshed token without id_token -- same account almost
+        # certainly, but unverifiable. Honest note (not warn), backup
+        # untouched. The decode re-runs only in the failure branch.
+        note(
+            f"keychain slot for profile {name!r} holds a refreshed token "
+            "without an identity claim; keeping its saved credential"
         )
+        return
+    seen = repr(candidate) if candidate else "undecodable"
+    warn(
+        f"keychain slot for profile {name!r} looks like a different "
+        f"account ({seen} vs {known!r}); not overwriting its saved "
+        "credential"
+    )
 
 
 def _serialize_lock(store):
@@ -529,7 +550,8 @@ def _ensure_target_keychain(store) -> Optional[Path]:
         return None
 
 
-def launch_guard(store, profile: str, capture: bool = False):
+def launch_guard(store, profile: str, capture: bool = False,
+                 persist_on_exit: bool = True):
     """Context manager swapping the shared keychain slot to ``profile``.
 
     Returns a null-context manager on platforms without a keychain bridge.
@@ -593,6 +615,14 @@ def launch_guard(store, profile: str, capture: bool = False):
         return contextlib.nullcontext()
 
     class _Guard:
+        def __init__(self, persist_on_exit: bool) -> None:
+            # Read-only mode (``agydra --usage`` and friends): the exit path
+            # must not attempt to rewrite the profile's ``.secret``. The
+            # swap+restore still happen (auth); only the credential-cap
+            # capture is skipped. Default True preserves every launch/login's
+            # behaviour; passing False is the orthogonal, explicit opt-out.
+            self._persist_on_exit = persist_on_exit
+
         def __enter__(self):
             self._lock = None
             self._had_shared: Optional[bytes] = None
@@ -673,7 +703,7 @@ def launch_guard(store, profile: str, capture: bool = False):
                     # Entry made no change (see __enter__): exit persists
                     # and restores nothing either, so this is a pure read.
                     return False
-                if self._swapped and not capture:
+                if self._swapped and not capture and self._persist_on_exit:
                     current = read_slot(shared_slot(), self._keychain_path)
                     if current is not None:
                         _persist_if_trusted(store, profile, current)
@@ -704,7 +734,7 @@ def launch_guard(store, profile: str, capture: bool = False):
             if data is not None:
                 _persist_if_trusted(store, profile, data)
 
-    return _Guard()
+    return _Guard(persist_on_exit)
 
 
 def rename_profile_slot(store, old_name: str, new_name: str) -> None:

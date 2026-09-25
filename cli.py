@@ -80,6 +80,74 @@ _SHORT_TO_FLAG: Dict[str, Tuple[str, bool]] = {
 _CANONICAL = vocab.CANONICAL
 _SUBCOMMAND_ALIASES = vocab.SUBCOMMAND_ALIASES
 
+_LAUNCHER_SHORT_LETTERS: frozenset = frozenset(short[1:] for short in _SHORT_TO_FLAG)
+
+
+def _is_all_launcher_letters(token: str, letters: Optional[frozenset] = None) -> bool:
+    """True when ``token`` is non-empty and every character of it is one of
+    the launcher's own short-flag letters (``p``/``r``/``n``/``b``/``f``
+    today, derived from ``_LAUNCH_FLAGS``).
+
+    Such a token could always have been spelled as a legitimate single-dash
+    launcher bundle (``-nr`` == ``-n -r``), so it must never be claimed by
+    subcommand dispatch — launcher-mode bundle parsing wins instead.
+    """
+    if letters is None:
+        letters = _LAUNCHER_SHORT_LETTERS
+    return bool(token) and all(char in letters for char in token)
+
+
+def _check_no_launcher_short_flag_collision(canonical_keys, letters) -> None:
+    """Fail loudly if any subcommand name/alias is fully composed of the
+    launcher's own short-flag letters.
+
+    A single-dash spelling of such a name would be indistinguishable from a
+    legitimate launcher-mode short-flag bundle, so it could never be safely
+    dispatched. This is checked at import time against both vocabularies'
+    single sources of truth (``vocab.CANONICAL`` and ``_LAUNCH_FLAGS``) so
+    the collision can never silently reappear if either one grows later —
+    it must fail import (or the dedicated test that also calls this
+    directly) instead of quietly breaking single-dash dispatch for one name.
+    """
+    colliding = sorted(
+        key for key in canonical_keys if _is_all_launcher_letters(key, letters)
+    )
+    if colliding:
+        raise RuntimeError(
+            "subcommand vocabulary collides with launcher short flags: "
+            f"{colliding!r} are fully composed of launcher letters "
+            f"{sorted(letters)!r} — a single-dash spelling of a name here "
+            "would be ambiguous with a launcher-mode bundle; rename the "
+            "colliding subcommand/alias or the launcher flag"
+        )
+
+
+_check_no_launcher_short_flag_collision(_CANONICAL, _LAUNCHER_SHORT_LETTERS)
+
+
+def _resolve_subcommand(token: str) -> Optional[str]:
+    """Resolve one argv[0] token to a canonical subcommand name.
+
+    Accepts the bare form (``list``), the double-dash form (``--list``) and
+    the single-dash form (``-list``) — all three derived from the same
+    ``vocab.CANONICAL`` table (DRY, not a second list). The single-dash form
+    is refused when the remainder is fully composed of the launcher's own
+    short-flag letters (see ``_is_all_launcher_letters``): such a token
+    could always have been a legitimate launcher-mode bundle instead, and
+    that parsing must win. Returns ``None`` when the token is not a
+    recognized subcommand spelling.
+    """
+    if token.startswith("--"):
+        return _CANONICAL.get(token[2:])
+    sub = _CANONICAL.get(token)
+    if sub is not None:
+        return sub
+    if token.startswith("-") and len(token) > 1:
+        remainder = token[1:]
+        if remainder in _CANONICAL and not _is_all_launcher_letters(remainder):
+            return _CANONICAL[remainder]
+    return None
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -775,36 +843,44 @@ def _report_error(exc: BaseException) -> int:
     raise exc
 
 
+def _print_top_level_help() -> None:
+    build_parser().print_help()
+    print()
+    print(_management_help())
+    print()
+    print(paint("examples:", "cyan", "bold"))
+    for group, entries in _EXAMPLES:
+        print(f"  {group}:")
+        for command, comment in entries:
+            print(
+                paint_each(
+                    [
+                        (f"    {command}", ("bold",)),
+                        (f"  # {comment}", ("dim",)),
+                    ]
+                )
+            )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     banner.show()
     raw = list(sys.argv[1:] if argv is None else argv)
     store = Store()
 
-    if not raw or raw[0] in ("help", "--help", "-h"):
-        build_parser().print_help()
-        print()
-        print(_management_help())
-        print()
-        print(paint("examples:", "cyan", "bold"))
-        for group, entries in _EXAMPLES:
-            print(f"  {group}:")
-            for command, comment in entries:
-                print(
-                    paint_each(
-                        [
-                            (f"    {command}", ("bold",)),
-                            (f"  # {comment}", ("dim",)),
-                        ]
-                    )
-                )
+    if not raw:
+        _print_top_level_help()
         return 0
 
-    if raw[0] == "version" or raw[0] == "--version":
+    sub = _resolve_subcommand(raw[0])
+
+    if raw[0] == "-h" or sub == "help":
+        _print_top_level_help()
+        return 0
+
+    if sub == "version":
         print(f"agydra {__version__}")
         return 0
 
-    dashed = raw[0][2:] if raw[0].startswith("--") else raw[0]
-    sub = _CANONICAL.get(dashed)
     if sub is not None:
         rest = raw[1:]
         parser = argparse.ArgumentParser(

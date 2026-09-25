@@ -149,9 +149,9 @@ class TestRunnerForce(BaseCase):
             handle.release()
 
     def test_release_after_guard_skipped_when_handle_is_none(self):
-        """``launch_as_child=True`` triggers the ``release_after_guard``
-        branch; with force the handle is ``None`` and the guard must
-        skip the release — DRY check that we do not regress to a
+        """``runner.run``'s unconditional post-guard release must skip
+        when the handle is ``None``; with force the handle is always
+        ``None`` — DRY check that we do not regress to a
         ``None.release()`` AttributeError."""
         handle = locks.try_lock(self.store, "work")
         try:
