@@ -88,15 +88,30 @@ def shared_slot() -> str:
 
 KEYCHAIN_TIMEOUT_S = 2.0
 
+KEYCHAIN_CREATE_TIMEOUT_S = 30.0
+"""Timeout for ``security create-keychain`` specifically.
 
-def _run(args) -> subprocess.CompletedProcess:
+Every other call in this module is non-interactive, so KEYCHAIN_TIMEOUT_S
+keeps it snappy. ``create-keychain`` invoked without ``-p`` is the one
+exception: macOS shows a native Security Agent GUI password prompt and
+waits for a human. Using the fast timeout here would kill that prompt
+(``platforms.run_with_group_kill`` tears down the whole process tree,
+Security Agent included) before anyone could type a password, so
+``_ensure_target_keychain`` would always "fail" on a timeout and
+permanently disable the keychain bridge via the skip marker -- exactly the
+self-heal this was meant to enable. This value is a generous, one-time
+allowance for a human to respond.
+"""
+
+
+def _run(args, timeout: float = KEYCHAIN_TIMEOUT_S) -> subprocess.CompletedProcess:
     out_fh = tempfile.TemporaryFile()
     err_fh = tempfile.TemporaryFile()
     try:
         try:
             result = platforms.run_with_group_kill(
                 ["security", *args],
-                timeout=KEYCHAIN_TIMEOUT_S,
+                timeout=timeout,
                 stdout=out_fh,
                 stderr=err_fh,
             )
@@ -558,7 +573,7 @@ def _ensure_target_keychain(store) -> Optional[Path]:
 
         target = _login_keychain_path()
         if not target.exists():
-            created = _run(["create-keychain", str(target)])
+            created = _run(["create-keychain", str(target)], timeout=KEYCHAIN_CREATE_TIMEOUT_S)
             if created.returncode != 0:
                 platforms.ensure_dir(marker.parent)
                 marker.touch()

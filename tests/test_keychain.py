@@ -2,6 +2,7 @@
 import base64
 import binascii
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -866,7 +867,7 @@ class TestEnsureTargetKeychain(unittest.TestCase):
             store = _StoreStub(Path(tmp) / "store")
             calls = []
 
-            def fake_run(args, input_bytes=None):
+            def fake_run(args, input_bytes=None, **kwargs):
                 calls.append(args)
                 verb = args[0]
                 if verb == "default-keychain" and "-s" not in args:
@@ -895,7 +896,7 @@ class TestEnsureTargetKeychain(unittest.TestCase):
             fake_home.mkdir()
             store = _StoreStub(Path(tmp) / "store")
 
-            def failing_run(args, input_bytes=None):
+            def failing_run(args, input_bytes=None, **kwargs):
                 if args[0] == "default-keychain":
                     return _rc(51)
                 if args[0] == "create-keychain":
@@ -914,6 +915,40 @@ class TestEnsureTargetKeychain(unittest.TestCase):
 
             with mock.patch.object(keychain, "_run", exploding_run):
                 self.assertIsNone(keychain._ensure_target_keychain(store))
+
+    def test_create_keychain_gets_a_longer_timeout_than_ordinary_calls(self):
+        """``security create-keychain`` with no ``-p`` triggers a native GUI
+        password prompt (see ``platforms.run_with_group_kill``'s own
+        docstring, which calls out killing "macOS's Security Agent for
+        `security`" on timeout). The fast ``KEYCHAIN_TIMEOUT_S`` used for
+        every other -- normally non-interactive -- ``security`` call would
+        kill that prompt before a human could ever type a password into it,
+        permanently writing the skip marker and disabling the keychain
+        bridge for good. This call must get enough time for a person to
+        actually respond.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp) / "home"
+            fake_home.mkdir()
+            store = _StoreStub(Path(tmp) / "store")
+            seen_timeouts = {}
+
+            def fake_run_with_group_kill(argv, *, timeout=None, **kwargs):
+                verb = argv[1] if len(argv) > 1 else None
+                seen_timeouts[verb] = timeout
+                if verb == "default-keychain" and "-s" not in argv:
+                    return subprocess.CompletedProcess(argv, 51)
+                return subprocess.CompletedProcess(argv, 0)
+
+            with mock.patch.object(
+                keychain.platforms, "run_with_group_kill", fake_run_with_group_kill
+            ), mock.patch.object(keychain.platforms, "real_home", return_value=fake_home):
+                result = keychain._ensure_target_keychain(store)
+
+            self.assertIsNotNone(result)
+            self.assertIn("create-keychain", seen_timeouts)
+            self.assertGreater(seen_timeouts["create-keychain"], keychain.KEYCHAIN_TIMEOUT_S)
+            self.assertEqual(seen_timeouts["default-keychain"], keychain.KEYCHAIN_TIMEOUT_S)
 
 
 class TestPurgeProfileSlot(BaseCase):
@@ -984,7 +1019,7 @@ class TestPurgeProfileSlot(BaseCase):
 
     def test_purge_swallows_keychain_error(self):
         """A failing `security` delete must not abort profile deletion."""
-        def failing_run(args, input_bytes=None):
+        def failing_run(args, input_bytes=None, **kwargs):
             return _rc(45)
 
         with mock.patch.object(keychain, "supported", return_value=True), \
