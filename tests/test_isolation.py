@@ -55,6 +55,30 @@ class TestIsolation(BaseCase):
         if not platforms.is_windows():
             self.assertEqual(first, [platforms.AGY_DATA_DIR_NAME, ".gitconfig"])
 
+    def test_link_hardlinks_file_targets_on_windows_without_privileges(self):
+        """Generic home entries (``.gitconfig``, ``.ssh/...``) are meant to
+        stay SHARED across profiles and launches -- the module docstring
+        says so explicitly ("without copying anything"). Only ``.gemini``
+        (always a directory) is meant to be genuinely per-profile isolated,
+        and that case never reaches this file-target branch. A one-time
+        ``copy2`` snapshot here would silently diverge from the real file
+        forever (nothing ever refreshes it -- see ``_mirror_dir``'s
+        idempotency check, which leaves an existing plain file alone),
+        breaking that documented sharing invariant on any Windows machine
+        without Developer Mode/admin privileges. A hardlink keeps it
+        genuinely shared, exactly like the symlink/junction paths above it.
+        """
+        target = self.fake_home / "shared-file.txt"
+        target.write_text("original")
+        link = self.store.overlays_dir / "shared-file-link.txt"
+        link.parent.mkdir(parents=True, exist_ok=True)
+
+        with mock.patch("isolation.platforms.is_windows", return_value=True), \
+                mock.patch("isolation.os.symlink", side_effect=OSError("no privilege")):
+            isolation._link(target, link)
+
+        self.assertEqual(link.stat().st_ino, target.stat().st_ino)
+
     def test_overlay_rejects_wrong_target(self):
         overlay = isolation.build_overlay("alpha", self.data_dir, self.store.root)
         link = overlay / platforms.AGY_DATA_DIR_NAME

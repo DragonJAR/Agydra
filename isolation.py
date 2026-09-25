@@ -59,8 +59,16 @@ def _link(target: Path, link: Path) -> None:
     POSIX: ``os.symlink`` (works for files and directories, no privileges).
     Windows (admin / Dev Mode): ``os.symlink`` same as POSIX.
     Windows (no privileges, directory target): ``mklink /J`` junction.
-    Windows (no privileges, file target): ``shutil.copy2`` — a hardlink
-        shares the inode and would break per-profile isolation.
+    Windows (no privileges, file target): ``os.link`` hardlink. The only
+        caller that reaches this branch is ``_mirror_dir``'s generic
+        entry pass, which mirrors entries the module docstring documents
+        as deliberately SHARED across profiles (``.gitconfig``, ``.ssh``,
+        ...) rather than per-profile data — a hardlink keeps that entry
+        genuinely in sync with the real file, exactly like the symlink/
+        junction paths above; ``.gemini`` (the one entry that IS meant to
+        be isolated) is always a directory and never reaches this branch.
+        Falls back to a one-time ``shutil.copy2`` only when the hardlink
+        itself is impossible (e.g. target on a different volume).
     """
     if not platforms.is_windows():
         os.symlink(target, link)
@@ -84,7 +92,10 @@ def _link(target: Path, link: Path) -> None:
                 f"(rc={result.returncode}): {detail}"
             )
         return
-    shutil.copy2(target, link)
+    try:
+        os.link(target, link)
+    except OSError:
+        shutil.copy2(target, link)
 
 
 def link_points_to(link: Path, target: Path) -> bool:
