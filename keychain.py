@@ -336,6 +336,33 @@ def decode_go_keyring_secret(data: Optional[bytes]) -> Optional[dict]:
     return decoded if isinstance(decoded, dict) else None
 
 
+def _as_envelope(data: bytes) -> bytes:
+    """Envelope form of ``data``, accepting either of the two shapes a
+    credential value reaches this module in.
+
+    ``token_payload_for_slot`` means the shared slot normally carries plain
+    JSON, but a ``.secret`` backup is always the envelope, and a slot value
+    that ``security`` round-tripped is not guaranteed to come back in the
+    shape it went in (the whole reason ``_normalize_read_slot_value``
+    exists). Enveloping something already enveloped yields bytes no decoder
+    can read, which the identity guard cannot tell apart from a foreign
+    credential -- so it would refuse a perfectly good token. Returning an
+    already-valid envelope unchanged removes that failure mode.
+
+    The prefix alone is the discriminator, not full decodability: a value
+    that carries the prefix but whose payload is damaged must still pass
+    through unchanged (the capture flow preserves the slot's exact bytes
+    and lets its own decode checks classify it), and plain JSON never
+    starts with the prefix. This is the ONE place that negotiates the two
+    shapes; ``envelope_token_bytes`` stays a strict, non-inspecting
+    transform so a caller that must build a fresh envelope gets no silent
+    normalization.
+    """
+    if data.startswith(_GO_KEYRING_PREFIX):
+        return bytes(data)
+    return envelope_token_bytes(data)
+
+
 def _secret_identity(data: Optional[bytes]) -> Optional[str]:
     """Email claim of a go-keyring-encoded secret, or None when it decodes
     to nothing (wrong format, no id_token, or no email claim)."""
@@ -435,10 +462,11 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
     with no known identity yet is a genuine first login: nothing to
     compare against, so it is trusted.
 
-    The shared keychain slot now carries plain JSON (see
-    :func:`token_payload_for_slot`); this entry re-envelopes the payload
-    before writing the ``.secret`` file backup so the identity guard keeps
-    decoding it.
+    The shared keychain slot normally carries plain JSON (see
+    :func:`token_payload_for_slot`), but a value already in envelope form
+    is possible too; :func:`_as_envelope` normalizes either into the
+    envelope form the ``.secret`` file backup uses, so the identity guard
+    keeps decoding it.
 
     Distinguishes THREE cases so the "looks like a different account"
     alarm is reserved for cases where identity laundering is actually
@@ -453,7 +481,7 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
        laundering; ``warn`` and keep the existing backup.
     """
     known = _known_identity(store, name)
-    serialized = envelope_token_bytes(data)
+    serialized = _as_envelope(data)
     if known is None:
         save_profile_slot(store, name, serialized)
         return
@@ -636,13 +664,14 @@ def launch_guard(store, profile: str, capture: bool = False,
                     return self
                 self._had_shared = read_slot(shared_slot(), self._keychain_path)
                 if not capture and self._had_shared is not None:
-                    # The shared slot already carries the plain-JSON payload
-                    # (see ``token_payload_for_slot``), not the envelope
-                    # form ``_secret_identity`` decodes -- re-envelope it in
-                    # memory purely to reuse that one decode path, the same
-                    # trick ``_persist_if_trusted`` already relies on.
+                    # The shared slot carries the plain-JSON payload when
+                    # agydra wrote it (see ``token_payload_for_slot``) and
+                    # the envelope when agy's own keyring layer did; only
+                    # the latter is what ``_secret_identity`` decodes, so
+                    # normalize in memory through the one helper that knows
+                    # both shapes.
                     shared_identity = _secret_identity(
-                        envelope_token_bytes(self._had_shared)
+                        _as_envelope(self._had_shared)
                     )
                     if shared_identity is not None:
                         known = _known_identity(store, profile, include_secret=False)
@@ -848,6 +877,10 @@ def capture_shared_slot_for_import(store, name: str, data_dir: Path) -> None:
         return
     if current is None:
         return
+    # ``.secret`` backups and every identity decode in this module use the
+    # envelope form, while the shared slot normally carries plain JSON;
+    # normalize once so the comparisons below and the saved backup agree.
+    current = _as_envelope(current)
 
     import account
 
