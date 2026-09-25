@@ -43,10 +43,9 @@ class TestLocks(BaseCase):
     def test_lock_held_while_handle_alive(self):
         """The lock is kernel-held on the open fd: as long as the caller
         keeps the handle alive (without release()), the profile stays busy.
-        (Dropping the handle lets CPython's GC close the fd and free the
-        lock — callers must keep the handle alive for the session's
-        lifetime; cross-process survival is covered by the -r integration
-        test with a live gate-held child.)"""
+        (The lock lives until explicit release() or process exit; raw OS
+        file descriptors are not closed by CPython GC — cross-process survival
+        is covered by the -r integration test with a live gate-held child.)"""
         handle = locks.try_lock(self.store, "work")
         self.assertTrue(locks.is_locked(self.store, "work"))
         handle.release()
@@ -127,6 +126,17 @@ class TestLockHolderPid(BaseCase):
     def test_holder_pid_none_when_unlocked(self):
         self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
 
+    def test_holder_pid_none_when_unlocked_with_stale_pid(self):
+        """Even if the lock file retains a PID from a previous plain-exec session,
+        lock_holder_pid must return None when the profile is unlocked."""
+        if sys.platform.startswith("win"):
+            self.skipTest("PID recording is POSIX-only by design")
+        handle = locks.try_lock(self.store, "work")
+        handle.record_holder_pid()
+        handle.release()
+        self.assertFalse(locks.is_locked(self.store, "work"))
+        self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
+
     def test_holder_pid_none_on_missing_file(self):
         self.assertIsNone(locks.lock_holder_pid(self.store, "missing"))
 
@@ -141,6 +151,24 @@ class TestLockHolderPid(BaseCase):
             self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
         finally:
             handle.release()
+
+    def test_reacquire_without_recording_clears_stale_pid(self):
+        """A plain-exec session leaves its PID on disk. A subsequent session
+        that does NOT record a PID (waited-child, sandbox) must not inherit
+        that stale PID in lock_holder_pid."""
+        if sys.platform.startswith("win"):
+            self.skipTest("PID recording is POSIX-only by design")
+        first = locks.try_lock(self.store, "work")
+        first.record_holder_pid()
+        first.release()
+
+        # Subsequent session acquires lock without recording PID
+        second = locks.try_lock(self.store, "work")
+        try:
+            self.assertTrue(locks.is_locked(self.store, "work"))
+            self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
+        finally:
+            second.release()
 
     def test_holder_pid_survives_reacquire_with_fresh_pid(self):
         """A stale PID from a previous session must not linger: the second

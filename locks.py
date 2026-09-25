@@ -2,7 +2,7 @@
 
 The lock lives exactly as long as the session it protects:
 
-- POSIX: the lock fd is inheritable and ``platforms.launch`` exec-replaces
+- POSIX: the lock fd is inheritable and ``platforms.launch_argv`` exec-replaces
   agydra with agy on the plain launch path, so the lock is held by the
   running agy process itself and the kernel releases it the moment agy
   exits (crash, kill, logout — no stale locks). Best-effort, POSIX-only
@@ -140,10 +140,9 @@ class LockHandle:
     exits — which is the whole point of the mechanism.
     """
 
-    __slots__ = ("path", "_fd", "_released")
+    __slots__ = ("_fd", "_released")
 
-    def __init__(self, path: Path, fd: int) -> None:
-        self.path = path
+    def __init__(self, fd: int) -> None:
         self._fd = fd
         self._released = False
 
@@ -234,13 +233,17 @@ def try_lock(store, name: str) -> LockHandle | None:
                 continue
             if not platforms.is_windows():
                 os.set_inheritable(fd, True)
+                try:
+                    os.ftruncate(fd, 0)
+                except OSError:
+                    pass
         except OSError as exc:
             try:
                 os.close(fd)
             except OSError:
                 pass
             raise LockError(f"cannot acquire session lock {path} ({exc})") from exc
-        return LockHandle(path, fd)
+        return LockHandle(fd)
     return None
 
 
@@ -274,6 +277,8 @@ def lock_holder_pid(store, name: str) -> Optional[int]:
     ``None`` on any error, missing file, or content that fails to parse
     cleanly — callers must fall back to the generic busy message."""
     if platforms.is_windows():
+        return None
+    if not is_locked(store, name):
         return None
     path = lock_path(store, name)
     try:

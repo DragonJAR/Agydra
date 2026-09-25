@@ -1,15 +1,15 @@
 """Launch orchestration: resolve profile → plan → (overlay) → run agy.
 
-This is the only code path that executes agy. It guarantees the two core
-invariants:
+This is the launch orchestration path for agy user sessions. It guarantees the
+two core invariants:
 
 - R1: agy is never intercepted; agydra only launches it with an isolated env.
 - R2: agydra never writes to the real ``~/.gemini``; every launch uses an
   overlay whose ``.gemini`` links to the profile's private store.
 
 ``build_plan`` is side-effect-free (resolution only) so ``status`` and
-``--dry-run`` never touch the filesystem; the overlay is built inside ``run``
-exclusively.
+``--dry-run`` never touch the filesystem; for a user session the overlay is
+built inside ``run`` exclusively.
 """
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ class LaunchPlan:
     binary_override: Optional[str] = None
     force: bool = False
     windows_redirect_home: bool = False
+    cwd: Optional[Path] = None
 
     def describe(self) -> str:
         lines = [
@@ -99,6 +100,7 @@ def build_plan(
         binary_override=binary_override,
         force=force,
         windows_redirect_home=bool(config.settings.get("windows_redirect_home")),
+        cwd=cwd,
     )
 
 
@@ -112,8 +114,8 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
     handle: Optional[locks.LockHandle] = None
     if plan.force:
         warn(
-            f"forcing launch on profile {plan.profile!r}: another live "
-            "session may be writing to the same data dir (--force opt-in)"
+            f"forcing launch on profile {plan.profile!r} without lock: "
+            "concurrent sessions may corrupt OAuth tokens (--force opt-in)"
         )
     else:
         attempts = 0
@@ -123,9 +125,21 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
             if handle is not None:
                 break
             if not plan.random_pick or (plan.reason and plan.reason.startswith("project marker")):
+                pid = locks.lock_holder_pid(store, plan.profile)
+                holder = f" (agy PID {pid})" if pid else ""
+                if plan.reason and plan.reason.startswith("project marker"):
+                    suggestion = (
+                        f"pinned by {plan.reason}; wait for it to finish "
+                        "or bypass with -f/--force, risk: concurrent sessions may corrupt OAuth tokens"
+                    )
+                else:
+                    suggestion = (
+                        "agydra -r picks a free one automatically; "
+                        "or bypass with -f/--force, risk: concurrent sessions may corrupt OAuth tokens"
+                    )
                 raise StoreError(
-                    f"profile {plan.profile!r} is busy: another live session is "
-                    "using it (agydra -r picks a free one automatically)"
+                    f"profile {plan.profile!r} is busy: another live session{holder} is "
+                    f"using it ({suggestion})"
                 )
             if max_attempts is None:
                 max_attempts = len(store.names())
@@ -138,12 +152,12 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
                 store, plan.args,
                 binary_override=plan.binary_override, random_pick=True,
                 launch_as_child=plan.launch_as_child,
+                cwd=plan.cwd,
             )
 
-    profile = store.get(plan.profile)
-    profile.touch()
-
     try:
+        profile = store.get(plan.profile)
+        profile.touch()
         store.save(profile)
 
         data_dir = store.profile_data_dir(plan.profile)

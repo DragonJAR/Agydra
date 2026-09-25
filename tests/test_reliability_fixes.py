@@ -81,6 +81,22 @@ class TestMarkerEncoding(unittest.TestCase):
                 resolver.resolve(store, cwd=tmp, env={})
             self.assertIn("not valid UTF-8", str(ctx.exception))
 
+    def test_oserror_marker_raises_cannot_read_not_utf8(self):
+        from unittest import mock
+
+        with isolated_store_env() as root:
+            store, tmp = self._store_with_profile(root)
+            marker = tmp / ".agydra"
+            marker.write_text("work\n", encoding="utf-8")
+            with mock.patch.object(
+                Path, "read_text", side_effect=PermissionError("denied")
+            ):
+                with self.assertRaises(StoreError) as ctx:
+                    resolver.resolve(store, cwd=tmp, env={})
+            msg = str(ctx.exception)
+            self.assertIn("cannot read project marker", msg)
+            self.assertNotIn("not valid UTF-8", msg)
+
 
 class TestCreateAtomicReserve(unittest.TestCase):
     def test_second_create_of_same_name_fails(self):
@@ -475,18 +491,25 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
 
         import locks, platforms
 
+        captured = {}
+
+        def fake_launch_argv(*args, **kwargs):
+            captured["pid_while_held"] = locks.lock_holder_pid(store, "work")
+            return 0
+
         with isolated_store_env():
             store = Store()
             store.create("work")
             plan = runner.build_plan(store, [], flag_ref="work")
             with mock.patch.object(platforms, "is_windows", return_value=False), \
                     mock.patch.object(
-                        platforms, "launch_argv", return_value=0
+                        platforms, "launch_argv", side_effect=fake_launch_argv
                     ) as launch_argv:
                 rc = runner.run(plan, store=store)
             self.assertEqual(rc, 0)
             launch_argv.assert_called_once()
-            self.assertEqual(locks.lock_holder_pid(store, "work"), os.getpid())
+            self.assertEqual(captured.get("pid_while_held"), os.getpid())
+            self.assertIsNone(locks.lock_holder_pid(store, "work"))
 
 
 class TestRunnerReleasesLockOnSetupException(unittest.TestCase):
@@ -513,6 +536,31 @@ class TestRunnerReleasesLockOnSetupException(unittest.TestCase):
                 side_effect=isolation.IsolationError("boom"),
             ):
                 with self.assertRaises(isolation.IsolationError):
+                    runner.run(plan, store=store)
+            self.assertFalse(locks.is_locked(store, "work"))
+
+    def test_store_get_error_leaves_profile_unlocked(self):
+        """If store.get raises (e.g. corrupt profile.json) right after
+        try_lock succeeds, runner.run must release the lock in-process
+        rather than leaking it."""
+        import os
+        import sys
+        from unittest import mock
+
+        import locks
+        from store import StoreError
+
+        with isolated_store_env(), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
+        ):
+            store = Store()
+            store.create("work")
+            plan = runner.build_plan(store, [], flag_ref="work")
+            with mock.patch.object(
+                store, "get",
+                side_effect=StoreError("corrupted metadata"),
+            ):
+                with self.assertRaises(StoreError):
                     runner.run(plan, store=store)
             self.assertFalse(locks.is_locked(store, "work"))
 
@@ -544,6 +592,164 @@ class TestRunnerReleasesLockOnExecFailure(unittest.TestCase):
             self.assertEqual(rc, 126)
             launch_argv.assert_called_once()
             self.assertFalse(locks.is_locked(store, "work"))
+
+
+class TestRunnerBusyProfileMessage(unittest.TestCase):
+    """The busy-profile error message must include the holder's PID when
+    available, fall back cleanly when None, and mention the -f opt-in."""
+
+    def test_busy_message_includes_holder_pid_when_present(self):
+        import os
+        import sys
+        from unittest import mock
+
+        import locks
+        from store import StoreError
+
+        with isolated_store_env(), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
+        ):
+            store = Store()
+            store.create("work")
+            plan = runner.build_plan(store, [], flag_ref="work")
+            with mock.patch.object(locks, "try_lock", return_value=None), \
+                    mock.patch.object(locks, "lock_holder_pid", return_value=12345):
+                with self.assertRaises(StoreError) as ctx:
+                    runner.run(plan, store=store)
+            msg = str(ctx.exception)
+            self.assertIn("agy PID 12345", msg)
+            self.assertIn("-f/--force", msg)
+
+    def test_busy_message_falls_back_cleanly_when_pid_is_none(self):
+        import os
+        import sys
+        from unittest import mock
+
+        import locks
+        from store import StoreError
+
+        with isolated_store_env(), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
+        ):
+            store = Store()
+            store.create("work")
+            plan = runner.build_plan(store, [], flag_ref="work")
+            with mock.patch.object(locks, "try_lock", return_value=None), \
+                    mock.patch.object(locks, "lock_holder_pid", return_value=None):
+                with self.assertRaises(StoreError) as ctx:
+                    runner.run(plan, store=store)
+            msg = str(ctx.exception)
+            self.assertNotIn("agy PID", msg)
+            self.assertIn("another live session", msg)
+            self.assertIn("-f/--force", msg)
+
+    def test_busy_message_pinned_by_marker_does_not_suggest_random_pick(self):
+        import os
+        import sys
+        from unittest import mock
+
+        import locks
+        from store import StoreError
+
+        with isolated_store_env(), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
+        ):
+            store = Store()
+            store.create("work")
+            plan = runner.build_plan(store, [], flag_ref="work")
+            plan.reason = "project marker .agydra (/some/path/.agydra)"
+            with mock.patch.object(locks, "try_lock", return_value=None), \
+                    mock.patch.object(locks, "lock_holder_pid", return_value=54321):
+                with self.assertRaises(StoreError) as ctx:
+                    runner.run(plan, store=store)
+            msg = str(ctx.exception)
+            self.assertIn("pinned by project marker", msg)
+            self.assertNotIn("agydra -r", msg)
+            self.assertIn("-f/--force", msg)
+            self.assertIn("agy PID 54321", msg)
+
+    def test_busy_message_without_marker_suggests_random_pick(self):
+        import os
+        import sys
+        from unittest import mock
+
+        import locks
+        from store import StoreError
+
+        with isolated_store_env(), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
+        ):
+            store = Store()
+            store.create("work")
+            plan = runner.build_plan(store, [], flag_ref="work")
+            with mock.patch.object(locks, "try_lock", return_value=None), \
+                    mock.patch.object(locks, "lock_holder_pid", return_value=None):
+                with self.assertRaises(StoreError) as ctx:
+                    runner.run(plan, store=store)
+            msg = str(ctx.exception)
+            self.assertIn("agydra -r picks a free one automatically", msg)
+            self.assertIn("-f/--force", msg)
+
+
+class TestRunnerPickRetryPreservesCwd(unittest.TestCase):
+    """When a random-pick collision triggers a retry in runner.run, the
+    original plan.cwd must be passed into build_plan so marker/directory
+    context is not lost."""
+
+    def test_retry_forwards_plan_cwd(self):
+        import os
+        import sys
+        from unittest import mock
+
+        import locks
+        from store import StoreError
+
+        with isolated_store_env(), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
+        ):
+            store = Store()
+            store.create("alpha")
+            store.create("beta")
+            for name in ("alpha", "beta"):
+                token_dir = store.profile_data_dir(name) / "antigravity-cli"
+                token_dir.mkdir(parents=True, exist_ok=True)
+                (token_dir / "antigravity-oauth-token").write_text(
+                    '{"token": {"access_token": "mock-token"}}', encoding="utf-8"
+                )
+
+            custom_cwd = Path("/custom/project/dir")
+            plan = runner.build_plan(store, [], random_pick=True, cwd=custom_cwd)
+            self.assertEqual(plan.cwd, custom_cwd)
+
+            orig_build_plan = runner.build_plan
+            build_plan_cwds = []
+
+            def tracked_build_plan(*args, **kwargs):
+                build_plan_cwds.append(kwargs.get("cwd"))
+                return orig_build_plan(*args, **kwargs)
+
+            orig_try_lock = locks.try_lock
+            call_count = 0
+            real_handle = None
+
+            def fake_try_lock(st, name):
+                nonlocal call_count, real_handle
+                call_count += 1
+                if call_count == 1:
+                    return None
+                real_handle = orig_try_lock(st, name)
+                return real_handle
+
+            try:
+                with mock.patch.object(locks, "try_lock", side_effect=fake_try_lock), \
+                        mock.patch.object(runner, "build_plan", side_effect=tracked_build_plan), \
+                        mock.patch.object(runner.platforms, "launch_argv", return_value=0):
+                    rc = runner.run(plan, store=store)
+                self.assertEqual(rc, 0)
+                self.assertIn(custom_cwd, build_plan_cwds)
+            finally:
+                if real_handle is not None:
+                    real_handle.release()
 
 
 if __name__ == "__main__":
