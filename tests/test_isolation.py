@@ -186,6 +186,44 @@ class TestMigrateRealDir(BaseCase):
             (self.data_dir / "escape").exists(),
             "the symlink must not have been moved into the profile store",
         )
+        # Note: on Windows, directory junctions created with mklink /J are reparse
+        # points where Path.is_symlink() is False. _is_link(entry) checks
+        # stat.FILE_ATTRIBUTE_REPARSE_POINT so junctions are caught identically.
+
+    def test_migrate_refuses_directory_vs_file_collision(self):
+        """A directory in ``real_dir`` colliding with an existing FILE in
+        ``data_dir`` must raise IsolationError (type mismatch) rather than
+        failing with a raw FileExistsError from shutil.copytree."""
+        real_dir = self.fake_home / "real-dir"
+        real_dir.mkdir()
+        (real_dir / "clash").mkdir()
+        (real_dir / "clash" / "file.txt").write_text("inside", encoding="utf-8")
+
+        target_file = self.data_dir / "clash"
+        target_file.write_text("existing file", encoding="utf-8")
+
+        with self.assertRaises(isolation.IsolationError) as cm:
+            isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
+        self.assertIn("type mismatch", str(cm.exception))
+        self.assertTrue(target_file.is_file(), "target file must remain intact")
+        self.assertEqual(target_file.read_text(encoding="utf-8"), "existing file")
+
+    def test_migrate_prevalidation_prevents_partial_move(self):
+        """Pre-validation ensures that if any entry violates an invariant,
+        no valid entries are moved prior to the failure."""
+        real_dir = self.fake_home / "real-dir"
+        real_dir.mkdir()
+        (real_dir / "valid.txt").write_text("valid data", encoding="utf-8")
+        outside = self.fake_home / "outside-link"
+        outside.mkdir()
+        link = real_dir / "bad-link"
+        link.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaises(isolation.IsolationError):
+            isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
+
+        self.assertTrue((real_dir / "valid.txt").exists(), "valid file must not be moved on failure")
+        self.assertFalse((self.data_dir / "valid.txt").exists(), "store must not contain partially migrated data")
 
 
 class TestIsolationAncestorMirroring(BaseCase):
@@ -380,8 +418,29 @@ class TestIsolationAncestorMirroring(BaseCase):
         overlay = platforms.ensure_dir(store_root / "overlays" / "alpha")
         (overlay / "Library").write_text("not a directory", encoding="utf-8")
 
-        with self.assertRaises(isolation.IsolationError):
+        with self.assertRaises(isolation.IsolationError) as cm:
             isolation.build_overlay("alpha", data_dir, store_root)
+        msg = str(cm.exception)
+        self.assertNotIn("doctor --fix", msg)
+        self.assertIn("remove it manually", msg)
+
+    def test_real_gemini_entry_remedies_order(self):
+        """Data-preserving doctor --fix must be listed before destructive remedies."""
+        store_root = self.fake_home / "Library" / "Application Support" / "agydra"
+        store_root.mkdir(parents=True)
+        data_dir = self._make_store("alpha")
+
+        overlay = platforms.ensure_dir(store_root / "overlays" / "alpha")
+        (overlay / platforms.AGY_DATA_DIR_NAME).mkdir()
+
+        with self.assertRaises(isolation.IsolationError) as cm:
+            isolation.build_overlay("alpha", data_dir, store_root)
+        msg = str(cm.exception)
+        fix_idx = msg.find("doctor --fix")
+        destructive_idx = msg.find("destructive")
+        self.assertNotEqual(fix_idx, -1, "expected doctor --fix in error message")
+        self.assertNotEqual(destructive_idx, -1, "expected destructive note in error message")
+        self.assertLess(fix_idx, destructive_idx, "doctor --fix must come before destructive remedies")
 
     def test_unlink_failure_at_ancestor_link_raises_isolation_error(self):
         store_root = self.fake_home / "Library" / "Application Support" / "agydra"
@@ -445,6 +504,28 @@ class TestIsolationAncestorMirroring(BaseCase):
                 "computed by _ancestor_chain's own walk must be reused, not "
                 "recomputed)",
             )
+
+
+class TestSandboxWrap(unittest.TestCase):
+    def test_sandbox_wrap_creates_directories_before_tmpfs(self):
+        """bwrap requires mount points to exist inside the sandbox before tmpfs
+        mounts over them; --dir ensures /run/user/<uid>/bus and keyring exist."""
+        with mock.patch("os.getuid", return_value=1000):
+            wrapped = isolation.sandbox_wrap(["agy", "login"])
+        self.assertIn("--dir", wrapped)
+        self.assertIn("--tmpfs", wrapped)
+        bus_dir = "/run/user/1000/bus"
+        keyring_dir = "/run/user/1000/keyring"
+        # Verify --dir precedes --tmpfs for each mount
+        bus_dir_idx = wrapped.index(bus_dir)
+        self.assertEqual(wrapped[bus_dir_idx - 1], "--dir")
+        bus_tmpfs_idx = wrapped.index(bus_dir, bus_dir_idx + 1)
+        self.assertEqual(wrapped[bus_tmpfs_idx - 1], "--tmpfs")
+        keyring_dir_idx = wrapped.index(keyring_dir)
+        self.assertEqual(wrapped[keyring_dir_idx - 1], "--dir")
+        keyring_tmpfs_idx = wrapped.index(keyring_dir, keyring_dir_idx + 1)
+        self.assertEqual(wrapped[keyring_tmpfs_idx - 1], "--tmpfs")
+        self.assertEqual(wrapped[-2:], ["agy", "login"])
 
 
 if __name__ == "__main__":

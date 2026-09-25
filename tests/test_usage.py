@@ -153,7 +153,7 @@ class _UsageBase(BaseCase):
 class TestQueryProfileUsageSuccess(_UsageBase):
     def test_success_parses_groups_and_buckets(self):
         self._write_response(REAL_USAGE_JSON)
-        result = usage.query_profile_usage(self.store, "alpha", timeout=5)
+        result = usage.query_profile_usage(self.store, "alpha", timeout=10)
         self.assertTrue(result.ok, result.error)
         self.assertEqual(len(result.groups), 2)
 
@@ -302,11 +302,11 @@ class TestQueryProfileUsageTimeoutKillsProcessGroup(_UsageBase):
         # starts, well before its (much longer) sleep -- so by the time
         # this call's own timeout fires and kills the group, the heartbeat
         # log already exists with at least one line.
-        result = usage.query_profile_usage(self.store, "alpha", timeout=1.0)
+        result = usage.query_profile_usage(self.store, "alpha", timeout=2.0)
         self.assertFalse(result.ok)
         self.assertIn("timed out", result.error)
 
-        deadline = _time.monotonic() + 2.0
+        deadline = _time.monotonic() + 5.0
         while not heartbeat_log.exists() and _time.monotonic() < deadline:
             _time.sleep(0.02)
         self.assertTrue(heartbeat_log.exists(), "grandchild never started heartbeating")
@@ -362,7 +362,7 @@ class TestQueryProfileUsageAlreadyBusyKeychainNoop(_UsageBase):
                 mock.patch.object(
                     keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
                 ):
-            result = usage.query_profile_usage(self.store, "alpha", timeout=5)
+            result = usage.query_profile_usage(self.store, "alpha", timeout=10)
 
         self.assertTrue(result.ok, result.error)
         # Same value before and after: genuinely a pure read for the

@@ -250,9 +250,42 @@ def _match_flag(token: str) -> Optional[List[Tuple[str, object, int]]]:
     return None
 
 
+class LaunchFlagsResult(Tuple[Dict[str, object], List[str]]):
+    """Result of ``_consume_launch_flags``: a ``(values, rest)`` 2-tuple that
+    also reports whether an already-consumed flag was repeated (causing the
+    remaining argv to be swallowed into agy's args).
+
+    Inherits from tuple so existing callers unpacking ``values, rest = ...``
+    continue to work seamlessly (DRY, backwards compatible).
+    """
+
+    swallowed: bool
+    swallowed_index: Optional[int]
+
+    def __new__(
+        cls,
+        values: Dict[str, object],
+        rest: List[str],
+        swallowed: bool = False,
+        swallowed_index: Optional[int] = None,
+    ):
+        obj = super().__new__(cls, (values, rest))
+        obj.swallowed = swallowed
+        obj.swallowed_index = swallowed_index
+        return obj
+
+    @property
+    def values(self) -> Dict[str, object]:
+        return self[0]
+
+    @property
+    def rest(self) -> List[str]:
+        return self[1]
+
+
 def _consume_launch_flags(
     argv: Sequence[str],
-) -> Tuple[Dict[str, object], List[str]]:
+) -> LaunchFlagsResult:
     """Split launcher argv into (flag values, args forwarded to agy).
 
     Only the FIRST occurrence of a value flag is consumed; a later identical
@@ -276,7 +309,7 @@ def _consume_launch_flags(
             swallowed = argv[i:]
             rest.extend(swallowed)
             _warn_late_flags(values, swallowed, include_booleans=True)
-            return values, rest
+            return LaunchFlagsResult(values, rest, swallowed=True, swallowed_index=i)
         i += 1
         for key, inline, width in matched:
             if width == 2:
@@ -285,7 +318,7 @@ def _consume_launch_flags(
                 inline = argv[i]
                 i += 1
             values[key] = inline if inline is not None else True
-    return values, rest
+    return LaunchFlagsResult(values, rest, swallowed=False)
 
 
 def _warn_late_flags(
@@ -314,32 +347,28 @@ def _warn_late_flags(
     leaves booleans unchecked — that ordering rule is already documented
     and a late boolean there is not silently discarded, it's just agy's.
     """
-    for key, (short, long_, takes_value, _metavar, _help) in _LAUNCH_FLAGS.items():
-        if (not takes_value and not include_booleans) or values[key] is not None:
+    for i, token in enumerate(raw):
+        if token == "--":
+            break
+        matched = _match_flag(token)
+        if matched is None:
             continue
-        for i, token in enumerate(raw):
-            if token == "--":
-                return
-            matched = _match_flag(token)
-            if matched is None:
+        for key, _inline, width in matched:
+            short, long_, takes_value, _metavar, _help = _LAUNCH_FLAGS[key]
+            if (not takes_value and not include_booleans) or values[key] is not None:
                 continue
-            if not any(m[0] == key for m in matched):
-                continue
-            for m in matched:
-                if m[0] != key:
-                    continue
-                if m[2] == 2 and i + 1 < len(raw):
-                    spelling = f"{token} {raw[i + 1]}"
-                else:
-                    spelling = token
-                _note(
-                    f"'{spelling}' was passed to agy, not agydra — agydra flags "
-                    f"must come first: agydra {spelling} <agy args...>"
-                )
-                return
+            if width == 2 and i + 1 < len(raw):
+                spelling = f"{token} {raw[i + 1]}"
+            else:
+                spelling = token
+            _note(
+                f"'{spelling}' was passed to agy, not agydra — agydra flags "
+                f"must come first: agydra {spelling} <agy args...>"
+            )
+            return
 
 
-def _assert_free(store: Store, name: str) -> None:
+def _assert_free(store: Store, name: str, action: str = "modifying the profile") -> None:
     """Refuse to mutate a profile that a live session is using.
 
     When the holder's PID can be read back from the lock file (POSIX
@@ -350,11 +379,10 @@ def _assert_free(store: Store, name: str) -> None:
         if pid:
             raise StoreError(
                 f"profile {name!r} has a live session (agy PID {pid}); end it "
-                f"(or: kill {pid}) before deleting or renaming the profile"
+                f"(or: kill {pid}) before {action}"
             )
         raise StoreError(
-            f"profile {name!r} has a live session; end it before deleting "
-            "or renaming the profile"
+            f"profile {name!r} has a live session; end it before {action}"
         )
 
 
@@ -388,11 +416,7 @@ def cmd_list(store: Store, _args) -> int:
             store.profile_data_dir(profile.name), store, profile.name,
         )
         is_default = paint("*", "green", "bold") if profile.name == default else ""
-        state_color = (
-            "green" if state == "authenticated"
-            else "yellow" if state != "not-authenticated"
-            else None
-        )
+        state_color = "green" if state == "authenticated" else None
         state_shown = paint(state, state_color) if state_color else state
         busy_shown = paint("yes", "yellow", "bold") if busy else "-"
         last = paint(profile.last_used or "-", "dim")
@@ -420,7 +444,7 @@ def cmd_login(store: Store, args) -> int:
         name = resolver.resolve(store).name
     else:
         name = store.resolve_ref(args.ref)
-    _assert_free(store, name)
+    _assert_free(store, name, "logging in")
     data_dir = store.profile_data_dir(name)
     state = account.auth_state(data_dir, store, name)
     if state == "authenticated" and not args.dry_run and not getattr(args, "force", False):
@@ -506,8 +530,10 @@ def _cmd_usage_compact(store: Store, _args) -> int:
         print("no profiles; create one with: agydra create <name>")
         return 0
     names = [p.name for p in profiles]
-    results = usage.gather_usage_report(store, names, on_progress=_usage_progress(sys.stderr))
-    _clear_usage_progress(sys.stderr)
+    try:
+        results = usage.gather_usage_report(store, names, on_progress=_usage_progress(sys.stderr))
+    finally:
+        _clear_usage_progress(sys.stderr)
 
     columns = usage.collect_bucket_columns(results)
     name_width = max(max(len(n) for n in names), len(_PROFILE_LABEL))
@@ -575,7 +601,7 @@ def cmd_default(store: Store, args) -> int:
 
 def cmd_rename(store: Store, args) -> int:
     old = store.resolve_ref(args.old)
-    _assert_free(store, old)
+    _assert_free(store, old, "renaming the profile")
     profile = store.rename(old, args.new)
     locks.forget(store, old)
     keychain.rename_profile_slot(store, old, profile.name)
@@ -591,6 +617,7 @@ def _confirm(prompt: str, assume_yes: bool) -> bool:
 
 def _finish_delete(store: Store, name: str, no_backup: bool) -> int:
     """Shared tail for both the normal and the corrupt-profile delete paths."""
+    _assert_free(store, name, "deleting the profile")
     backup = store.delete(name, backup=not no_backup)
     locks.forget(store, name)
     keychain.purge_profile_slot(store, name)
@@ -606,7 +633,7 @@ def cmd_delete(store: Store, args) -> int:
     except StoreError:
         if args.ref not in store.unreadable_profiles():
             raise
-        _assert_free(store, args.ref)
+        _assert_free(store, args.ref, "deleting the profile")
         if not _confirm(
             f"delete unreadable profile {args.ref!r} (corrupt or incomplete "
             "metadata)?",
@@ -615,7 +642,7 @@ def cmd_delete(store: Store, args) -> int:
             print("cancelled")
             return 1
         return _finish_delete(store, args.ref, args.no_backup)
-    _assert_free(store, name)
+    _assert_free(store, name, "deleting the profile")
     profile = store.get(name)
     email = profile.email or account.detect_email(store.profile_data_dir(name), store, name) or "?"
     if not _confirm(f"delete profile {name!r} ({email})?", args.force):
@@ -633,11 +660,13 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
     allowed = {"settings.json", "mcp.json"}
     src_dir = store.profile_data_dir(src)
     resolved: List[str] = []
+    seen: set = set()
     for target in targets:
         target_name = store.resolve_ref(target)
-        if target_name == src:
+        if target_name == src or target_name in seen:
             continue
-        _assert_free(store, target_name)
+        _assert_free(store, target_name, "sharing config")
+        seen.add(target_name)
         resolved.append(target_name)
     copied: List[str] = []
     for target_name in resolved:
@@ -679,7 +708,7 @@ def cmd_import(store: Store, args) -> int:
             f"Usage: agydra import <profile-name>   (use -s DIR to override the source)."
         )
     name = store.resolve_ref(ref)
-    _assert_free(store, name)
+    _assert_free(store, name, "importing into it")
     if args.source is not None:
         real = Path(args.source).expanduser()
         if not real.is_dir():
@@ -764,7 +793,7 @@ def cmd_doctor(store: Store, args) -> int:
         print(f"  - {line}")
     if not _confirm("apply these repairs?", getattr(args, "force", False)):
         print("cancelled")
-        return exit_code
+        return 1
     print()
     doctor._apply_fixes(store, ctx)
     return doctor._post_fix_exit_code(store)
@@ -802,7 +831,7 @@ _SUBCOMMAND_HELP: Dict[str, str] = {
     "rename": "rename a profile (refuses busy)",
     "delete": "backup ZIP then delete a profile (refuses busy)",
     "share-config": "copy settings.json + mcp.json between profiles",
-    "doctor": "diagnose the installation (--fix removes orphaned artifacts)",
+    "doctor": "diagnose the installation (--fix repairs overlays, dangling defaults, orphan slots/artifacts)",
     "usage": "aggregate quota usage across profiles (or one, in detail)",
     "setup": "one-command install of the shim",
     "help": "show this help",
@@ -841,7 +870,7 @@ _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
         "daily use",
         [
             ("agydra -p work", "launch agy with 'work'"),
-            ("agydra", "launch agy with default profile"),
+            ("agydra 'your prompt'", "launch agy with default profile"),
             ("agydra -r", "pick a free authenticated profile"),
         ],
     ),
@@ -1036,11 +1065,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _report_error(exc)
 
     try:
-        values, agy_args = _consume_launch_flags(raw)
+        flags = _consume_launch_flags(raw)
+        values, agy_args = flags
         if values["profile"] is not None and values["random"]:
             _error("-p/--profile and -r/--random are mutually exclusive")
             return 2
-        _warn_late_flags(values, raw)
+        if not flags.swallowed:
+            _warn_late_flags(values, raw)
         plan = runner.build_plan(
             store,
             agy_args,

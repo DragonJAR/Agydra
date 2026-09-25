@@ -336,6 +336,33 @@ def decode_go_keyring_secret(data: Optional[bytes]) -> Optional[dict]:
     return decoded if isinstance(decoded, dict) else None
 
 
+def _as_envelope(data: bytes) -> bytes:
+    """Envelope form of ``data``, accepting either of the two shapes a
+    credential value reaches this module in.
+
+    ``token_payload_for_slot`` means the shared slot normally carries plain
+    JSON, but a ``.secret`` backup is always the envelope, and a slot value
+    that ``security`` round-tripped is not guaranteed to come back in the
+    shape it went in (the whole reason ``_normalize_read_slot_value``
+    exists). Enveloping something already enveloped yields bytes no decoder
+    can read, which the identity guard cannot tell apart from a foreign
+    credential -- so it would refuse a perfectly good token. Returning an
+    already-valid envelope unchanged removes that failure mode.
+
+    The prefix alone is the discriminator, not full decodability: a value
+    that carries the prefix but whose payload is damaged must still pass
+    through unchanged (the capture flow preserves the slot's exact bytes
+    and lets its own decode checks classify it), and plain JSON never
+    starts with the prefix. This is the ONE place that negotiates the two
+    shapes; ``envelope_token_bytes`` stays a strict, non-inspecting
+    transform so a caller that must build a fresh envelope gets no silent
+    normalization.
+    """
+    if data.startswith(_GO_KEYRING_PREFIX):
+        return bytes(data)
+    return envelope_token_bytes(data)
+
+
 def _secret_identity(data: Optional[bytes]) -> Optional[str]:
     """Email claim of a go-keyring-encoded secret, or None when it decodes
     to nothing (wrong format, no id_token, or no email claim)."""
@@ -434,10 +461,11 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
     with no known identity yet is a genuine first login: nothing to
     compare against, so it is trusted.
 
-    The shared keychain slot now carries plain JSON (see
-    :func:`token_payload_for_slot`); this entry re-envelopes the payload
-    before writing the ``.secret`` file backup so the identity guard keeps
-    decoding it.
+    The shared keychain slot normally carries plain JSON (see
+    :func:`token_payload_for_slot`), but a value already in envelope form
+    is possible too; :func:`_as_envelope` normalizes either into the
+    envelope form the ``.secret`` file backup uses, so the identity guard
+    keeps decoding it.
 
     Distinguishes THREE cases so the "looks like a different account"
     alarm is reserved for cases where identity laundering is actually
@@ -452,7 +480,7 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
        laundering; ``warn`` and keep the existing backup.
     """
     known = _known_identity(store, name)
-    serialized = envelope_token_bytes(data)
+    serialized = _as_envelope(data)
     if known is None:
         save_profile_slot(store, name, serialized)
         return
@@ -478,11 +506,15 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
 
 
 def _serialize_lock(store):
-    """Cross-process mutex for shared-slot swaps (macOS/Linux only)."""
+    """Cross-process mutex for shared-slot swaps (macOS only)."""
     path = _slots_dir(store) / "swap.lock"
     platforms.ensure_dir(path.parent)
     handle = open(path, "a+")
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        handle.close()
+        raise
     return handle
 
 
@@ -564,10 +596,10 @@ def launch_guard(store, profile: str, capture: bool = False,
     only around an interactive ``agydra login`` run.
 
     Why the default exit restores: a normal launch must leave the shared
-    slot exactly as it found it. The login flow, however, relies on the
-    exit running BEFORE cmd_login's capture step (see runner.run's launch
-    ordering), so a plain restore there would overwrite/delete the very
-    token capture needs to read — the capture would always see None.
+    slot exactly as it found it. The login flow, however, sets capture=True
+    so that exit persists the shared slot directly into the profile's
+    private slot via _capture_and_keep() instead of restoring the pre-launch
+    shared slot.
 
     When ``profile`` has no private slot yet but the shared slot is not
     empty (see the module docstring), entry clears the shared slot instead
@@ -635,13 +667,14 @@ def launch_guard(store, profile: str, capture: bool = False,
                     return self
                 self._had_shared = read_slot(shared_slot(), self._keychain_path)
                 if not capture and self._had_shared is not None:
-                    # The shared slot already carries the plain-JSON payload
-                    # (see ``token_payload_for_slot``), not the envelope
-                    # form ``_secret_identity`` decodes -- re-envelope it in
-                    # memory purely to reuse that one decode path, the same
-                    # trick ``_persist_if_trusted`` already relies on.
+                    # The shared slot carries the plain-JSON payload when
+                    # agydra wrote it (see ``token_payload_for_slot``) and
+                    # the envelope when agy's own keyring layer did; only
+                    # the latter is what ``_secret_identity`` decodes, so
+                    # normalize in memory through the one helper that knows
+                    # both shapes.
                     shared_identity = _secret_identity(
-                        envelope_token_bytes(self._had_shared)
+                        _as_envelope(self._had_shared)
                     )
                     if shared_identity is not None:
                         known = _known_identity(store, profile, include_secret=False)
@@ -663,11 +696,16 @@ def launch_guard(store, profile: str, capture: bool = False,
                         candidate = _secret_identity(slot)
                         if candidate != known:
                             seen = repr(candidate) if candidate else "undecodable"
-                            _quarantine_profile_slot(store, profile)
+                            quarantined = _quarantine_profile_slot(store, profile)
+                            action = (
+                                f"quarantined to {quarantined}"
+                                if quarantined is not None
+                                else "quarantine failed"
+                            )
                             warn(
                                 f"keychain slot for profile {profile!r} looks "
                                 f"like a different account ({seen} vs "
-                                f"{known!r}); quarantined, not swapped in"
+                                f"{known!r}); {action}, not swapped in"
                             )
                             slot = None
                 if slot is not None:
@@ -675,13 +713,22 @@ def launch_guard(store, profile: str, capture: bool = False,
                     # or whatever the file holds). Unwrap so the live shared
                     # slot carries plain JSON -- agy parses it; see the
                     # ``token_payload_for_slot`` docstring.
-                    write_slot(
-                        shared_slot(),
-                        token_payload_for_slot(slot),
-                        self._keychain_path,
-                    )
-                    self._swapped = True
-                elif self._had_shared is not None:
+                    try:
+                        payload = token_payload_for_slot(slot)
+                    except ValueError as exc:
+                        warn(
+                            f"keychain swap skipped ({exc}); continuing without "
+                            "per-profile credential swap"
+                        )
+                        slot = None
+                    else:
+                        write_slot(
+                            shared_slot(),
+                            payload,
+                            self._keychain_path,
+                        )
+                        self._swapped = True
+                if slot is None and self._had_shared is not None:
                     delete_slot(shared_slot(), self._keychain_path)
             except (KeychainError, OSError, ValueError) as exc:
                 # ValueError covers the strict unwrap rejecting a
@@ -702,27 +749,24 @@ def launch_guard(store, profile: str, capture: bool = False,
                     # Entry made no change (see __enter__): exit persists
                     # and restores nothing either, so this is a pure read.
                     return False
-                current = None
-                current_read = False
-                if self._swapped and not capture and self._persist_on_exit:
-                    current = read_slot(shared_slot(), self._keychain_path)
-                    current_read = True
-                    if current is not None:
-                        _persist_if_trusted(store, profile, current)
-
                 if capture:
                     self._capture_and_keep()
                 else:
+                    current: Optional[bytes] = None
+                    if self._swapped and self._persist_on_exit:
+                        current = read_slot(shared_slot(), self._keychain_path)
+                        if current is not None:
+                            _persist_if_trusted(store, profile, current)
+
                     if self._had_shared is not None:
                         write_slot(shared_slot(), self._had_shared, self._keychain_path)
                     elif self._swapped:
-                        # The persist-on-exit read above already covers this
-                        # exact same condition (swapped, not had_shared) when
-                        # it ran -- reuse its result instead of reading the
-                        # shared slot a second time for the same value.
-                        if not current_read:
-                            current = read_slot(shared_slot(), self._keychain_path)
-                        if current is not None:
+                        has_content = (
+                            (current is not None)
+                            if self._persist_on_exit
+                            else (read_slot(shared_slot(), self._keychain_path) is not None)
+                        )
+                        if has_content:
                             try:
                                 delete_slot(shared_slot(), self._keychain_path)
                             except KeychainError:
@@ -781,7 +825,8 @@ def purge_profile_slot(store, name: str) -> None:
         warn(f"could not purge keychain slot for {name!r} ({exc})")
     if supported():
         try:
-            delete_slot(profile_slot(name))
+            target = _ensure_target_keychain(store)
+            delete_slot(profile_slot(name), target)
         except (KeychainError, OSError) as exc:
             warn(f"could not delete keychain entry for {name!r} ({exc})")
 
@@ -862,6 +907,10 @@ def capture_shared_slot_for_import(store, name: str, data_dir: Path) -> None:
         return
     if current is None:
         return
+    # ``.secret`` backups and every identity decode in this module use the
+    # envelope form, while the shared slot normally carries plain JSON;
+    # normalize once so the comparisons below and the saved backup agree.
+    current = _as_envelope(current)
 
     import account
 

@@ -50,11 +50,13 @@ def _marker_resolution(store: Store, cwd: Path) -> Optional[Resolution]:
         return None
     try:
         ref = marker.read_text(encoding="utf-8-sig").strip()
-    except (OSError, UnicodeDecodeError) as exc:
+    except UnicodeDecodeError as exc:
         raise StoreError(
             f"project marker {marker} is not valid UTF-8 "
             f"(PowerShell `>` writes UTF-16; re-save as UTF-8): {exc}"
         ) from exc
+    except OSError as exc:
+        raise StoreError(f"cannot read project marker {marker}: {exc}") from exc
     if not ref:
         raise StoreError(
             f"project marker {marker} is empty; write a profile name or delete the file"
@@ -85,9 +87,9 @@ def resolve(
 
     default = store.default_name()
     if default:
-        try:
+        if store.exists(default):
             return Resolution(store.resolve_ref(default), "default profile")
-        except StoreError:
+        if store.names():
             warn(
                 f"default profile {default!r} does not exist; falling back to "
                 "the first profile (fix with: agydra default <name>)"
@@ -115,7 +117,7 @@ _TOO_FEW = (
 )
 _NO_FREE = (
     "no free authenticated profile: every eligible one has a live session "
-    "(see: agydra list)"
+    "(wait for one to finish, or bypass with -f/--force; see: agydra list)"
 )
 _NOT_AUTHENTICATED = (
     "no authenticated profile available; authenticate one with: "
@@ -131,11 +133,11 @@ def pick_free_profile(
     Deterministic and side-effect-free (the caller takes the lock later, in
     ``runner.run``, which owns all filesystem mutation):
 
-    1. the 2-profile floor (a choice needs at least two candidates);
-    2. a store marker pinning this directory wins (``-r`` asks agydra to
+    1. a store marker pinning this directory wins (``-r`` asks agydra to
        CHOOSE, so an explicit project pin must win over the choice);
-    3. skip profiles with a live session (advisory lock held);
-    4. skip unauthenticated profiles;
+    2. the 2-profile floor (a choice needs at least two candidates);
+    3. skip unauthenticated profiles;
+    4. skip profiles with a live session (advisory lock held);
     5. prefer the least-recently-used, break ties by seq (creation order).
 
     With ``force=True`` (launcher ``-f`` mode), the busy filter is skipped
@@ -147,29 +149,31 @@ def pick_free_profile(
     names = [p.name for p in profiles]
     if not names:
         raise StoreError(_NO_PROFILES)
-    if not force and len(names) < MIN_PROFILES:
-        raise StoreError(_TOO_FEW)
 
     marker = _marker_resolution(store, cwd or Path.cwd())
     if marker is not None:
         return marker
 
-    candidates = profiles if force else [
-        p for p in profiles if not locks.is_locked(store, p.name)
-    ]
-    if not candidates:
-        raise StoreError(_NO_FREE)
-    usable = [
-        p for p in candidates
+    if not force and len(names) < MIN_PROFILES:
+        raise StoreError(_TOO_FEW)
+
+    authenticated = [
+        p for p in profiles
         if account.auth_state(
             store.profile_data_dir(p.name), store, p.name,
         )
         == "authenticated"
     ]
-    if not usable:
+    if not authenticated:
         raise StoreError(_NOT_AUTHENTICATED)
+
+    candidates = authenticated if force else [
+        p for p in authenticated if not locks.is_locked(store, p.name)
+    ]
+    if not candidates:
+        raise StoreError(_NO_FREE)
     best = min(
-        usable, key=lambda p: (p.last_used or "", p.seq)
+        candidates, key=lambda p: (p.last_used or "", p.seq)
     )
     reason = (
         "least-recently-used profile (-r, forced)"

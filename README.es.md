@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/Licencia-MIT-yellow.svg" alt="Licencia: MIT"></a>
-  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Versi%C3%B3n-1.1.0-blue.svg" alt="Versión"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Versi%C3%B3n-1.2.0-blue.svg" alt="Versión"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white" alt="Python"></a>
   <img src="https://img.shields.io/badge/Plataformas-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey.svg" alt="Plataformas">
   <a href="https://www.DragonJAR.org"><img src="https://img.shields.io/badge/Autor-DragonJAR-orange.svg" alt="Autor: DragonJAR"></a>
@@ -215,7 +215,8 @@ copied: personal/mcp.json
 | `delete NOMBRE\|# [-f] [--no-backup]` | `rm` | ZIP de respaldo y borrar (rechaza ocupados). |
 | `share-config ORIGEN DESTINO...` | `share` | Copia solo `settings.json` + `mcp.json` entre perfiles. |
 | `setup [-n]` | `install` | Instalación en un comando: crea el venv, instala el console script y verifica; `-n` imprime el estado actual. `python3 agydra.py` es el bootstrap sin instalación desde un clon limpio. |
-| `doctor` | `doc` | Diagnóstico completo del entorno. |
+| `doctor [--fix] [-f]` | `doc` | Diagnósticos del entorno; sale 1 si algún check falla. `--fix` migra un overlay con directorio real al almacén del perfil y lo revincula, limpia un perfil default colgado, purga slots huérfanos del llavero de macOS y elimina overlays/locks/secretos de keychain/backups huérfanos dejados por un perfil borrado a mano (pide confirmación salvo `-f`/`--force`). |
+| `usage [NOMBRE\|#]` | `us` | Consulta de cuota mediante `/usage` de agy. Sin ref: tabla compacta de todos los perfiles (una columna por bucket, coloreada por cuota restante). Con ref: vista detallada por grupo con barras de progreso y cuenta regresiva de reseteo. Funciona incluso con un perfil ocupado (solo lectura, sin lock de sesión; en macOS el swap de llavero es un no-op si el perfil ya posee el slot compartido); la consulta entre múltiples perfiles es secuencial. |
 
 | Flag corto | Flag largo | Función |
 |:-:|---|---|
@@ -242,6 +243,8 @@ agydra/                  # raíz del repo — layout plano, sin subdirectorio de
 ├── agydra.py            # VERSION + bootstrap de un comando (python3 agydra.py)
 ├── models.py            # dataclasses Profile / Config + DEFAULT_SETTINGS
 ├── platforms.py         # rutas por OS, variable de home, resolución del binario, lanzamiento
+├── ui.py                # primitivas de salida en consola (colores, warn/note/error)
+├── banner.py            # renderizado ASCII/ANSI del logo en la terminal
 ├── store.py             # CRUD de perfiles, config, escrituras atómicas, backups
 ├── locks.py             # locks de sesión kernel-held (flock / msvcrt)
 ├── resolver.py          # cascada de resolución, perfil libre -r, marcador .agydra
@@ -249,16 +252,18 @@ agydra/                  # raíz del repo — layout plano, sin subdirectorio de
 ├── keychain.py          # puente de llavero macOS (slot compartido ↔ privado por perfil)
 ├── isolation.py         # overlay home, enlaces (symlink+junction), env, bwrap
 ├── runner.py            # build_plan (puro) + run (lock → overlay → keychain → exec)
-├── doctor.py            # 8 checks de diagnóstico; exit 1 si alguno FALLA
+├── doctor.py            # 10 checks de diagnóstico; exit 1 si alguno FALLA
 ├── cli.py               # CLI argparse; el lanzador es el modo por defecto
-tests/
-├── conftest.py          # home falso + binario agy falso + AGYDRA_HOME aislado
-└── test_*.py            # ~196 tests (193 pasan + 3 skips de plataforma en macOS)
-README.md
-README.es.md
-AGENTS.md
-LICENSE
-pyproject.toml
+├── vocab.py             # vocabulario compartido de subcomandos y nombres reservados
+├── orphans.py           # escaneo inverso + limpieza de artefactos huérfanos
+├── usage.py             # `agydra usage`: consulta y parseo de cuotas de agy /usage
+├── bootstrap.py         # instalador de un comando (venv + script de consola + shim en PATH)
+├── tests/               # 490+ tests (fake home + binario agy falso)
+├── README.md            # Este documento (inglés)
+├── README.es.md         # Versión en español
+├── AGENTS.md            # Convenciones de desarrollo
+├── LICENSE              # Licencia MIT
+└── pyproject.toml       # Metadatos del paquete (layout plano py-modules)
 ```
 
 El almacén de datos en runtime vive fuera del repo: `%LOCALAPPDATA%\agydra` (Windows), `~/Library/Application Support/agydra` (macOS), `$XDG_DATA_HOME/agydra` o `~/.local/share/agydra` (Linux); la variable `AGYDRA_HOME` lo sobreescribe.
@@ -295,7 +300,7 @@ Orden de resolución del binario `agy`: flag `--binary` → `agy_binary` en `agy
 
 - **Solo stdlib.** Cero dependencias de terceros; Python ≥ 3.9. No añadas paquetes.
 - **Multiplataforma por construcción.** Cada diferencia de OS vive en `platforms.py` y en los helpers de enlaces de `isolation.py`; nunca ramifiques por SO fuera de esos límites.
-- **Tests antes de declarar listo.** Desde la raíz del repo: `python3 -m pytest -q` (102 pasan + 3 skips de plataforma en macOS).
+- **Tests antes de declarar listo.** Desde la raíz del repo: `python3 -m pytest -q` (511 pasan + 3 skips de plataforma en macOS).
 - Consulta `AGENTS.md` para las guías de invariantes, layout y convenciones del proyecto.
 
 ## 📄 Licencia

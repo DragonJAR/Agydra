@@ -66,9 +66,9 @@ def paint(
     """
     if not styles:
         return text
+    codes = "".join(_STYLES[name] for name in styles)
     if not color_enabled(stream):
         return text
-    codes = "".join(_STYLES[name] for name in styles)
     return f"{codes}{text}{RESET}"
 
 
@@ -106,8 +106,8 @@ def pad(painted: str, width: int) -> str:
     ``paint`` wraps text in ANSI codes whose bytes an f-string ``:<width``
     spec counts as content, silently shifting every following column. This
     is its companion: pad by visible width (``strip_ansi``) and, when the
-    cell ends in a reset code, move the filler outside the color span so
-    no invisible trailing spaces are emitted.
+    cell ends in a reset code, place filler spaces before the trailing RESET
+    so styling covers the cell and resets cleanly at the end of the padded cell.
     """
     visible = len(strip_ansi(painted))
     filler = " " * max(width - visible, 0)

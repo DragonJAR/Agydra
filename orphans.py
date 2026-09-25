@@ -63,20 +63,38 @@ class OrphanScan:
         )
 
     def describe(self) -> List[str]:
-        """Human-readable lines, one per non-empty category."""
+        """Human-readable lines, one per non-empty category with resource type and path."""
         lines = []
         if self.overlays:
-            lines.append(f"overlays: {', '.join(self.overlays)}")
+            paths = ", ".join(f"overlays/{n}" for n in self.overlays)
+            lines.append(f"overlay directories: {paths}")
         if self.locks:
-            lines.append(f"locks: {', '.join(self.locks)}")
+            paths = ", ".join(f"locks/{n}{locks.LOCK_SUFFIX}" for n in self.locks)
+            lines.append(f"session lock files: {paths}")
         if self.keychain_secrets:
-            lines.append(f"keychain secrets: {', '.join(self.keychain_secrets)}")
+            paths = ", ".join(f"keychain/{n}{_SECRET_SUFFIX}" for n in self.keychain_secrets)
+            lines.append(f"keychain secret backups: {paths}")
         if self.keychain_quarantine:
-            lines.append(
-                f"keychain quarantine files: {', '.join(self.keychain_quarantine)}"
-            )
+            paths = ", ".join(f"keychain/{f}" for f in self.keychain_quarantine)
+            lines.append(f"keychain quarantine files: {paths}")
         if self.backups:
-            lines.append(f"backups: {', '.join(self.backups)}")
+            paths = ", ".join(f"backups/{f}" for f in self.backups)
+            lines.append(f"backup archives: {paths}")
+        return lines
+
+    def describe_actions(self) -> List[str]:
+        """Human-readable action items (action + type + path) for preview and confirmation."""
+        lines = []
+        for name in self.overlays:
+            lines.append(f"remove orphan overlay directory overlays/{name}")
+        for name in self.locks:
+            lines.append(f"remove orphan session lock file locks/{name}{locks.LOCK_SUFFIX}")
+        for name in self.keychain_secrets:
+            lines.append(f"remove orphan keychain secret backup keychain/{name}{_SECRET_SUFFIX}")
+        for filename in self.keychain_quarantine:
+            lines.append(f"remove orphan keychain quarantine file keychain/{filename}")
+        for filename in self.backups:
+            lines.append(f"remove orphan backup archive backups/{filename}")
         return lines
 
 
@@ -133,21 +151,20 @@ def remove_orphans(store, scan: OrphanScan) -> List[str]:
     was actually removed (so callers can log/print the real outcome, not
     the stale scan).
 
-    Re-verifies liveness right before removing anything whose bare
-    ``<name>`` path could collide with a profile recreated during the
-    (arbitrarily long) confirmation pause between detect and fix:
+    Re-verifies liveness right before removing anything that could collide
+    with a profile recreated during the (arbitrarily long) confirmation pause
+    between detect and fix:
 
-    - ``overlays`` and ``keychain_secrets`` are name-only paths, so a
-      profile recreated in that gap would have a brand-new overlay /
-      keychain secret at the exact same path — skipped by re-deriving the
-      CURRENT name set (one fresh ``store.names()`` call, not the caller's
-      stale ``scan``) and checking membership.
-    - ``locks`` is re-verified via ``locks.try_lock`` itself (not a
-      separate is_locked-probe-then-unlink) so no other opener can be
-      mid-acquire on that inode at the instant of removal.
-    - ``keychain_quarantine`` and ``backups`` are timestamped filenames
-      that cannot collide with a freshly recreated same-named profile's
-      fresh artifacts, so they carry no such race and need no re-check.
+    - ``overlays``, ``locks``, and ``keychain_secrets`` are name-based paths,
+      so a profile recreated in that gap would have live artifacts at that
+      exact same path -- skipped by re-deriving the CURRENT name set
+      (one fresh ``store.names()`` call, not the caller's stale ``scan``)
+      and checking membership. In addition, ``locks`` is acquired via
+      ``locks.try_lock`` so no other opener can be mid-acquire on that inode.
+    - ``keychain_quarantine`` and ``backups`` are checked against the fresh
+      name set via owner extraction and ``store_mod.backup_owner`` so that
+      a recreated profile's historical quarantine or backup archives are
+      not deleted out from under it.
     """
     removed: List[str] = []
     current_names = set(store.names())
@@ -158,9 +175,12 @@ def remove_orphans(store, scan: OrphanScan) -> List[str]:
         path = store.overlays_dir / name
         if path.exists():
             store_mod.rmtree(path)
-            removed.append(f"overlay: {name}")
+            if not path.exists():
+                removed.append(f"overlay: {name}")
 
     for name in scan.locks:
+        if name in current_names:
+            continue
         handle = locks.try_lock(store, name)
         if handle is None:
             continue
@@ -182,6 +202,9 @@ def remove_orphans(store, scan: OrphanScan) -> List[str]:
             pass
 
     for filename in scan.keychain_quarantine:
+        owner = filename.split(_QUARANTINE_INFIX, 1)[0]
+        if owner in current_names:
+            continue
         try:
             (keychain._slots_dir(store) / filename).unlink(missing_ok=True)
             removed.append(f"keychain quarantine: {filename}")
@@ -189,6 +212,8 @@ def remove_orphans(store, scan: OrphanScan) -> List[str]:
             pass
 
     for filename in scan.backups:
+        if any(store_mod.backup_owner(name, filename) for name in current_names):
+            continue
         try:
             (store.backups_dir / filename).unlink(missing_ok=True)
             removed.append(f"backup: {filename}")

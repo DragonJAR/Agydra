@@ -233,6 +233,8 @@ agydra/                     # repo root — flat layout, no package subdir
 ├── agydra.py           # VERSION + one-command bootstrap (python3 agydra.py)
 ├── models.py           # Profile/Config dataclasses, explicit (de)serialization
 ├── platforms.py        # OS paths, binary discovery, exec/launch per platform
+├── ui.py               # Console output primitives (colors, warn/note/error)
+├── banner.py           # ASCII/ANSI logo rendition for the terminal
 ├── store.py            # Profile store: CRUD, atomic JSON writes, backups
 ├── locks.py            # Kernel-held per-profile session locks
 ├── resolver.py         # Profile resolution cascade with human-readable reasons
@@ -242,9 +244,11 @@ agydra/                     # repo root — flat layout, no package subdir
 ├── runner.py           # Launch orchestration: resolve → plan → overlay → run
 ├── doctor.py           # Diagnostics: binary, permissions, isolation, canary, orphans
 ├── cli.py              # argparse CLI: launcher + management subcommands
+├── vocab.py            # Shared subcommand vocabulary + reserved names
 ├── orphans.py          # Reverse scan + cleanup of orphaned store artifacts
 ├── usage.py            # `agydra usage`: query + parse agy's /usage quota report
-├── tests/              # ~394 tests (fake home + fake agy binary fixtures)
+├── bootstrap.py        # One-command installer (venv + console script + PATH shim)
+├── tests/              # 490+ tests (fake home + fake agy binary fixtures)
 ├── README.md           # This document (English)
 ├── README.es.md        # Spanish version
 ├── AGENTS.md           # Development conventions
@@ -298,7 +302,7 @@ disabled otherwise (pipes, CI). `NO_COLOR=1` forces plain output;
 - Every feature must work cross-platform (macOS, Linux, Windows) from the
   single codebase; keep `platforms.py` the only per-OS layer.
 - Run the full suite before opening a change:
-  `python3 -m pytest -q` (148 passed + 3 platform skips on macOS).
+  `python3 -m pytest -q` (511 passed + 3 platform skips on macOS).
 - See [AGENTS.md](AGENTS.md) for conventions.
 
 ## 📄 License

@@ -1,4 +1,5 @@
 """Store CRUD, validation, atomicity, backup and ref resolution."""
+import errno
 import json
 import sys
 import unittest
@@ -6,7 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from store import Store, StoreError
+import store as store_mod
+from store import Config, Store, StoreError, backup_owner, read_json_object
 
 from conftest import BaseCase
 
@@ -213,7 +215,7 @@ class TestStore(BaseCase):
         store.save_config(config)
         raw = json.loads(store.config_path.read_text(encoding="utf-8"))
         self.assertEqual(raw["agy_binary"], "/usr/bin/agy")
-        self.assertFalse(store.config_path.with_name("agydra.json.tmp").exists())
+        self.assertEqual(list(store.config_path.parent.glob("agydra.json.*.tmp")), [])
 
     def test_atomic_replace_verify_failure_leaves_no_final_or_tmp(self):
         """When ``verify`` raises, ``_atomic_replace`` must remove the tmp
@@ -253,8 +255,6 @@ class TestStore(BaseCase):
         """
         import os
         import time
-
-        import store as store_mod
 
         src = self._tmp / "src.bin"
         src.write_bytes(b"payload")
@@ -326,42 +326,59 @@ class TestStore(BaseCase):
 
     def test_save_config_refuses_to_overwrite_corrupt_config(self):
         """Bug guard: the corrupt-config guard must precede the write."""
-        from store import StoreError as _StoreError
-
         fresh = self._tmp / "fresh-root"
         store = Store(root=fresh)
         fresh.mkdir(parents=True, exist_ok=True)
         (fresh / "agydra.json").write_text("{bad json", encoding="utf-8")
-        with self.assertRaises(_StoreError):
+        with self.assertRaises(StoreError):
             store.save_config(store.load_config())
 
     def test_load_config_degrades_with_warning_under_corrupt(self):
-        from store import Config as _Config
-
         fresh = self._tmp / "fresh-root"
         fresh.mkdir(parents=True, exist_ok=True)
         (fresh / "agydra.json").write_text("not json", encoding="utf-8")
         store = Store(root=fresh)
         config = store.load_config()
-        self.assertIsInstance(config, _Config)
+        self.assertIsInstance(config, Config)
 
     def test_load_config_degrades_on_valid_json_non_object_root(self):
         """Bug guard: a JSON list/str/int root is corruption, not a crash —
         and save_config must refuse to overwrite it."""
-        from store import StoreError as _StoreError
-
         fresh = self._tmp / "fresh-root"
         fresh.mkdir(parents=True, exist_ok=True)
         (fresh / "agydra.json").write_text("[1, 2]", encoding="utf-8")
         store = Store(root=fresh)
         config = store.load_config()
         self.assertIsNone(config.default_profile)
-        with self.assertRaises(_StoreError):
+        with self.assertRaises(StoreError):
             store.save_config(store.load_config())
 
-    def test_config_rejects_non_object_settings(self):
-        from models import Config
+    def test_create_succeeds_with_warning_when_config_is_corrupt(self):
+        """Regression test: corrupt agydra.json must not fail profile creation.
 
+        create() must succeed, emit a warn that the profile could not be marked
+        as default, the profile must appear in list(), and no StoreError must be
+        raised.
+        """
+        fresh = self._tmp / "fresh-root"
+        fresh.mkdir(parents=True, exist_ok=True)
+        (fresh / "agydra.json").write_text("{bad json", encoding="utf-8")
+        store = Store(root=fresh)
+
+        warnings = []
+        with unittest.mock.patch("store.warn", side_effect=warnings.append):
+            profile = store.create("alpha")
+
+        self.assertEqual(profile.name, "alpha")
+        self.assertIn("alpha", [p.name for p in store.list()])
+        self.assertTrue(store.profile_meta_path("alpha").is_file())
+        self.assertTrue(store.profile_data_dir("alpha").is_dir())
+        self.assertTrue(
+            any("could not mark" in w and "default profile" in w for w in warnings),
+            f"Expected warning that profile could not be marked as default, got: {warnings}",
+        )
+
+    def test_config_rejects_non_object_settings(self):
         with self.assertRaises(ValueError):
             Config.from_dict({"settings": ["not", "an", "object"]})
 
@@ -372,36 +389,131 @@ class TestStore(BaseCase):
         store = Store(root=fresh)
         store.create("work")
         store.profile_meta_path("work").write_text("[1, 2]", encoding="utf-8")
-        with self.assertRaises(StoreError):
+        with self.assertRaises(StoreError) as ctx:
             store.get("work")
+        self.assertIn("remove it with: agydra delete work", str(ctx.exception))
+        self.assertNotIn("recreate the profile", str(ctx.exception))
 
     def test_read_json_object_strict_and_tolerant_contracts(self):
         """``read_json_object`` is the single shared JSON reader; both
         contracts live in one place so strict and tolerant call sites can
         never drift apart."""
-        import store as _store
-
         fresh = self._tmp / "fresh-root"
         fresh.mkdir(parents=True, exist_ok=True)
         path = fresh / "probe.json"
 
         path.write_text('{"k": 1}', encoding="utf-8")
-        self.assertEqual(_store.read_json_object(path), {"k": 1})
+        self.assertEqual(read_json_object(path), {"k": 1})
 
         path.write_text("[1, 2]", encoding="utf-8")
         with self.assertRaises(ValueError):
-            _store.read_json_object(path)
-        self.assertIsNone(_store.read_json_object(path, tolerant=True))
+            read_json_object(path)
+        self.assertIsNone(read_json_object(path, tolerant=True))
 
         path.write_text("not json", encoding="utf-8")
         with self.assertRaises(ValueError):
-            _store.read_json_object(path)
-        self.assertIsNone(_store.read_json_object(path, tolerant=True))
+            read_json_object(path)
+        self.assertIsNone(read_json_object(path, tolerant=True))
 
         missing = fresh / "missing.json"
-        self.assertIsNone(_store.read_json_object(missing, tolerant=True))
+        self.assertIsNone(read_json_object(missing, tolerant=True))
         with self.assertRaises(OSError):
-            _store.read_json_object(missing)
+            read_json_object(missing)
+
+    def test_delete_empty_subdirs_creates_no_backup(self):
+        """Empty directories under profile_dir must not trigger 0-file backups."""
+        store = Store()
+        pdir = store.profile_dir("empty-dirs")
+        (pdir / "data" / "antigravity-cli").mkdir(parents=True)
+        backup = store.delete("empty-dirs")
+        self.assertIsNone(backup)
+        self.assertFalse(pdir.exists())
+
+    def test_delete_keychain_only_creates_backup_with_secret(self):
+        """A profile with no files in profile_dir but with a keychain secret
+        must create a backup zip containing that secret before deletion."""
+        import zipfile
+        import keychain
+
+        store = Store()
+        pdir = store.profile_dir("kc-only")
+        (pdir / "data").mkdir(parents=True)
+        secret_path = keychain.slot_backup_path(store, "kc-only")
+        secret_path.parent.mkdir(parents=True, exist_ok=True)
+        secret_path.write_bytes(b"oauth-secret-payload")
+
+        backup = store.delete("kc-only")
+        self.assertIsNotNone(backup)
+        self.assertTrue(backup.exists())
+
+        with zipfile.ZipFile(backup) as zf:
+            names = zf.namelist()
+            self.assertIn(f"_keychain/kc-only{keychain.SECRET_SUFFIX}", names)
+            self.assertEqual(
+                zf.read(f"_keychain/kc-only{keychain.SECRET_SUFFIX}"),
+                b"oauth-secret-payload",
+            )
+
+    def test_rename_to_non_empty_target_directory_raises_store_error(self):
+        """On POSIX, renaming to a non-empty directory raises OSError with
+        ENOTEMPTY/EEXIST. rename() must map this to StoreError 'already exists'."""
+        store = Store()
+        store.create("alpha")
+        target_dir = store.profile_dir("beta")
+        target_dir.mkdir(parents=True)
+        (target_dir / "rogue.txt").write_text("blocked", encoding="utf-8")
+
+        with self.assertRaises(StoreError) as ctx:
+            store.rename("alpha", "beta")
+        self.assertIn("already exists", str(ctx.exception))
+
+    def test_rename_unexpected_oserror_reraised(self):
+        """Unexpected OSErrors (e.g. EACCES) during directory rename must be reraised."""
+        store = Store()
+        store.create("alpha")
+        with unittest.mock.patch("store.rename_dir_with_retry", side_effect=OSError(errno.EACCES, "Denied")):
+            with self.assertRaises(OSError) as ctx:
+                store.rename("alpha", "beta")
+            self.assertEqual(ctx.exception.errno, errno.EACCES)
+
+    def test_backup_owner_requires_zip_extension(self):
+        """backup_owner must require .zip extension and profile prefix."""
+        stamp = "2026-01-02T030405.123Z0000"
+        self.assertTrue(backup_owner("work", f"work-{stamp}.zip"))
+        self.assertFalse(backup_owner("work", f"work-{stamp}"))
+        self.assertFalse(backup_owner("work", f"work-{stamp}.tar"))
+        self.assertFalse(backup_owner("work", f"other-{stamp}.zip"))
+        self.assertFalse(backup_owner("work", f"work-2-{stamp}.zip"))
+
+    def test_rename_to_same_name_fails(self):
+        store = Store()
+        store.create("work")
+        with self.assertRaises(StoreError) as ctx:
+            store.rename("work", "work")
+        self.assertEqual(str(ctx.exception), "cannot rename profile 'work' to itself")
+
+    def test_resolve_ref_unreadable_token_with_hash(self):
+        """#broken must report unreadable metadata, not unknown profile."""
+        store = Store()
+        broken_dir = store.profile_dir("broken")
+        broken_dir.mkdir(parents=True)
+        with self.assertRaises(StoreError) as ctx:
+            store.resolve_ref("#broken")
+        self.assertIn("profile 'broken' has unreadable metadata", str(ctx.exception))
+        self.assertIn("agydra delete broken", str(ctx.exception))
+
+    def test_resolve_ref_suggests_create_only_for_valid_names(self):
+        """resolve_ref should suggest 'create it with: agydra create <ref>'
+        ONLY when ref is a syntactically valid profile name."""
+        store = Store()
+        with self.assertRaises(StoreError) as ctx:
+            store.resolve_ref("validname")
+        self.assertIn("— create it with: agydra create validname", str(ctx.exception))
+
+        for invalid in ("#broken", "INVALID!", "9", "#9", "aux", "doctor"):
+            with self.assertRaises(StoreError) as ctx:
+                store.resolve_ref(invalid)
+            self.assertNotIn("create it with", str(ctx.exception))
 
 
 if __name__ == "__main__":

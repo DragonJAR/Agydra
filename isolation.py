@@ -11,8 +11,9 @@ instead, recursively mirrored one level deeper, so the store itself is never
 reachable through the overlay while unrelated siblings under that ancestor
 (``~/Library/Keychains``, other apps' data, ...) still are.
 
-Building the overlay is idempotent: each launch only adds missing links and
-repairs links/ancestor directories that point to the wrong place.
+Building the overlay is idempotent: each launch adds missing links, repairs
+broken links, ensures the ``.gemini`` link points to the target profile store,
+and replaces stale ancestor links with real mirrored directories.
 """
 from __future__ import annotations
 
@@ -203,8 +204,7 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
                 raise IsolationError(
                     f"overlay entry {link} is a real file, not the "
                     "expected mirrored directory; refusing to break "
-                    "isolation — remove it manually, recreate the profile, "
-                    "or run `agydra doctor --fix`"
+                    "isolation — remove it manually or recreate the profile"
                 )
             platforms.ensure_dir(link)
             _mirror_dir(entry, link, level + 1, ctx)
@@ -242,12 +242,11 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
     pre-existing same-named file is overwritten by its overlay version,
     same-named directories are merged. Refuses when ``real_dir`` is a link
     (nothing to recover), ``data_dir`` does not exist (no profile store to
-    receive the data), an entry is itself a symlink (a real-dir recovery
-    should never legitimately contain one, and moving it verbatim would
-    become a permanent, unchecked escape from isolation), or a plain-file
-    entry collides with an existing DIRECTORY at the target (a type
-    mismatch that ``shutil.move`` would otherwise silently nest one level
-    deeper instead of raising).
+    receive the data), an entry is itself a link (symlink or Windows
+    junction; a real-dir recovery should never legitimately contain one, and
+    moving it verbatim would become a permanent, unchecked escape from
+    isolation), or a type mismatch collides between file and directory at
+    the target.
     """
     if _is_link(real_dir) or not real_dir.is_dir():
         raise IsolationError(
@@ -259,25 +258,38 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
             f"cannot migrate {real_dir}: profile data dir {data_dir} does "
             "not exist yet (create the profile first)"
         )
-    import shutil
 
     try:
-        for entry in real_dir.iterdir():
+        entries = list(real_dir.iterdir())
+    except OSError as exc:
+        raise IsolationError(
+            f"could not list entries in {real_dir}: {exc}"
+        ) from exc
+
+    # Pre-validate all entries before mutating anything so that if any
+    # invariant is violated, nothing in real_dir has been moved or deleted.
+    for entry in entries:
+        if _is_link(entry):
+            raise IsolationError(
+                f"cannot migrate {entry}: real_dir must not contain "
+                "symlinks or junctions (isolation invariant); remove it "
+                "manually and re-run `agydra doctor --fix`"
+            )
+        target = data_dir / entry.name
+        if target.exists() and entry.is_dir() != target.is_dir():
+            target_type = "directory" if target.is_dir() else "file"
+            source_type = "directory" if entry.is_dir() else "file"
+            raise IsolationError(
+                f"cannot migrate {entry}: a {target_type} already exists "
+                f"at {target} (type mismatch with source {source_type}); "
+                "resolve manually and re-run `agydra doctor --fix`"
+            )
+
+    try:
+        for entry in entries:
             target = data_dir / entry.name
-            if entry.is_symlink():
-                raise IsolationError(
-                    f"cannot migrate {entry}: real_dir must not contain "
-                    "symlinks (isolation invariant); remove it manually "
-                    "and re-run `agydra doctor --fix`"
-                )
             if entry.is_dir() and target.exists():
                 shutil.copytree(entry, target, dirs_exist_ok=True)
-            elif target.is_dir():
-                raise IsolationError(
-                    f"cannot migrate {entry}: a directory already exists "
-                    f"at {target} (type mismatch); resolve manually and "
-                    "re-run `agydra doctor --fix`"
-                )
             else:
                 shutil.move(str(entry), str(target))
         store.rmtree(real_dir)
@@ -316,9 +328,10 @@ def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
         raise IsolationError(
             f"overlay entry {gemini_link} is a real directory/file, not the "
             "expected link to the profile store; refusing to break "
-            "isolation — remove it manually, recreate the profile, "
-            "or run `agydra doctor --fix` to migrate its contents into "
-            "the profile store and relink automatically"
+            "isolation — run `agydra doctor --fix` to migrate its contents "
+            "into the profile store and relink automatically (preserves data), "
+            "or remove it manually / recreate the profile "
+            "(destructive: discards whatever the overlay directory contains)"
         )
     if not _is_link(gemini_link):
         try:
@@ -365,10 +378,14 @@ def sandbox_wrap(argv: List[str]) -> List[str]:
     present. The same overlay-based HOME redirection applies inside.
     """
     uid = os.getuid()
+    bus_dir = f"/run/user/{uid}/bus"
+    keyring_dir = f"/run/user/{uid}/keyring"
     wrapped = [
         "bwrap",
         "--dev-bind", "/", "/",
-        "--tmpfs", f"/run/user/{uid}/bus",
-        "--tmpfs", f"/run/user/{uid}/keyring",
+        "--dir", bus_dir,
+        "--tmpfs", bus_dir,
+        "--dir", keyring_dir,
+        "--tmpfs", keyring_dir,
     ]
     return wrapped + argv

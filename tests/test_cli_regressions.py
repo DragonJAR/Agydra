@@ -64,11 +64,13 @@ class TestListColumnsAlignWithColor(BaseCase):
         self.assertEqual(plain_row[busy_at], "-")
         self.assertEqual(plain_row[last_at], "-")
 
-    def test_ansi_padding_moves_filler_outside_color_span(self):
-        cell = ui.pad(ui.paint("authenticated", "green"), 20)
+    def test_ansi_padding_places_filler_before_trailing_reset(self):
+        painted = ui.paint("authenticated", "green")
+        cell = ui.pad(painted, 20)
         self.assertTrue(cell.endswith(ui.RESET))
         self.assertEqual(len(ui.strip_ansi(cell)), 20)
-        self.assertLess(cell.index(ui.RESET), len(cell) - 1)
+        filler = " " * (20 - len("authenticated"))
+        self.assertEqual(cell, painted[:-len(ui.RESET)] + filler + ui.RESET)
 
     def capture_list(self):
         import cli
@@ -368,3 +370,173 @@ class TestDashedSubcommandDispatch(BaseCase):
         result = self._run_cli("-nr")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("profile", strip_ansi(result.stdout))
+
+
+class TestLateFlagWarningNoDuplicates(BaseCase):
+    """Regression: when an already-consumed flag repeats and swallows the rest
+    of argv into agy's args, warnings for flags caught in that tail (such as -b
+    or boolean flags -n/-r/-f) must be emitted EXACTLY ONCE, never duplicated
+    by a redundant second pass over raw in main()."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("alpha")
+
+    def test_repeated_flag_swallowing_value_flag_warns_exactly_once(self):
+        # -p alpha consumes profile; -p beta repeats, swallowing -b /opt/fake
+        result = self._run_cli("-p", "alpha", "-p", "beta", "-b", "/opt/fake")
+        needle = "'-b /opt/fake' was passed to agy, not agydra"
+        self.assertIn(needle, result.stderr)
+        self.assertEqual(
+            result.stderr.count(needle), 1,
+            f"Expected exactly 1 warning for late -b, got:\n{result.stderr}",
+        )
+
+    def test_repeated_flag_swallowing_boolean_flag_warns_exactly_once(self):
+        # -p alpha consumes profile; -p beta repeats, swallowing -n
+        # (This was the original bug that launched without dry-run)
+        result = self._run_cli("-p", "alpha", "-p", "beta", "-n")
+        needle = "'-n' was passed to agy, not agydra"
+        self.assertIn(needle, result.stderr)
+        self.assertEqual(
+            result.stderr.count(needle), 1,
+            f"Expected exactly 1 warning for late -n, got:\n{result.stderr}",
+        )
+
+    def test_late_flag_after_non_flag_still_warns_exactly_once(self):
+        # General case: -p after a non-flag token
+        result = self._run_cli("chat", "-p", "alpha", "-n")
+        needle = "'-p alpha' was passed to agy, not agydra"
+        self.assertIn(needle, result.stderr)
+        self.assertEqual(
+            result.stderr.count(needle), 1,
+            f"Expected exactly 1 warning for late -p, got:\n{result.stderr}",
+        )
+
+    def test_consume_launch_flags_returns_swallowed_flag(self):
+        import cli
+
+        flags_no_swallow = cli._consume_launch_flags(["-p", "alpha", "chat"])
+        self.assertFalse(flags_no_swallow.swallowed)
+        self.assertIsNone(flags_no_swallow.swallowed_index)
+        values, rest = flags_no_swallow
+        self.assertEqual(values["profile"], "alpha")
+        self.assertEqual(rest, ["chat"])
+
+        flags_swallowed = cli._consume_launch_flags(["-p", "alpha", "-p", "beta", "-n"])
+        self.assertTrue(flags_swallowed.swallowed)
+        self.assertEqual(flags_swallowed.swallowed_index, 2)
+        values, rest = flags_swallowed
+        self.assertEqual(values["profile"], "alpha")
+        self.assertEqual(rest, ["-p", "beta", "-n"])
+
+
+class TestLateFlagsDashDashOrder(BaseCase):
+    """_warn_late_flags must evaluate tokens in command-line order and break on --,
+    never early-returning on -- and missing flags before it."""
+
+    def _warn(self, raw, include_booleans=False):
+        import cli
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            cli._warn_late_flags(
+                {k: None for k in cli._LAUNCH_FLAGS},
+                raw,
+                include_booleans=include_booleans,
+            )
+        return buf.getvalue()
+
+    def test_flag_before_dash_dash_warns(self):
+        out = self._warn(["chat", "-b", "/opt/fake", "--", "prompt"])
+        self.assertIn("'-b /opt/fake' was passed to agy, not agydra", out)
+
+    def test_flag_after_dash_dash_is_ignored(self):
+        out = self._warn(["chat", "--", "-p", "work"])
+        self.assertEqual(out, "")
+
+
+class TestAssertFreeActionContext(BaseCase):
+    """_assert_free should customize the error message according to the action."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("busy-prof")
+
+    def test_assert_free_messages(self):
+        import cli, locks
+        handle = locks.try_lock(self.store, "busy-prof")
+        try:
+            with self.assertRaises(StoreError) as ctx:
+                cli._assert_free(self.store, "busy-prof", "logging in")
+            self.assertIn("before logging in", str(ctx.exception))
+
+            with self.assertRaises(StoreError) as ctx:
+                cli._assert_free(self.store, "busy-prof", "sharing config")
+            self.assertIn("before sharing config", str(ctx.exception))
+
+            with self.assertRaises(StoreError) as ctx:
+                cli._assert_free(self.store, "busy-prof", "deleting the profile")
+            self.assertIn("before deleting the profile", str(ctx.exception))
+        finally:
+            handle.release()
+
+
+class TestDeleteTOCTOUGuard(BaseCase):
+    """_finish_delete must assert the profile is free right before deleting."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("victim")
+
+    def test_finish_delete_refuses_busy_profile(self):
+        import cli, locks
+        handle = locks.try_lock(self.store, "victim")
+        try:
+            with self.assertRaises(StoreError) as ctx:
+                cli._finish_delete(self.store, "victim", no_backup=True)
+            self.assertIn("has a live session", str(ctx.exception))
+            self.assertIn("before deleting the profile", str(ctx.exception))
+        finally:
+            handle.release()
+
+
+class TestShareConfigDeduplication(BaseCase):
+    """_share_config must deduplicate duplicate targets in args.targets."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("src")
+        self.store.create("target")
+        src_data = self.store.profile_data_dir("src")
+        src_data.mkdir(parents=True, exist_ok=True)
+        (src_data / "settings.json").write_text("{}", encoding="utf-8")
+
+    def test_duplicate_targets_copied_once(self):
+        import cli
+        copied = cli._share_config(self.store, "src", ["target", "target", "target"])
+        self.assertEqual(copied, ["target/settings.json"])
+
+
+class TestDoctorFixDeclinedExitCode(BaseCase):
+    """Declining confirmation in cmd_doctor --fix must return exit code 1."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+
+    def test_declined_confirm_returns_exit_1(self):
+        import cli
+        class Args:
+            fix = True
+            force = False
+
+        from unittest import mock
+        with mock.patch("doctor.run_checks", return_value=0), \
+             mock.patch("doctor._preview_fixables", return_value=["orphan overlay"]), \
+             mock.patch("cli._confirm", return_value=False):
+            code = cli.cmd_doctor(self.store, Args())
+            self.assertEqual(code, 1)

@@ -112,10 +112,10 @@ def resolve_agy_binary(explicit: Optional[str] = None) -> Optional[Path]:
         p = Path(candidate).expanduser()
         if p.is_file() and (is_windows() or os.access(p, os.X_OK)):
             return p
+        which_p = shutil.which(str(p))
+        if which_p:
+            return Path(which_p)
         if is_windows():
-            which_p = shutil.which(str(p))
-            if which_p:
-                return Path(which_p)
             if os.path.dirname(str(p)) and not p.suffix:
                 probed = _probe_pathext(p)
                 if probed:
@@ -148,7 +148,7 @@ def console_script(venv_base: Path, name: str = "agydra") -> Path:
     return venv_base / VENV_BIN_SUBDIR / (name + _EXE_SUFFIX)
 
 
-def launch(binary: Path, args: Sequence[str], env: Mapping[str, str]) -> int:
+def launch_argv(argv: Sequence[str], env: Mapping[str, str]) -> int:
     """Launch agy replacing the current process when possible.
 
     On POSIX (macOS/Linux) ``os.execvpe`` replaces the process image so the
@@ -156,11 +156,6 @@ def launch(binary: Path, args: Sequence[str], env: Mapping[str, str]) -> int:
     Windows ``execvpe`` spawns-and-exits without waiting, so we use
     ``subprocess.run`` and propagate the child's exit code.
     """
-    return launch_argv([str(binary), *args], env)
-
-
-def launch_argv(argv: Sequence[str], env: Mapping[str, str]) -> int:
-    """Same contract as ``launch`` but taking a prebuilt argv (sandbox)."""
     if is_windows():
         return run_wait(argv, env)
     try:
@@ -171,7 +166,6 @@ def launch_argv(argv: Sequence[str], env: Mapping[str, str]) -> int:
     except OSError as exc:
         print(f"agydra: cannot execute {argv[0]}: {exc}", file=sys.stderr)
         return 126
-    return 127
 
 
 def drain_tty_input() -> None:
@@ -225,12 +219,13 @@ def _kill_process_group(proc: "subprocess.Popen") -> None:
     """
     if is_windows():
         try:
-            subprocess.run(
+            res = subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            return
+            if res.returncode == 0:
+                return
         except OSError:
             pass
         try:
@@ -292,7 +287,10 @@ def run_with_group_kill(
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_process_group(proc)
-        proc.communicate()
+        try:
+            proc.communicate(timeout=2.0)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
         raise
     return subprocess.CompletedProcess(list(argv), proc.returncode, out, err)
 

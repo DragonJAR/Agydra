@@ -937,6 +937,27 @@ class TestPurgeProfileSlot(BaseCase):
             return _rc(0)
 
         with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(keychain, "_ensure_target_keychain", return_value=Path("/fake/login.keychain-db")), \
+                mock.patch.object(keychain, "_run", fake_run):
+            keychain.purge_profile_slot(self.store, "work")
+
+        self.assertFalse(self.backup.exists(), "file backup must be unlinked")
+        self.assertIn(
+            ["delete-generic-password", "-s", "gemini/agydra/work", "-a", "antigravity", "/fake/login.keychain-db"],
+            calls,
+            "real keychain entry must be deleted targeting the resolved keychain",
+        )
+
+    def test_purge_degrades_when_target_keychain_is_none(self):
+        """When target resolution returns None, degrades gracefully without path."""
+        calls = []
+
+        def fake_run(args, input_bytes=None):
+            calls.append(args)
+            return _rc(0)
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(keychain, "_ensure_target_keychain", return_value=None), \
                 mock.patch.object(keychain, "_run", fake_run):
             keychain.purge_profile_slot(self.store, "work")
 
@@ -944,7 +965,7 @@ class TestPurgeProfileSlot(BaseCase):
         self.assertIn(
             ["delete-generic-password", "-s", "gemini/agydra/work", "-a", "antigravity"],
             calls,
-            "real keychain entry must be deleted via delete_slot",
+            "real keychain entry must be deleted via delete_slot without target",
         )
 
     def test_purge_without_keychain_bridge_only_unlinks_backup(self):
@@ -1387,7 +1408,7 @@ class TestKeychainCheckFlagsStaleSharedFormat(unittest.TestCase):
 
         store = _StoreStub(Path(self.id().replace(" ", "_")[:80]) if False else Path("/tmp/nonexistent-store-audit"))
         ctx = doctor._DoctorContext(
-            scan=(list([]), []), names=[], profile_count=0,
+            scan=(list([]), []), names=[],
         )
         with mock.patch.object(_kc, "supported", return_value=True), \
                 mock.patch.object(doctor.keychain, "describe",
@@ -1534,6 +1555,186 @@ class TestLaunchGuardPersistOnExit(unittest.TestCase):
             persist.assert_not_called()
             # Restore semantics untouched: shared slot back to had_shared.
             self.assertEqual(kc.shared, had)
+
+
+class TestLaunchGuardClearsSharedOnUndecodableSecret(unittest.TestCase):
+    """When a profile has a `.secret` file whose payload is undecodable
+    (raises ValueError on unwrap) and has no known identity to trigger
+    quarantine, launch_guard must not leave the shared slot holding a
+    foreign credential from an earlier session: entry must best-effort
+    clear the shared slot so agy never inherits the foreign account."""
+
+    def test_undecodable_secret_clears_foreign_shared_slot(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("beta")
+            # Profile has no known email / on-disk token, but has an undecodable .secret
+            undecodable_secret = b"corrupted-non-envelope-and-non-json-bytes"
+            keychain.save_profile_slot(store, "beta", undecodable_secret)
+
+            foreign_shared = _slot_payload_json("prior-user@example.com")
+            kc = _MemoryKeychain(foreign_shared)
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                guard = keychain.launch_guard(store, "beta", capture=False)
+                state = guard.__enter__()
+                self.assertFalse(state._swapped)
+                self.assertIsNone(kc.shared)
+                self.assertIn(("delete", None), kc.calls)
+                state.__exit__(None, None, None)
+            self.assertEqual(kc.shared, foreign_shared)
+
+    def test_quarantine_warning_names_destination_path(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            profile = store.get("alpha")
+            profile.email = "alpha@example.com"
+            store.save(profile)
+            foreign_secret = _go_keyring_secret("mallory@example.com")
+            keychain.save_profile_slot(store, "alpha", foreign_secret)
+
+            kc = _MemoryKeychain(b"foreign-shared")
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ), \
+                    mock.patch.object(keychain, "warn") as mock_warn:
+                guard = keychain.launch_guard(store, "alpha")
+                state = guard.__enter__()
+                state.__exit__(None, None, None)
+
+            quarantined = list(keychain._slots_dir(store).glob("alpha.secret.corrupt-*"))
+            self.assertEqual(len(quarantined), 1)
+            target_path = str(quarantined[0])
+            warn_calls = [c.args[0] for c in mock_warn.call_args_list]
+            self.assertTrue(
+                any(f"quarantined to {target_path}, not swapped in" in msg for msg in warn_calls),
+                f"Expected quarantine path in warning messages, got: {warn_calls}",
+            )
+
+    def test_quarantine_warning_reports_failure_when_quarantine_returns_none(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            profile = store.get("alpha")
+            profile.email = "alpha@example.com"
+            store.save(profile)
+            foreign_secret = _go_keyring_secret("mallory@example.com")
+            keychain.save_profile_slot(store, "alpha", foreign_secret)
+
+            kc = _MemoryKeychain(b"foreign-shared")
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ), \
+                    mock.patch.object(keychain, "_quarantine_profile_slot", return_value=None), \
+                    mock.patch.object(keychain, "warn") as mock_warn:
+                guard = keychain.launch_guard(store, "alpha")
+                state = guard.__enter__()
+                state.__exit__(None, None, None)
+
+            warn_calls = [c.args[0] for c in mock_warn.call_args_list]
+            self.assertTrue(
+                any("quarantine failed, not swapped in" in msg for msg in warn_calls),
+                f"Expected 'quarantine failed' in warning messages, got: {warn_calls}",
+            )
+
+
+class TestSerializeLock(unittest.TestCase):
+    def test_serialize_lock_closes_handle_on_flock_oserror(self):
+        with isolated_store_env():
+            store = Store()
+            handles = []
+            orig_open = open
+
+            def tracking_open(*args, **kwargs):
+                h = orig_open(*args, **kwargs)
+                handles.append(h)
+                return h
+
+            with mock.patch("fcntl.flock", side_effect=OSError("flock lock error")), \
+                    mock.patch("builtins.open", side_effect=tracking_open):
+                with self.assertRaises(OSError):
+                    keychain._serialize_lock(store)
+
+            self.assertEqual(len(handles), 1)
+            self.assertTrue(handles[0].closed, "file handle must be closed after fcntl error")
+
+
+class TestLaunchGuardExitRedundantRead(unittest.TestCase):
+    """Exit must not read the shared slot twice when swapped and had_shared is None."""
+
+    def test_exit_reads_slot_only_once_when_persist_on_exit(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            secret = _go_keyring_secret("alpha@example.com")
+            keychain.save_profile_slot(store, "alpha", secret)
+
+            kc = _MemoryKeychain(None)  # had_shared is None
+            read_count = 0
+            orig_read_slot = keychain.read_slot
+
+            def counting_read_slot(service, keychain_path=None):
+                nonlocal read_count
+                read_count += 1
+                return orig_read_slot(service, keychain_path)
+
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ), \
+                    mock.patch.object(keychain, "_serialize_lock", return_value=None):
+                guard = keychain.launch_guard(store, "alpha", persist_on_exit=True)
+                state = guard.__enter__()
+                self.assertTrue(state._swapped)
+                self.assertIsNone(state._had_shared)
+
+                with mock.patch.object(keychain, "read_slot", side_effect=counting_read_slot):
+                    state.__exit__(None, None, None)
+
+            # On exit, read_slot should be called at most once (for persist/checking content), not twice!
+            self.assertEqual(read_count, 1)
+
+    def test_exit_reads_slot_at_most_once_when_persist_on_exit_false(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            secret = _go_keyring_secret("alpha@example.com")
+            keychain.save_profile_slot(store, "alpha", secret)
+
+            kc = _MemoryKeychain(None)  # had_shared is None
+            read_count = 0
+            orig_read_slot = keychain.read_slot
+
+            def counting_read_slot(service, keychain_path=None):
+                nonlocal read_count
+                read_count += 1
+                return orig_read_slot(service, keychain_path)
+
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ), \
+                    mock.patch.object(keychain, "_serialize_lock", return_value=None):
+                guard = keychain.launch_guard(store, "alpha", persist_on_exit=False)
+                state = guard.__enter__()
+                self.assertTrue(state._swapped)
+                self.assertIsNone(state._had_shared)
+
+                with mock.patch.object(keychain, "read_slot", side_effect=counting_read_slot):
+                    state.__exit__(None, None, None)
+
+            # When persist_on_exit is False, read_slot is called at most once to check if content needs deletion
+            self.assertEqual(read_count, 1)
 
 
 if __name__ == "__main__":

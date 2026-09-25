@@ -36,7 +36,7 @@ def _decode_jwt_payload(token: str) -> dict:
 
 
 def _oauth_obj(data_dir: Path):
-    """Token JSON from the on-disk layout, or None when missing/malformed."""
+    """Yield decoded token JSON from the on-disk layout, if present and valid."""
     path = data_dir / AGY_CLI_DIR / TOKEN_FILE
     if not path.is_file():
         return
@@ -98,8 +98,8 @@ def _token_payload(raw: dict) -> dict:
     """Return the inner ``token`` sub-object of a decoded session file, or
     ``raw`` itself when the file has no ``token`` wrapper.
 
-    Centralizes the one normalization every consumer needs so
-    ``detect_email`` and ``auth_state`` cannot drift.
+    Used by ``auth_state`` to normalize the token dictionary regardless of
+    whether ``token`` is nested under a wrapper or at the top level.
     """
     inner = raw.get("token")
     return inner if isinstance(inner, dict) else raw
@@ -176,26 +176,6 @@ def detect_email(
     return email
 
 
-def _macos_keychain_authenticated(store, name) -> Optional[bool]:
-    """macOS fallback: the profile's keychain slot is present.
-
-    Legacy single-profile stores (pre-bridge) are not special-cased anymore:
-    the shared-slot fallback could attribute another profile's token to a
-    store that had never used the bridge."""
-    if not platforms.is_macos():
-        return None
-    try:
-        import keychain
-
-        if not keychain.supported():
-            return None
-        if name and keychain.load_profile_slot(store, name) is not None:
-            return True
-        return False
-    except Exception:
-        return None
-
-
 def auth_state(
     data_dir: Path,
     store=None,
@@ -212,8 +192,6 @@ def auth_state(
             token.get("access_token") or token.get("refresh_token")
         ):
             return "authenticated"
-    if _macos_keychain_authenticated(store, name):
-        return "authenticated"
     return "not-authenticated"
 
 
