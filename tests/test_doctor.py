@@ -227,6 +227,48 @@ class TestDoctor(BaseCase):
             "ghost's own file-backed slot backup must be untouched",
         )
 
+    def test_apply_fixes_detects_file_orphans_deleted_after_ctx_was_built(self):
+        """Regression: ``_fix_orphans`` must scan against the SAME fresh
+        ``current_names`` snapshot ``_apply_fixes`` already computes for the
+        keychain-orphan purge, never the stale pre-confirmation ``ctx.names``
+        it used to close over.
+
+        Scenario: "foo" is alive (and thus in ``ctx.names``) when ``ctx`` is
+        captured. During the (arbitrarily long) confirmation pause, "foo"'s
+        profile directory is removed by hand (not through ``agydra
+        delete``), leaving its overlay and keychain-secret backup genuinely
+        orphaned. A stale ``ctx.names`` still lists "foo" as known, so
+        scanning against it would miss these newly-orphaned artifacts in
+        this very ``--fix`` pass -- under-reported until the next `doctor`
+        run, contradicting the reason the file-based orphan purge exists."""
+        self.store.create("foo")
+        keychain.save_profile_slot(self.store, "foo", b"foo-secret")
+        (self.store.overlays_dir / "foo").mkdir(parents=True, exist_ok=True)
+
+        ctx = self._ctx()
+        self.assertIn("foo", ctx.names)
+
+        # Simulate the pause: "foo"'s profile directory disappears by hand,
+        # leaving its overlay/keychain-secret backup truly orphaned.
+        import shutil
+
+        shutil.rmtree(self.store.profile_dir("foo"))
+        self.assertNotIn("foo", self.store.names())
+
+        with mock.patch.object(keychain, "supported", return_value=False):
+            doctor._apply_fixes(self.store, ctx)
+
+        self.assertFalse(
+            (self.store.overlays_dir / "foo").exists(),
+            "foo's overlay must be recognized and purged as an orphan in "
+            "this same --fix pass, not left for a later run",
+        )
+        self.assertIsNone(
+            keychain.load_profile_slot(self.store, "foo"),
+            "foo's keychain-secret backup must be purged alongside its "
+            "overlay",
+        )
+
 
 class TestIsolationRecovery(BaseCase):
     """``_check_isolation`` must distinguish the recoverable real-dir case
@@ -343,6 +385,74 @@ class TestIsolationRecovery(BaseCase):
         )
         self.assertEqual(rc, 0)
         self.assertIsNone(self.store.default_name())
+
+
+class TestOrphanScanCaching(BaseCase):
+    """``_DoctorContext`` already exists to stop doctor's main check pass
+    from re-globbing ``profiles/`` per check; the orphan scan (added later)
+    slipped through as a second layer of the same duplicate work --
+    ``find_orphans``/``orphan_slots`` used to run once for the check pass,
+    once (redundantly) for ``_preview_fixables``, and once more (correctly)
+    as the fix-time refresh."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("alpha")
+        # A genuine file-based orphan: keeps find_orphans's scan non-empty
+        # across every call, so the preview/fix steps actually run instead
+        # of short-circuiting on "no fixable items".
+        (self.store.overlays_dir / "ghost").mkdir(parents=True, exist_ok=True)
+
+    def test_fix_run_scans_orphans_at_most_twice(self):
+        """The check-and-fix decision flow ``cli.cmd_doctor`` drives --
+        ``run_checks`` (check pass), ``_preview_fixables`` (what --fix
+        would do) and ``_apply_fixes`` (the fix-time refresh) -- must call
+        ``orphans.find_orphans``/``keychain.orphan_slots`` at most twice
+        each: once for the check pass, once for the fix-time refresh
+        (state may have drifted during the confirmation pause).
+        ``_preview_fixables`` must reuse the check pass's cached result
+        instead of recomputing a third time. (``doctor._post_fix_exit_code``
+        is intentionally excluded here: it is a separate, necessary,
+        state-changed-by-then recompute against a brand-new ``Store``, not
+        part of this duplicate-work pattern.)"""
+        import orphans as orphans_mod
+
+        find_orphans_spy = mock.Mock(wraps=orphans_mod.find_orphans)
+        orphan_slots_spy = mock.Mock(return_value=["ghost"])
+
+        with mock.patch.object(orphans_mod, "find_orphans", find_orphans_spy), \
+                mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    doctor.keychain, "describe",
+                    return_value={
+                        "supported": True, "shared": False,
+                        "shared_format": None, "profile_slots": {},
+                    },
+                ), \
+                mock.patch.object(doctor.keychain, "orphan_slots", orphan_slots_spy), \
+                mock.patch.object(
+                    doctor.keychain, "_ensure_target_keychain", return_value=None
+                ), \
+                mock.patch.object(doctor.keychain, "delete_slot"):
+            ctx = doctor._build_ctx(self.store)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                doctor.run_checks(self.store, ctx=ctx)
+            preview = doctor._preview_fixables(self.store, ctx)
+            self.assertTrue(preview, "fixture must produce fixable items")
+            doctor._apply_fixes(self.store, ctx)
+
+        self.assertLessEqual(
+            find_orphans_spy.call_count, 2,
+            f"find_orphans should run at most twice (check pass + fix "
+            f"refresh), got {find_orphans_spy.call_count}",
+        )
+        self.assertLessEqual(
+            orphan_slots_spy.call_count, 2,
+            f"orphan_slots should run at most twice (check pass + fix "
+            f"refresh), got {orphan_slots_spy.call_count}",
+        )
 
 
 if __name__ == "__main__":

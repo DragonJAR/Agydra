@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from agydra import __version__
 import account, isolation, keychain, platforms
@@ -24,11 +24,22 @@ class _DoctorContext:
 
     Doctor used to re-glob profiles/ 4× per run (one per check that read the
     store). One scan now feeds all checks; downstream helpers consume the
-    cached tuples instead of paying another ``store.scan()``/``store.names()``."""
+    cached tuples instead of paying another ``store.scan()``/``store.names()``.
+
+    ``orphan_scan``/``keychain_orphans`` cache what ``_check_orphans``/
+    ``_check_keychain`` already computed during the check pass, so
+    ``_preview_fixables`` (called right after, before anything mutates
+    disk) reads the cached result instead of paying for a third,
+    100%-redundant ``orphans.find_orphans``/``keychain.orphan_slots`` call.
+    ``None`` until the corresponding check has run; the fix-time refresh in
+    ``_apply_fixes`` always recomputes fresh regardless, since state may
+    have changed by then."""
 
     scan: Tuple[List, List[str]]
     names: List[str]
     profile_count: int
+    orphan_scan: Optional[Any] = None
+    keychain_orphans: Optional[List[str]] = None
 
 
 def _check_binary(store: Store, _ctx: "_DoctorContext"):
@@ -217,6 +228,7 @@ def _check_keychain(store: Store, ctx: "_DoctorContext"):
             seen = candidate if candidate else "undecodable"
             mismatches.append(f"{name}: secret={seen} cached={known}")
     orphans = keychain.orphan_slots(store, ctx.names)
+    ctx.keychain_orphans = orphans
     lines = [
         "keychain bridge: "
         f"shared slot {shared_txt}; per-profile slots: "
@@ -260,6 +272,7 @@ def _check_orphans(store: Store, ctx: "_DoctorContext"):
     import orphans
 
     scan = orphans.find_orphans(store, ctx.names)
+    ctx.orphan_scan = scan
     if scan.is_empty():
         return OK, "orphans: none found"
     lines = ["orphaned store artifacts found (see: agydra doctor --fix)"]
@@ -332,7 +345,7 @@ CHECKS = [
 ]
 
 
-def _fix_orphans(store: Store, ctx: "_DoctorContext") -> None:
+def _fix_orphans(store: Store, names: List[str]) -> None:
     """Remove orphaned store artifacts found by ``_check_orphans``.
 
     Confirmation is a CLI concern, not a doctor one: ``cli.cmd_doctor``
@@ -341,10 +354,18 @@ def _fix_orphans(store: Store, ctx: "_DoctorContext") -> None:
     the removal is already approved -- this quietly performs it and
     reports exactly what it removed, in the same style as the check
     lines above it.
+
+    ``names`` must be a FRESH profile list, not the pre-confirmation
+    ``ctx.names`` snapshot: the confirmation pause can pause for an
+    arbitrary time, during which a profile could be deleted by hand,
+    genuinely orphaning its overlay/keychain-secret -- a stale ``names``
+    would miss that in this very pass (see ``_apply_fixes``, which passes
+    the same ``current_names`` it already computed for the keychain-orphan
+    purge).
     """
     import orphans
 
-    scan = orphans.find_orphans(store, ctx.names)
+    scan = orphans.find_orphans(store, names)
     if scan.is_empty():
         return
     removed = orphans.remove_orphans(store, scan)
@@ -355,7 +376,14 @@ def _fix_orphans(store: Store, ctx: "_DoctorContext") -> None:
 def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
     """What ``doctor --fix`` would change, in human-readable form. Single
     source of truth so the confirmation gate and the live-apply step can
-    never disagree about what is on the menu."""
+    never disagree about what is on the menu.
+
+    Reads the orphan scan/keychain-orphan results the check pass already
+    cached on ``ctx`` (``_check_orphans``/``_check_keychain``) instead of
+    recomputing them here -- nothing has mutated disk between the check
+    pass and this preview, so a third scan would be 100% redundant. Falls
+    back to computing them when ``ctx`` was not run through a check pass
+    first (e.g. a caller invoking this directly)."""
     lines: List[str] = []
     for name in ctx.names:
         gemini_link = store.overlays_dir / name / platforms.AGY_DATA_DIR_NAME
@@ -366,11 +394,16 @@ def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
     default = store.default_name()
     if default and default not in ctx.names:
         lines.append(f"clear dangling default profile {default!r}")
-    for orphan in keychain.orphan_slots(store, ctx.names):
+    keychain_orphans = ctx.keychain_orphans
+    if keychain_orphans is None:
+        keychain_orphans = keychain.orphan_slots(store, ctx.names)
+    for orphan in keychain_orphans:
         lines.append(f"purge orphan keychain slot {orphan!r}")
-    import orphans
+    scan = ctx.orphan_scan
+    if scan is None:
+        import orphans
 
-    scan = orphans.find_orphans(store, ctx.names)
+        scan = orphans.find_orphans(store, ctx.names)
     if not scan.is_empty():
         lines.extend(f"remove orphan: {line}" for line in scan.describe())
     return lines
@@ -430,7 +463,7 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
             paint("[fix]", "cyan", "bold")
             + f" purged orphan keychain slot for {orphan!r}"
         )
-    _fix_orphans(store, ctx)
+    _fix_orphans(store, current_names)
 
 
 def _build_ctx(store: Store) -> "_DoctorContext":

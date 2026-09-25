@@ -334,6 +334,51 @@ class TestLaunchGuardRestore(unittest.TestCase):
         self.assertEqual(keychain.load_profile_slot(store, "alpha"), pre_existing_envelope)
 
 
+class TestLaunchGuardExitReadSlotDedup(unittest.TestCase):
+    """``__exit__``'s restore branch must not read the shared slot twice for
+    the exact same value: the ``_persist_if_trusted`` read (``current``) and
+    the ``elif``'s own ``read_slot`` call cover the identical condition
+    (``self._swapped`` and ``self._had_shared is None``), with nothing
+    touching the keychain in between -- the second read is a pure repeat of
+    the first."""
+
+    def test_exit_reads_shared_slot_at_most_once(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = _StoreStub(Path(tmp.name))
+        kc = _MemoryKeychain(None)
+        keychain.save_profile_slot(
+            store, "alpha",
+            keychain.envelope_token_bytes(_slot_payload_json("alpha@example.com")),
+        )
+        with mock.patch.object(keychain, "_run", kc.run), \
+                mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                ):
+            guard = keychain.launch_guard(store, "alpha")
+            state = guard.__enter__()
+            self.assertTrue(state._swapped)
+            self.assertIsNone(state._had_shared)
+
+            original_read_slot = keychain.read_slot
+            read_calls = []
+
+            def counting_read_slot(*args, **kwargs):
+                read_calls.append((args, kwargs))
+                return original_read_slot(*args, **kwargs)
+
+            with mock.patch.object(keychain, "read_slot", counting_read_slot):
+                state.__exit__(None, None, None)
+
+        self.assertLessEqual(
+            len(read_calls), 1,
+            f"__exit__ must read the shared slot at most once for this "
+            f"swapped/capture=False/had_shared=None scenario, got "
+            f"{len(read_calls)}",
+        )
+
+
 def _go_keyring_secret(email: str) -> bytes:
     jwt = _make_jwt({"email": email})
     payload = json.dumps({
@@ -1004,6 +1049,42 @@ class TestOrphanSlots(BaseCase):
                 mock.patch.object(keychain, "_run", exploding_run):
             self.assertEqual(keychain.orphan_slots(self.store, known_names=[]), [])
 
+    def test_run_failure_warns_instead_of_reporting_silent_zero_orphans(self):
+        """A ``dump-keychain`` that raises must not look identical to a
+        genuinely orphan-free store -- every other fallible operation in
+        this module warns on failure; this one silently returned ``[]``."""
+        def exploding_run(args, input_bytes=None):
+            raise OSError("security is unavailable")
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(keychain, "_run", exploding_run), \
+                mock.patch.object(
+                    keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                ), \
+                mock.patch.object(keychain, "warn") as warn_mock:
+            orphans = keychain.orphan_slots(self.store, known_names=[])
+        self.assertEqual(orphans, [])
+        warn_mock.assert_called_once()
+        self.assertIn("dump-keychain", warn_mock.call_args[0][0].lower())
+
+    def test_nonzero_returncode_warns_instead_of_reporting_silent_zero_orphans(self):
+        seen_args = []
+
+        def fake_run(args, input_bytes=None):
+            seen_args.append(args)
+            return _rc(1, b"")
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(keychain, "_run", fake_run), \
+                mock.patch.object(
+                    keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                ), \
+                mock.patch.object(keychain, "warn") as warn_mock:
+            orphans = keychain.orphan_slots(self.store, known_names=[])
+        self.assertEqual(orphans, [])
+        warn_mock.assert_called_once()
+        self.assertIn("dump-keychain", warn_mock.call_args[0][0].lower())
+
 
 class TestKeychainSlotFormat(BaseCase):
     """The shared keychain slot (where agy reads) and the per-profile
@@ -1227,6 +1308,44 @@ class TestDescribeSharedFormat(unittest.TestCase):
         self.assertNotIn("shared_format", report)
 
 
+class TestKnownIdentityOnDiskToken(unittest.TestCase):
+    """``_known_identity``'s on-disk-token branch must behave exactly like
+    ``account.detect_email(data_dir)`` (no ``store``/``name``, so it only
+    ever walks the on-disk token file, never the keychain fallback) --
+    pinned directly through the ``data_dir`` argument since this was
+    previously a hand-rolled reimplementation of that same lookup."""
+
+    def test_email_from_on_disk_token_is_found(self):
+        import json as _json
+        import account as _account
+
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            data_dir = store.profile_data_dir("alpha")
+            cli_dir = data_dir / _account.AGY_CLI_DIR
+            cli_dir.mkdir(parents=True, exist_ok=True)
+            jwt = _make_jwt({"email": "alpha@example.com"})
+            payload = {
+                "token": {"access_token": "a", "refresh_token": "r"},
+                "auth_method": "consumer",
+                "id_token": jwt,
+            }
+            (cli_dir / _account.TOKEN_FILE).write_text(
+                _json.dumps(payload), encoding="utf-8"
+            )
+
+            email = keychain._known_identity(store, "alpha")
+        self.assertEqual(email, "alpha@example.com")
+
+    def test_no_on_disk_token_returns_none(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            email = keychain._known_identity(store, "alpha")
+        self.assertIsNone(email)
+
+
 class TestLaunchGuardFailOpenOnForeignSecret(unittest.TestCase):
     """The guard's documented fail-open contract covers ANY swap failure —
     including the strict unwrap rejecting a foreign-format ``.secret``."""
@@ -1284,30 +1403,137 @@ class TestKeychainCheckFlagsStaleSharedFormat(unittest.TestCase):
         self.assertIn("self-heals", message)
 
 
+class TestPersistClassification(unittest.TestCase):
+    """``_persist_if_trusted`` must distinguish THREE exit-persist cases:
+    (1) payload decodable but WITHOUT an identity claim — a mid-session
+    token refresh (Google drops id_token on refresh), benign: note and
+    keep the existing backup; (2) undecodable garbage — keep warning;
+    (3) a DIFFERENT email — keep warning (identity-laundering guard)."""
 
-        """A ``.secret`` in a foreign/undecodable format (e.g. plain JSON
-        written by a pre-fix build) must fail open like every other swap
-        error — warn, skip the swap, let the launch continue — never a raw
-        ``ValueError`` traceback (the guard's documented fail-open contract
-        covers ANY swap failure)."""
-        with isolated_store_env():
-            store = Store()
-            store.create("alpha")
-            # No known identity (no email, no on-disk token) → the identity
-            # guard does not quarantine; the strict unwrap is the first
-            # thing to reject the payload.
-            keychain.save_profile_slot(store, "alpha", b'{"not":"envelope"}')
+    def setUp(self):
+        import base64 as _b64
+        import json as _json
 
-            kc = _MemoryKeychain(None)
-            with mock.patch.object(keychain, "_run", kc.run), \
-                    mock.patch.object(keychain, "supported", return_value=True), \
+        self.store = _StoreStub(Path(self.id().replace(" ", "_")[:80]) if False else Path(tempfile.mkdtemp(prefix="persist-cls-")))
+        self.slots = keychain._slots_dir(self.store)
+        self.slots.mkdir(parents=True, exist_ok=True)
+        self.backup = keychain.slot_backup_path(self.store, "work")
+        self.backup.write_bytes(b"go-keyring-base64:Zm9v")
+
+        def jwt(email):
+            import base64 as _b
+            payload = _b.urlsafe_b64encode(_json.dumps({"email": email}).encode()).rstrip(b"=").decode()
+            return f"alg.{payload}.sig"
+
+        self.refresh_payload = _json.dumps({
+            "token": {"access_token": "ya29.refreshed", "refresh_token": "rt",
+                      "token_type": "Bearer", "expiry": "2099-01-01T00:00:00Z"},
+            "auth_method": "consumer",
+            # NO id_token: the refresh-response shape
+        }).encode()
+        self.different_payload = _json.dumps({
+            "token": {"access_token": "ya29.x", "refresh_token": "r",
+                      "token_type": "Bearer", "expiry": "2099-01-01T00:00:00Z"},
+            "auth_method": "consumer",
+            "id_token": jwt("mallory@evil.com"),
+        }).encode()
+        self.known_email = "known@example.com"
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.store.root, ignore_errors=True)
+
+    def _persist(self, data):
+        """Persist with a known identity; capture note/warn streams."""
+        import io
+        from unittest import mock
+
+        note_buf, warn_buf = io.StringIO(), io.StringIO()
+        with mock.patch.object(keychain, "note",
+                               lambda m: note_buf.write(m + "\n")), \
+                mock.patch.object(keychain, "warn",
+                                  lambda m: warn_buf.write(m + "\n")):
+            keychain._persist_if_trusted(self.store, "work", data)
+        return note_buf.getvalue(), warn_buf.getvalue()
+
+    def _known_identity_side_effect(self):
+        """Provide a deterministic known identity for the stub store."""
+        from unittest import mock
+
+        return mock.patch.object(
+            keychain, "_known_identity",
+            lambda *a, **k: self.known_email,
+        )
+
+    def test_refresh_without_identity_notes_and_keeps_backup(self):
+        # .secret baseline must survive: refreshed token has no id_token,
+        # so the identity cannot be confirmed and the backup is kept.
+        before = self.backup.read_bytes()
+        with self._known_identity_side_effect():
+            note_out, warn_out = self._persist(self.refresh_payload)
+        self.assertTrue(note_out.strip(), "expected a discrete note")
+        self.assertNotIn("different account", note_out)
+        self.assertEqual(warn_out, "", "refresh-shaped payload must not warn")
+        self.assertEqual(self.backup.read_bytes(), before,
+                         ".secret must not be overwritten by a refresh")
+
+    def test_garbage_payload_still_warns(self):
+        from unittest import mock
+
+        with self._known_identity_side_effect():
+            note_out, warn_out = self._persist(b"\x00\x01total-garbage")
+        self.assertIn("different account", warn_out)
+        self.assertEqual(note_out, "")
+
+    def test_different_email_still_warns(self):
+        from unittest import mock
+
+        with self._known_identity_side_effect():
+            note_out, warn_out = self._persist(self.different_payload)
+        self.assertIn("different account", warn_out)
+        self.assertEqual(note_out, "")
+
+
+class TestLaunchGuardPersistOnExit(unittest.TestCase):
+    """``launch_guard(persist_on_exit=False)`` is the query mode: the exit
+    path must not attempt a credential persist at all (usage is read-only —
+    it observes the slot, never rewrites the profile's backup)."""
+
+    def test_persist_block_skipped_and_restore_intact(self):
+        import sys as _sys
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _StoreStub(Path(tmp) / "store")
+            had = b'{"token":{"access_token":"prior"}}'
+            kc = _MemoryKeychain(had)
+
+            def fake_run(args, input_bytes=None):
+                return _rc(0)  # find/write/delete all succeed
+
+            # A .secret so the swap happens (non-empty slot → swapped).
+            slots = keychain._slots_dir(store)
+            slots.mkdir(parents=True, exist_ok=True)
+            keychain.slot_backup_path(store, "work").write_bytes(
+                keychain.envelope_token_bytes(had)
+            )
+
+            with mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(keychain, "_run", fake_run), \
                     mock.patch.object(
-                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
-                    ):
-                guard = keychain.launch_guard(store, "alpha")
-                state = guard.__enter__()  # must NOT raise ValueError
-            self.assertFalse(state._swapped, "undecodable slot must not be swapped")
-
+                        keychain, "_ensure_target_keychain",
+                        return_value=Path("/fake")), \
+                    mock.patch.object(keychain, "_serialize_lock",
+                                      return_value=None), \
+                    mock.patch.object(
+                        keychain, "_persist_if_trusted") as persist:
+                with keychain.launch_guard(store, "work",
+                                           persist_on_exit=False):
+                    pass  # simulate the agy query
+            persist.assert_not_called()
+            # Restore semantics untouched: shared slot back to had_shared.
+            self.assertEqual(kc.shared, had)
 
 
 if __name__ == "__main__":
