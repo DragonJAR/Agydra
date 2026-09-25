@@ -10,11 +10,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from agydra import __version__
-import account, banner, keychain, locks, platforms, resolver, runner, vocab
+import account, banner, keychain, locks, platforms, resolver, runner, usage, vocab
 from bootstrap import BootstrapError
 from isolation import IsolationError
 from store import Store, StoreError, atomic_copy, atomic_write_bytes, rename_dir_with_retry
-from ui import error as _error, note as _note, pad, paint, paint_each
+from ui import bar as _bar, error as _error, note as _note, pad, paint, paint_each
 
 
 class ColoredHelpFormatter(argparse.HelpFormatter):
@@ -255,6 +255,10 @@ def _assert_free(store: Store, name: str) -> None:
 
 
 _PROFILE_LABEL = "PROFILE"
+_EMAIL_COL_WIDTH = 34
+"""Shared EMAIL column width: `cmd_list`'s profile table and the usage
+compact table's header/rows both render this column at the same width --
+one named constant instead of two hand-copied ``34`` literals."""
 
 
 def cmd_list(store: Store, _args) -> int:
@@ -266,7 +270,7 @@ def cmd_list(store: Store, _args) -> int:
     width = max(len(p.name) for p in profiles)
     width = max(width, len(_PROFILE_LABEL))
     header = (
-        f"{'#':<3}{_PROFILE_LABEL:<{width + 2}}{'EMAIL':<34}{'AUTH':<20}"
+        f"{'#':<3}{_PROFILE_LABEL:<{width + 2}}{'EMAIL':<{_EMAIL_COL_WIDTH}}{'AUTH':<20}"
         f"{'DEFAULT':<9}{'BUSY':<6}LAST USED"
     )
     print(paint(header, "bold"))
@@ -289,7 +293,7 @@ def cmd_list(store: Store, _args) -> int:
         busy_shown = paint("yes", "yellow", "bold") if busy else "-"
         last = paint(profile.last_used or "-", "dim")
         print(
-            f"{idx:<3}{profile.name:<{width + 2}}{email:<34}"
+            f"{idx:<3}{profile.name:<{width + 2}}{email:<{_EMAIL_COL_WIDTH}}"
             f"{pad(state_shown, 20)}{pad(is_default, 9)}{pad(busy_shown, 6)}{last}"
         )
     return 0
@@ -350,6 +354,107 @@ def cmd_status(store: Store, args) -> int:
     print(f"auth      : {state}")
     print(f"busy      : {'yes' if locks.is_locked(store, plan.profile) else 'no'}")
     print(f"store     : {data_dir}")
+    return 0
+
+
+_USAGE_MIN_COL_WIDTH = 9
+
+
+def _usage_progress(stream) -> "usage.ProgressCallback":
+    """Print a "checking <name>... (i/N)" indicator while a multi-profile
+    usage report is in flight (querying ~7 profiles sequentially, by
+    design -- see usage.py -- can take several seconds).
+
+    On a TTY the line is overwritten in place (carriage return, no
+    newline); on a redirected/piped stream (a log file, a CI runner) it
+    degrades to one plain line per profile instead of control-character
+    spinner mess -- the same TTY-detection idiom ``banner.show`` and
+    ``ui.color_enabled`` already use.
+    """
+    is_tty = hasattr(stream, "isatty") and stream.isatty()
+
+    def _report(index: int, total: int, name: str) -> None:
+        message = f"checking {name}... ({index}/{total})"
+        if is_tty:
+            stream.write("\r" + message.ljust(60))
+            stream.flush()
+        else:
+            print(message, file=stream)
+
+    return _report
+
+
+def _clear_usage_progress(stream) -> None:
+    if hasattr(stream, "isatty") and stream.isatty():
+        stream.write("\r" + " " * 60 + "\r")
+        stream.flush()
+
+
+def cmd_usage(store: Store, args) -> int:
+    if args.ref is not None:
+        return _cmd_usage_detail(store, args)
+    return _cmd_usage_compact(store, args)
+
+
+def _cmd_usage_compact(store: Store, _args) -> int:
+    profiles = store.list()
+    if not profiles:
+        print("no profiles; create one with: agydra create <name>")
+        return 0
+    names = [p.name for p in profiles]
+    results = usage.gather_usage_report(store, names, on_progress=_usage_progress(sys.stderr))
+    _clear_usage_progress(sys.stderr)
+
+    columns = usage.collect_bucket_columns(results)
+    name_width = max(max(len(n) for n in names), len(_PROFILE_LABEL))
+    col_widths = [max(_USAGE_MIN_COL_WIDTH, len(col.header) + 1) for col in columns]
+    total_col_width = sum(col_widths) or _USAGE_MIN_COL_WIDTH
+
+    header = f"{'#':<3}{_PROFILE_LABEL:<{name_width + 2}}{'EMAIL':<{_EMAIL_COL_WIDTH}}"
+    for column, width in zip(columns, col_widths):
+        header += f"{column.header:<{width}}"
+    print(paint(header, "bold"))
+
+    for idx, (profile, result) in enumerate(zip(profiles, results), start=1):
+        email = profile.email or "-"
+        row = f"{idx:<3}{profile.name:<{name_width + 2}}{email:<{_EMAIL_COL_WIDTH}}"
+        if result.ok:
+            cells = ""
+            for column, width in zip(columns, col_widths):
+                bucket = usage.bucket_by_id(result, column.id)
+                if bucket is None:
+                    cells += pad(paint("-", "dim"), width)
+                    continue
+                pct = f"{round(bucket.remaining_fraction * 100)}%"
+                cells += pad(paint(pct, usage.usage_color(bucket.remaining_fraction)), width)
+            print(row + cells)
+        elif result.error == "not authenticated":
+            print(row + pad(paint("not authenticated", "dim"), total_col_width))
+        else:
+            cells = "".join(pad(paint("-", "dim"), width) for width in col_widths)
+            print(row + cells + paint(f" ({result.error})", "dim"))
+    return 0
+
+
+def _cmd_usage_detail(store: Store, args) -> int:
+    name = store.resolve_ref(args.ref)
+    profile = store.get(name)
+    result = usage.query_profile_usage(store, name)
+    print(f"profile   : {profile.name}")
+    if profile.email:
+        print(f"email     : {profile.email}")
+    if not result.ok:
+        _error(f"usage unavailable: {result.error}")
+        return 1
+    for group in result.groups:
+        print()
+        print(paint(group.name, "bold"))
+        for bucket in group.buckets:
+            pct = bucket.remaining_fraction * 100
+            color = usage.usage_color(bucket.remaining_fraction)
+            gauge = paint(_bar(bucket.remaining_fraction), color)
+            countdown = usage.format_countdown(bucket.reset_time)
+            print(f"  {bucket.name:<28}[{gauge}] {pct:5.1f}%  reset in {countdown}")
     return 0
 
 
@@ -594,6 +699,7 @@ _SUBCOMMAND_HELP: Dict[str, str] = {
     "delete": "backup ZIP then delete a profile (refuses busy)",
     "share-config": "copy settings.json + mcp.json between profiles",
     "doctor": "diagnose the installation (--fix removes orphaned artifacts)",
+    "usage": "aggregate quota usage across profiles (or one, in detail)",
     "setup": "one-command install of the shim",
     "help": "show this help",
     "version": "print the version",
@@ -645,6 +751,8 @@ _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
             ("agydra rename old new", "rename a profile (refuses busy)"),
             ("agydra delete old", "backup ZIP + delete (refuses busy)"),
             ("agydra doctor", "diagnose the installation"),
+            ("agydra usage", "quota usage across all profiles"),
+            ("agydra usage work", "detailed quota usage for 'work'"),
         ],
     ),
 ]
@@ -791,6 +899,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "removes a live lock or anything a current profile owns",
             )
             parser.set_defaults(func=cmd_doctor)
+        elif sub == "usage":
+            parser.add_argument(
+                "ref", nargs="?",
+                help="profile name or number for a detailed view "
+                "(omit for a compact table of every profile)",
+            )
+            parser.set_defaults(func=cmd_usage)
         elif sub == "setup":
             parser.add_argument(
                 "-n", "--dry-run", action="store_true",

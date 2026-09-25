@@ -51,12 +51,61 @@ def write_fake_agy(path: Path) -> Path:
 
     script = path
     script.parent.mkdir(parents=True, exist_ok=True)
+    (script.parent / "heartbeat_child.py").write_text(
+        # Spawned as a GRANDCHILD of the fake agy (see FAKE_AGY_USAGE_SPAWN_CHILD_LOG
+        # below): proves a timeout kills the whole process group, not just the
+        # immediate agy child -- it keeps appending to its log until something
+        # actually kills IT, unlike agy's own sleep just returning on timeout.
+        "import sys, time\n"
+        "path = sys.argv[1]\n"
+        "i = 0\n"
+        "while True:\n"
+        "    with open(path, 'a') as fh:\n"
+        "        fh.write(str(i) + '\\n')\n"
+        "    i += 1\n"
+        "    time.sleep(0.05)\n",
+        encoding="utf-8",
+    )
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import os, sys, time\n"
         "if '--version' in sys.argv:\n"
         "    print('fake-agy 1.0')\n"
         "    raise SystemExit(0)\n"
+        "if '--print' in sys.argv:\n"
+        "    profile = os.environ.get('AGYDRA_PROFILE', '')\n"
+        "    tag = profile.upper()\n"
+        "    child_log = os.environ.get('FAKE_AGY_USAGE_SPAWN_CHILD_LOG')\n"
+        "    if child_log:\n"
+        "        import subprocess\n"
+        "        heartbeat = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'heartbeat_child.py')\n"
+        "        subprocess.Popen([sys.executable, heartbeat, child_log])\n"
+        "    sleep_s = (\n"
+        "        os.environ.get('FAKE_AGY_USAGE_SLEEP_' + tag)\n"
+        "        or os.environ.get('FAKE_AGY_USAGE_SLEEP')\n"
+        "    )\n"
+        "    if sleep_s:\n"
+        "        time.sleep(float(sleep_s))\n"
+        "    log_path = os.environ.get('FAKE_AGY_USAGE_LOG')\n"
+        "    if log_path:\n"
+        "        hold = float(os.environ.get('FAKE_AGY_USAGE_HOLD', '0'))\n"
+        "        with open(log_path, 'a') as fh:\n"
+        "            fh.write(profile + ' start\\n')\n"
+        "        time.sleep(hold)\n"
+        "        with open(log_path, 'a') as fh:\n"
+        "            fh.write(profile + ' end\\n')\n"
+        "    response_file = (\n"
+        "        os.environ.get('FAKE_AGY_USAGE_RESPONSE_FILE_' + tag)\n"
+        "        or os.environ.get('FAKE_AGY_USAGE_RESPONSE_FILE')\n"
+        "    )\n"
+        "    exit_code = int(\n"
+        "        os.environ.get('FAKE_AGY_USAGE_EXIT_' + tag)\n"
+        "        or os.environ.get('FAKE_AGY_USAGE_EXIT', '0')\n"
+        "    )\n"
+        "    if response_file:\n"
+        "        with open(response_file) as fh:\n"
+        "            sys.stdout.write(fh.read())\n"
+        "    raise SystemExit(exit_code)\n"
         "if '--hold' in sys.argv:\n"
         "    # Hold the session open until the test removes the gate file:\n"
         "    # exercises the -r free-profile selection under live locks.\n"

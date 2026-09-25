@@ -22,6 +22,7 @@ SUBCOMMAND_ALIASES: Dict[str, Tuple[str, ...]] = {
     "delete": ("rm",),
     "share-config": ("share",),
     "doctor": ("doc",),
+    "usage": ("us",),
     "setup": ("install",),
     "help": (),
     "version": (),

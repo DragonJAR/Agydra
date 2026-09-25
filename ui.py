@@ -145,6 +145,20 @@ def _enable_windows_vt() -> None:
         pass
 
 
+def bar(fraction: float, width: int = 24, *, filled: str = "#", empty: str = "-") -> str:
+    """Plain-text progress bar for ``fraction`` (clamped to 0..1).
+
+    Generic rendering primitive with no business rules baked in (no
+    thresholds, no colors) -- callers wrap the result in :func:`paint`
+    themselves for coloring, keeping this module free of caller-specific
+    semantics like quota thresholds. ASCII-only so it renders identically
+    on every supported terminal, including legacy Windows ``conhost``.
+    """
+    fraction = max(0.0, min(1.0, fraction))
+    filled_len = round(width * fraction)
+    return filled * filled_len + empty * (width - filled_len)
+
+
 def warn(message: str) -> None:
     print(paint("agydra: warning:", "yellow", stream=sys.stderr) + f" {message}",
           file=sys.stderr)

@@ -193,14 +193,14 @@ class TestReservedProfileNames(BaseCase):
         self.store = Store()
 
     def test_canonical_subcommand_name_is_refused(self):
-        for name in ("status", "list", "create", "delete", "rename", "doctor"):
+        for name in ("status", "list", "create", "delete", "rename", "doctor", "usage"):
             with self.subTest(name=name):
                 with self.assertRaises(StoreError) as cm:
                     self.store.create(name)
                 self.assertIn("reserved profile name", str(cm.exception))
 
     def test_alias_is_refused(self):
-        for alias in ("ls", "mv", "rm", "c", "in", "imp"):
+        for alias in ("ls", "mv", "rm", "c", "in", "imp", "us"):
             with self.subTest(alias=alias):
                 with self.assertRaises(StoreError) as cm:
                     self.store.create(alias)
