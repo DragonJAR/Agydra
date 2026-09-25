@@ -6,6 +6,7 @@ so a crash can never leave a half-written config.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -65,9 +66,9 @@ def backup_owner(name: str, filename: str) -> bool:
     ``orphans.py`` (flag a zip only when NO current profile owns it).
     """
     prefix = f"{name}-"
-    if not filename.startswith(prefix):
+    if not filename.endswith(".zip") or not filename.startswith(prefix):
         return False
-    remainder = filename.removesuffix(".zip")[len(prefix):]
+    remainder = filename[:-4][len(prefix):]
     return _is_backup_stamp(remainder)
 
 
@@ -217,17 +218,24 @@ def _rmtree_readonly_ok(function, path, _excinfo):
         pass
 
 
-def _has_backup_worthy_content(path: Path) -> bool:
-    """True iff there is anything under ``path`` worth zipping into a backup.
+def _has_backup_worthy_content(
+    path: Path, store: Optional[Store] = None, name: Optional[str] = None
+) -> bool:
+    """True iff there is anything under ``path`` or in keychain worth zipping.
 
-    Covers both a normal profile (``profile.json`` + ``data/``) and the
-    unreadable-profile case where metadata is missing or corrupt but
-    ``data/`` survived with real credentials — either way, deleting
-    without a backup first would destroy real data silently. ``any()``
-    short-circuits on the first entry ``rglob`` yields, so an empty or
-    missing directory costs nothing extra.
+    Covers both a normal profile (files under ``path``) and the keychain-only
+    case where filesystem data is absent but a keychain slot backup survived —
+    either way, deleting without a backup first would destroy real data silently.
+    Empty subdirectories without files do not count (preventing 0-file empty
+    backup zips).
     """
-    return path.is_dir() and any(path.rglob("*"))
+    if path.is_dir() and any(p.is_file() for p in path.rglob("*")):
+        return True
+    if store is not None and name is not None:
+        import keychain
+
+        return keychain.slot_backup_path(store, name).is_file()
+    return False
 
 
 def _unreadable_metadata_message(name: str) -> str:
@@ -287,7 +295,7 @@ class Store:
         return Config()
 
     def save_config(self, config: Config) -> None:
-        if self.config_path.exists() and not self._config_parses():
+        if not self._config_writable():
             raise StoreError(
                 f"refusing to overwrite corrupt {self.config_path}; "
                 "fix or delete it first (it may hold profiles' settings)"
@@ -307,6 +315,10 @@ class Store:
             return True
         except (OSError, ValueError, TypeError, AttributeError):
             return False
+
+    def _config_writable(self) -> bool:
+        """True iff save_config would allow writing to config_path."""
+        return not (self.config_path.exists() and not self._config_parses())
 
     def profile_dir(self, name: str) -> Path:
         return self.profiles_dir / name
@@ -341,6 +353,8 @@ class Store:
 
     def create(self, name: str, description: str = "") -> Profile:
         self.validate_name(name)
+        config = self.load_config()
+        config_writable = self._config_writable()
         profile_dir = self.profile_dir(name)
         data_dir = self.profile_data_dir(name)
         try:
@@ -356,10 +370,18 @@ class Store:
         profile = Profile(name=name, seq=seq, description=description)
         platforms.ensure_dir(data_dir)
         _atomic_write_json(self.profile_meta_path(name), profile.to_dict())
-        config = self.load_config()
         if not config.default_profile:
-            config.default_profile = name
-            self.save_config(config)
+            if config_writable:
+                config.default_profile = name
+                try:
+                    self.save_config(config)
+                except StoreError as exc:
+                    warn(f"could not mark {name!r} as default profile ({exc})")
+            else:
+                warn(
+                    f"could not mark {name!r} as default profile: "
+                    f"{self.config_path} is corrupt"
+                )
         return profile
 
     def get(self, name: str) -> Profile:
@@ -374,7 +396,7 @@ class Store:
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise StoreError(
                 f"profile {name!r} metadata is corrupt ({exc}); "
-                "restore it from backups/ or recreate the profile"
+                f"restore it from backups/ or remove it with: agydra delete {name}"
             ) from exc
 
     def save(self, profile: Profile) -> None:
@@ -428,6 +450,8 @@ class Store:
             rmtree(overlay)
 
     def rename(self, old: str, new: str) -> Profile:
+        if old == new:
+            raise StoreError(f"cannot rename profile {old!r} to itself")
         self.validate_name(new)
         profile = self.get(old)
         if self.exists(new):
@@ -439,11 +463,16 @@ class Store:
             )
         try:
             rename_dir_with_retry(self.profile_dir(old), self.profile_dir(new))
-        except FileExistsError as exc:
-            raise StoreError(
-                f"refusing to rename: target {self.profile_dir(new)} already exists "
-                "(another profile may have just been created with that name)"
-            ) from exc
+        except (FileExistsError, OSError) as exc:
+            if isinstance(exc, FileExistsError) or getattr(exc, "errno", None) in (
+                errno.ENOTEMPTY,
+                errno.EEXIST,
+            ):
+                raise StoreError(
+                    f"refusing to rename: target {self.profile_dir(new)} already exists "
+                    "(another profile may have just been created with that name)"
+                ) from exc
+            raise
         profile.name = new
         self.save(profile)
         self._remove_overlay(old)
@@ -460,7 +489,7 @@ class Store:
                 f"profile {name!r} does not exist (see: agydra list)"
             )
         backup_path: Optional[Path] = None
-        if backup and _has_backup_worthy_content(profile_dir):
+        if backup and _has_backup_worthy_content(profile_dir, self, name):
             backup_path = self._write_backup(name)
         rmtree(profile_dir)
         self._remove_overlay(name)
@@ -569,7 +598,14 @@ class Store:
             )
         if ref in unreadable:
             raise StoreError(_unreadable_metadata_message(ref))
+        if token in unreadable:
+            raise StoreError(_unreadable_metadata_message(token))
+        can_create = bool(
+            NAME_RE.match(ref or "")
+            and ref not in _WINDOWS_RESERVED_NAMES
+            and ref not in vocab.RESERVED_NAMES
+        )
+        hint = f" — create it with: agydra create {ref}" if can_create else ""
         raise StoreError(
-            f"unknown profile {ref!r}; existing: {', '.join(names) or '(none)'} "
-            "— create it with: agydra create " + ref
+            f"unknown profile {ref!r}; existing: {', '.join(names) or '(none)'}{hint}"
         )

@@ -19,10 +19,12 @@ def _utcnow_iso() -> str:
 class Profile:
     """A named, isolated identity for agy.
 
-    ``data_dir`` holds the equivalent of ``~/.gemini`` for this profile.
-    ``seq`` is a monotonic insertion counter: it defines the stable numbering
-    shown by ``list`` and used by ``-p <number>`` (timestamps alone collide
-    when several profiles are created within the same instant).
+    The profile data directory (derived via ``store.profile_data_dir(name)``)
+    holds the equivalent of ``~/.gemini`` for this profile.
+    ``seq`` is a monotonic insertion counter: it defines the stable
+    insertion-order sort key in ``_scan`` (so ``list`` and ``resolve_ref``
+    number profiles predictably; timestamps alone collide when several
+    profiles are created within the same instant).
     """
 
     name: str

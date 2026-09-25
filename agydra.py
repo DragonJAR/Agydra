@@ -7,7 +7,7 @@ This single file is the repo-root entry point AND the package identity:
   project: venv + editable package + PATH shim, then re-executes the
   installed ``agydra`` command with the remaining arguments.
 - ``VERSION``/``__version__`` are the single source of truth setuptools
-  reads for the package version (pyproject: ``attr = "VERSION"``).
+  reads for the package version (pyproject: ``attr = "agydra.VERSION"``).
 
 The implementation lives in the sibling top-level modules (``cli``,
 ``runner``, ``store``, ...); ``agydra setup`` shares this bootstrap via
