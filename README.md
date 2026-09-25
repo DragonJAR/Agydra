@@ -205,6 +205,7 @@ OAuth tokens are never copied
 | `agydra share-config SRC TARGET...` · `share` | Copy `settings.json` + `mcp.json` only |
 | `agydra setup [-n]` · `install` | One-command install: create the venv, install the console script, verify; `-n` prints the current install state. `python3 agydra.py` is the zero-install bootstrap from a fresh clone |
 | `agydra doctor [--fix] [-f]` · `doc` | Diagnostics; exit 1 iff any check fails. `--fix` migrates a real-dir overlay into the profile store and relinks it, clears a dangling default profile, purges orphaned macOS-keychain slots, and removes orphaned overlays/locks/keychain secrets/backups left behind by a manually deleted profile (asks for confirmation unless `-f`/`--force`) |
+| `agydra usage [NAME\|#]` · `us` | Quota usage from agy's own `/usage` query. No ref: a compact table across every profile (one column per usage bucket, colored by remaining quota). With a ref: a detailed per-group view with progress bars and reset countdowns for one profile. Works even on a busy profile (read-only, no session lock taken, and on macOS the keychain swap becomes a true no-op when the profile already owns the shared slot, so a live session's token refresh is never clobbered); querying several profiles is intentionally sequential |
 
 | Flag | Long form | Description |
 |---|---|---|
@@ -240,7 +241,8 @@ agydra/                     # repo root — flat layout, no package subdir
 ├── doctor.py           # Diagnostics: binary, permissions, isolation, canary, orphans
 ├── cli.py              # argparse CLI: launcher + management subcommands
 ├── orphans.py          # Reverse scan + cleanup of orphaned store artifacts
-├── tests/              # ~349 tests (fake home + fake agy binary fixtures)
+├── usage.py            # `agydra usage`: query + parse agy's /usage quota report
+├── tests/              # ~394 tests (fake home + fake agy binary fixtures)
 ├── README.md           # This document (English)
 ├── README.es.md        # Spanish version
 ├── AGENTS.md           # Development conventions
