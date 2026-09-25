@@ -207,18 +207,21 @@ def ensure_path_shim(root: Path, out: Callable[[str], None]) -> Optional[Path]:
     if not target.exists():
         raise BootstrapError(f"console script missing: {target}")
     shim = shim_path()
-    platforms.ensure_dir(shim.parent)
-    if shim.exists():
-        body = shim.read_text(encoding="utf-8", errors="replace")
-        if str(target) not in body:
-            if SHIM_MARKER not in body:
-                raise BootstrapError(
-                    f"refusing to overwrite foreign file at {shim}; "
-                    "inspect it and remove it manually, then re-run setup"
-                )
-            out(f"refreshing stale shim: {shim}")
-    shim.write_text(_shim_content(target), encoding="utf-8")
-    shim.chmod(shim.stat().st_mode | 0o755)
+    try:
+        platforms.ensure_dir(shim.parent)
+        if shim.exists():
+            body = shim.read_text(encoding="utf-8", errors="replace")
+            if str(target) not in body:
+                if SHIM_MARKER not in body:
+                    raise BootstrapError(
+                        f"refusing to overwrite foreign file at {shim}; "
+                        "inspect it and remove it manually, then re-run setup"
+                    )
+                out(f"refreshing stale shim: {shim}")
+        shim.write_text(_shim_content(target), encoding="utf-8")
+        shim.chmod(shim.stat().st_mode | 0o755)
+    except OSError as exc:
+        raise BootstrapError(f"could not write shim at {shim}: {exc}") from exc
     out(f"shim installed: {shim} -> {target}")
     return shim
 

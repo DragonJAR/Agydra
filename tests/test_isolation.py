@@ -404,6 +404,48 @@ class TestIsolationAncestorMirroring(BaseCase):
             with self.assertRaises(isolation.IsolationError):
                 isolation.build_overlay("alpha", data_dir, store_root)
 
+    def test_build_overlay_reuses_ancestor_chain_identities(self):
+        """build_overlay's ctx setup must reuse the identities _ancestor_chain
+        already computed while walking from real_home down to store_root,
+        instead of re-stat'ing every ancestor (and store_root a further
+        extra time) on top of that walk. ``_mirror_dir`` is stubbed out here
+        so only the ctx-construction phase is measured — its own per-child
+        stat while recursing is a separate, necessary cost this fix does not
+        touch."""
+        store_root = self.fake_home / "Library" / "Application Support" / "agydra"
+        store_root.mkdir(parents=True)
+        (self.fake_home / "Library" / "Keychains").mkdir(parents=True)
+        data_dir = self._make_store("alpha")
+
+        ancestor_paths, _ = isolation._ancestor_chain(self.fake_home, store_root)
+        self.assertTrue(ancestor_paths, "expected a non-empty ancestor chain for this layout")
+
+        real_identity = isolation._identity
+        counts: dict = {}
+
+        def counting_identity(path):
+            key = str(path)
+            counts[key] = counts.get(key, 0) + 1
+            return real_identity(path)
+
+        with mock.patch.object(isolation, "_identity", side_effect=counting_identity), \
+                mock.patch.object(isolation, "_mirror_dir", lambda *a, **k: None):
+            isolation.build_overlay("alpha", data_dir, store_root)
+
+        for path in ancestor_paths:
+            # real_home itself is stat'd twice inside _ancestor_chain's own
+            # walk (once as the home-identity baseline, once more when the
+            # walk reaches it) — pre-existing, unrelated to this fix. Every
+            # other ancestor, and store_root, must be stat'd exactly once.
+            expected = 2 if path == self.fake_home else 1
+            self.assertEqual(
+                counts.get(str(path), 0), expected,
+                f"{path} was stat'd {counts.get(str(path), 0)} times during "
+                f"build_overlay's ctx setup; expected {expected} (identities "
+                "computed by _ancestor_chain's own walk must be reused, not "
+                "recomputed)",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

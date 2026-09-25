@@ -376,6 +376,46 @@ class ShimInstall(unittest.TestCase):
                 shim2 = bootstrap.ensure_path_shim(proj, lambda _l: None)
                 self.assertEqual(shim2, expected)
 
+    def test_oserror_writing_shim_becomes_bootstrap_error(self):
+        """A filesystem failure inside ensure_path_shim (e.g. an unwritable
+        ~/.local/bin) must surface as a clean BootstrapError, matching every
+        other bootstrap step, instead of propagating a raw OSError out of
+        run()."""
+        if sys.platform.startswith("win"):
+            self.skipTest("POSIX-only")
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            with _sandbox_home(Path(td)):
+                with mock.patch.object(
+                    bootstrap.Path, "write_text",
+                    side_effect=PermissionError("denied"),
+                ):
+                    with self.assertRaises(bootstrap.BootstrapError):
+                        bootstrap.ensure_path_shim(proj, lambda _l: None)
+
+    def test_run_reports_clean_message_when_shim_write_fails(self):
+        if sys.platform.startswith("win"):
+            self.skipTest("POSIX-only")
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            with _sandbox_home(Path(td)):
+                real_ensure_venv = bootstrap.ensure_venv
+                real_install_editable = bootstrap.install_editable
+                bootstrap.ensure_venv = lambda _root, _out: bootstrap.venv_python(proj)
+                bootstrap.install_editable = lambda _root, _vpy, _out: None
+                try:
+                    with mock.patch.object(
+                        bootstrap.Path, "write_text",
+                        side_effect=PermissionError("denied"),
+                    ):
+                        captured: list[str] = []
+                        code = bootstrap.run(captured.append)
+                finally:
+                    bootstrap.ensure_venv = real_ensure_venv
+                    bootstrap.install_editable = real_install_editable
+            self.assertEqual(code, 1)
+            self.assertTrue(any(line.startswith("setup: ") for line in captured))
+
 
 class RunDispatch(unittest.TestCase):
     """run() orchestrates every step; failure modes return exit code 1."""

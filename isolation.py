@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import List, NamedTuple, Optional, Tuple
 
 import platforms
+import store
 
 _Identity = Optional[Tuple[int, int]]
 
@@ -108,28 +109,34 @@ def _identity(path: Path) -> _Identity:
     return (st.st_dev, st.st_ino)
 
 
-def _ancestor_chain(real_home: Path, store_root: Path) -> List[Path]:
-    """Ordered ancestors from ``real_home`` down to ``store_root`` inclusive.
+def _ancestor_chain(real_home: Path, store_root: Path) -> Tuple[List[Path], List[_Identity]]:
+    """Ordered ancestors from ``real_home`` down to ``store_root`` inclusive,
+    paired with the filesystem identity already computed for each one.
 
     Walks upward from ``store_root`` via ``.parent``, comparing filesystem
     identity (not string equality) at each step against ``real_home`` — so a
     differently-cased ``AGYDRA_HOME`` on a case-insensitive filesystem still
-    resolves to the correct chain. Empty when the store does not live under
-    the real home at all (nothing to protect via ancestor mirroring then).
+    resolves to the correct chain. Both lists are empty when the store does
+    not live under the real home at all (nothing to protect via ancestor
+    mirroring then). Callers (``build_overlay``) must reuse the returned
+    identities instead of calling ``_identity`` again on these same paths.
     """
     home_identity = _identity(real_home)
     if home_identity is None:
-        return []
+        return [], []
     chain = [store_root]
+    identities = [_identity(store_root)]
     current = store_root
-    while _identity(current) != home_identity:
+    while identities[-1] != home_identity:
         parent = current.parent
         if parent == current:
-            return []
+            return [], []
         current = parent
         chain.append(current)
+        identities.append(_identity(current))
     chain.reverse()
-    return chain
+    identities.reverse()
+    return chain, identities
 
 
 class _MirrorContext(NamedTuple):
@@ -273,7 +280,7 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
                 )
             else:
                 shutil.move(str(entry), str(target))
-        shutil.rmtree(real_dir)
+        store.rmtree(real_dir)
     except OSError as exc:
         raise IsolationError(
             f"could not migrate overlay data from {real_dir} into the "
@@ -294,11 +301,11 @@ def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
     real_home = platforms.real_home()
     overlay = platforms.ensure_dir(store_root / platforms.OVERLAYS_DIRNAME / name)
     store_resolved = store_root.resolve()
-    chain = _ancestor_chain(real_home, store_root)
+    _, chain_identities = _ancestor_chain(real_home, store_root)
     ctx = _MirrorContext(
-        chain_identities=[_identity(p) for p in chain],
+        chain_identities=chain_identities,
         store_resolved=store_resolved,
-        store_identity=_identity(store_root),
+        store_identity=chain_identities[-1] if chain_identities else _identity(store_root),
         agy_data_identity=_identity(platforms.agy_data_dir(real_home)),
     )
 
