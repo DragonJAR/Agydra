@@ -2,6 +2,7 @@
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,6 +90,19 @@ class TestResolveAgyBinary(unittest.TestCase):
         found = self._touch("agy")
         found.chmod(found.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         os.environ["PATH"] = str(found.parent)
+        self.assertEqual(platforms.resolve_agy_binary(), found)
+
+    def test_candidate_command_name_on_path_resolved(self):
+        """When candidate is a bare command name on PATH (not an existing path in CWD),
+        it must be resolved via shutil.which on all platforms."""
+        found = self._touch("agy-custom")
+        os.environ["PATH"] = str(found.parent)
+        self.assertEqual(platforms.resolve_agy_binary("agy-custom"), found)
+
+    def test_env_var_command_name_on_path_resolved(self):
+        found = self._touch("agy-custom-env")
+        os.environ["PATH"] = str(found.parent)
+        os.environ[platforms.AGY_BIN_ENV] = "agy-custom-env"
         self.assertEqual(platforms.resolve_agy_binary(), found)
 
     def test_nonexistent_explicit_returns_none(self):
@@ -195,12 +209,12 @@ class TestLaunch(unittest.TestCase):
         if not platforms.is_windows():
             self.skipTest("exec-replacement semantics; covered by CLI integration")
         script = self._script("exit42.cmd", "@echo off\r\nexit /b 42\r\n")
-        code = platforms.launch(script, [], dict(os.environ))
+        code = platforms.launch_argv([str(script)], dict(os.environ))
         self.assertEqual(code, 42)
 
     def test_missing_binary_returns_127(self):
-        code = platforms.launch(
-            self._tmp / "does-not-exist", [], dict(os.environ)
+        code = platforms.launch_argv(
+            [str(self._tmp / "does-not-exist")], dict(os.environ)
         )
         self.assertEqual(code, 127)
 
@@ -209,7 +223,7 @@ class TestLaunch(unittest.TestCase):
         script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         if platforms.is_windows():
             self.skipTest("POSIX exec semantics")
-        code = platforms.launch(script, [], dict(os.environ))
+        code = platforms.launch_argv([str(script)], dict(os.environ))
         self.assertEqual(code, 126)
 
 
@@ -289,6 +303,53 @@ class TestDrainTtyInput(unittest.TestCase):
                 mock.patch("termios.tcflush") as flush:
             platforms.drain_tty_input()
         flush.assert_not_called()
+
+
+class TestKillProcessGroup(unittest.TestCase):
+    def test_windows_taskkill_failure_falls_back_to_proc_kill(self):
+        """When taskkill returns non-zero, _kill_process_group must fall back to proc.kill()."""
+        from unittest import mock
+        proc = mock.MagicMock(pid=9999)
+        mock_result = mock.MagicMock(returncode=1)
+        with mock.patch.object(platforms, "is_windows", return_value=True), \
+                mock.patch("subprocess.run", return_value=mock_result) as mock_run:
+            platforms._kill_process_group(proc)
+        mock_run.assert_called_once_with(
+            ["taskkill", "/F", "/T", "/PID", "9999"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.kill.assert_called_once()
+
+    def test_windows_taskkill_success_skips_proc_kill(self):
+        """When taskkill succeeds (returncode 0), proc.kill() is not called."""
+        from unittest import mock
+        proc = mock.MagicMock(pid=9999)
+        mock_result = mock.MagicMock(returncode=0)
+        with mock.patch.object(platforms, "is_windows", return_value=True), \
+                mock.patch("subprocess.run", return_value=mock_result):
+            platforms._kill_process_group(proc)
+        proc.kill.assert_not_called()
+
+
+class TestRunWithGroupKill(unittest.TestCase):
+    def test_timeout_expired_cleans_up_with_timeout(self):
+        """A timeout triggers process group kill and re-raises TimeoutExpired."""
+        from unittest import mock
+        with mock.patch("subprocess.Popen") as mock_popen, \
+                mock.patch.object(platforms, "_kill_process_group") as mock_kill:
+            proc = mock.MagicMock()
+            proc.communicate.side_effect = [
+                subprocess.TimeoutExpired(cmd=["sleep"], timeout=0.1),
+                ("out", "err"),
+            ]
+            mock_popen.return_value = proc
+            with self.assertRaises(subprocess.TimeoutExpired):
+                platforms.run_with_group_kill(["sleep", "10"], timeout=0.1)
+            mock_kill.assert_called_once_with(proc)
+            self.assertEqual(proc.communicate.call_count, 2)
+            _, kwargs = proc.communicate.call_args_list[1]
+            self.assertEqual(kwargs.get("timeout"), 2.0)
 
 
 if __name__ == "__main__":
