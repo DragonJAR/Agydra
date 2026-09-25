@@ -1,5 +1,6 @@
 """Lightweight checks for the keychain bridge naming and descriptor shape."""
 import base64
+import binascii
 import json
 import sys
 import tempfile
@@ -71,6 +72,80 @@ class TestDecodeGoKeyringSecret(unittest.TestCase):
 
     def test_none_input_returns_none(self):
         self.assertIsNone(keychain.decode_go_keyring_secret(None))
+
+
+class TestNormalizeReadSlotValue(unittest.TestCase):
+    """``security find-generic-password -w`` always appends exactly one
+    trailing newline, and can print a stored value back as a HEX-ASCII
+    representation instead of the raw bytes -- neither is compensated for
+    by the caller, so a value read once and written back unchanged picks
+    up one more layer of hex-encoding each round-trip. ``read_slot``
+    normalizes both quirks away via ``_normalize_read_slot_value``."""
+
+    def test_strips_exactly_one_trailing_newline(self):
+        with mock.patch.object(keychain, "_run", return_value=_rc(0, b"payload\n")):
+            self.assertEqual(keychain.read_slot("gemini"), b"payload")
+
+    def test_keeps_a_legitimate_trailing_newline(self):
+        """A secret that itself ends in ``\\n`` still gets exactly one MORE
+        appended by `security` -- only that one must be removed."""
+        with mock.patch.object(keychain, "_run", return_value=_rc(0, b"payload\n\n")):
+            self.assertEqual(keychain.read_slot("gemini"), b"payload\n")
+
+    def test_peels_one_hex_layer_back_to_the_real_payload(self):
+        real_payload = _go_keyring_secret("someone@example.com")
+        layer1 = binascii.hexlify(real_payload)
+        with mock.patch.object(keychain, "_run", return_value=_rc(0, layer1)):
+            self.assertEqual(keychain.read_slot("gemini"), real_payload)
+
+    def test_peels_two_hex_layers_back_to_the_real_payload(self):
+        real_payload = _go_keyring_secret("someone@example.com")
+        layer2 = binascii.hexlify(binascii.hexlify(real_payload))
+        with mock.patch.object(keychain, "_run", return_value=_rc(0, layer2)):
+            self.assertEqual(keychain.read_slot("gemini"), real_payload)
+
+    def test_peels_three_hex_layers_back_to_the_real_payload(self):
+        real_payload = _go_keyring_secret("someone@example.com")
+        layer3 = binascii.hexlify(
+            binascii.hexlify(binascii.hexlify(real_payload))
+        )
+        with mock.patch.object(keychain, "_run", return_value=_rc(0, layer3)):
+            self.assertEqual(keychain.read_slot("gemini"), real_payload)
+
+    def test_uncorrupted_go_keyring_value_is_returned_unchanged(self):
+        """Critical safety property: a real, uncorrupted secret must never
+        be mistaken for hex and mangled -- the envelope prefix contains
+        non-hex characters, so it never even enters the peel loop."""
+        real_payload = _go_keyring_secret("someone@example.com")
+        with mock.patch.object(keychain, "_run", return_value=_rc(0, real_payload)):
+            self.assertEqual(keychain.read_slot("gemini"), real_payload)
+
+    def test_uncorrupted_plain_json_value_is_returned_unchanged(self):
+        payload = _slot_payload_json("someone@example.com")
+        with mock.patch.object(keychain, "_run", return_value=_rc(0, payload)):
+            self.assertEqual(keychain.read_slot("gemini"), payload)
+
+    def test_single_hex_layer_that_bottoms_out_in_garbage_is_returned_as_is(self):
+        """One valid hex layer whose unhexlified content is neither further
+        hex nor a recognizable payload must not be peeled -- the single hex
+        string itself is returned, not the garbage underneath it."""
+        garbage = b"\xff\xfe\xfd\xfc not utf-8 at all"
+        one_layer = binascii.hexlify(garbage)
+        with mock.patch.object(keychain, "_run", return_value=_rc(0, one_layer)):
+            self.assertEqual(keychain.read_slot("gemini"), one_layer)
+
+    def test_hex_chain_deeper_than_the_bound_never_raises_and_returns_unchanged(self):
+        """A hex chain that stays valid hex for MORE layers than the bound
+        allows must not be partially peeled, must not raise, and must not
+        loop forever -- it comes back exactly as read, newline-stripped
+        only, so the existing identity-mismatch/quarantine logic treats it
+        as undecodable instead of a wrong guess silently corrupting it
+        further."""
+        chain = b"\xff\xfe\xfd\xfc unresolved binary"
+        for _ in range(keychain._MAX_HEX_PEEL_LAYERS + 1):
+            chain = binascii.hexlify(chain)
+        with mock.patch.object(keychain, "_run", return_value=_rc(0, chain)):
+            self.assertEqual(keychain.read_slot("gemini"), chain)
 
 
 class _StoreStub:
@@ -422,6 +497,151 @@ class TestLaunchGuardEntrySelfRepair(unittest.TestCase):
             self.assertEqual(
                 kc.shared, keychain.token_payload_for_slot(unverified_secret)
             )
+
+
+class TestLaunchGuardAlreadyCurrent(unittest.TestCase):
+    """A non-login guard (``capture=False``) must become a true no-op when
+    the shared slot already holds THIS profile's own live credential (a
+    real session for it is already running) -- see the module docstring's
+    ``launch_guard`` note. Swapping in and later restoring the pre-call
+    snapshot would risk clobbering a token that session refreshes while
+    this call's subprocess runs, on every single call against a busy
+    profile (usage.py's primary use case)."""
+
+    def test_shared_already_matches_profile_is_a_pure_noop(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            profile = store.get("alpha")
+            profile.email = "alpha@example.com"
+            store.save(profile)
+            keychain.save_profile_slot(
+                store, "alpha", _go_keyring_secret("alpha@example.com")
+            )
+
+            kc = _MemoryKeychain(_slot_payload_json("alpha@example.com"))
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                guard = keychain.launch_guard(store, "alpha", capture=False)
+                state = guard.__enter__()
+                self.assertTrue(state._already_current)
+                self.assertFalse(state._swapped)
+                # Nothing swapped in on entry.
+                self.assertEqual(kc.calls, [])
+                state.__exit__(None, None, None)
+            # Nothing persisted/restored on exit either: still exactly what
+            # was there before the guard ran, and no write/delete happened.
+            self.assertEqual(kc.calls, [])
+            self.assertEqual(kc.shared, _slot_payload_json("alpha@example.com"))
+            self.assertEqual(
+                keychain.load_profile_slot(store, "alpha"),
+                _go_keyring_secret("alpha@example.com"),
+            )
+
+    def test_different_profile_in_shared_slot_keeps_existing_swap_behavior(self):
+        """Regression guard: a DIFFERENT profile's identity in the shared
+        slot must still go through the existing swap-and-restore path --
+        this fix must not affect the case where the shared slot is not
+        already this profile's own."""
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            profile = store.get("alpha")
+            profile.email = "alpha@example.com"
+            store.save(profile)
+            own_secret = _go_keyring_secret("alpha@example.com")
+            keychain.save_profile_slot(store, "alpha", own_secret)
+
+            kc = _MemoryKeychain(_slot_payload_json("mallory@example.com"))
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                guard = keychain.launch_guard(store, "alpha", capture=False)
+                state = guard.__enter__()
+                self.assertFalse(state._already_current)
+                self.assertTrue(state._swapped)
+                self.assertEqual(kc.shared, keychain.token_payload_for_slot(own_secret))
+                state.__exit__(None, None, None)
+            # Restored to the pre-call snapshot on exit, exactly as before
+            # this fix.
+            self.assertEqual(kc.shared, _slot_payload_json("mallory@example.com"))
+
+
+class TestLaunchGuardRecoversHexCorruptedSharedSlot(unittest.TestCase):
+    """Regression for the exponential-growth keychain corruption bug: a
+    shared slot value that has already been hex-wrapped twice (as if from
+    two prior corrupted read/write round-trips) must still let
+    ``launch_guard`` recover the real identity underneath -- both the
+    ``_already_current`` no-op path and the existing mismatch/quarantine
+    path -- instead of erroring out or misfiring on what looks like
+    garbage."""
+
+    def test_already_current_no_op_recovers_through_double_hex_corruption(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            profile = store.get("alpha")
+            profile.email = "alpha@example.com"
+            store.save(profile)
+            keychain.save_profile_slot(
+                store, "alpha", _go_keyring_secret("alpha@example.com")
+            )
+
+            real_shared = _slot_payload_json("alpha@example.com")
+            corrupted_shared = binascii.hexlify(binascii.hexlify(real_shared))
+            kc = _MemoryKeychain(corrupted_shared)
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                guard = keychain.launch_guard(store, "alpha", capture=False)
+                state = guard.__enter__()
+                self.assertTrue(state._already_current)
+                self.assertFalse(state._swapped)
+                self.assertEqual(kc.calls, [])
+                state.__exit__(None, None, None)
+            # A true no-op: the still-corrupted value is left untouched
+            # rather than rewritten (which would just re-wrap it again).
+            self.assertEqual(kc.calls, [])
+            self.assertEqual(kc.shared, corrupted_shared)
+
+    def test_different_profile_mismatch_still_detected_through_double_hex_corruption(self):
+        """A DIFFERENT profile's identity, hidden under the same double-hex
+        corruption, must still be recognized as different -- the guard
+        falls through to its normal swap-and-restore path, not a false
+        ``_already_current``. The restore at exit writes back the
+        NORMALIZED value, so this round-trip self-heals the corruption
+        instead of adding another hex layer to it."""
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            profile = store.get("alpha")
+            profile.email = "alpha@example.com"
+            store.save(profile)
+            own_secret = _go_keyring_secret("alpha@example.com")
+            keychain.save_profile_slot(store, "alpha", own_secret)
+
+            foreign_shared = _slot_payload_json("mallory@example.com")
+            corrupted_shared = binascii.hexlify(binascii.hexlify(foreign_shared))
+            kc = _MemoryKeychain(corrupted_shared)
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                guard = keychain.launch_guard(store, "alpha", capture=False)
+                state = guard.__enter__()
+                self.assertFalse(state._already_current)
+                self.assertTrue(state._swapped)
+                self.assertEqual(kc.shared, keychain.token_payload_for_slot(own_secret))
+                state.__exit__(None, None, None)
+            self.assertEqual(kc.shared, foreign_shared)
 
 
 class TestCaptureSharedSlotForImport(unittest.TestCase):

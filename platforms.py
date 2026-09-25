@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -208,6 +209,92 @@ def drain_tty_input() -> None:
             termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
     except (OSError, ValueError, AttributeError):
         pass
+
+
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    """Best-effort kill of ``proc``'s WHOLE process tree, not just itself.
+
+    POSIX: ``proc`` was started in its own session (see
+    ``run_with_group_kill``), so ``os.killpg`` reaches every descendant in
+    one signal. Windows has no `killpg` equivalent; ``taskkill /T`` is the
+    closest match (kills the process and its children by PID), with
+    ``proc.kill()`` as a final fallback either way if that itself fails.
+    Every failure here is swallowed -- the caller's own ``communicate()``
+    retry is what actually reaps the child; a kill that could not be
+    delivered must not turn into a crash of the timeout path itself.
+    """
+    if is_windows():
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        except OSError:
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def run_with_group_kill(
+    argv: Sequence[str],
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    timeout: Optional[float] = None,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text: bool = False,
+) -> subprocess.CompletedProcess:
+    """Like ``subprocess.run``, but a timeout kills the child's WHOLE
+    process tree instead of just the immediate child.
+
+    ``subprocess.run``'s own timeout handling only ever signals the
+    immediate child it spawned; any grandchild that child spawned (a tool
+    invocation, an OAuth browser helper, macOS's Security Agent for
+    `security`, ...) is left running and orphaned. Started in its own
+    session/process group (POSIX) or process group (Windows) precisely so
+    a timeout can reach the whole tree via ``_kill_process_group``.
+
+    Re-raises ``subprocess.TimeoutExpired`` on timeout, exactly like
+    ``subprocess.run`` -- callers keep their existing
+    ``except subprocess.TimeoutExpired`` contract (``usage.py``) or wrap
+    this to swallow it into a degraded result of their own
+    (``keychain._run``); this helper does not hide the timeout, only
+    hardens what happens to the child tree when one occurs.
+
+    ``stdin``/``stdout``/``stderr`` default to the usual pipe/devnull
+    behavior but are overridable: ``keychain._run`` passes temp files
+    instead of pipes to sidestep a macOS-specific deadlock (a `security`
+    grandchild inheriting the pipe write-end and blocking `communicate()`
+    forever) that this helper's other caller does not share.
+    """
+    popen_kwargs = dict(
+        stdin=stdin, stdout=stdout, stderr=stderr, env=env, text=text,
+    )
+    if is_windows():
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(list(argv), **popen_kwargs)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        proc.communicate()
+        raise
+    return subprocess.CompletedProcess(list(argv), proc.returncode, out, err)
 
 
 def run_wait(argv: Sequence[str], env: Mapping[str, str]) -> int:

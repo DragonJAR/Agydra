@@ -36,7 +36,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 import time
@@ -94,27 +93,20 @@ def _run(args) -> subprocess.CompletedProcess:
     out_fh = tempfile.TemporaryFile()
     err_fh = tempfile.TemporaryFile()
     try:
-        proc = subprocess.Popen(
-            ["security", *args],
-            stdin=subprocess.DEVNULL,
-            stdout=out_fh,
-            stderr=err_fh,
-            start_new_session=True,
-        )
         try:
-            proc.communicate(timeout=KEYCHAIN_TIMEOUT_S)
+            result = platforms.run_with_group_kill(
+                ["security", *args],
+                timeout=KEYCHAIN_TIMEOUT_S,
+                stdout=out_fh,
+                stderr=err_fh,
+            )
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
-                proc.kill()
-            proc.communicate()
             return subprocess.CompletedProcess(
                 args, returncode=-1, stdout=b"", stderr=b"security timed out"
             )
         out_fh.seek(0)
         err_fh.seek(0)
-        return subprocess.CompletedProcess(args, proc.returncode, out_fh.read(), err_fh.read())
+        return subprocess.CompletedProcess(args, result.returncode, out_fh.read(), err_fh.read())
     except OSError as exc:
         return subprocess.CompletedProcess(args, returncode=-1, stderr=str(exc).encode())
     finally:
@@ -122,19 +114,107 @@ def _run(args) -> subprocess.CompletedProcess:
         err_fh.close()
 
 
+_MAX_HEX_PEEL_LAYERS = 5
+"""Bound on how many accidental hex-encoding layers ``_normalize_read_slot_value``
+will peel back. Real corruption from the `security -w` round-trip bug is at
+most a handful of accidental re-reads/re-writes, never unbounded, so this is
+a safety cap against looping on adversarial/malformed input, not a tuning
+knob for a real scenario."""
+
+_HEX_BYTES_RE = re.compile(rb"^[0-9a-fA-F]+$")
+
+
+def _is_hex_bytes(data: bytes) -> bool:
+    """True when ``data`` is a non-empty, even-length string of only hex
+    digits -- i.e. a plausible ``binascii.unhexlify`` candidate."""
+    return bool(data) and len(data) % 2 == 0 and bool(_HEX_BYTES_RE.match(data))
+
+
+def _looks_like_real_payload(data: bytes) -> bool:
+    """True when ``data`` looks like the actual secret rather than yet
+    another hex layer to peel: the go-keyring envelope prefix, or plain
+    UTF-8 text (JSON included) that is not itself all hex digits.
+
+    The hex check runs BEFORE the UTF-8/JSON one on purpose: hexlifying an
+    ASCII hex-digit string (each of whose bytes is already in the
+    ``0-9a-f``/``0-9A-F`` range) always produces ANOTHER all-decimal-digit
+    string -- a byte value like ``0x61`` (``'a'``) hex-encodes to ``"61"``,
+    digits only, never a letter. A purely decimal string is also valid
+    JSON (a bare integer), so checking JSON validity first would mistake
+    an intermediate hex layer for the real payload and stop peeling one
+    layer too early -- checking hex-ness first avoids that false positive.
+    """
+    if data.startswith(_GO_KEYRING_PREFIX):
+        return True
+    if _is_hex_bytes(data):
+        return False
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return bool(text)
+
+
+def _normalize_read_slot_value(raw: bytes) -> bytes:
+    """Undo ``security find-generic-password -w``'s output quirks.
+
+    Two independent, empirically observed quirks: it always appends exactly
+    one trailing ``\\n`` to whatever it prints, and it can print a stored
+    value back as a HEX-ASCII representation of the raw bytes instead of the
+    raw bytes themselves. Neither is compensated for by the caller, so a
+    value read once and written back unchanged (e.g. a launch guard's
+    restore path) picks up one more layer of hex-encoding each round-trip --
+    this is the fix for that corruption.
+
+    Strips exactly one trailing ``\\n`` -- never more, since a secret that
+    legitimately ends in ``\\n`` still gets that one appended by `security`
+    itself, and blindly ``.rstrip()``-ing would eat a real trailing newline.
+
+    Then, bounded by ``_MAX_HEX_PEEL_LAYERS``, peels one hex layer at a time
+    ONLY while doing so stays fully justified: the current bytes must
+    themselves be a valid even-length, all-hex-digit string, AND the result
+    of unhexlifying them must be either shorter hex (keep peeling) or
+    something that looks like the real payload (stop and return it). Any
+    step that fails this -- not hex, a decode error, or a peel landing on
+    bytes that are neither further hex nor a recognizable payload -- aborts
+    the WHOLE peel and returns the newline-stripped value AS-IS: a partial,
+    unjustified peel would risk mangling a genuine secret, so this fails
+    toward "let the existing identity-mismatch/quarantine logic treat it as
+    undecodable" rather than guessing wrong. Never raises: this is the one
+    place in the module that hex-decodes a read value; do not duplicate it.
+    """
+    stripped = raw[:-1] if raw.endswith(b"\n") else raw
+    current = stripped
+    for _ in range(_MAX_HEX_PEEL_LAYERS):
+        if not _is_hex_bytes(current):
+            return stripped
+        try:
+            peeled = binascii.unhexlify(current)
+        except (binascii.Error, ValueError):
+            return stripped
+        if _looks_like_real_payload(peeled):
+            return peeled
+        if not _is_hex_bytes(peeled):
+            return stripped
+        current = peeled
+    return stripped
+
+
 def read_slot(service: str, keychain_path: Optional[Path] = None) -> Optional[bytes]:
     """Return the slot's secret bytes, or None when absent/unreadable.
 
     ``keychain_path``, when given, is appended as the explicit target so the
     lookup never depends on the ambient "default keychain" — see
-    ``_ensure_target_keychain``.
+    ``_ensure_target_keychain``. On success the raw ``security`` output is
+    passed through ``_normalize_read_slot_value`` first (trailing-newline
+    strip + accidental hex-layer peeling); see that function's docstring.
     """
     args = ["find-generic-password", "-s", service, "-a", SHARED_ACCOUNT, "-w"]
     if keychain_path is not None:
         args.append(str(keychain_path))
     result = _run(args)
     if result.returncode == 0:
-        return result.stdout
+        return _normalize_read_slot_value(result.stdout)
     if result.returncode in NOT_FOUND_CODES:
         return None
     raise KeychainError(
@@ -493,6 +573,19 @@ def launch_guard(store, profile: str, capture: bool = False):
     whatever credential source the profile still has (its on-disk token,
     or nothing, in which case the shared slot is cleared like any other
     profile with no usable private slot).
+
+    Non-login (``capture=False``) entry has one more short-circuit: when
+    the shared slot ALREADY decodes to ``profile``'s own known identity
+    (a real session for this exact profile is already running and put it
+    there), entry does nothing at all -- no swap in, no lock-protected
+    write -- and exit correspondingly persists/restores nothing either.
+    Without this, every call would still swap the profile's own `.secret`
+    in and, on exit, restore whatever the shared slot held *before* this
+    call -- which, if the still-running session refreshed its OAuth token
+    while this call's subprocess was executing, is now stale and would
+    clobber that live session's fresh token. A DIFFERENT profile currently
+    occupying the shared slot (the non-busy-profile case) is unaffected and
+    still gets the existing, ``swap.lock``-serialized swap-and-restore.
     """
     if not supported():
         import contextlib
@@ -504,6 +597,7 @@ def launch_guard(store, profile: str, capture: bool = False):
             self._lock = None
             self._had_shared: Optional[bytes] = None
             self._swapped = False
+            self._already_current = False
             self._keychain_path: Optional[Path] = None
             try:
                 self._lock = _serialize_lock(store)
@@ -511,6 +605,28 @@ def launch_guard(store, profile: str, capture: bool = False):
                 if self._keychain_path is None:
                     return self
                 self._had_shared = read_slot(shared_slot(), self._keychain_path)
+                if not capture and self._had_shared is not None:
+                    # The shared slot already carries the plain-JSON payload
+                    # (see ``token_payload_for_slot``), not the envelope
+                    # form ``_secret_identity`` decodes -- re-envelope it in
+                    # memory purely to reuse that one decode path, the same
+                    # trick ``_persist_if_trusted`` already relies on.
+                    shared_identity = _secret_identity(
+                        envelope_token_bytes(self._had_shared)
+                    )
+                    if shared_identity is not None:
+                        known = _known_identity(store, profile, include_secret=False)
+                        if known is not None and shared_identity == known:
+                            # The shared slot already holds THIS profile's
+                            # own live credential (a real session for it is
+                            # already running). Swapping anything in/out
+                            # here would risk clobbering a token that
+                            # session refreshes while our subprocess runs --
+                            # see the module docstring's launch_guard notes.
+                            # Treat this as a true no-op: nothing is read,
+                            # written, or restored for this invocation.
+                            self._already_current = True
+                            return self
                 slot = load_profile_slot(store, profile)
                 if slot is not None:
                     known = _known_identity(store, profile, include_secret=False)
@@ -552,6 +668,10 @@ def launch_guard(store, profile: str, capture: bool = False):
         def __exit__(self, *exc_info):
             try:
                 if self._keychain_path is None:
+                    return False
+                if self._already_current:
+                    # Entry made no change (see __enter__): exit persists
+                    # and restores nothing either, so this is a pure read.
                     return False
                 if self._swapped and not capture:
                     current = read_slot(shared_slot(), self._keychain_path)
