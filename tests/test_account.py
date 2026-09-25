@@ -209,5 +209,48 @@ class TestSyncProfileEmailKeychainPoisoning(unittest.TestCase):
             self.assertEqual(refreshed.email, "new@example.com")
 
 
+class TestAuthStateKeychain(unittest.TestCase):
+    def _write_secret(self, store, name, access_token="a", refresh_token="r"):
+        payload = json.dumps({
+            "token": {"access_token": access_token, "refresh_token": refresh_token},
+            "auth_method": "consumer",
+        }).encode("utf-8")
+        secret = b"go-keyring-base64:" + base64.b64encode(payload)
+        keychain.save_profile_slot(store, name, secret)
+
+    def test_valid_keychain_secret_is_authenticated(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("kc")
+            self._write_secret(store, "kc")
+            data_dir = store.profile_data_dir("kc")
+            self.assertFalse((data_dir / account.AGY_CLI_DIR).exists())
+
+            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
+                    mock.patch.object(keychain, "supported", return_value=True):
+                self.assertEqual(account.auth_state(data_dir, store, "kc"), "authenticated")
+
+    def test_corrupt_keychain_secret_is_not_authenticated(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("kc")
+            keychain.save_profile_slot(store, "kc", b"corrupted-not-an-envelope-or-valid-json")
+            data_dir = store.profile_data_dir("kc")
+
+            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
+                    mock.patch.object(keychain, "supported", return_value=True):
+                self.assertEqual(account.auth_state(data_dir, store, "kc"), "not-authenticated")
+
+    def test_no_secret_or_token_is_not_authenticated(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("empty")
+            data_dir = store.profile_data_dir("empty")
+
+            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
+                    mock.patch.object(keychain, "supported", return_value=True):
+                self.assertEqual(account.auth_state(data_dir, store, "empty"), "not-authenticated")
+
+
 if __name__ == "__main__":
     unittest.main()
