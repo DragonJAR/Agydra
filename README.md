@@ -248,7 +248,7 @@ agydra/                     # repo root — flat layout, no package subdir
 ├── orphans.py          # Reverse scan + cleanup of orphaned store artifacts
 ├── usage.py            # `agydra usage`: query + parse agy's /usage quota report
 ├── bootstrap.py        # One-command installer (venv + console script + PATH shim)
-├── tests/              # 512 tests (fake home + fake agy binary fixtures)
+├── tests/              # 517 tests (fake home + fake agy binary fixtures)
 ├── README.md           # This document (English)
 ├── README.es.md        # Spanish version
 ├── AGENTS.md           # Development conventions
@@ -302,7 +302,7 @@ disabled otherwise (pipes, CI). `NO_COLOR=1` forces plain output;
 - Every feature must work cross-platform (macOS, Linux, Windows) from the
   single codebase; keep `platforms.py` the only per-OS layer.
 - Run the full suite before opening a change:
-  `python3 -m pytest -q` (512 passed + 3 platform skips on macOS).
+  `python3 -m pytest -q` (517 passed + 3 platform skips on macOS).
 - See [AGENTS.md](AGENTS.md) for conventions.
 
 ## 📄 License
