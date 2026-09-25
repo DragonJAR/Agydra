@@ -187,7 +187,6 @@ class TestPickFreeProfileAuthAndBusyOrder(BaseCase):
         self.assertEqual(res.name, "solo")
         self.assertIn("marker", res.reason)
 
-        # Without the marker in cwd, it raises MIN_PROFILES floor error
         with self.assertRaises(StoreError) as ctx:
             resolver.pick_free_profile(single_store, cwd=self._tmp)
         self.assertIn("at least 2 profiles", str(ctx.exception))

@@ -274,7 +274,7 @@ class TestDrainTtyInput(unittest.TestCase):
                 mock.patch.object(platforms, "is_windows", return_value=True), \
                 mock.patch.object(ctypes, "windll", windll, create=True):
             platforms.drain_tty_input()
-        kernel32.GetStdHandle.assert_called_once_with(-10)  # STD_INPUT_HANDLE
+        kernel32.GetStdHandle.assert_called_once_with(-10)
         kernel32.FlushConsoleInputBuffer.assert_called_once_with(1234)
 
     def test_never_raises_on_tty_errors(self):
@@ -287,7 +287,7 @@ class TestDrainTtyInput(unittest.TestCase):
         with mock.patch.object(_sys, "stdin", self._fake_stdin(True)), \
                 mock.patch.object(platforms, "is_windows", return_value=False), \
                 mock.patch("termios.tcflush", exploding_flush):
-            platforms.drain_tty_input()  # must swallow, not raise
+            platforms.drain_tty_input()
 
     def test_fileneno_failure_is_swallowed(self):
         import sys as _sys

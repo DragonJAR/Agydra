@@ -376,6 +376,27 @@ class ShimInstall(unittest.TestCase):
                 shim2 = bootstrap.ensure_path_shim(proj, lambda _l: None)
                 self.assertEqual(shim2, expected)
 
+    def test_shim_write_goes_through_temp_file_and_replace(self):
+        """Refreshing an existing shim must never touch the live shim path
+        directly: a failure during the final rename (disk full, permission
+        lost mid-setup) must leave the previous shim byte-for-byte intact
+        instead of a truncated/corrupt file, matching every other durable
+        write in the project (store.py's mkstemp + fsync + os.replace
+        discipline)."""
+        if sys.platform.startswith("win"):
+            self.skipTest("POSIX-only")
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            with _sandbox_home(Path(td)) as expected:
+                bootstrap.ensure_path_shim(proj, lambda _l: None)
+                original = expected.read_text(encoding="utf-8")
+                with mock.patch.object(
+                    bootstrap.os, "replace", side_effect=OSError("disk full"),
+                ):
+                    with self.assertRaises(bootstrap.BootstrapError):
+                        bootstrap.ensure_path_shim(proj, lambda _l: None)
+                self.assertEqual(expected.read_text(encoding="utf-8"), original)
+
     def test_oserror_writing_shim_becomes_bootstrap_error(self):
         """A filesystem failure inside ensure_path_shim (e.g. an unwritable
         ~/.local/bin) must surface as a clean BootstrapError, matching every
@@ -387,7 +408,7 @@ class ShimInstall(unittest.TestCase):
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)):
                 with mock.patch.object(
-                    bootstrap.Path, "write_text",
+                    bootstrap.tempfile, "mkstemp",
                     side_effect=PermissionError("denied"),
                 ):
                     with self.assertRaises(bootstrap.BootstrapError):
@@ -405,7 +426,7 @@ class ShimInstall(unittest.TestCase):
                 bootstrap.install_editable = lambda _root, _vpy, _out: None
                 try:
                     with mock.patch.object(
-                        bootstrap.Path, "write_text",
+                        bootstrap.tempfile, "mkstemp",
                         side_effect=PermissionError("denied"),
                     ):
                         captured: list[str] = []

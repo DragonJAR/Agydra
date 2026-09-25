@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/Licencia-MIT-yellow.svg" alt="Licencia: MIT"></a>
-  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Versi%C3%B3n-1.2.0-blue.svg" alt="Versión"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Versi%C3%B3n-1.0.0-blue.svg" alt="Versión"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white" alt="Python"></a>
   <img src="https://img.shields.io/badge/Plataformas-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey.svg" alt="Plataformas">
   <a href="https://www.DragonJAR.org"><img src="https://img.shields.io/badge/Autor-DragonJAR-orange.svg" alt="Autor: DragonJAR"></a>
@@ -79,7 +79,7 @@ agydra doctor
 ```
 
 ```text
-agydra doctor — agydra 1.2.0 on darwin
+agydra doctor — agydra 1.0.0 on darwin
 legend: [ok]=pass [!!]=warn [XX]=fail
 [ok] agy binary: /usr/local/bin/agy
 [ok] store writable: ~/Library/Application Support/agydra
@@ -258,7 +258,7 @@ agydra/                  # raíz del repo — layout plano, sin subdirectorio de
 ├── orphans.py           # escaneo inverso + limpieza de artefactos huérfanos
 ├── usage.py             # `agydra usage`: consulta y parseo de cuotas de agy /usage
 ├── bootstrap.py         # instalador de un comando (venv + script de consola + shim en PATH)
-├── tests/               # 511 tests (fake home + binario agy falso)
+├── tests/               # 512 tests (fake home + binario agy falso)
 ├── README.md            # Este documento (inglés)
 ├── README.es.md         # Versión en español
 ├── AGENTS.md            # Convenciones de desarrollo
@@ -300,7 +300,7 @@ Orden de resolución del binario `agy`: flag `--binary` → `agy_binary` en `agy
 
 - **Solo stdlib.** Cero dependencias de terceros; Python ≥ 3.9. No añadas paquetes.
 - **Multiplataforma por construcción.** Cada diferencia de OS vive en `platforms.py` y en los helpers de enlaces de `isolation.py`; nunca ramifiques por SO fuera de esos límites.
-- **Tests antes de declarar listo.** Desde la raíz del repo: `python3 -m pytest -q` (511 pasan + 3 skips de plataforma en macOS).
+- **Tests antes de declarar listo.** Desde la raíz del repo: `python3 -m pytest -q` (512 pasan + 3 skips de plataforma en macOS).
 - Consulta `AGENTS.md` para las guías de invariantes, layout y convenciones del proyecto.
 
 ## 📄 Licencia

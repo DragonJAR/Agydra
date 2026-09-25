@@ -195,7 +195,7 @@ def drain_tty_input() -> None:
             import ctypes
 
             kernel32 = ctypes.windll.kernel32
-            handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+            handle = kernel32.GetStdHandle(-10)
             kernel32.FlushConsoleInputBuffer(handle)
         else:
             import termios

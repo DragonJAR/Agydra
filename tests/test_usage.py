@@ -206,7 +206,7 @@ class TestQueryProfileUsageFailureModes(_UsageBase):
         self.assertIn("timed out", result.error)
 
     def test_not_authenticated_short_circuits_without_subprocess(self):
-        self.store.create("beta")  # never authenticated: no token file
+        self.store.create("beta")
         with mock.patch.object(usage.subprocess, "run") as mock_run:
             result = usage.query_profile_usage(self.store, "beta")
         mock_run.assert_not_called()

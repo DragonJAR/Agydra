@@ -1,7 +1,6 @@
 """Exhaustive matrix validation for all CLI parameters, flags, bundles, and subcommands."""
 from __future__ import annotations
 
-import os
 import sys
 import unittest
 from pathlib import Path
@@ -227,7 +226,7 @@ class TestCliParameterMatrix(BaseCase):
             with self.subTest(cmd=cmd):
                 res = self._run_cli(cmd)
                 self.assertEqual(res.returncode, 0, res.stderr)
-                self.assertIn("agydra 1.2.0", res.stdout)
+                self.assertIn("agydra 1.0.0", res.stdout)
 
 
 if __name__ == "__main__":

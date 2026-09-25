@@ -989,7 +989,7 @@ class TestPurgeProfileSlot(BaseCase):
 
         with mock.patch.object(keychain, "supported", return_value=True), \
                 mock.patch.object(keychain, "_run", failing_run):
-            keychain.purge_profile_slot(self.store, "work")  # must not raise
+            keychain.purge_profile_slot(self.store, "work")
         self.assertFalse(self.backup.exists())
 
 
@@ -1270,7 +1270,7 @@ class TestDescribeSharedFormat(unittest.TestCase):
             def run(self, args, input_bytes=None):
                 if args[0] == "find-generic-password" and "-w" in args:
                     if self.shared is None:
-                        return _rc(44)  # NOT_FOUND → read_slot returns None
+                        return _rc(44)
                     return _rc(0, self.shared)
                 return _rc(0)
 
@@ -1391,7 +1391,7 @@ class TestLaunchGuardFailOpenOnForeignSecret(unittest.TestCase):
                         keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
                     ):
                 guard = keychain.launch_guard(store, "alpha")
-                state = guard.__enter__()  # must NOT raise ValueError
+                state = guard.__enter__()
             self.assertFalse(state._swapped, "undecodable slot must not be swapped")
 
 
@@ -1450,7 +1450,6 @@ class TestPersistClassification(unittest.TestCase):
             "token": {"access_token": "ya29.refreshed", "refresh_token": "rt",
                       "token_type": "Bearer", "expiry": "2099-01-01T00:00:00Z"},
             "auth_method": "consumer",
-            # NO id_token: the refresh-response shape
         }).encode()
         self.different_payload = _json.dumps({
             "token": {"access_token": "ya29.x", "refresh_token": "r",
@@ -1522,7 +1521,6 @@ class TestLaunchGuardPersistOnExit(unittest.TestCase):
     it observes the slot, never rewrites the profile's backup)."""
 
     def test_persist_block_skipped_and_restore_intact(self):
-        import sys as _sys
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1531,7 +1529,7 @@ class TestLaunchGuardPersistOnExit(unittest.TestCase):
             kc = _MemoryKeychain(had)
 
             def fake_run(args, input_bytes=None):
-                return _rc(0)  # find/write/delete all succeed
+                return _rc(0)
 
             # A .secret so the swap happens (non-empty slot → swapped).
             slots = keychain._slots_dir(store)
@@ -1551,7 +1549,7 @@ class TestLaunchGuardPersistOnExit(unittest.TestCase):
                         keychain, "_persist_if_trusted") as persist:
                 with keychain.launch_guard(store, "work",
                                            persist_on_exit=False):
-                    pass  # simulate the agy query
+                    pass
             persist.assert_not_called()
             # Restore semantics untouched: shared slot back to had_shared.
             self.assertEqual(kc.shared, had)
@@ -1677,7 +1675,7 @@ class TestLaunchGuardExitRedundantRead(unittest.TestCase):
             secret = _go_keyring_secret("alpha@example.com")
             keychain.save_profile_slot(store, "alpha", secret)
 
-            kc = _MemoryKeychain(None)  # had_shared is None
+            kc = _MemoryKeychain(None)
             read_count = 0
             orig_read_slot = keychain.read_slot
 
@@ -1700,7 +1698,6 @@ class TestLaunchGuardExitRedundantRead(unittest.TestCase):
                 with mock.patch.object(keychain, "read_slot", side_effect=counting_read_slot):
                     state.__exit__(None, None, None)
 
-            # On exit, read_slot should be called at most once (for persist/checking content), not twice!
             self.assertEqual(read_count, 1)
 
     def test_exit_reads_slot_at_most_once_when_persist_on_exit_false(self):
@@ -1710,7 +1707,7 @@ class TestLaunchGuardExitRedundantRead(unittest.TestCase):
             secret = _go_keyring_secret("alpha@example.com")
             keychain.save_profile_slot(store, "alpha", secret)
 
-            kc = _MemoryKeychain(None)  # had_shared is None
+            kc = _MemoryKeychain(None)
             read_count = 0
             orig_read_slot = keychain.read_slot
 
@@ -1733,7 +1730,6 @@ class TestLaunchGuardExitRedundantRead(unittest.TestCase):
                 with mock.patch.object(keychain, "read_slot", side_effect=counting_read_slot):
                     state.__exit__(None, None, None)
 
-            # When persist_on_exit is False, read_slot is called at most once to check if content needs deletion
             self.assertEqual(read_count, 1)
 
 

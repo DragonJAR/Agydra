@@ -87,7 +87,6 @@ class TestUsageCli(BaseCase):
         self.store = Store()
         for name in ("alpha", "beta", "gamma", "delta"):
             self.store.create(name)
-        # gamma is left unauthenticated on purpose.
         for name in ("alpha", "beta", "delta"):
             token_dir = self.store.profile_data_dir(name) / "antigravity-cli"
             token_dir.mkdir(parents=True, exist_ok=True)
@@ -167,7 +166,6 @@ class TestUsageCli(BaseCase):
         self.assertIn("not authenticated", res.stderr)
 
     def test_no_profiles_prints_hint(self):
-        # Fresh store with no profiles at all.
         empty_store_dir = self._tmp / "empty-store"
         empty_store_dir.mkdir()
         env = dict(os.environ)

@@ -162,7 +162,6 @@ class TestLockHolderPid(BaseCase):
         first.record_holder_pid()
         first.release()
 
-        # Subsequent session acquires lock without recording PID
         second = locks.try_lock(self.store, "work")
         try:
             self.assertTrue(locks.is_locked(self.store, "work"))

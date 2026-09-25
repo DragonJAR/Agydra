@@ -14,13 +14,18 @@ Design invariants (see AGENTS.md):
 - Idempotent: every step checks its own precondition and no-ops when already
   satisfied; re-running never destroys a working install.
 - Never requires sudo/admin: everything lives under the user directory.
-- No network: ``pip install -e .`` resolves from local metadata only.
+- No network for the install itself: ``pip install -e .`` resolves from
+  local metadata only. The one documented exception is ``install_editable``
+  upgrading the venv's own pip from PyPI when it is older than
+  ``PIP_FLOOR`` (needed for PEP 660 editable installs); that step runs at
+  most once per venv and only on a pip old enough to lack the feature.
 """
 from __future__ import annotations
 
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -190,6 +195,32 @@ def install_editable(root: Path, vpy: Path, out: Callable[[str], None]) -> None:
         raise BootstrapError(f"pip succeeded but console script is missing: {script}")
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write ``content`` to ``path`` atomically: a unique temp file in the
+    same directory, flushed and fsync'd, then ``os.replace``d into place.
+
+    Mirrors store.py's mkstemp + fsync + os.replace discipline so the shim
+    can never end up truncated by a crash or a permission loss mid-write —
+    a failure before the replace leaves whatever was already at ``path``
+    (nothing, or a previous valid shim) untouched.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def ensure_path_shim(root: Path, out: Callable[[str], None]) -> Optional[Path]:
     """Write (or refresh) the ``~/.local/bin/agydra`` shim.
 
@@ -218,7 +249,7 @@ def ensure_path_shim(root: Path, out: Callable[[str], None]) -> Optional[Path]:
                         "inspect it and remove it manually, then re-run setup"
                     )
                 out(f"refreshing stale shim: {shim}")
-        shim.write_text(_shim_content(target), encoding="utf-8")
+        _atomic_write_text(shim, _shim_content(target))
         shim.chmod(shim.stat().st_mode | 0o755)
     except OSError as exc:
         raise BootstrapError(f"could not write shim at {shim}: {exc}") from exc
