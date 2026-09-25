@@ -328,6 +328,19 @@ class TestBusyGuards(BaseCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.store.exists("work"))
 
+    def test_dashed_rm_alias_force_skips_confirmation_like_delete(self):
+        """``-rm`` is delete's ``rm`` alias resolved via the single-dash
+        subcommand dispatch form (``_resolve_subcommand``) -- INTENTIONALLY
+        a subcommand, not a launcher-mode bundle, since ``rm`` only
+        partially overlaps the launcher's short-flag letters (see
+        ``test_partial_letter_overlap_alias_dispatches_as_subcommand`` in
+        test_vocab_and_bundles.py). ``agydra -rm work -f`` must skip the
+        confirmation prompt exactly like ``agydra delete work -f`` does,
+        since the trailing ``-f`` is parsed as delete's own --force."""
+        result = self._run_cli("-rm", "work", "-f", "--no-backup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.store.exists("work"))
+
     def test_rename_refuses_busy_profile(self):
         handle = locks.try_lock(self.store, "work")
         try:

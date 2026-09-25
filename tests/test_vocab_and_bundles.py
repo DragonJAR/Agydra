@@ -21,12 +21,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cli import (
+    _check_no_launcher_long_flag_collision,
+    _check_no_launcher_short_flag_collision,
     _consume_launch_flags,
+    _is_all_launcher_letters,
+    _LAUNCHER_LONG_NAMES,
+    _LAUNCHER_SHORT_LETTERS,
     _match_flag,
+    _resolve_subcommand,
     _warn_late_flags,
 )
 from store import Store, StoreError
 
+import vocab
 from conftest import BaseCase
 
 
@@ -200,7 +207,7 @@ class TestReservedProfileNames(BaseCase):
                 self.assertIn("reserved profile name", str(cm.exception))
 
     def test_alias_is_refused(self):
-        for alias in ("ls", "mv", "rm", "c", "in", "imp", "us"):
+        for alias in ("ls", "mv", "rm", "c", "in", "imp", "us", "h"):
             with self.subTest(alias=alias):
                 with self.assertRaises(StoreError) as cm:
                     self.store.create(alias)
@@ -264,6 +271,148 @@ class TestRuntimeBundleLaunch(BaseCase):
         result = self._run_cli("-n", "-p", "lab", "chat")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("profile : lab", result.stdout)
+
+
+class TestLauncherShortFlagCollisionGuard(unittest.TestCase):
+    """A single-dash subcommand token (``agydra -<name>``) is indistinguishable
+    from a launcher-mode short-flag bundle when every character of ``<name>``
+    is itself one of the launcher's own short-flag letters -- ``-nr`` must
+    always mean ``-n -r``, never a hypothetical subcommand named "nr". This
+    collision must never silently reappear as either vocabulary grows, so
+    it is checked at import time against the real tables AND unit-tested
+    here directly against crafted, hypothetical vocabularies -- not just
+    today's real data."""
+
+    def test_real_vocabulary_has_no_collision_today(self):
+        _check_no_launcher_short_flag_collision(
+            vocab.CANONICAL, _LAUNCHER_SHORT_LETTERS
+        )
+
+    def test_is_all_launcher_letters_true_for_full_overlap(self):
+        self.assertTrue(_is_all_launcher_letters("nr", {"n", "r"}))
+        self.assertTrue(_is_all_launcher_letters("prnbf", {"p", "r", "n", "b", "f"}))
+
+    def test_is_all_launcher_letters_false_for_partial_or_no_overlap(self):
+        self.assertFalse(_is_all_launcher_letters("rm", {"p", "r", "n", "b", "f"}))
+        self.assertFalse(_is_all_launcher_letters("us", {"p", "r", "n", "b", "f"}))
+
+    def test_is_all_launcher_letters_false_for_empty_token(self):
+        self.assertFalse(_is_all_launcher_letters("", {"p", "r", "n", "b", "f"}))
+
+    def test_guard_raises_for_a_hypothetical_colliding_alias(self):
+        hypothetical_canonical = {"list": "list", "nr": "list"}
+        with self.assertRaises(RuntimeError) as cm:
+            _check_no_launcher_short_flag_collision(
+                hypothetical_canonical, {"p", "r", "n", "b", "f"}
+            )
+        self.assertIn("nr", str(cm.exception))
+
+    def test_guard_passes_for_a_non_colliding_hypothetical_vocabulary(self):
+        hypothetical_canonical = {"list": "list", "status": "status"}
+        _check_no_launcher_short_flag_collision(
+            hypothetical_canonical, {"p", "r", "n", "b", "f"}
+        )
+
+    def test_guard_detects_collision_if_a_new_launcher_letter_is_added(self):
+        """Simulates the launcher vocabulary growing a new short flag that
+        happens to spell out an existing subcommand alias entirely."""
+        hypothetical_canonical = {"doctor": "doctor", "doc": "doctor"}
+        with self.assertRaises(RuntimeError):
+            _check_no_launcher_short_flag_collision(
+                hypothetical_canonical, {"d", "o", "c"}
+            )
+
+
+class TestLauncherLongFlagCollisionGuard(unittest.TestCase):
+    """A double-dash subcommand token (``agydra --<name>``) is resolved by
+    ``_resolve_subcommand`` BEFORE the launcher's own argparse-based flag
+    parsing ever runs, so a subcommand named exactly like one of
+    ``_LAUNCH_FLAGS``'s long names (e.g. a hypothetical subcommand
+    ``force``) would silently shadow that launcher flag (``agydra --force``
+    would dispatch to the subcommand instead of setting the force flag).
+    This is the second, narrower collision class from the short-flag
+    bundle one above; checked at import time against the real tables AND
+    unit-tested here directly against crafted, hypothetical vocabularies."""
+
+    def test_real_vocabulary_has_no_collision_today(self):
+        _check_no_launcher_long_flag_collision(
+            vocab.CANONICAL, _LAUNCHER_LONG_NAMES
+        )
+
+    def test_guard_raises_for_a_hypothetical_colliding_alias(self):
+        hypothetical_canonical = {"list": "list", "force": "list"}
+        with self.assertRaises(RuntimeError) as cm:
+            _check_no_launcher_long_flag_collision(
+                hypothetical_canonical, {"profile", "random", "dry-run", "binary", "force"}
+            )
+        self.assertIn("force", str(cm.exception))
+
+    def test_guard_passes_for_a_non_colliding_hypothetical_vocabulary(self):
+        hypothetical_canonical = {"list": "list", "status": "status"}
+        _check_no_launcher_long_flag_collision(
+            hypothetical_canonical, {"profile", "random", "dry-run", "binary", "force"}
+        )
+
+    def test_guard_detects_collision_if_a_new_launcher_long_name_is_added(self):
+        """Simulates the launcher vocabulary growing a new long flag that
+        happens to exactly spell out an existing subcommand alias."""
+        hypothetical_canonical = {"doctor": "doctor", "doc": "doctor"}
+        with self.assertRaises(RuntimeError):
+            _check_no_launcher_long_flag_collision(
+                hypothetical_canonical, {"doc"}
+            )
+
+
+class TestResolveSubcommandSingleDash(unittest.TestCase):
+    """Direct unit coverage of the single-dash resolution rule, independent
+    of subprocess end-to-end tests."""
+
+    def test_single_dash_resolves_every_canonical_name_and_alias(self):
+        for canonical, aliases in vocab.SUBCOMMAND_ALIASES.items():
+            for name in (canonical, *aliases):
+                with self.subTest(name=name):
+                    self.assertEqual(_resolve_subcommand("-" + name), canonical)
+
+    def test_double_dash_still_resolves_every_canonical_name_and_alias(self):
+        for canonical, aliases in vocab.SUBCOMMAND_ALIASES.items():
+            for name in (canonical, *aliases):
+                with self.subTest(name=name):
+                    self.assertEqual(_resolve_subcommand("--" + name), canonical)
+
+    def test_bare_still_resolves_every_canonical_name_and_alias(self):
+        for canonical, aliases in vocab.SUBCOMMAND_ALIASES.items():
+            for name in (canonical, *aliases):
+                with self.subTest(name=name):
+                    self.assertEqual(_resolve_subcommand(name), canonical)
+
+    def test_launcher_bundles_never_resolve_to_a_subcommand(self):
+        for token in ("-n", "-r", "-nr", "-rp", "-rn", "-b/opt/agy", "-nrf", "-", "--"):
+            with self.subTest(token=token):
+                self.assertIsNone(_resolve_subcommand(token))
+
+    def test_unrelated_dashed_token_resolves_to_none(self):
+        self.assertIsNone(_resolve_subcommand("-xyz"))
+        self.assertIsNone(_resolve_subcommand("--xyz"))
+
+    def test_partial_letter_overlap_alias_dispatches_as_subcommand(self):
+        """``-rm``/``--rm`` are INTENTIONALLY subcommand dispatch (``delete``
+        via its ``rm`` alias), not a launcher-mode short-flag bundle.
+
+        Only tokens FULLY composed of the launcher's own short-flag letters
+        (``p``/``r``/``n``/``b``/``f``) are protected from single-dash
+        dispatch by ``_check_no_launcher_short_flag_collision`` and stay
+        bundles (see ``TestLauncherShortFlagCollisionGuard`` and
+        ``test_launcher_bundles_never_resolve_to_a_subcommand`` above).
+        ``rm`` only PARTIALLY overlaps those letters (``r`` is one, ``m`` is
+        not), so it is not fully-launcher-letters and dispatches as a
+        subcommand instead -- a consistent extension of the pre-existing
+        ``--rm`` -> delete precedent (which predates single-dash support),
+        not a new special case. A direct, real-world consequence: a token
+        like ``agydra -rm alpha`` deletes profile ``alpha`` instead of being
+        forwarded to ``agy`` as opaque args.
+        """
+        self.assertEqual(_resolve_subcommand("-rm"), "delete")
+        self.assertEqual(_resolve_subcommand("--rm"), "delete")
 
 
 class TestRuntimeCreateRefusesReservedName(BaseCase):

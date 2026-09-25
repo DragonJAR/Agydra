@@ -190,6 +190,8 @@ OAuth tokens are never copied
 
 ## 🧭 Commands
 
+Any management command below also works as `--NAME`/`-NAME` (e.g. `agydra --list`, `agydra -list`), matching the `--help`/`--version` precedent.
+
 | Command | Description |
 |---|---|
 | `agydra [-p PROFILE\|#] [-r] [-n] [-b PATH] [-f] <agy args...>` | Launch `agy` with the resolved profile. Flags must come **before** agy args (a late `-p` is passed to agy with a warning). Short flags bundle: `-nr -p work` == `-n -r -p work`. `-r` picks a free profile, `-n` dry-run, `-b` binary override, `-f` skips the session lock. Profile names may not collide with a subcommand or alias (`status`, `ls`, `mv`, ...) — the dispatcher would shadow them |
