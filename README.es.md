@@ -258,7 +258,7 @@ agydra/                  # raíz del repo — layout plano, sin subdirectorio de
 ├── orphans.py           # escaneo inverso + limpieza de artefactos huérfanos
 ├── usage.py             # `agydra usage`: consulta y parseo de cuotas de agy /usage
 ├── bootstrap.py         # instalador de un comando (venv + script de consola + shim en PATH)
-├── tests/               # 490+ tests (fake home + binario agy falso)
+├── tests/               # 511 tests (fake home + binario agy falso)
 ├── README.md            # Este documento (inglés)
 ├── README.es.md         # Versión en español
 ├── AGENTS.md            # Convenciones de desarrollo

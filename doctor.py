@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple
 
 from agydra import __version__
 import account, isolation, keychain, platforms
@@ -361,7 +361,7 @@ CHECKS = [
 ]
 
 
-def _fix_orphans(store: Store, names_or_ctx: Union["_DoctorContext", Sequence[str]]) -> None:
+def _fix_orphans(store: Store, names: Sequence[str]) -> None:
     """Remove orphaned store artifacts found by ``_check_orphans``.
 
     Confirmation is a CLI concern, not a doctor one: ``cli.cmd_doctor``
@@ -370,14 +370,14 @@ def _fix_orphans(store: Store, names_or_ctx: Union["_DoctorContext", Sequence[st
     approved -- this quietly performs it and reports exactly what it
     removed, in the same style as the check lines above it.
 
-    ``names_or_ctx`` can be a FRESH profile list or a context snapshot:
-    the confirmation pause can take an arbitrary time, during which a
-    profile could be deleted by hand, genuinely orphaning its overlay/
-    keychain-secret -- a fresh ``names`` avoids missing that.
+    ``names`` must be a FRESH profile list, not a stale ``_DoctorContext``
+    snapshot: the confirmation pause can take an arbitrary time, during
+    which a profile could be deleted by hand, genuinely orphaning its
+    overlay/keychain-secret -- the caller re-derives ``names`` right
+    before calling this, same as the keychain-orphan purge next to it.
     """
     import orphans
 
-    names = names_or_ctx.names if isinstance(names_or_ctx, _DoctorContext) else names_or_ctx
     scan = orphans.find_orphans(store, names)
     if scan.is_empty():
         return
