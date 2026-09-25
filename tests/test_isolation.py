@@ -536,33 +536,5 @@ class TestSandboxWrap(unittest.TestCase):
         self.assertEqual(wrapped[-2:], ["agy", "login"])
 
 
-class TestUnlinkLink(unittest.TestCase):
-    def test_unlink_link_removes_regular_file(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "test.txt"
-            f.write_text("hello", encoding="utf-8")
-            self.assertTrue(f.exists())
-            isolation._unlink_link(f)
-            self.assertFalse(f.exists())
-
-    def test_unlink_link_windows_junction_uses_rmdir(self):
-        fake_path = mock.MagicMock(spec=Path)
-        fake_path.is_symlink.return_value = False
-        fake_path.unlink.side_effect = PermissionError(5, "Access is denied")
-        with mock.patch("platforms.is_windows", return_value=True), \
-             mock.patch("isolation._is_link", return_value=True), \
-             mock.patch("os.rmdir") as mock_rmdir:
-            isolation._unlink_link(fake_path)
-            mock_rmdir.assert_called_once_with(fake_path)
-
-    def test_unlink_link_posix_raises_on_unlink_error(self):
-        fake_path = mock.MagicMock(spec=Path)
-        fake_path.unlink.side_effect = OSError("disk failure")
-        with mock.patch("platforms.is_windows", return_value=False):
-            with self.assertRaises(OSError):
-                isolation._unlink_link(fake_path)
-
-
 if __name__ == "__main__":
     unittest.main()

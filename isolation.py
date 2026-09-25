@@ -87,30 +87,6 @@ def _link(target: Path, link: Path) -> None:
     shutil.copy2(target, link)
 
 
-def _unlink_link(path: Path) -> None:
-    """Remove a link (symlink, file, or Windows directory junction).
-
-    On Windows, directory junctions cannot be deleted with DeleteFileW
-    (Path.unlink / os.unlink raises PermissionError: [WinError 5] or
-    IsADirectoryError); they must be removed with RemoveDirectoryW
-    (os.rmdir), which deletes the junction link without touching target
-    contents.
-    """
-    if platforms.is_windows() and _is_link(path) and not path.is_symlink():
-        try:
-            os.rmdir(path)
-            return
-        except OSError:
-            pass
-    try:
-        path.unlink()
-    except (IsADirectoryError, PermissionError, OSError):
-        if platforms.is_windows():
-            os.rmdir(path)
-        else:
-            raise
-
-
 def link_points_to(link: Path, target: Path) -> bool:
     try:
         if not _is_link(link):
@@ -228,7 +204,7 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
         if next_identity is not None and identity == next_identity:
             if _is_link(link):
                 try:
-                    _unlink_link(link)
+                    link.unlink()
                 except OSError as exc:
                     raise IsolationError(
                         f"could not remove stale overlay link {link} to "
@@ -255,7 +231,7 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
             if link.exists():
                 continue
             try:
-                _unlink_link(link)
+                link.unlink()
             except OSError:
                 continue
         elif link.exists():
@@ -357,7 +333,7 @@ def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
 
     gemini_link = overlay / platforms.AGY_DATA_DIR_NAME
     if _is_link(gemini_link) and not link_points_to(gemini_link, data_dir):
-        _unlink_link(gemini_link)
+        gemini_link.unlink()
     if gemini_link.exists() and not _is_link(gemini_link):
         raise IsolationError(
             f"overlay entry {gemini_link} is a real directory/file, not the "
