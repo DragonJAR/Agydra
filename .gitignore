@@ -48,6 +48,7 @@ $RECYCLE.BIN/
 
 # --- Agent tooling ---
 .atl/
+AGENTS.md
 
 # --- Planning artifacts (implemented, kept out of the repo) ---
 PLAN-agy-multisesion.md
