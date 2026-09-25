@@ -63,6 +63,14 @@ class TestIsolation(BaseCase):
         isolation.build_overlay("alpha", self.data_dir, self.store.root)
         self.assertEqual(link.resolve(), self.data_dir.resolve())
 
+    def test_link_points_to_windows_case_insensitivity(self):
+        link = self.store.overlays_dir / "alpha" / platforms.AGY_DATA_DIR_NAME
+        isolation.build_overlay("alpha", self.data_dir, self.store.root)
+        self.assertTrue(isolation.link_points_to(link, self.data_dir))
+        with mock.patch("isolation.platforms.is_windows", return_value=True):
+            mismatched_target = Path(str(self.data_dir).upper())
+            self.assertTrue(isolation.link_points_to(link, mismatched_target))
+
     def test_isolated_env_sets_home_redirect(self):
         overlay = isolation.build_overlay("alpha", self.data_dir, self.store.root)
         env = isolation.isolated_env(overlay, extra={"FOO": "bar"},
@@ -510,7 +518,7 @@ class TestSandboxWrap(unittest.TestCase):
     def test_sandbox_wrap_creates_directories_before_tmpfs(self):
         """bwrap requires mount points to exist inside the sandbox before tmpfs
         mounts over them; --dir ensures /run/user/<uid>/bus and keyring exist."""
-        with mock.patch("os.getuid", return_value=1000):
+        with mock.patch("os.getuid", return_value=1000, create=True):
             wrapped = isolation.sandbox_wrap(["agy", "login"])
         self.assertIn("--dir", wrapped)
         self.assertIn("--tmpfs", wrapped)

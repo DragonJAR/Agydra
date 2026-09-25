@@ -351,6 +351,21 @@ class TestRunWithGroupKill(unittest.TestCase):
             _, kwargs = proc.communicate.call_args_list[1]
             self.assertEqual(kwargs.get("timeout"), 2.0)
 
+    def test_run_with_group_kill_forwards_encoding_and_errors(self):
+        from unittest import mock
+        with mock.patch("subprocess.Popen") as mock_popen:
+            proc = mock.MagicMock()
+            proc.communicate.return_value = ("out", "err")
+            proc.returncode = 0
+            mock_popen.return_value = proc
+            platforms.run_with_group_kill(
+                ["echo", "hi"], text=True, encoding="utf-8", errors="replace"
+            )
+            _, kwargs = mock_popen.call_args
+            self.assertTrue(kwargs.get("text"))
+            self.assertEqual(kwargs.get("encoding"), "utf-8")
+            self.assertEqual(kwargs.get("errors"), "replace")
+
 
 if __name__ == "__main__":
     unittest.main()

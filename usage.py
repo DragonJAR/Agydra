@@ -202,11 +202,16 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
         with keychain.launch_guard(store, name, capture=False,
                                   persist_on_exit=False):
             proc = platforms.run_with_group_kill(
-                argv, env=env, timeout=timeout, text=True,
+                argv,
+                env=env,
+                timeout=timeout,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
     except subprocess.TimeoutExpired:
         return UsageResult(name=name, ok=False, error="timed out")
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return UsageResult(name=name, ok=False, error=f"could not run agy: {exc}")
 
     if proc.returncode != 0:

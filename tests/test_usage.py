@@ -213,6 +213,12 @@ class TestQueryProfileUsageFailureModes(_UsageBase):
         self.assertFalse(result.ok)
         self.assertEqual(result.error, "not authenticated")
 
+    def test_subprocess_decode_error_degrades(self):
+        with mock.patch("platforms.run_with_group_kill", side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")):
+            result = usage.query_profile_usage(self.store, "alpha")
+        self.assertFalse(result.ok)
+        self.assertIn("could not run agy", result.error)
+
 
 class TestQueryProfileUsageOverlayRace(_UsageBase):
     """isolation.build_overlay can raise a bare FileExistsError (an OSError

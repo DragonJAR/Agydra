@@ -129,8 +129,8 @@ class Helpers(unittest.TestCase):
     def test_venv_path_layout_matches_os(self):
         root = Path("/tmp/foo")
         if sys.platform.startswith("win"):
-            self.assertTrue(str(bootstrap.venv_python(root)).endswith("Scripts/python.exe"))
-            self.assertTrue(str(bootstrap.console_script(root)).endswith("Scripts/agydra.exe"))
+            self.assertTrue(bootstrap.venv_python(root).as_posix().endswith("Scripts/python.exe"))
+            self.assertTrue(bootstrap.console_script(root).as_posix().endswith("Scripts/agydra.exe"))
         else:
             self.assertTrue(str(bootstrap.venv_python(root)).endswith("bin/python"))
             self.assertTrue(str(bootstrap.console_script(root)).endswith("bin/agydra"))
@@ -140,6 +140,21 @@ class Helpers(unittest.TestCase):
         self.assertIn(bootstrap.SHIM_MARKER, s)
         self.assertIn("/abs/path/venv/bin/agydra", s)
         self.assertTrue(s.startswith("#!/bin/sh"))
+
+    def test_dir_on_path_posix(self):
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/home/user/.local/bin"}):
+            self.assertTrue(bootstrap._dir_on_path(Path("/home/user/.local/bin")))
+            self.assertFalse(bootstrap._dir_on_path(Path("/bin")))
+
+    def test_dir_on_path_windows_normalization(self):
+        with mock.patch("bootstrap.platforms.is_windows", return_value=True):
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": r"C:\Windows\System32;C:\Users\User\.venv\Scripts\;D:\Tools"},
+            ):
+                self.assertTrue(bootstrap._dir_on_path(Path(r"c:\users\user\.venv\scripts")))
+                self.assertTrue(bootstrap._dir_on_path(Path("C:/Users/User/.venv/Scripts")))
+                self.assertFalse(bootstrap._dir_on_path(Path(r"C:\Nonexistent")))
 
 
 class CheckState(unittest.TestCase):

@@ -1646,6 +1646,8 @@ class TestLaunchGuardClearsSharedOnUndecodableSecret(unittest.TestCase):
 
 class TestSerializeLock(unittest.TestCase):
     def test_serialize_lock_closes_handle_on_flock_oserror(self):
+        if not keychain.platforms.is_macos():
+            self.skipTest("macOS keychain mutex only")
         with isolated_store_env():
             store = Store()
             handles = []

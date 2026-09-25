@@ -89,7 +89,17 @@ def _link(target: Path, link: Path) -> None:
 
 def link_points_to(link: Path, target: Path) -> bool:
     try:
-        return _is_link(link) and link.resolve() == target.resolve()
+        if not _is_link(link):
+            return False
+        if link.resolve() == target.resolve():
+            return True
+        if platforms.is_windows():
+            import ntpath
+
+            return ntpath.normcase(ntpath.normpath(str(link.resolve()))) == ntpath.normcase(
+                ntpath.normpath(str(target.resolve()))
+            )
+        return False
     except OSError:
         return False
 

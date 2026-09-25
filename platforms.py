@@ -251,6 +251,8 @@ def run_with_group_kill(
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
     text: bool = False,
+    encoding: Optional[str] = None,
+    errors: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
     """Like ``subprocess.run``, but a timeout kills the child's WHOLE
     process tree instead of just the immediate child.
@@ -276,7 +278,13 @@ def run_with_group_kill(
     forever) that this helper's other caller does not share.
     """
     popen_kwargs = dict(
-        stdin=stdin, stdout=stdout, stderr=stderr, env=env, text=text,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        env=env,
+        text=text,
+        encoding=encoding,
+        errors=errors,
     )
     if is_windows():
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP

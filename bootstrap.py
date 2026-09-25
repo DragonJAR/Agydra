@@ -92,6 +92,14 @@ def shim_path() -> Path:
 
 def _dir_on_path(d: Path) -> bool:
     """Exact PATH membership (split, not substring — avoids prefix false hits)."""
+    if platforms.is_windows():
+        import ntpath
+
+        target = ntpath.normcase(ntpath.normpath(str(d)))
+        for part in os.environ.get("PATH", "").split(";"):
+            if part and ntpath.normcase(ntpath.normpath(part)) == target:
+                return True
+        return False
     return str(d) in os.environ.get("PATH", "").split(os.pathsep)
 
 
