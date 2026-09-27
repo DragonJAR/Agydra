@@ -255,7 +255,7 @@ class TestRandomProfileSelection(BaseCase):
         gate = self._tmp / "gate"
         env = dict(os.environ)
         env["FAKE_AGY_GATE"] = str(gate)
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [sys.executable, "-m", "agydra", "-p", "work", "--hold"],
             env=env,
         )
@@ -271,9 +271,11 @@ class TestRandomProfileSelection(BaseCase):
             self.assertIn("PROFILE=lab", result.stdout)
         finally:
             gate.touch()
-            import time
-
-            time.sleep(0.3)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 class TestBusyGuards(BaseCase):

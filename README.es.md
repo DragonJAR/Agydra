@@ -206,8 +206,8 @@ copied: personal/mcp.json
 | `agydra [-p PERFIL\|#] [-r] [-n] [-b RUTA] [-f] <args de agy...>` | — | Lanza `agy` con la sesión aislada del perfil resuelto. Los flags de agydra van **antes** de los args de agy; un `-p` tardío va a `agy` y se imprime un aviso. Los flags cortos se agrupan estilo getopt: `-nr -p work` == `-n -r -p work`. `-f` omite el lock de sesión. Los nombres de perfil no pueden chocar con un subcomando o alias (`status`, `ls`, `mv`, ...) — el dispatcher los opacaría. |
 | `list` | `ls`, `l` | Tabla de perfiles: número, email, default, estado de auth, ocupado, último uso. |
 | `create NOMBRE [-d DESC]` | `c` | Crea el almacén de un perfil. |
-| `login NOMBRE\|#` | `in` | Corre el OAuth de `agy` aislado a ese perfil. |
-| `import NOMBRE` | `imp` | **Copia** (nunca mueve) el `~/.gemini` genérico a un perfil. |
+| `login [NOMBRE\|#] [-f] [-n]` | `in` | Corre el OAuth de `agy` aislado a ese perfil (`-f` fuerza re-autenticación sin confirmación; `-n` dry-run). |
+| `import NOMBRE\|# [-s DIR]` | `imp` | **Copia** (nunca mueve) el `~/.gemini` genérico a un perfil; `-s DIR` sobreescribe el directorio de origen. |
 | `status [-n]` | `st` | Perfil resuelto + razón + binario + email + auth + ocupado; cero efectos secundarios. |
 | `default [NOMBRE\|#]` | `d` | Ver o fijar el perfil default. |
 | `use NOMBRE\|#` | `u` | Escribe el marcador `.agydra` fijando el perfil para ese directorio de proyecto. |
@@ -225,6 +225,22 @@ copied: personal/mcp.json
 | `-n` | `--dry-run` | Imprime el plan de lanzamiento sin ejecutar nada. |
 | `-b RUTA` | `--binary RUTA` | Sobreescribe el binario `agy`. |
 | `-f` | `--force` | Lanza sin tomar el lock de sesión, incluso contra un perfil ya ocupado; sesiones concurrentes sobre el mismo perfil pueden corromper los tokens OAuth. |
+
+### 🔀 Combinaciones Comunes de Parámetros
+
+Los flags cortos se pueden agrupar según la convención estándar POSIX getopt (`-nr` == `-n -r`). Los parámetros de `agydra` deben preceder siempre a los argumentos destinados a `agy`:
+
+| Combinación | Equivalencias | Propósito |
+|---|---|---|
+| `agydra -p trabajo "prompt"` | `--profile=trabajo`, `-ptrabajo` | Lanza `agy` con un perfil explícito. |
+| `agydra -r "prompt"` | `--random` | Elige automáticamente un perfil libre y autenticado. |
+| `agydra -rf "prompt"` | `-r -f`, `--random --force` | Elige perfil libre; si todos están ocupados o solo existe 1 perfil, fuerza el lanzamiento. |
+| `agydra -np trabajo` | `-n -p trabajo`, `--dry-run -p trabajo` | Inspecciona el plan de lanzamiento (rutas, env, binario) sin ejecutar nada. |
+| `agydra -nr` | `-n -r`, `--dry-run --random` | Muestra qué perfil libre se elegiría sin ejecutar ninguna acción. |
+| `agydra -fp trabajo` | `-f -p trabajo`, `--force -p trabajo` | Omite el lock de sesión para una tarea paralela urgente o tras una caída anormal previa. |
+| `agydra -b /ruta/agy -p trabajo` | `--binary /ruta/agy -p trabajo` | Ejecuta un binario específico o de prueba de `agy` con las credenciales aisladas del perfil. |
+| `agydra doctor --fix -f` | `agydra doc --fix --force` | Aplica reparaciones automáticas (enlaces, slots huérfanos, defaults colgados) sin pedir confirmación interactiva. |
+| `agydra delete antiguo -f` | `agydra rm antiguo --force` | Borrado no interactivo del perfil (genera respaldo ZIP primero; sigue rechazando perfiles ocupados). |
 
 `-p` y `-r` son mutuamente excluyentes. Sin `-p`, la resolución sigue una cascada determinista (gana el primer match): flag `--profile` → variable de entorno `AGYDRA_PROFILE` → archivo marcador `.agydra` (el ancestro más cercano del CWD; lo escribe `agydra use`) → default configurado → primer perfil. El marcador pisa a `-r`. `status` siempre muestra qué perfil se usará desde el directorio actual y por qué. `-r` normalmente requiere 2+ perfiles y descarta los ocupados o sin autenticar; `-f` levanta ambas restricciones para `-r -f`.
 

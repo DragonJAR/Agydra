@@ -197,7 +197,7 @@ Any management command below also works as `--NAME`/`-NAME` (e.g. `agydra --list
 | `agydra [-p PROFILE\|#] [-r] [-n] [-b PATH] [-f] <agy args...>` | Launch `agy` with the resolved profile. Flags must come **before** agy args (a late `-p` is passed to agy with a warning). Short flags bundle: `-nr -p work` == `-n -r -p work`. `-r` picks a free profile, `-n` dry-run, `-b` binary override, `-f` skips the session lock. Profile names may not collide with a subcommand or alias (`status`, `ls`, `mv`, ...) — the dispatcher would shadow them |
 | `agydra list` · `ls` · `l` | Table: number, email, default, auth state, busy, last use |
 | `agydra create NAME [-d DESC]` · `c` | Create a profile store |
-| `agydra login NAME\|#` · `in` | Run agy's OAuth flow isolated to that profile |
+| `agydra login [NAME\|#] [-f] [-n]` · `in` | Run agy's OAuth flow isolated to that profile (`-f` force re-login without prompt; `-n` dry-run) |
 | `agydra import NAME\|# [-s DIR]` · `imp` | **Copy** (never move) the generic `~/.gemini` into a profile; source is auto-detected, `-s DIR` overrides it (passing a path as NAME is rejected with guidance) |
 | `agydra status [-n]` · `st` | Resolved profile + reason + binary + email + auth + busy; zero side effects |
 | `agydra default [NAME\|#]` · `d` | Get or set the default profile |
@@ -216,6 +216,22 @@ Any management command below also works as `--NAME`/`-NAME` (e.g. `agydra --list
 | `-n` | `--dry-run` | Print the launch plan, execute nothing |
 | `-b PATH` | `--binary` | Override the `agy` binary for this launch |
 | `-f` | `--force` | Launch without taking the session lock, even against an already-busy profile; concurrent sessions on the same profile may corrupt OAuth tokens |
+
+### 🔀 Common Flag Combinations
+
+Short flags bundle following standard POSIX getopt conventions (`-nr` == `-n -r`). Agydra flags must always precede arguments passed to `agy`:
+
+| Combination | Equivalents | Purpose |
+|---|---|---|
+| `agydra -p work "prompt"` | `--profile=work`, `-pwork` | Launch `agy` with an explicit profile. |
+| `agydra -r "prompt"` | `--random` | Automatically pick an idle, authenticated profile. |
+| `agydra -rf "prompt"` | `-r -f`, `--random --force` | Pick a free profile; if all are busy or only 1 profile exists, force launch anyway. |
+| `agydra -np work` | `-n -p work`, `--dry-run -p work` | Inspect the launch plan (paths, env, binary) for a profile without executing anything. |
+| `agydra -nr` | `-n -r`, `--dry-run --random` | Inspect which free profile would be selected without executing anything. |
+| `agydra -fp work` | `-f -p work`, `--force -p work` | Bypass the active session lock for an urgent parallel session or after a process crash. |
+| `agydra -b /path/to/agy -p work` | `--binary /path/to/agy -p work` | Run a specific or experimental `agy` binary with isolated profile credentials. |
+| `agydra doctor --fix -f` | `agydra doc --fix --force` | Apply automated repair of dangling profiles, orphaned slots, and links without interactive confirmation prompts. |
+| `agydra delete old -f` | `agydra rm old --force` | Non-interactive deletion of a profile (creates safety backup ZIP first; still refuses a busy profile). |
 
 **Resolution cascade** (launch without `-p`): `--profile` flag → `AGYDRA_PROFILE`
 env var → `.agydra` marker file (nearest ancestor of CWD, written by

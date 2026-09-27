@@ -97,6 +97,7 @@ def _atomic_replace(path: Path, write_payload, verify=None) -> None:
 
     The tmp keeps mkstemp's 0600 (never widened) because backups written
     through this skeleton embed ``.secret`` material."""
+    path = Path(path)
     platforms.ensure_dir(path.parent)
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
@@ -261,6 +262,7 @@ def rmtree(path: Path) -> None:
     Public (used across modules, e.g. bootstrap.py's broken-venv cleanup) —
     not a store-private helper.
     """
+    path = Path(path)
     try:
         if sys.version_info >= (3, 12):
             shutil.rmtree(path, onexc=_rmtree_readonly_ok)

@@ -32,7 +32,7 @@ class Resolution:
 
 
 def _find_marker(start: Path) -> Optional[Path]:
-    current = start.resolve()
+    current = Path(start).resolve()
     for directory in (current, *current.parents):
         marker = directory / MARKER_FILE
         if marker.is_file():
@@ -73,7 +73,7 @@ def resolve(
 ) -> Resolution:
     """Resolve which profile to use. Raises StoreError when none applies."""
     env = env if env is not None else os.environ
-    cwd = cwd or Path.cwd()
+    cwd = Path(cwd) if cwd is not None else Path.cwd()
 
     if flag_ref is not None:
         return Resolution(store.resolve_ref(flag_ref), f"flag --profile={flag_ref}")
@@ -151,7 +151,7 @@ def pick_free_profile(
     if not names:
         raise StoreError(_NO_PROFILES)
 
-    marker = _marker_resolution(store, cwd or Path.cwd())
+    marker = _marker_resolution(store, Path(cwd) if cwd is not None else Path.cwd())
     if marker is not None:
         return marker
 

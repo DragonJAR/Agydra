@@ -483,7 +483,8 @@ class TestLaunchGuardEntrySelfRepair(unittest.TestCase):
                     mock.patch.object(keychain, "supported", return_value=True), \
                     mock.patch.object(
                         keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
-                    ):
+                    ), \
+                    mock.patch.object(keychain, "_serialize_lock", return_value=None):
                 guard = keychain.launch_guard(store, "alpha")
                 state = guard.__enter__()
 
@@ -510,7 +511,8 @@ class TestLaunchGuardEntrySelfRepair(unittest.TestCase):
                     mock.patch.object(keychain, "supported", return_value=True), \
                     mock.patch.object(
                         keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
-                    ):
+                    ), \
+                    mock.patch.object(keychain, "_serialize_lock", return_value=None):
                 guard = keychain.launch_guard(store, "alpha")
                 state = guard.__enter__()
 
@@ -535,7 +537,8 @@ class TestLaunchGuardEntrySelfRepair(unittest.TestCase):
                     mock.patch.object(keychain, "supported", return_value=True), \
                     mock.patch.object(
                         keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
-                    ):
+                    ), \
+                    mock.patch.object(keychain, "_serialize_lock", return_value=None):
                 guard = keychain.launch_guard(store, "alpha")
                 state = guard.__enter__()
 
@@ -1423,7 +1426,8 @@ class TestLaunchGuardFailOpenOnForeignSecret(unittest.TestCase):
                     mock.patch.object(keychain, "supported", return_value=True), \
                     mock.patch.object(
                         keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
-                    ):
+                    ), \
+                    mock.patch.object(keychain, "_serialize_lock", return_value=None):
                 guard = keychain.launch_guard(store, "alpha")
                 state = guard.__enter__()
             self.assertFalse(state._swapped, "undecodable slot must not be swapped")

@@ -38,7 +38,7 @@ def _decode_jwt_payload(token: str) -> dict:
 
 def _oauth_obj(data_dir: Path):
     """Yield decoded token JSON from the on-disk layout, if present and valid."""
-    path = data_dir / AGY_CLI_DIR / TOKEN_FILE
+    path = Path(data_dir) / AGY_CLI_DIR / TOKEN_FILE
     if not path.is_file():
         return
     raw = store.read_json_object(path, tolerant=True)
@@ -151,6 +151,7 @@ def detect_email_source(
     one; plain ``detect_email`` callers that only need the email keep
     calling that instead.
     """
+    data_dir = Path(data_dir)
     for raw, source in _iter_tokens(data_dir, store, name):
         email = email_from_raw(raw)
         if email:
@@ -187,6 +188,7 @@ def auth_state(
     ``store``/``name`` enable the precise per-profile keychain lookup on
     macOS; without them only the on-disk token file is consulted.
     """
+    data_dir = Path(data_dir)
     for raw, _source in _iter_tokens(data_dir, store, name):
         token = _token_payload(raw)
         if isinstance(token, dict) and (

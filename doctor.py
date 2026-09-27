@@ -60,8 +60,14 @@ def _check_store(store: Store, _ctx: "_DoctorContext"):
         fd, probe_name = _tempfile.mkstemp(
             dir=str(store.root), prefix=".write-probe.", suffix=".tmp"
         )
-        os.close(fd)
-        Path(probe_name).unlink()
+        try:
+            pass
+        finally:
+            os.close(fd)
+            try:
+                Path(probe_name).unlink()
+            except OSError:
+                pass
     except OSError as exc:
         return FAIL, f"store not writable: {store.root} ({exc})"
     return OK, f"store writable: {store.root}"

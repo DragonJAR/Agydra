@@ -67,6 +67,7 @@ def build_plan(
     force: bool = False,
 ) -> LaunchPlan:
     """Resolve everything needed to launch agy without mutating anything."""
+    cwd = Path(cwd) if cwd is not None else None
     if random_pick:
         resolution = resolver.pick_free_profile(store, cwd=cwd, force=force)
     else:

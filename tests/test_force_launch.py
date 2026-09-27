@@ -211,10 +211,10 @@ class TestForceEndToEnd(BaseCase):
         finally:
             gate.touch()
             try:
-                first.wait(timeout=10)
+                first.communicate(timeout=10)
             except subprocess.TimeoutExpired:
                 first.kill()
-                first.wait(timeout=5)
+                first.communicate(timeout=5)
 
 
 if __name__ == "__main__":
