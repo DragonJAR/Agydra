@@ -33,6 +33,18 @@ agydra -p trabajo … → mismo binario agy, pero HOME apunta al overlay aislado
 - **Sin parches ni intercepciones binarias:** `agy` se ejecuta sin modificaciones; el aislamiento se logra puramente mediante redirección de entorno y overlays en el sistema de archivos.
 - **Bloqueos consultivos a nivel de kernel:** Las sesiones están protegidas por locks de archivo del SO que se liberan automáticamente incluso ante fallos abruptos o reinicios.
 
+### 💰 La Ventaja del Plan Familiar de Google: Multiplica tu Cuota al 100% Dentro de las Políticas
+
+A diferencia de la mayoría de proveedores de IA (donde las suscripciones son individuales y costosas por usuario, sin opciones familiares compartidas), **Google es de las pocas plataformas que ofrece planes familiares (Google One AI Premium / Google AI Pro)** que permiten compartir la suscripción con hasta 5 miembros de la familia.
+
+Lo fundamental: **cada cuenta del grupo familiar cuenta con sus propios límites y cuotas independientes de IA**.
+
+Esto desbloquea una estrategia de alto rendimiento y 100% legítima:
+- **Rentabilidad Máxima:** Con una única suscripción familiar, puedes configurar hasta 5 cuentas dedicadas (ej. desarrollo personal, investigación profunda, agentes automáticos o pruebas de clientes), multiplicando tu cuota efectiva de IA por 5 a una fracción del costo habitual.
+- **100% Conforme a los Términos de Servicio:** Cero riesgo de bloqueos. No se realizan llamadas no oficiales, scraping ni hacks de tokens compartidos: cada perfil se autentica de forma independiente vía OAuth a través del cliente oficial `agy` de Google.
+- **Balanceo y Rotación Automática:** Con `agydra -r`, despachas tareas sobre el pool de tus cuentas familiares; si una cuenta alcanza temporalmente su límite de tasa, `agydra` asigna el trabajo automáticamente a la siguiente cuenta libre.
+- **Monitoreo Centralizado de Cuotas:** Ejecuta `agydra usage` para supervisar en segundos el estado del cupo restante y la cuenta regresiva de reinicio de todas tus cuentas familiares en una sola vista.
+
 ---
 
 ## ⚡ Inicio Rápido
@@ -96,7 +108,7 @@ agydra status
 ```
 
 ### 2. Pool de Cuentas y Ejecución Concurrente (`agydra -r`)
-Al orquestar agentes automáticos o scripts en segundo plano entre varias terminales, usa `-r` (`--random`) para seleccionar automáticamente el perfil autenticado, desocupado y menos recientemente usado:
+Al orquestar agentes automáticos, tareas en lote o rotar entre un grupo de cuentas de un Plan Familiar de Google entre varias terminales, usa `-r` (`--random`) para seleccionar automáticamente el perfil autenticado, desocupado y menos recientemente usado:
 
 ```sh
 # Terminal 1: Toma el perfil 'alfa'

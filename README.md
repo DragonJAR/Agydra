@@ -33,6 +33,18 @@ agydra -p work ...  → same agy binary, but HOME points to an isolated profile 
 - **No binary patching or proxying:** `agy` runs unmodified; isolation is achieved purely via environment redirection and filesystem overlays.
 - **Kernel-held advisory locks:** Profile sessions are protected by OS-level file locks that release automatically even after a crash or hard termination.
 
+### 💰 The Google Family Plan Advantage: 5x AI Quota, 100% Policy-Compliant
+
+Unlike most AI providers (where subscriptions are strictly individual and charged per-seat without shared family tiers), **Google is one of the very few platforms that offers a Family Group plan (Google One AI Premium / Google AI Pro)**, allowing a single subscription to be shared among up to 5 member accounts.
+
+Crucially: **every member account receives its own distinct, individual AI model quotas and rate limits**.
+
+This unlocks a high-leverage, completely legitimate setup:
+- **Maximum Cost-Efficiency:** Under a single family subscription, you can configure up to 5 dedicated Google accounts (e.g., personal development, deep research, automated agent tasks, client experiments), effectively multiplying your total AI quota by 5 at a fraction of the cost.
+- **100% Compliant with Terms of Service:** Zero risk of policy violations. There is no scraping, no reverse-engineered API proxying, and no shared token hacks. Every profile authenticates independently via standard OAuth through Google's official `agy` CLI.
+- **Automated Account Pooling:** Using `agydra -r`, you can dispatch tasks across your pool of family accounts; if one account temporarily hits a rate limit, `agydra` automatically routes work to the next idle profile.
+- **Single-Pane Quota Visibility:** Run `agydra usage` to monitor remaining quotas and reset countdowns across every account in your pool from a single terminal view.
+
 ---
 
 ## ⚡ Quickstart
@@ -96,7 +108,7 @@ agydra status
 ```
 
 ### 2. Parallel Account Pooling (`agydra -r`)
-When orchestrating automated agents or background scripts across multiple terminals, use `-r` (`--random`) to automatically pick the least-recently-used, idle authenticated profile:
+When orchestrating automated agents, batch tasks, or rotating through a Google Family Plan account pool across multiple terminals, use `-r` (`--random`) to automatically pick the least-recently-used, idle authenticated profile:
 
 ```sh
 # Terminal 1: Grabs profile 'alpha'
