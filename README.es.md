@@ -1,7 +1,7 @@
 # agydra
 
 <p align="center">
-  <img src="logo.png" alt="logo de agydra" width="180">
+  <img src="logo.png" alt="logo de agydra">
 </p>
 
 <p align="center">
