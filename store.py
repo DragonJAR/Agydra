@@ -18,7 +18,8 @@ import zipfile
 from pathlib import Path
 from typing import List, Optional
 
-import platforms, vocab
+import platforms
+import vocab
 from models import Config, Profile, _utcnow_iso
 from ui import warn
 
@@ -270,8 +271,8 @@ def rmtree(path: Path) -> None:
 
 
 class Store:
-    def __init__(self, root: Optional[Path] = None) -> None:
-        self.root = root or platforms.base_dir()
+    def __init__(self, root: Optional[Path | str] = None) -> None:
+        self.root = Path(root) if root is not None else platforms.base_dir()
         self.profiles_dir = self.root / "profiles"
         self.overlays_dir = self.root / platforms.OVERLAYS_DIRNAME
         self.backups_dir = self.root / "backups"

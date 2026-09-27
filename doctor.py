@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
 
 from agydra import __version__
-import account, isolation, keychain, platforms
+import account
+import isolation
+import keychain
+import platforms
 from store import Store
 from ui import paint, warn
 

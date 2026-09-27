@@ -10,7 +10,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import banner, cli
+import banner
+import cli
 from ui import strip_ansi
 
 from conftest import BaseCase

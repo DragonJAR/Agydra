@@ -17,7 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-import isolation, keychain, locks, platforms, resolver
+import isolation
+import keychain
+import locks
+import platforms
+import resolver
 from store import Store, StoreError
 from ui import warn
 

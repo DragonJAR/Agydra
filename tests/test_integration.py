@@ -9,7 +9,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import account, locks, platforms
+import account
+import locks
+import platforms
 from store import Store
 
 from conftest import BaseCase, _make_jwt

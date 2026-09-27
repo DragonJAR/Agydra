@@ -51,28 +51,31 @@ def base_dir() -> Path:
     if is_windows():
         return _windows_base_dir()
     if is_macos():
-        return Path.home() / "Library" / "Application Support" / APP_NAME
+        return real_home() / "Library" / "Application Support" / APP_NAME
     xdg = os.environ.get("XDG_DATA_HOME")
     if xdg:
         p = Path(xdg).expanduser()
         if p.is_absolute():
             return p / APP_NAME
-    return Path.home() / ".local" / "share" / APP_NAME
+    return real_home() / ".local" / "share" / APP_NAME
 
 
 def _windows_base_dir() -> Path:
-    root = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    root = os.environ.get("LOCALAPPDATA") or str(real_home() / "AppData" / "Local")
     return Path(root) / APP_NAME
 
 
 def real_home() -> Path:
     """The actual user home directory (never redirected by agydra)."""
+    explicit = os.environ.get("AGYDRA_REAL_HOME")
+    if explicit:
+        return Path(explicit).expanduser()
     return Path.home()
 
 
 def agy_data_dir(home: Optional[Path] = None) -> Path:
     """Agy's data directory (``.gemini``) under the given home."""
-    return (home or real_home()) / AGY_DATA_DIR_NAME
+    return (Path(home) if home is not None else real_home()) / AGY_DATA_DIR_NAME
 
 
 _DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"

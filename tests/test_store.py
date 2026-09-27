@@ -223,7 +223,6 @@ class TestStore(BaseCase):
         Drives ``Store._write_backup`` because it's the only production
         caller that passes ``verify``.
         """
-        import zipfile
 
         store = Store()
         store.create("broken-zip")
@@ -286,6 +285,7 @@ class TestStore(BaseCase):
     def test_construction_has_no_filesystem_side_effects(self):
         fresh = self._tmp / "fresh-root"
         store = Store(root=fresh)
+        self.assertEqual(store.root, fresh)
         self.assertFalse(fresh.exists())
 
     def test_create_bootstraps_layout(self):

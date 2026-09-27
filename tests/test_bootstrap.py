@@ -458,7 +458,7 @@ class RunDispatch(unittest.TestCase):
 
     def test_run_returns_1_when_ensure_venv_raises(self):
         with tempfile.TemporaryDirectory() as td:
-            proj = _make_fake_project(Path(td), with_console=False)
+            _make_fake_project(Path(td), with_console=False)
 
             real_ensure = bootstrap.ensure_venv
 

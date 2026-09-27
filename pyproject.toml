@@ -9,7 +9,18 @@ description = "Multi-profile launcher for the agy CLI (isolated OAuth per profil
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "agydra contributors" }]
+authors = [
+    { name = "DragonJAR", email = "contacto@dragonjar.org" },
+]
+keywords = [
+    "antigravity",
+    "agy",
+    "cli",
+    "multi-profile",
+    "oauth",
+    "isolation",
+    "dragonjar",
+]
 classifiers = [
     "Environment :: Console",
     "Operating System :: MacOS",
@@ -18,6 +29,11 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Utilities",
 ]
+
+[project.urls]
+Homepage = "https://www.dragonjar.org"
+Repository = "https://github.com/DragonJAR/agydra"
+Issues = "https://github.com/DragonJAR/agydra/issues"
 
 [project.scripts]
 agydra = "cli:main"

@@ -303,7 +303,7 @@ Orden de resolución del binario `agy`: flag `--binary` → `agy_binary` en `agy
 - **Solo stdlib.** Cero dependencias de terceros; Python ≥ 3.9. No añadas paquetes.
 - **Multiplataforma por construcción.** Cada diferencia de OS vive en `platforms.py` y en los helpers de enlaces de `isolation.py`; nunca ramifiques por SO fuera de esos límites.
 - **Tests antes de declarar listo.** Desde la raíz del repo: `python3 -m pytest -q` (522 pasan + 3 skips de plataforma en macOS).
-- Consulta `AGENTS.md` para las guías de invariantes, layout y convenciones del proyecto.
+- Consulta [AGENTS.md](AGENTS.md) para las guías de invariantes, layout y convenciones del proyecto.
 
 ## 📄 Licencia
 

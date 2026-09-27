@@ -17,7 +17,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import locks, resolver, runner
+import locks
+import resolver
+import runner
 from store import Store, StoreError
 
 from conftest import BaseCase

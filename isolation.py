@@ -143,6 +143,8 @@ def _ancestor_chain(real_home: Path, store_root: Path) -> Tuple[List[Path], List
     mirroring then). Callers (``build_overlay``) must reuse the returned
     identities instead of calling ``_identity`` again on these same paths.
     """
+    real_home = Path(real_home)
+    store_root = Path(store_root)
     home_identity = _identity(real_home)
     if home_identity is None:
         return [], []
@@ -269,6 +271,8 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
     isolation), or a type mismatch collides between file and directory at
     the target.
     """
+    real_dir = Path(real_dir)
+    data_dir = Path(data_dir)
     if _is_link(real_dir) or not real_dir.is_dir():
         raise IsolationError(
             f"cannot migrate {real_dir}: expected a real directory "
@@ -331,6 +335,8 @@ def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
       root become real directories (recursively mirrored, see
       ``_mirror_dir``), everything else is linked whole.
     """
+    data_dir = Path(data_dir)
+    store_root = Path(store_root)
     real_home = platforms.real_home()
     overlay = platforms.ensure_dir(store_root / platforms.OVERLAYS_DIRNAME / name)
     store_resolved = store_root.resolve()
@@ -368,10 +374,11 @@ def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
 def isolated_env(overlay: Path, extra: dict, config_windows_redirect_home: bool = False) -> dict:
     """Environment for the agy child process with the home redirected."""
     env = dict(os.environ)
+    real_home = platforms.real_home()
+    env["AGYDRA_REAL_HOME"] = str(real_home)
     env[platforms.home_redirect_var()] = str(overlay)
     if platforms.is_windows() and config_windows_redirect_home:
         env["HOME"] = str(overlay)
-    real_home = platforms.real_home()
     for xdg_var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
         value = env.get(xdg_var)
         if not value:

@@ -69,7 +69,7 @@ def project_root(cwd: Optional[Path] = None) -> Path:
 
 
 def venv_dir(root: Path) -> Path:
-    return root / VENV_DIRNAME
+    return Path(root) / VENV_DIRNAME
 
 
 def venv_python(root: Path) -> Path:
@@ -83,7 +83,7 @@ def console_script(root: Path) -> Path:
 
 def user_bin_dir() -> Path:
     """User-writable PATH directory for the shim (``~/.local/bin``)."""
-    return Path.home() / ".local" / "bin"
+    return platforms.real_home() / ".local" / "bin"
 
 
 def shim_path() -> Path:

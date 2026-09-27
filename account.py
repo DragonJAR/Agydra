@@ -17,7 +17,8 @@ import json
 from pathlib import Path
 from typing import Optional
 
-import platforms, store
+import platforms
+import store
 
 AGY_CLI_DIR = "antigravity-cli"
 TOKEN_FILE = "antigravity-oauth-token"

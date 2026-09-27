@@ -176,7 +176,8 @@ class TestImportGuards(BaseCase):
         )
 
     def test_import_onto_locked_profile_reports_the_live_session(self):
-        import cli, locks
+        import cli
+        import locks
 
         self.store.create("held")
         data = self.store.profile_data_dir("held")
@@ -242,7 +243,8 @@ class TestIsolationErrorPointsToDoctorFix(BaseCase):
     manually"."""
 
     def test_login_error_message_mentions_doctor_fix(self):
-        import isolation, platforms
+        import isolation
+        import platforms
 
         self.store = Store()
         self.store.create("alpha")
@@ -465,7 +467,8 @@ class TestAssertFreeActionContext(BaseCase):
         self.store.create("busy-prof")
 
     def test_assert_free_messages(self):
-        import cli, locks
+        import cli
+        import locks
         handle = locks.try_lock(self.store, "busy-prof")
         try:
             with self.assertRaises(StoreError) as ctx:
@@ -492,7 +495,8 @@ class TestDeleteTOCTOUGuard(BaseCase):
         self.store.create("victim")
 
     def test_finish_delete_refuses_busy_profile(self):
-        import cli, locks
+        import cli
+        import locks
         handle = locks.try_lock(self.store, "victim")
         try:
             with self.assertRaises(StoreError) as ctx:

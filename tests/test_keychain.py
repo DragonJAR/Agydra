@@ -1296,7 +1296,6 @@ class TestDescribeSharedFormat(unittest.TestCase):
     instead of forcing the user to read agy's cli.log."""
 
     def _kc_with_shared(self, payload):
-        import keychain as _kc
 
         class _MemKc:
             def __init__(self, payload):
@@ -1467,7 +1466,6 @@ class TestPersistClassification(unittest.TestCase):
     (3) a DIFFERENT email — keep warning (identity-laundering guard)."""
 
     def setUp(self):
-        import base64 as _b64
         import json as _json
 
         self.store = _StoreStub(Path(self.id().replace(" ", "_")[:80]) if False else Path(tempfile.mkdtemp(prefix="persist-cls-")))
@@ -1534,7 +1532,6 @@ class TestPersistClassification(unittest.TestCase):
                          ".secret must not be overwritten by a refresh")
 
     def test_garbage_payload_still_warns(self):
-        from unittest import mock
 
         with self._known_identity_side_effect():
             note_out, warn_out = self._persist(b"\x00\x01total-garbage")
@@ -1542,7 +1539,6 @@ class TestPersistClassification(unittest.TestCase):
         self.assertEqual(note_out, "")
 
     def test_different_email_still_warns(self):
-        from unittest import mock
 
         with self._known_identity_side_effect():
             note_out, warn_out = self._persist(self.different_payload)

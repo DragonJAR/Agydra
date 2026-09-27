@@ -14,7 +14,10 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import doctor
-import isolation, keychain, platforms, ui
+import isolation
+import keychain
+import platforms
+import ui
 from store import Store
 
 from conftest import BaseCase, _make_jwt

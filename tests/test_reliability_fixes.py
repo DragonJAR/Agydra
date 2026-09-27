@@ -14,7 +14,10 @@ from pathlib import Path
 
 from conftest import isolated_store_env
 
-import keychain, models, resolver, runner
+import keychain
+import models
+import resolver
+import runner
 from store import Store, StoreError
 
 
@@ -330,7 +333,8 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
         import sys
         from unittest import mock
 
-        import locks, platforms
+        import locks
+        import platforms
 
         with isolated_store_env(), mock.patch.dict(
             os.environ, {"AGYDRA_AGY_BIN": sys.executable}
@@ -357,7 +361,7 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
         import sys
         from unittest import mock
 
-        import locks, platforms
+        import platforms
 
         with isolated_store_env(), mock.patch.dict(
             os.environ, {"AGYDRA_AGY_BIN": sys.executable}
@@ -382,7 +386,7 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
         import sys
         from unittest import mock
 
-        import locks, platforms
+        import platforms
 
         with isolated_store_env(), mock.patch.dict(
             os.environ, {"AGYDRA_AGY_BIN": sys.executable}
@@ -406,7 +410,8 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
         import sys
         from unittest import mock
 
-        import locks, platforms
+        import locks
+        import platforms
 
         order = []
 
@@ -460,7 +465,8 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
         import sys
         from unittest import mock
 
-        import locks, platforms
+        import locks
+        import platforms
 
         captured = {}
 
@@ -489,7 +495,8 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
         import os
         from unittest import mock
 
-        import locks, platforms
+        import locks
+        import platforms
 
         captured = {}
 
@@ -523,7 +530,8 @@ class TestRunnerReleasesLockOnSetupException(unittest.TestCase):
         import sys
         from unittest import mock
 
-        import isolation, locks
+        import isolation
+        import locks
 
         with isolated_store_env(), mock.patch.dict(
             os.environ, {"AGYDRA_AGY_BIN": sys.executable}
@@ -575,10 +583,10 @@ class TestRunnerReleasesLockOnExecFailure(unittest.TestCase):
     returns is always safe."""
 
     def test_launch_argv_failure_releases_the_lock(self):
-        import os
         from unittest import mock
 
-        import locks, platforms
+        import locks
+        import platforms
 
         with isolated_store_env():
             store = Store()
@@ -702,7 +710,6 @@ class TestRunnerPickRetryPreservesCwd(unittest.TestCase):
         from unittest import mock
 
         import locks
-        from store import StoreError
 
         with isolated_store_env(), mock.patch.dict(
             os.environ, {"AGYDRA_AGY_BIN": sys.executable}
@@ -752,34 +759,6 @@ class TestRunnerPickRetryPreservesCwd(unittest.TestCase):
                     real_handle.release()
 
 
-class TestRunnerReleasesLockOnExecFailure(unittest.TestCase):
-    """``platforms.launch_argv`` deliberately catches ``execvpe`` failures
-    (missing/non-executable binary) and returns 126/127 instead of raising,
-    for a clean CLI error. On the plain-exec path (no sandbox, not a waited
-    child, not Windows) that return must still release the just-acquired
-    lock: a genuinely successful ``execvpe`` never returns control to this
-    function at all, so releasing unconditionally after ``launch_argv``
-    returns is always safe."""
-
-    def test_launch_argv_failure_releases_the_lock(self):
-        import os
-        from unittest import mock
-
-        import locks, platforms
-
-        with isolated_store_env():
-            store = Store()
-            store.create("work")
-            plan = runner.build_plan(store, [], flag_ref="work")
-            with mock.patch.object(platforms, "is_windows", return_value=False), \
-                    mock.patch.object(
-                        platforms, "launch_argv", return_value=126
-                    ) as launch_argv:
-                rc = runner.run(plan, store=store)
-            self.assertEqual(rc, 126)
-            launch_argv.assert_called_once()
-            self.assertFalse(locks.is_locked(store, "work"))
-
-
 if __name__ == "__main__":
     unittest.main()
+
