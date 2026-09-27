@@ -13,66 +13,237 @@
   <a href="README.md"><img src="https://img.shields.io/badge/Read%20in-English-0078D4?logo=readme&logoColor=white" alt="Read in English"></a>
 </p>
 
-> **Lanzador multi-perfil para el CLI `agy` (Google Antigravity) con sesiones OAuth totalmente aisladas por perfil.** Una única instalación de `agy`, muchas cuentas de Google con sesión independiente en la misma máquina, sobre **macOS, Linux y Windows** desde una sola base de código. `agydra` está construido solo con la librería estándar de Python (cero dependencias de terceros en runtime), no intercepta `agy` jamás y nunca toca tu `~/.gemini` real: cada perfil autentica en su almacén privado mediante un home overlay.
+> **Una sola instalación de `agy`, múltiples cuentas de Google totalmente aisladas.** `agydra` es un lanzador multi-perfil para el CLI `agy` (Google Antigravity) que proporciona a cada perfil su propia sesión OAuth privada mediante un home overlay por perfil. El directorio `~/.gemini` real nunca se modifica y `agy` jamás es interceptado. Construido estrictamente con la librería estándar de Python (**Python ≥ 3.9, cero dependencias de terceros en runtime**): un núcleo limpio y DRY con adaptadores ligeros para macOS, Linux y Windows.
 
-## 🎯 Qué hace esta herramienta
+---
 
-- **Muchas cuentas, un solo binario.** Lanza el mismo `agy` con la sesión aislada del perfil que elijas, sin duplicar instalaciones ni tocar la sesión genérica.
-- **Aislamiento real.** Cada perfil autentica en su propio almacén privado; el `~/.gemini` real permanece intacto y `agy` nunca se intercepta ni se modifica.
-- **Multiplataforma.** macOS, Linux y Windows desde una única base de código solo-stdlib, sin `sudo` ni permisos de administrador.
-- **Sesiones paralelas.** Locks mantenidos por el kernel (POSIX `flock` / Windows `msvcrt`) evitan sesiones huérfanas y permiten correr varios perfiles a la vez.
-- **Resolución determinista.** Cascada flag → entorno → marcador de proyecto → default → primer perfil, siempre con la razón visible en `status`.
+## 💡 ¿Por qué Agydra?
+
+El CLI `agy` deriva su almacén de datos (`~/.gemini`) directamente del directorio personal del usuario. Si gestionas múltiples cuentas de Google (por ejemplo personal, corporativa, de clientes o de pruebas), alternar entre ellas normalmente requiere iniciar sesión repetidamente, sobreescribir tokens OAuth y arriesgarte a ejecutar prompts en la cuenta equivocada.
+
+`agydra` resuelve esto limpiamente a nivel del sistema operativo:
 
 ```
-agy                 → sesión genérica, conserva el ~/.gemini real (intacto)
-agydra -p trabajo ... → mismo binario agy, pero HOME apunta al overlay del perfil
+agy                 → sesión genérica, utiliza el ~/.gemini real (intacto)
+agydra -p trabajo … → mismo binario agy, pero HOME apunta al overlay aislado del perfil
 ```
 
-El mecanismo: `agy` deriva todo su directorio de datos (`~/.gemini`) desde la variable de home que ve en ejecución (`HOME` en POSIX, `USERPROFILE` en Windows). Por lanzamiento, `agydra` construye un **home overlay por perfil**: `<overlay>/.gemini` enlaza al almacén privado del perfil, el resto de entradas del home real se reflejan con enlaces, y `agy` se lanza con la variable de home redirigida. Nada más cambia.
+- **Cero mezcla de credenciales:** Cada perfil autentica en su propio almacén aislado.
+- **Ejecución paralela multi-cuenta:** Ejecuta tareas en paralelo entre distintas cuentas de forma simultánea sin conflictos de tokens.
+- **Sin parches ni intercepciones binarias:** `agy` se ejecuta sin modificaciones; el aislamiento se logra puramente mediante redirección de entorno y overlays en el sistema de archivos.
+- **Bloqueos consultivos a nivel de kernel:** Las sesiones están protegidas por locks de archivo del SO que se liberan automáticamente incluso ante fallos abruptos o reinicios.
 
-## 📦 Instalación
+---
 
-**Opción 1 — instalar con pip o pipx** (desde un checkout de este repositorio):
+## ⚡ Inicio Rápido
 
-```sh
-pip install .      # o: pipx install .
-```
-
-**Opción 2 — ejecutar sin instalar** (solo Python 3.9+):
-
-```sh
-python3 -m agydra --help
-```
-
-## ⚡ Instalación en un comando
-
-Dos puntos de entrada equivalentes:
-
-```sh
-python3 agydra.py    # desde un clon limpio: sin instalar nada, delega en el paquete
-agydra setup         # una vez instalado (alias: agydra install)
-```
-
-El setup es idempotente (puede re-ejecutarse sin riesgo):
-
-- Valida Python ≥ 3.9.
-- Crea `<repo>/.venv` y ejecuta `pip install -e .` dentro (solo metadatos locales, sin descargas de red).
-- Escribe un shim administrado en `~/.local/bin/agydra` para que `agydra` funcione desde cualquier directorio.
-- Verifica la instalación ejecutando `agydra --version` y sugiere `agydra doctor`.
-
-En Windows no hay shim: el setup imprime el directorio `Scripts` del venv que debe estar en el `PATH`. Con `agydra setup -n` (`--dry-run`) imprimes el estado actual de la instalación (venv, console script, shim, `PATH`) sin tocar nada.
-
-> **Seguridad:** el setup se niega a sobrescribir un archivo ajeno en `~/.local/bin/agydra` (solo reescribe shims que llevan el marcador "Managed by agydra setup"), refresca automáticamente un shim obsoleto y recrea un venv al que le falte el intérprete. `agydra doctor` ahora incluye un check `install` que cubre venv + console script + shim + `PATH`.
-
-## ⚙️ Requisitos previos
+### Requisitos Previos
 
 | Requisito | Detalle |
 |---|---|
-| Python ≥ 3.9 | Solo librería estándar — cero dependencias de terceros en runtime. |
-| CLI `agy` | Ya instalado y en `PATH`, o indicado con `-b RUTA`, `agy_binary` en `agydra.json` o la variable `AGYDRA_AGY_BIN`. |
-| `bwrap` (opcional) | Solo Linux: endurece el aislamiento enmascarando sockets DBus/keyring si `use_linux_sandbox=true`. Si falta, `agydra` degrada con aviso. |
+| **Python ≥ 3.9** | Solo librería estándar — cero dependencias de terceros en runtime. |
+| **CLI `agy`** | Instalado y disponible en el `PATH` (o especificado mediante `-b` / archivo de configuración). |
+| **bwrap** *(opcional)* | Solo Linux: sandbox bubblewrap para enmascarar sockets DBus/keyring (`use_linux_sandbox`). |
 
-**Verificación rápida del entorno:**
+### 1. Instalación
+
+**Recomendado (Instalación en un solo comando desde el clon):**
+
+```sh
+# Clona el repo, crea un venv local, instala el script de consola y coloca un shim en ~/.local/bin
+python3 agydra.py
+```
+
+*O mediante pip/pipx:*
+
+```sh
+pip install .        # o: pipx install .
+```
+
+Verifica tu entorno de inmediato:
+
+```sh
+agydra doctor
+```
+
+### 2. Configuración Inicial (En menos de 60 segundos)
+
+```sh
+# 1. Crea tu perfil aislado
+agydra create trabajo -d "Cuenta corporativa"
+
+# 2. Completa el flujo OAuth una sola vez (los tokens se guardan en el almacén de 'trabajo')
+agydra login trabajo
+
+# 3. Lanza agy con tu nuevo perfil
+agydra -p trabajo "Explica la computación cuántica en tres frases"
+```
+
+---
+
+## 🚀 Flujos de Trabajo Principales
+
+### 1. Aislamiento por Proyecto sin Fricción (`agydra use`)
+Olvídate de pasar `-p` en cada comando. Fija un perfil a un repositorio o carpeta una sola vez:
+
+```sh
+cd ~/proyectos/pasarela-pagos
+agydra use cliente-acme
+
+# Todos los comandos agydra dentro de este árbol usarán automáticamente 'cliente-acme'
+agydra "Resume los commits recientes"
+agydra status
+```
+
+### 2. Pool de Cuentas y Ejecución Concurrente (`agydra -r`)
+Al orquestar agentes automáticos o scripts en segundo plano entre varias terminales, usa `-r` (`--random`) para seleccionar automáticamente el perfil autenticado, desocupado y menos recientemente usado:
+
+```sh
+# Terminal 1: Toma el perfil 'alfa'
+agydra -r "Ejecutar pruebas de integración"
+
+# Terminal 2: Toma automáticamente el perfil 'beta' (salta el ocupado 'alfa')
+agydra -r "Revisar hallazgos de seguridad"
+```
+
+### 3. Inspección de Cuotas en Tiempo Real (`agydra usage`)
+Supervisa cuotas de modelos y límites de tasa en todas tus cuentas sin necesidad de abrir sesiones interactivas:
+
+```sh
+# Vista global resumida de todas las cuentas
+agydra usage
+
+# Desglose detallado para un perfil específico con temporizadores de reinicio
+agydra usage trabajo
+```
+
+*Nota:* `agydra usage` es de solo lectura y puede ejecutarse de forma segura junto a sesiones activas.
+
+### 4. Compartir Configuración sin Fugas de Secretos (`agydra share-config`)
+Distribuye herramientas personalizadas y definiciones MCP entre cuentas sin transferir secretos OAuth:
+
+```sh
+# Copia únicamente settings.json y mcp.json; las credenciales permanecen estrictamente privadas
+agydra share-config trabajo personal pruebas
+```
+
+### 5. Verificación en Seco (`agydra -n`)
+Inspecciona variables de entorno, redirecciones del sistema de archivos y argumentos sin ejecutar ninguna acción:
+
+```sh
+agydra -np trabajo "¿Cuál es mi entorno actual?"
+```
+
+---
+
+## 🧭 Referencia de Comandos y Parámetros
+
+### Subcomandos y Alias
+
+Cualquier subcomando de gestión acepta también la sintaxis `--NOMBRE` o `-NOMBRE` (por ejemplo `agydra --list` == `agydra list`).
+
+| Comando | Alias | Descripción |
+|---|---|---|
+| `agydra [FLAGS] <args de agy...>` | — | Lanzador por defecto: ejecuta `agy` con el perfil resuelto. |
+| `agydra list` | `ls`, `l` | Muestra tabla de perfiles: número, email, marca default, estado de auth, ocupado, último uso. |
+| `agydra create NOMBRE [-d DESC]` | `c` | Crea el almacén de un perfil aislado. |
+| `agydra login [NOMBRE\|#] [-f] [-n]` | `in` | Corre el flujo OAuth de `agy` aislado a ese perfil (`-f` fuerza re-login; `-n` dry-run). |
+| `agydra import NOMBRE\|# [-s DIR]` | `imp` | **Copia** (nunca mueve) un `~/.gemini` existente a un perfil (`-s` sobreescribe el directorio origen). |
+| `agydra status [-n]` | `st` | Muestra perfil activo, razón de resolución, binario, email, estado de auth y lock. |
+| `agydra default [NOMBRE\|#]` | `d` | Consulta o establece el perfil por defecto global. |
+| `agydra use NOMBRE\|#` | `u` | Escribe un marcador `.agydra` fijando el perfil al directorio actual. |
+| `agydra rename A B` | `mv` | Renombra un perfil y actualiza referencias por defecto (rechaza perfiles ocupados). |
+| `agydra delete NOMBRE\|# [-f] [--no-backup]` | `rm` | Crea un respaldo de seguridad ZIP en `backups/` y elimina el perfil (rechaza ocupados). |
+| `agydra share-config ORIGEN DESTINO...` | `share` | Copia de forma segura `settings.json` y `mcp.json` desde `ORIGEN` (nunca credenciales). |
+| `agydra setup [-n]` | `install` | Instalador idempotente: valida venv, instala script de consola y configura shim en PATH. |
+| `agydra doctor [--fix] [-f]` | `doc` | Suite de diagnósticos. `--fix` repara automáticamente enlaces rotos, locks huérfanos y slots obsoletos. |
+| `agydra usage [NOMBRE\|#]` | `us` | Inspecciona cuotas en vivo y estados de límite de tasa entre cuentas. |
+
+### Parámetros del Lanzador
+
+Los flags del lanzador deben especificarse **antes** de los argumentos destinados a `agy`:
+
+| Flag Corto | Flag Largo | Descripción |
+|:---:|---|---|
+| `-p NOMBRE\|#` | `--profile` | Perfil objetivo por nombre o número 1-based (de `agydra list`). |
+| `-r` | `--random` | Elige automáticamente el perfil libre, autenticado y menos usado (requiere 2+ perfiles). |
+| `-n` | `--dry-run` | Imprime el plan de lanzamiento, rutas y entorno sin ejecutar `agy`. |
+| `-b RUTA` | `--binary` | Sobreescribe la ruta del ejecutable `agy` para esta llamada. |
+| `-f` | `--force` | Omite la adquisición del lock de sesión; permite ejecuciones paralelas o de emergencia sobre perfiles ocupados. |
+
+### 🔀 Combinaciones Comunes de Parámetros
+
+Los flags cortos se pueden agrupar según las convenciones estándar POSIX (`-nr` == `-n -r`):
+
+| Combinación | Equivalencias | Propósito |
+|---|---|---|
+| `agydra -p trabajo "prompt"` | `--profile=trabajo`, `-ptrabajo` | Lanza `agy` con un perfil explícito. |
+| `agydra -r "prompt"` | `--random` | Toma automáticamente una cuenta libre y autenticada del pool. |
+| `agydra -rf "prompt"` | `-r -f`, `--random --force` | Elige perfil libre; si todos están ocupados o solo hay 1 perfil, fuerza el lanzamiento. |
+| `agydra -np trabajo` | `-n -p trabajo`, `--dry-run -p trabajo` | Inspecciona el plan de lanzamiento (rutas, entorno, binario) sin ejecutar nada. |
+| `agydra -nr` | `-n -r`, `--dry-run --random` | Visualiza qué perfil libre sería seleccionado sin ejecutar `agy`. |
+| `agydra -fp trabajo` | `-f -p trabajo`, `--force -p trabajo` | Omite el lock de sesión para una tarea paralela urgente o tras una caída previa. |
+| `agydra -b /ruta/agy -p trabajo` | `--binary /ruta/agy -p trabajo` | Prueba un binario experimental de `agy` con credenciales aisladas. |
+| `agydra doctor --fix -f` | `agydra doc --fix --force` | Ejecuta autoreparación de perfiles colgados, locks y enlaces huérfanos sin confirmación interactiva. |
+| `agydra delete antiguo -f` | `agydra rm antiguo --force` | Borrado no interactivo (genera respaldo ZIP primero; sigue rechazando perfiles ocupados). |
+
+### Cascada de Resolución de Perfiles
+
+Al lanzar sin `-p`, `agydra` resuelve el perfil activo de forma determinista (la primera coincidencia gana):
+
+```
+1. Flag --profile / -p
+   └── 2. Variable de entorno AGYDRA_PROFILE
+       └── 3. Archivo marcador .agydra (directorio ancestro más cercano al CWD; anula -r)
+           └── 4. default_profile configurado en agydra.json
+               └── 5. Primer perfil en orden alfabético
+```
+
+**Códigos de Salida:** `0` Éxito · `1` Error general o fallo de diagnóstico · `2` Conflicto de flags (`-p` + `-r`) · `126` Binario no ejecutable · `127` Binario no encontrado · `130` Interrumpido con Ctrl-C.
+
+---
+
+## 🛡️ Arquitectura e Invariantes
+
+```
+Home del Host (~/)
+├── .gitconfig, .ssh, .bashrc (compartidos de forma nativa vía enlaces/junctions)
+└── ~/.gemini (datos genéricos, INTACTOS)
+
+Almacén Agydra (<store root>/)
+├── profiles/
+│   ├── trabajo/data/     <── Almacenamiento real de tokens OAuth y settings de 'trabajo'
+│   └── personal/data/    <── Almacenamiento real de tokens OAuth y settings de 'personal'
+└── overlays/
+    └── trabajo/          <── HOME inyectado durante la ejecución de agydra
+        ├── .gemini       ───> symlink hacia profiles/trabajo/data
+        └── (symlinks hacia herramientas del host: .gitconfig, .ssh, ...)
+```
+
+### 1. Mecánica del Home Overlay
+- `agydra` crea una estructura aislada en `<store>/overlays/<perfil>`.
+- `<overlay>/.gemini` enlaza directamente a `<store>/profiles/<perfil>/data`.
+- Las entradas principales de configuración del usuario (`.ssh`, `.gitconfig`, entornos de terminal) se reflejan mediante symlinks (o junctions en Windows), asegurando que las herramientas de desarrollo funcionen con total normalidad.
+- Los directorios ancestros de la raíz del almacén (como `~/Library` en macOS) se reflejan como directorios reales para que el almacén mismo permanezca inaccesible desde el overlay.
+- Se inyecta `AGYDRA_REAL_HOME` en el proceso hijo, permitiendo que subshells y comandos secundarios ubiquen el home real del sistema.
+
+### 2. Bloqueos Consultivos a Nivel de Kernel
+- El control de concurrencia utiliza locks de archivo del SO en `<store>/locks/<perfil>.lock` (`fcntl.flock` en POSIX, `msvcrt.locking` en Windows).
+- **Cero bloqueos huérfanos:** El bloqueo está ligado al descriptor de archivo del proceso activo. Si el proceso termina (de forma normal, anormal o por `SIGKILL`), el kernel del sistema operativo libera el lock de inmediato.
+
+### 3. Adaptadores Multiplataforma
+
+| Plataforma | Mecanismo | Detalle |
+|---|---|---|
+| **macOS** | Puente de Keychain | Enlaza el servicio fijo `antigravity` de `agy` con slots privados por perfil (`agydra.<perfil>`). Intercambia credenciales en el slot activo para la sesión y las restaura al salir. Todas las escrituras validan la identidad contra el email conocido del perfil. |
+| **Linux** | Sandbox bwrap | Sandboxing opcional con bubblewrap (`use_linux_sandbox=true`) para enmascarar sockets DBus/keyring y forzar aislamiento estricto en disco. Degrada limpiamente con una advertencia si `bwrap` no está instalado. |
+| **Windows** | Junctions Nativas | El reflejo de directorios aprovecha junctions NTFS (`mklink /J`) y llamadas estándar `Path.unlink()` sin requerir permisos de Administrador ni Modo Desarrollador. |
+
+---
+
+## 🩺 Diagnóstico y Salud (`agydra doctor`)
+
+La suite de diagnósticos ejecuta 10 comprobaciones exhaustivas en una sola pasada:
 
 ```sh
 agydra doctor
@@ -83,254 +254,135 @@ agydra doctor — agydra 1.0.0 on darwin
 legend: [ok]=pass [!!]=warn [XX]=fail
 [ok] agy binary: /usr/local/bin/agy
 [ok] store writable: ~/Library/Application Support/agydra
-[ok] profiles: 2
-...
+[ok] profiles: 3
+  - trabajo: authenticated
+  - personal: authenticated
+  - pruebas: not-authenticated
+[ok] locks: no live sessions
+[ok] isolation: verified
+[ok] keychain bridge: functional
+[ok] profile stores contain agy data layout (schema canary passed)
+[ok] store clean (no orphaned artifacts)
+[ok] linux sandbox: n/a (not linux)
+[ok] install: shim valid at ~/.local/bin/agydra
+
 result: healthy
 ```
 
-## 🚀 Ejemplos de uso
-
-**1. Crear el primer perfil, autenticarlo y lanzarlo**
-
+**Reparación Automática:**
 ```sh
-agydra create trabajo -d "Cuenta laboral"
-agydra login trabajo
-agydra -p trabajo "resume la reunión de ayer"
+agydra doctor --fix
 ```
+Limpia automáticamente overlays huérfanos, purga locks colgados, elimina slots obsoletos del llavero y reconecta enlaces rotos.
 
-```text
-created profile: trabajo
-authenticate it with: agydra login trabajo
-launching agy for login under profile 'trabajo'...
-complete the OAuth flow in the browser; tokens land in the profile store
-```
+---
 
-**2. Fijar un perfil por proyecto con `use`**
+## ⚙️ Referencia de Configuración
 
-```sh
-cd ~/proyectos/api-pagos
-agydra use trabajo
-agydra status
-```
+La configuración global reside en `<store root>/agydra.json`:
 
-```text
-pinned /Users/tu/api-pagos/.agydra -> profile 'trabajo'
-agy launches in this directory will use 'trabajo' automatically
-profile   : trabajo
-reason    : project marker /Users/tu/api-pagos/.agydra
-binary    : /usr/local/bin/agy
-email     : tu@empresa.com
-auth      : authenticated
-busy      : no
-store     : ~/Library/Application Support/agydra/profiles/trabajo/data
-```
-
-**3. Sesiones paralelas con `-r` (perfil libre autenticado)**
-
-```sh
-agydra -r "revisa el error del despliegue"    # terminal 1
-agydra -r "genera tests del módulo pagos"     # terminal 2
-agydra list
-```
-
-```text
-#  PROFILE    EMAIL             AUTH           DEFAULT  BUSY  LAST USED
-1  trabajo    tu@empresa.com    authenticated  *        yes   2026-01-02T10:00:00Z
-2  personal   tu@gmail.com      authenticated           yes   2026-01-02T10:00:05Z
-```
-
-`-r` exige 2+ perfiles y elige el perfil libre autenticado menos usado; nunca lanza uno ocupado ni sin autenticar.
-
-**4. Inspeccionar el plan de lanzamiento con `--dry-run`**
-
-```sh
-agydra -n -p trabajo "resume la reunión"
-```
-
-```text
-profile : trabajo (flag --profile=trabajo)
-binary : /usr/local/bin/agy
-argv    : /usr/local/bin/agy resume la reunión
-overlay : ~/Library/Application Support/agydra/overlays/trabajo
-env     : HOME=~/Library/Application Support/agydra/overlays/trabajo
-sandbox : off
-```
-
-**5. Compartir settings entre perfiles (nunca credenciales)**
-
-```sh
-agydra share-config trabajo personal
-```
-
-```text
-copied: personal/settings.json
-copied: personal/mcp.json
-```
-
-## 📖 Capacidades
-
-**Gestión de perfiles**
-
-| Capacidad | Detalle |
+| Sistema Operativo | Ubicación por Defecto del Almacén |
 |---|---|
-| Crear y autenticar | `create` crea el almacén del perfil; `login` corre el OAuth de `agy` aislado a ese perfil. |
-| Importar sesión genérica | `import NOMBRE` **copia** (nunca mueve) el `~/.gemini` genérico a un perfil; la fuente se autodetecta y `-s DIR` la sobrescribe (pasar una ruta como NOMBRE se rechaza con guía correcta). |
-| Renombrar y borrar | `rename` actualiza la referencia default; `delete` crea un ZIP de respaldo antes de borrar (conserva 5). Ambos rechazan perfiles ocupados. |
-| Fijar por proyecto | `use` escribe el marcador `.agydra` para fijar el perfil de ese directorio. |
-| Inspección sin efectos | `list` y `status` muestran número, email, estado de auth, ocupado y último uso sin tocar el sistema de archivos. |
-| Compartir settings | `share-config` copia solo `settings.json` + `mcp.json` entre perfiles. |
+| **macOS** | `~/Library/Application Support/agydra` |
+| **Linux** | `$XDG_DATA_HOME/agydra` o `~/.local/share/agydra` |
+| **Windows** | `%LOCALAPPDATA%\agydra` |
 
-**Aislamiento y seguridad**
-
-| Capacidad | Detalle |
-|---|---|
-| Home overlay por perfil | `<overlay>/.gemini` enlaza al almacén privado; las entradas del home no relacionadas se reflejan con enlaces, y las que son ancestras del store (p. ej. `~/Library` en macOS) se reflejan como directorios reales para que el store nunca quede accesible. |
-| `~/.gemini` real intacto | `agydra` nunca escribe en el directorio de datos genérico ni intercepta `agy`. |
-| Locks kernel-held | POSIX `flock` con fd heredable llevado en `execvpe` / Windows `msvcrt` byte-range: sin locks huérfanos; `delete`/`rename` rechazan perfiles ocupados. |
-| Escrituras atómicas | Toda escritura de JSON/config usa tmp + fsync + `os.replace`. |
-| Config corrupta | Degrada a defaults en lectura y se niega a escribir hasta que la repares. |
-| Diagnóstico | `doctor` revisa binario, permisos del almacén, perfiles, locks, aislamiento, canario de esquema y sandbox; sale 1 si algún check falla. |
-
-**Matriz multiplataforma**
-
-| Plataforma | Mecanismo |
-|---|---|
-| macOS | Home overlay + puente de llavero (keychain): intercambia el slot compartido fijo de `agy` por un slot privado por perfil alrededor de cada lanzamiento y lo restaura después; los fallos son avisos no fatales. |
-| Linux | Home overlay + sandbox bwrap (bubblewrap) opcional enmascarando sockets DBus/keyring con `use_linux_sandbox=true`; degrada con aviso si falta `bwrap`. |
-| Windows | Home overlay redirigiendo `USERPROFILE`; los enlaces de directorio caen a junctions (`mklink /J`), sin permisos de administrador. |
-
-## 🧭 Comandos
-
-| Comando | Alias | Descripción |
-|---|---|---|
-| `agydra [-p PERFIL\|#] [-r] [-n] [-b RUTA] [-f] <args de agy...>` | — | Lanza `agy` con la sesión aislada del perfil resuelto. Los flags de agydra van **antes** de los args de agy; un `-p` tardío va a `agy` y se imprime un aviso. Los flags cortos se agrupan estilo getopt: `-nr -p work` == `-n -r -p work`. `-f` omite el lock de sesión. Los nombres de perfil no pueden chocar con un subcomando o alias (`status`, `ls`, `mv`, ...) — el dispatcher los opacaría. |
-| `list` | `ls`, `l` | Tabla de perfiles: número, email, default, estado de auth, ocupado, último uso. |
-| `create NOMBRE [-d DESC]` | `c` | Crea el almacén de un perfil. |
-| `login [NOMBRE\|#] [-f] [-n]` | `in` | Corre el OAuth de `agy` aislado a ese perfil (`-f` fuerza re-autenticación sin confirmación; `-n` dry-run). |
-| `import NOMBRE\|# [-s DIR]` | `imp` | **Copia** (nunca mueve) el `~/.gemini` genérico a un perfil; `-s DIR` sobreescribe el directorio de origen. |
-| `status [-n]` | `st` | Perfil resuelto + razón + binario + email + auth + ocupado; cero efectos secundarios. |
-| `default [NOMBRE\|#]` | `d` | Ver o fijar el perfil default. |
-| `use NOMBRE\|#` | `u` | Escribe el marcador `.agydra` fijando el perfil para ese directorio de proyecto. |
-| `rename A B` | `mv` | Renombra un perfil (rechaza ocupados). |
-| `delete NOMBRE\|# [-f] [--no-backup]` | `rm` | ZIP de respaldo y borrar (rechaza ocupados). |
-| `share-config ORIGEN DESTINO...` | `share` | Copia solo `settings.json` + `mcp.json` entre perfiles. |
-| `setup [-n]` | `install` | Instalación en un comando: crea el venv, instala el console script y verifica; `-n` imprime el estado actual. `python3 agydra.py` es el bootstrap sin instalación desde un clon limpio. |
-| `doctor [--fix] [-f]` | `doc` | Diagnósticos del entorno; sale 1 si algún check falla. `--fix` migra un overlay con directorio real al almacén del perfil y lo revincula, limpia un perfil default colgado, purga slots huérfanos del llavero de macOS y elimina overlays/locks/secretos de keychain/backups huérfanos dejados por un perfil borrado a mano (pide confirmación salvo `-f`/`--force`). |
-| `usage [NOMBRE\|#]` | `us` | Consulta de cuota mediante `/usage` de agy. Sin ref: tabla compacta de todos los perfiles (una columna por bucket, coloreada por cuota restante). Con ref: vista detallada por grupo con barras de progreso y cuenta regresiva de reseteo. Funciona incluso con un perfil ocupado (solo lectura, sin lock de sesión; en macOS el swap de llavero es un no-op si el perfil ya posee el slot compartido); la consulta entre múltiples perfiles es secuencial. |
-
-| Flag corto | Flag largo | Función |
-|:-:|---|---|
-| `-p PERFIL` | `--profile PERFIL` | Elige perfil por nombre o número 1-based. |
-| `-r` | `--random` | Perfil libre autenticado menos usado (requiere 2+). |
-| `-n` | `--dry-run` | Imprime el plan de lanzamiento sin ejecutar nada. |
-| `-b RUTA` | `--binary RUTA` | Sobreescribe el binario `agy`. |
-| `-f` | `--force` | Lanza sin tomar el lock de sesión, incluso contra un perfil ya ocupado; sesiones concurrentes sobre el mismo perfil pueden corromper los tokens OAuth. |
-
-### 🔀 Combinaciones Comunes de Parámetros
-
-Los flags cortos se pueden agrupar según la convención estándar POSIX getopt (`-nr` == `-n -r`). Los parámetros de `agydra` deben preceder siempre a los argumentos destinados a `agy`:
-
-| Combinación | Equivalencias | Propósito |
-|---|---|---|
-| `agydra -p trabajo "prompt"` | `--profile=trabajo`, `-ptrabajo` | Lanza `agy` con un perfil explícito. |
-| `agydra -r "prompt"` | `--random` | Elige automáticamente un perfil libre y autenticado. |
-| `agydra -rf "prompt"` | `-r -f`, `--random --force` | Elige perfil libre; si todos están ocupados o solo existe 1 perfil, fuerza el lanzamiento. |
-| `agydra -np trabajo` | `-n -p trabajo`, `--dry-run -p trabajo` | Inspecciona el plan de lanzamiento (rutas, env, binario) sin ejecutar nada. |
-| `agydra -nr` | `-n -r`, `--dry-run --random` | Muestra qué perfil libre se elegiría sin ejecutar ninguna acción. |
-| `agydra -fp trabajo` | `-f -p trabajo`, `--force -p trabajo` | Omite el lock de sesión para una tarea paralela urgente o tras una caída anormal previa. |
-| `agydra -b /ruta/agy -p trabajo` | `--binary /ruta/agy -p trabajo` | Ejecuta un binario específico o de prueba de `agy` con las credenciales aisladas del perfil. |
-| `agydra doctor --fix -f` | `agydra doc --fix --force` | Aplica reparaciones automáticas (enlaces, slots huérfanos, defaults colgados) sin pedir confirmación interactiva. |
-| `agydra delete antiguo -f` | `agydra rm antiguo --force` | Borrado no interactivo del perfil (genera respaldo ZIP primero; sigue rechazando perfiles ocupados). |
-
-`-p` y `-r` son mutuamente excluyentes. Sin `-p`, la resolución sigue una cascada determinista (gana el primer match): flag `--profile` → variable de entorno `AGYDRA_PROFILE` → archivo marcador `.agydra` (el ancestro más cercano del CWD; lo escribe `agydra use`) → default configurado → primer perfil. El marcador pisa a `-r`. `status` siempre muestra qué perfil se usará desde el directorio actual y por qué. `-r` normalmente requiere 2+ perfiles y descarta los ocupados o sin autenticar; `-f` levanta ambas restricciones para `-r -f`.
-
-| Código de salida | Significado |
-|:-:|---|
-| `0` | Éxito. |
-| `1` | Error de ejecución o check de `doctor` fallido. |
-| `2` | Conflicto `-p` + `-r`. |
-| `126` / `127` | Binario no ejecutable / no encontrado. |
-| `130` | Cancelado con Ctrl-C. |
-
-## 🔧 Estructura del proyecto
-
-```
-agydra/                  # raíz del repo — layout plano, sin subdirectorio de paquete
-├── agydra.py            # VERSION + bootstrap de un comando (python3 agydra.py)
-├── models.py            # dataclasses Profile / Config + DEFAULT_SETTINGS
-├── platforms.py         # rutas por OS, variable de home, resolución del binario, lanzamiento
-├── ui.py                # primitivas de salida en consola (colores, warn/note/error)
-├── banner.py            # renderizado ASCII/ANSI del logo en la terminal
-├── store.py             # CRUD de perfiles, config, escrituras atómicas, backups
-├── locks.py             # locks de sesión kernel-held (flock / msvcrt)
-├── resolver.py          # cascada de resolución, perfil libre -r, marcador .agydra
-├── account.py           # detección de auth/email desde los datos del perfil
-├── keychain.py          # puente de llavero macOS (slot compartido ↔ privado por perfil)
-├── isolation.py         # overlay home, enlaces (symlink+junction), env, bwrap
-├── runner.py            # build_plan (puro) + run (lock → overlay → keychain → exec)
-├── doctor.py            # 10 checks de diagnóstico; exit 1 si alguno FALLA
-├── cli.py               # CLI argparse; el lanzador es el modo por defecto
-├── vocab.py             # vocabulario compartido de subcomandos y nombres reservados
-├── orphans.py           # escaneo inverso + limpieza de artefactos huérfanos
-├── usage.py             # `agydra usage`: consulta y parseo de cuotas de agy /usage
-├── bootstrap.py         # instalador de un comando (venv + script de consola + shim en PATH)
-├── tests/               # 522 tests (fake home + binario agy falso)
-├── README.md            # Este documento (inglés)
-├── README.es.md         # Versión en español
-├── AGENTS.md            # Convenciones de desarrollo
-├── LICENSE              # Licencia MIT
-└── pyproject.toml       # Metadatos del paquete (layout plano py-modules)
-```
-
-El almacén de datos en runtime vive fuera del repo: `%LOCALAPPDATA%\agydra` (Windows), `~/Library/Application Support/agydra` (macOS), `$XDG_DATA_HOME/agydra` o `~/.local/share/agydra` (Linux); la variable `AGYDRA_HOME` lo sobreescribe.
-
-## ⚙️ Configuración
-
-`agydra.json`, en la raíz del almacén:
-
-**Color:** toda la ayuda y el estado se colorean automáticamente en TTY y se
-desactivan en pipes/CI. `NO_COLOR=1` fuerza salida plana; `FORCE_COLOR=1` la
-fuerza a color.
+*Sobreescribir con:* `export AGYDRA_HOME=/ruta/personalizada`
 
 ```json
 {
-  "default_profile": "work",
+  "default_profile": "trabajo",
   "settings": {
     "use_linux_sandbox": false,
     "copy_settings_on_create": true,
     "windows_redirect_home": false
   },
-  "agy_binary": "/absolute/path/to/agy"
+  "agy_binary": "/usr/local/bin/agy"
 }
 ```
 
-> `use_linux_sandbox` y `windows_redirect_home` son opcionales (`false` por defecto); ponlos en `true` para activar el sandbox bwrap (Linux) o la redirección `USERPROFILE` (Windows).
+### Variables de Entorno
 
-Orden de resolución del binario `agy`: flag `--binary` → `agy_binary` en `agydra.json` → variable de entorno `AGYDRA_AGY_BIN` → búsqueda en `PATH`.
-
-## ⚠️ Limitaciones
-
-- `agydra` no gestiona la instalación, actualización ni renovación de tokens de `agy`: eso queda dentro del directorio de datos de cada perfil, propiedad de `agy`.
-- La derivación del home es una propiedad del `agy` actual, no un contrato de API: si una versión futura deja de derivar su directorio de datos desde la variable de home, el canario de esquema de `doctor` lo reportará tras el siguiente `login`.
-- Las ramas específicas de Windows (junctions, `msvcrt`, `USERPROFILE`) están implementadas pero solo se ejecutan en Windows real.
-
-## 🤝 Contribuir
-
-- **Solo stdlib.** Cero dependencias de terceros; Python ≥ 3.9. No añadas paquetes.
-- **Multiplataforma por construcción.** Cada diferencia de OS vive en `platforms.py` y en los helpers de enlaces de `isolation.py`; nunca ramifiques por SO fuera de esos límites.
-- **Tests antes de declarar listo.** Desde la raíz del repo: `python3 -m pytest -q` (522 pasan + 3 skips de plataforma en macOS).
-- Consulta [AGENTS.md](AGENTS.md) para las guías de invariantes, layout y convenciones del proyecto.
-
-## 📄 Licencia
-
-Licencia [MIT](LICENSE). Puedes usar, copiar y modificar este software libremente conservando el aviso de copyright y esta licencia.
-
-## 👨💻 Autor
-
-[![Autor: DragonJAR](https://img.shields.io/badge/Autor-DragonJAR-orange.svg)](https://www.DragonJAR.org)
-
-Creado y mantenido por **[DragonJAR](https://www.DragonJAR.org)** — seguridad, comunidad y herramientas libres.
+| Variable | Propósito |
+|---|---|
+| `AGYDRA_PROFILE` | Establece el perfil activo por defecto (anulado por `-p` y por el marcador `.agydra`). |
+| `AGYDRA_HOME` | Directorio personalizado para el almacén de perfiles y overlays. |
+| `AGYDRA_AGY_BIN` | Ruta explícita al ejecutable `agy`. |
+| `AGYDRA_NO_KEYCHAIN` | Desactiva el intercambio de llavero en macOS (solo archivos de tokens en disco). |
+| `NO_COLOR` / `FORCE_COLOR` | Controla los colores ANSI en la terminal. |
 
 ---
 
-`agydra` es una herramienta comunitaria independiente, sin afiliación ni respaldo de Google. `agy` / Antigravity son productos de Google. Usa tus propias cuentas responsablemente.
+## 🔧 Estructura del Proyecto y Pruebas
+
+```text
+agydra/                     # Estructura plana (cero dependencias de terceros)
+├── agydra.py               # Punto de entrada para bootstrap y definición de versión
+├── models.py               # Modelos de datos Profile y Config
+├── platforms.py            # Detección de rutas por SO, descubrimiento de binarios y ejecución
+├── ui.py                   # Formato ANSI en terminal y estilos de salida
+├── banner.py               # Renderizado del logo en terminal
+├── store.py                # CRUD de perfiles, operaciones atómicas y respaldos ZIP
+├── locks.py                # Bloqueos de sesión a nivel de kernel (flock / msvcrt)
+├── resolver.py             # Cascada determinista de resolución y evaluación de marcadores
+├── account.py              # Parseo de tokens OAuth y detección de identidad
+├── keychain.py             # Puente de llavero por perfil en macOS
+├── isolation.py            # Construcción de home overlays y redirección de entorno
+├── runner.py               # Orquestación de lanzamiento: resolver → planear → overlay → ejecutar
+├── doctor.py               # Suite de diagnóstico y motor de autoreparación
+├── cli.py                  # Analizador de argumentos CLI y despachador de comandos
+├── vocab.py                # Vocabulario de comandos y nombres de perfil reservados
+├── orphans.py              # Auditoría inversa del almacén y limpiador de huérfanos
+├── usage.py                # Inspector de cuotas y parseador de límites de tasa
+├── bootstrap.py            # Instalador idempotente de venv y shim en PATH
+├── tests/                  # 525 pruebas automáticas unitarias y de integración
+├── README.md               # Documentación en inglés
+├── README.es.md            # Documentación en español
+├── AGENTS.md               # Convenciones de desarrollo e invariantes arquitectónicos
+├── LICENSE                 # Licencia MIT
+└── pyproject.toml          # Metadatos del empaquetado
+```
+
+### Ejecución de Pruebas
+
+La suite de pruebas valida entornos simulados, casos límite y todas las plataformas sin tocar los archivos del sistema:
+
+```sh
+python3 -W error::ResourceWarning -m pytest tests/ -q
+# 522 passed, 3 skipped (en macOS) en ~40s (0 advertencias)
+
+python3 -m unittest discover -s tests -q
+# Ran 525 tests en ~36s - OK
+```
+
+---
+
+## ⚠️ Limitaciones
+
+- `agydra` gestiona **perfiles y sesiones**, no la instalación ni las actualizaciones del binario `agy`.
+- El aislamiento depende de que `agy` derive su directorio de configuración a partir de `HOME` (o `USERPROFILE`). Si una versión futura de `agy` cambia este comportamiento, el canario de esquema de `agydra doctor` lo detecta inmediatamente y te avisa.
+- Las ramas específicas de Windows se verifican en Windows nativo; en sistemas Unix se validan mediante la suite de pruebas unitarias aisladas.
+
+---
+
+## 🤝 Contribuir
+
+¡Agradecemos las contribuciones de la comunidad! Por favor respeta nuestros invariantes centrales:
+1. **Cero dependencias de terceros en runtime:** Usa estrictamente la librería estándar de Python (`sys`, `os`, `pathlib`, `fcntl`, `tempfile`, etc.).
+2. **Paridad multiplataforma:** Los cambios deben ejecutarse de forma idéntica en macOS, Linux y Windows.
+3. **Verificación exhaustiva:** Ejecuta los 525 tests antes de abrir un pull request.
+4. **Coherencia arquitectónica:** Revisa [AGENTS.md](AGENTS.md) para conocer las directrices completas.
+
+---
+
+## 📄 Licencia
+
+Distribuido bajo la **Licencia MIT**. Consulta [LICENSE](LICENSE) para más detalles.
+
+## 👨💻 Autor
+
+Desarrollado y mantenido por **[DragonJAR](https://www.DragonJAR.org)** — Seguridad, Comunidad y Herramientas Libres.
+
+---
+
+*Aviso: `agydra` es un proyecto comunitario independiente y no está afiliado, respaldado ni patrocinado por Google. `agy` y Antigravity son marcas registradas de Google LLC. Utiliza tus cuentas y tokens cumpliendo los Términos de Servicio de Google.*
