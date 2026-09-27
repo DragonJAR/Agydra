@@ -138,6 +138,7 @@ class BaseCase(unittest.TestCase):
         self._old_env = dict(os.environ)
         os.environ["AGYDRA_HOME"] = str(self.store_root)
         os.environ["HOME"] = str(self.fake_home)
+        os.environ["AGYDRA_REAL_HOME"] = str(self.fake_home)
         os.environ.pop("AGYDRA_PROFILE", None)
         os.environ.pop("XDG_DATA_HOME", None)
         if sys.platform.startswith("win"):

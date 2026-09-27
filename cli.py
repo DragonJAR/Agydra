@@ -825,7 +825,7 @@ def cmd_setup(_store: Store, args) -> int:
         print(f"  [{'ok' if state['on_path'] else '!!'}] shim dir on PATH: {state['on_path']}")
         print("run `agydra setup` to create or repair anything marked [--]/[!!]")
         return 0
-    return bootstrap.run()
+    return bootstrap.run(force=getattr(args, "force", False))
 
 
 _SUBCOMMAND_HELP: Dict[str, str] = {
@@ -1061,6 +1061,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.add_argument(
                 "-n", "--dry-run", action="store_true",
                 help="print what setup would do without touching anything",
+            )
+            parser.add_argument(
+                "-f", "--force", action="store_true",
+                help="force overwrite of foreign or existing shim at ~/.local/bin/agydra",
             )
             parser.set_defaults(func=cmd_setup)
         args = parser.parse_args(rest)

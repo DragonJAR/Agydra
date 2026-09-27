@@ -46,10 +46,11 @@ def _make_fake_project(tmp: Path, *, with_console: bool) -> Path:
 class _HomeSandbox:
     """Context manager that restores the previous $HOME on exit."""
 
-    __slots__ = ("_old",)
+    __slots__ = ("_old", "_old_real")
 
-    def __init__(self, old):
+    def __init__(self, old, old_real):
         self._old = old
+        self._old_real = old_real
 
     def __enter__(self):
         return bootstrap.shim_path()
@@ -59,20 +60,27 @@ class _HomeSandbox:
             os.environ.pop("HOME", None)
         else:
             os.environ["HOME"] = self._old
+        if self._old_real is None:
+            os.environ.pop("AGYDRA_REAL_HOME", None)
+        else:
+            os.environ["AGYDRA_REAL_HOME"] = self._old_real
         return False
 
 
 def _sandbox_home(base: Path) -> _HomeSandbox:
-    """Pin $HOME to ``base/fakehome`` for the duration of a ``with`` block.
+    """Pin $HOME and $AGYDRA_REAL_HOME to ``base/fakehome`` for the duration of a ``with`` block.
 
     Bootstrap resolves ``~/.local/bin`` from HOME, so every test that touches
     shim state must sandbox it; the returned context manager yields the
     ``shim_path()`` computed under the fake home for like-for-like asserts.
     """
     old = os.environ.get("HOME")
-    os.environ["HOME"] = str(base / "fakehome")
+    old_real = os.environ.get("AGYDRA_REAL_HOME")
+    fake = str(base / "fakehome")
+    os.environ["HOME"] = fake
+    os.environ["AGYDRA_REAL_HOME"] = fake
     (base / "fakehome").mkdir(parents=True, exist_ok=True)
-    return _HomeSandbox(old)
+    return _HomeSandbox(old, old_real)
 
 
 class VersionAttrGuard(unittest.TestCase):
@@ -381,6 +389,72 @@ class ShimInstall(unittest.TestCase):
                 with self.assertRaises(bootstrap.BootstrapError):
                     bootstrap.ensure_path_shim(proj, lambda _l: None)
 
+    def test_force_overwrites_foreign_shim(self):
+        if sys.platform.startswith("win"):
+            self.skipTest("POSIX-only")
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            with _sandbox_home(Path(td)) as expected:
+                shim = bootstrap.shim_path()
+                shim.parent.mkdir(parents=True, exist_ok=True)
+                shim.write_text("#!/bin/sh\necho 'totally unrelated'\n", encoding="utf-8")
+                res = bootstrap.ensure_path_shim(proj, lambda _l: None, force=True)
+                self.assertEqual(res, expected)
+                body = expected.read_text(encoding="utf-8")
+                self.assertIn(bootstrap.SHIM_MARKER, body)
+                self.assertIn(str(bootstrap.console_script(proj)), body)
+
+    def test_refuses_foreign_shim_advises_force(self):
+        """Foreign shim rejection error message must advise user about --force."""
+        if sys.platform.startswith("win"):
+            self.skipTest("POSIX-only")
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            with _sandbox_home(Path(td)):
+                shim = bootstrap.shim_path()
+                shim.parent.mkdir(parents=True, exist_ok=True)
+                shim.write_text("#!/bin/sh\necho 'foreign'\n", encoding="utf-8")
+                with self.assertRaises(bootstrap.BootstrapError) as ctx:
+                    bootstrap.ensure_path_shim(proj, lambda _l: None, force=False)
+                self.assertIn("(or use --force)", str(ctx.exception))
+                self.assertIn("refusing to overwrite foreign file", str(ctx.exception))
+
+    def test_windows_ensure_path_shim_ignores_force_and_returns_none(self):
+        """On Windows, ensure_path_shim returns None regardless of force."""
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            logs: list[str] = []
+            with mock.patch("bootstrap.platforms.is_windows", return_value=True):
+                res_false = bootstrap.ensure_path_shim(proj, logs.append, force=False)
+                res_true = bootstrap.ensure_path_shim(proj, logs.append, force=True)
+            self.assertIsNone(res_false)
+            self.assertIsNone(res_true)
+            self.assertTrue(any("Windows: add the venv Scripts dir to PATH" in l for l in logs))
+
+    def test_refresh_stale_managed_shim_with_and_without_force(self):
+        """A stale managed shim (with SHIM_MARKER) is refreshed both with and without force."""
+        if sys.platform.startswith("win"):
+            self.skipTest("POSIX-only")
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            with _sandbox_home(Path(td)) as expected:
+                shim = bootstrap.shim_path()
+                shim.parent.mkdir(parents=True, exist_ok=True)
+                stale_content = f"#!/bin/sh\n# {bootstrap.SHIM_MARKER}\nexec /old/path/agydra \"$@\"\n"
+                shim.write_text(stale_content, encoding="utf-8")
+
+                logs: list[str] = []
+                res = bootstrap.ensure_path_shim(proj, logs.append, force=False)
+                self.assertEqual(res, expected)
+                self.assertIn(str(bootstrap.console_script(proj)), expected.read_text(encoding="utf-8"))
+                self.assertTrue(any("refreshing stale shim" in l for l in logs))
+
+                logs.clear()
+                shim.write_text(stale_content, encoding="utf-8")
+                res = bootstrap.ensure_path_shim(proj, logs.append, force=True)
+                self.assertEqual(res, expected)
+                self.assertIn(str(bootstrap.console_script(proj)), expected.read_text(encoding="utf-8"))
+
     def test_idempotent_on_existing_managed_shim(self):
         if sys.platform.startswith("win"):
             self.skipTest("POSIX-only")
@@ -473,6 +547,61 @@ class RunDispatch(unittest.TestCase):
                 bootstrap.ensure_venv = real_ensure
             self.assertEqual(code, 1)
             self.assertTrue(any("synthetic failure" in line for line in captured))
+
+    def test_run_fails_on_foreign_shim_without_force(self):
+        """bootstrap.run(..., force=False) must fail when a foreign shim exists."""
+        if sys.platform.startswith("win"):
+            self.skipTest("POSIX-only")
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            with _sandbox_home(Path(td)):
+                shim = bootstrap.shim_path()
+                shim.parent.mkdir(parents=True, exist_ok=True)
+                shim.write_text("#!/bin/sh\necho foreign\n", encoding="utf-8")
+
+                real_ensure_venv = bootstrap.ensure_venv
+                real_install_editable = bootstrap.install_editable
+                bootstrap.ensure_venv = lambda _root, _out: bootstrap.venv_python(proj)
+                bootstrap.install_editable = lambda _root, _vpy, _out: None
+                try:
+                    captured: list[str] = []
+                    code = bootstrap.run(captured.append, root=proj, force=False)
+                finally:
+                    bootstrap.ensure_venv = real_ensure_venv
+                    bootstrap.install_editable = real_install_editable
+
+                self.assertEqual(code, 1)
+                self.assertTrue(any("refusing to overwrite foreign file" in l for l in captured))
+                self.assertTrue(any("(or use --force)" in l for l in captured))
+
+    def test_run_succeeds_on_foreign_shim_with_force(self):
+        """bootstrap.run(..., force=True) overwrites a foreign shim and completes setup."""
+        if sys.platform.startswith("win"):
+            self.skipTest("POSIX-only")
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            with _sandbox_home(Path(td)) as expected:
+                shim = bootstrap.shim_path()
+                shim.parent.mkdir(parents=True, exist_ok=True)
+                shim.write_text("#!/bin/sh\necho foreign\n", encoding="utf-8")
+
+                real_ensure_venv = bootstrap.ensure_venv
+                real_install_editable = bootstrap.install_editable
+                real_verify = bootstrap.verify_install
+                bootstrap.ensure_venv = lambda _root, _out: bootstrap.venv_python(proj)
+                bootstrap.install_editable = lambda _root, _vpy, _out: None
+                bootstrap.verify_install = lambda _root, _out: True
+                try:
+                    captured: list[str] = []
+                    code = bootstrap.run(captured.append, root=proj, force=True)
+                finally:
+                    bootstrap.ensure_venv = real_ensure_venv
+                    bootstrap.install_editable = real_install_editable
+                    bootstrap.verify_install = real_verify
+
+                self.assertEqual(code, 0)
+                self.assertIn(bootstrap.SHIM_MARKER, expected.read_text(encoding="utf-8"))
+                self.assertTrue(any("setup: agydra is installed and ready" in l for l in captured))
 
 
 class RunHelperOSError(unittest.TestCase):

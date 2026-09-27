@@ -342,7 +342,7 @@ def _check_bootstrap(_store: Store, _ctx: "_DoctorContext"):
     elif shim_state == "foreign":
         return WARN, (
             f"install: foreign file at {bootstrap.shim_path()} — inspect and "
-            "remove it, then re-run `agydra setup`"
+            "remove it, or re-run `agydra setup --force`"
         )
     elif shim_state == "stale":
         parts.append("shim stale (venv moved?) — re-run `agydra setup`")

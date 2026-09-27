@@ -54,12 +54,12 @@ def project_root(cwd: Optional[Path] = None) -> Path:
     module, then the process CWD. Returns the first candidate that looks
     like the project; otherwise the first candidate so callers can report it.
     """
-    here = Path(__file__).resolve().parent
+    here = platforms.canonical_path(Path(__file__).resolve().parent)
     candidates: list[Path] = []
     if cwd is not None:
-        candidates.append(Path(cwd).resolve())
+        candidates.append(platforms.canonical_path(Path(cwd).resolve()))
     candidates.append(here)
-    process_cwd = Path.cwd()
+    process_cwd = platforms.canonical_path(Path.cwd().resolve())
     if process_cwd not in candidates:
         candidates.append(process_cwd)
     for cand in candidates:
@@ -229,12 +229,13 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
-def ensure_path_shim(root: Path, out: Callable[[str], None]) -> Optional[Path]:
+def ensure_path_shim(root: Path, out: Callable[[str], None], force: bool = False) -> Optional[Path]:
     """Write (or refresh) the ``~/.local/bin/agydra`` shim.
 
-    Only shims carrying ``SHIM_MARKER`` are rewritten; a foreign file at the
-    shim path is reported, never clobbered. Returns the shim path, or None
-    on Windows where the venv Scripts dir must be added to PATH instead.
+    Only shims carrying ``SHIM_MARKER`` are rewritten (unless ``force=True``);
+    a foreign file at the shim path is reported, never clobbered without force.
+    Returns the shim path, or None on Windows where the venv Scripts dir must
+    be added to PATH instead.
     """
     if platforms.is_windows():
         out(
@@ -251,10 +252,10 @@ def ensure_path_shim(root: Path, out: Callable[[str], None]) -> Optional[Path]:
         if shim.exists():
             body = shim.read_text(encoding="utf-8", errors="replace")
             if str(target) not in body:
-                if SHIM_MARKER not in body:
+                if SHIM_MARKER not in body and not force:
                     raise BootstrapError(
                         f"refusing to overwrite foreign file at {shim}; "
-                        "inspect it and remove it manually, then re-run setup"
+                        "inspect it and remove it manually, then re-run setup (or use --force)"
                     )
                 out(f"refreshing stale shim: {shim}")
         _atomic_write_text(shim, _shim_content(target))
@@ -318,32 +319,36 @@ def check_state(root: Path) -> dict:
     return state
 
 
-def run(out: Optional[Callable[[str], None]] = None) -> int:
+def run(
+    out: Optional[Callable[[str], None]] = None,
+    root: Optional[Path] = None,
+    force: bool = False,
+) -> int:
     """Full bootstrap: venv -> editable install -> shim -> verify.
 
     Idempotent: safe to re-run at any time (``agydra setup``). Returns a
     process exit code: 0 ok, 1 on any BootstrapError.
     """
     say = out if out is not None else (lambda line: print(line))
-    root = project_root()
+    target_root = platforms.canonical_path(root) if root is not None else project_root()
     try:
         if not python_ok(sys.version_info):
             raise BootstrapError(
                 f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required, found "
                 f"{sys.version_info[0]}.{sys.version_info[1]}"
             )
-        vpy = ensure_venv(root, say)
-        install_editable(root, vpy, say)
-        ensure_path_shim(root, say)
-        if not verify_install(root, say):
+        vpy = ensure_venv(target_root, say)
+        install_editable(target_root, vpy, say)
+        ensure_path_shim(target_root, say, force=force)
+        if not verify_install(target_root, say):
             say("setup: verification failed — see the lines above")
             return 1
     except BootstrapError as exc:
         say(f"setup: {exc}")
         return 1
-    state = check_state(root)
+    state = check_state(target_root)
     if not state["on_path"]:
-        bindir = console_script(root).parent if platforms.is_windows() else user_bin_dir()
+        bindir = console_script(target_root).parent if platforms.is_windows() else user_bin_dir()
         say(f"note: {bindir} is not on this shell's PATH; add it or re-login")
     say("setup: agydra is installed and ready (run `agydra doctor` next)")
     return 0

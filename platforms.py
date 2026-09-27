@@ -133,6 +133,55 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def canonical_path(path: Path) -> Path:
+    """Resolve symlinks and return the canonical, case-exact path on disk.
+
+    On case-insensitive filesystems (macOS APFS, Windows NTFS),
+    `Path.resolve()` preserves whatever casing was passed in rather than
+    the casing stored in the filesystem directory entry. This helper
+    recovers the exact on-disk casing so paths remain valid across
+    case-sensitive environments (such as Linux ext4/btrfs).
+    """
+    p = Path(path).resolve()
+    if not p.exists():
+        return p
+    if is_macos():
+        try:
+            import fcntl
+
+            fd = os.open(str(p), os.O_RDONLY)
+            try:
+                # F_GETPATH on macOS queries the kernel for the true canonical path
+                f_getpath = getattr(fcntl, "F_GETPATH", 50)
+                buf = b"\x00" * 1024
+                res = fcntl.fcntl(fd, f_getpath, buf)
+                canonical_str = res.split(b"\x00", 1)[0].decode("utf-8", "replace")
+                if canonical_str:
+                    return Path(canonical_str)
+            finally:
+                os.close(fd)
+        except (OSError, ImportError, ValueError):
+            pass
+    parts = p.parts
+    if not parts:
+        return p
+    current = Path(parts[0])
+    for part in parts[1:]:
+        matched = False
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    if entry.name.lower() == part.lower():
+                        current = current / entry.name
+                        matched = True
+                        break
+        except OSError:
+            pass
+        if not matched:
+            current = current / part
+    return current
+
+
 if is_windows():
     VENV_BIN_SUBDIR = "Scripts"
     _EXE_SUFFIX = ".exe"

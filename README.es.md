@@ -13,37 +13,44 @@
   <a href="README.md"><img src="https://img.shields.io/badge/Read%20in-English-0078D4?logo=readme&logoColor=white" alt="Read in English"></a>
 </p>
 
-> **Una sola instalación de `agy`, múltiples cuentas de Google totalmente aisladas.** `agydra` es un lanzador multi-perfil para el CLI `agy` (Google Antigravity) que proporciona a cada perfil su propia sesión OAuth privada mediante un home overlay por perfil. El directorio `~/.gemini` real nunca se modifica y `agy` jamás es interceptado. Construido estrictamente con la librería estándar de Python (**Python ≥ 3.9, cero dependencias de terceros en runtime**): un núcleo limpio y DRY con adaptadores ligeros para macOS, Linux y Windows.
+> **Una sola instalación de `agy`, múltiples cuentas de Google totalmente aisladas y cero cuellos de botella.** `agydra` es un gestor multi-perfil y despachador de cargas para el CLI `agy` (Google Antigravity). Concebido específicamente para desbloquear el inmenso potencial de los **Planes Familiares de Google (Google One AI Premium / Google AI Pro)** —donde cada cuenta miembro dispone de cuotas de tokens y límites de tasa (rate limits) 100% independientes—, `agydra` elimina la restricción de un único `~/.gemini` mediante *home overlays* aislados por perfil. El directorio real `~/.gemini` jamás se altera y el binario `agy` nunca se intercepta ni parchea. Desarrollado estrictamente con la librería estándar de Python (**Python ≥ 3.9, cero dependencias de terceros en runtime**): un núcleo limpio y DRY con adaptadores nativos para macOS, Linux y Windows.
 
 ---
 
 ## 💡 ¿Por qué Agydra?
 
-El CLI `agy` deriva su almacén de datos (`~/.gemini`) directamente del directorio personal del usuario. Si gestionas múltiples cuentas de Google (por ejemplo personal, corporativa, de clientes o de pruebas), alternar entre ellas normalmente requiere iniciar sesión repetidamente, sobreescribir tokens OAuth y arriesgarte a ejecutar prompts en la cuenta equivocada.
+### 🎯 La Génesis: Desbloqueando la Ventaja del Plan Familiar de Google
 
-`agydra` resuelve esto limpiamente a nivel del sistema operativo:
+A diferencia de prácticamente toda la industria de IA (donde las suscripciones son estrictamente individuales, cobradas por usuario y sin opciones compartidas), **Google ofrece una ventaja disruptiva a través de los Grupos Familiares en Google One AI Premium / Google AI Pro**. Una sola suscripción familiar permite invitar hasta a 5 miembros adicionales (6 cuentas familiares en total).
+
+Lo fundamental: **cada una de las cuentas del grupo familiar recibe sus propios límites de tokens y ventanas de tasa (rate limits) de 5 horas de forma 100% individual e independiente**.
+
+Para desarrolladores, investigadores y flujos con agentes autónomos, esto representa una oportunidad extraordinaria y 100% legítima: **multiplicar la capacidad de cómputo de IA de 5x a 6x bajo una única suscripción y a una fracción del costo habitual**.
+
+### 🚧 El Bloqueo: La Arquitectura Monolítica de Almacén Único de `agy`
+
+A pesar de la generosa política de cuotas de Google, el cliente oficial Antigravity (`agy`) fue diseñado con una limitación estructural crítica: deriva su configuración y tokens de sesión exclusivamente de una única ruta fija en el directorio del usuario: `~/.gemini`.
+
+Esta restricción generaba un grave cuello de botella operativo:
+- **Cambio destructivo de cuentas:** Para alternar a otra cuenta del grupo familiar, el usuario debía ejecutar el flujo OAuth en el navegador, sobreescribiendo las credenciales anteriores y perdiendo el contexto activo de sesión.
+- **Cero concurrencia:** Era imposible ejecutar pruebas, builds o subagentes autónomos en paralelo entre distintas cuentas, ya que todas las llamadas colisionaban en la misma carpeta física `~/.gemini` y en los mismos registros de keychain.
+- **Capacidad desperdiciada:** Al alcanzar el límite de 5 horas en una cuenta durante una sesión intensa de programación, el trabajo se detenía por completo, a pesar de tener las demás cuentas del plan familiar ociosas y con el 100% de su cuota disponible.
+
+### 🚀 La Solución: Pooling Multi-Cuenta Legítimo con Agydra
+
+`agydra` fue concebida precisamente para derribar esta barrera y convertir un conjunto de cuentas familiares de Google en un pool unificado de alta disponibilidad para desarrollo con IA:
 
 ```
 agy                 → sesión genérica, utiliza el ~/.gemini real (intacto)
-agydra -p trabajo … → mismo binario agy, pero HOME apunta al overlay aislado del perfil
+agydra -p fam-dev   → mismo binario agy, pero HOME apunta al overlay aislado del perfil
 ```
 
-- **Cero mezcla de credenciales:** Cada perfil autentica en su propio almacén aislado.
-- **Ejecución paralela multi-cuenta:** Ejecuta tareas en paralelo entre distintas cuentas de forma simultánea sin conflictos de tokens.
-- **Sin parches ni intercepciones binarias:** `agy` se ejecuta sin modificaciones; el aislamiento se logra puramente mediante redirección de entorno y overlays en el sistema de archivos.
-- **Bloqueos consultivos a nivel de kernel:** Las sesiones están protegidas por locks de archivo del SO que se liberan automáticamente incluso ante fallos abruptos o reinicios.
-
-### 💰 La Ventaja del Plan Familiar de Google: Multiplica tu Cuota al 100% Dentro de las Políticas
-
-A diferencia de la mayoría de proveedores de IA (donde las suscripciones son individuales y costosas por usuario, sin opciones familiares compartidas), **Google es de las pocas plataformas que ofrece planes familiares (Google One AI Premium / Google AI Pro)** que permiten compartir la suscripción con hasta 5 miembros de la familia.
-
-Lo fundamental: **cada cuenta del grupo familiar cuenta con sus propios límites y cuotas independientes de IA**.
-
-Esto desbloquea una estrategia de alto rendimiento y 100% legítima:
-- **Rentabilidad Máxima:** Con una única suscripción familiar, puedes configurar hasta 5 cuentas dedicadas (ej. desarrollo personal, investigación profunda, agentes automáticos o pruebas de clientes), multiplicando tu cuota efectiva de IA por 5 a una fracción del costo habitual.
-- **100% Conforme a los Términos de Servicio:** Cero riesgo de bloqueos. No se realizan llamadas no oficiales, scraping ni hacks de tokens compartidos: cada perfil se autentica de forma independiente vía OAuth a través del cliente oficial `agy` de Google.
-- **Balanceo y Rotación Automática:** Con `agydra -r`, despachas tareas sobre el pool de tus cuentas familiares; si una cuenta alcanza temporalmente su límite de tasa, `agydra` asigna el trabajo automáticamente a la siguiente cuenta libre.
-- **Monitoreo Centralizado de Cuotas:** Ejecuta `agydra usage` para supervisar en segundos el estado del cupo restante y la cuenta regresiva de reinicio de todas tus cuentas familiares en una sola vista.
+- **Pooling Multi-Cuenta 100% Conforme a Políticas:** Cero ingeniería inversa, sin scraping y sin hacks de tokens compartidos. Cada perfil se autentica de forma independiente vía OAuth estándar mediante el CLI oficial `agy` de Google.
+- **Cero Mezcla de Credenciales:** Cada perfil mantiene sus tokens privados en un almacén aislado (`<store>/profiles/<nombre>/data`), completamente desacoplado de los archivos del sistema host.
+- **Ejecución Paralela Multi-Cuenta:** Ejecuta tareas en simultáneo entre distintas cuentas sin ningún conflicto de tokens ni sobreescrituras.
+- **Bloqueos Consultivos a Nivel de Kernel:** Las sesiones se protegen mediante locks de archivo del SO (`fcntl.flock` / `msvcrt.locking`) que se liberan automáticamente incluso ante fallos abruptos o señales SIGKILL.
+- **Despacho y Rotación Automática (`-r`):** Distribuye comandos al perfil libre y menos recientemente usado de forma automática, esquivando los límites de tasa de cuentas individuales.
+- **Monitoreo Centralizado de Cuotas (`usage`):** Supervisa cuotas en vivo, ventanas de 5 horas y cuentas regresivas de reinicio de todo el pool familiar en una sola pantalla.
 
 ---
 
@@ -89,6 +96,68 @@ agydra login trabajo
 
 # 3. Lanza agy con tu nuevo perfil
 agydra -p trabajo "Explica la computación cuántica en tres frases"
+```
+
+### 3. ⭐ Caso de Uso Estelar: Creación y Orquestación de un Pool de Plan Familiar
+
+A continuación se presenta el flujo completo de principio a fin para configurar y orquestar un pool multi-cuenta aprovechando al máximo un Plan Familiar de Google (Google One AI Premium / Google AI Pro):
+
+#### Paso 1: Crea los perfiles del grupo familiar
+Configura almacenes aislados para las cuentas de tu grupo familiar (por ejemplo, especializadas en desarrollo, investigación o agentes autónomos):
+```sh
+agydra create fam-principal     -d "Plan Familiar - Cuenta Principal"
+agydra create fam-desarrollo    -d "Plan Familiar - Código y Refactorización"
+agydra create fam-agentes       -d "Plan Familiar - Agentes Autónomos"
+agydra create fam-investigacion -d "Plan Familiar - Investigación Profunda"
+```
+
+#### Paso 2: Autentica cada cuenta una sola vez
+Inicia sesión en cada perfil mediante el flujo OAuth oficial. El navegador abrirá la página oficial de Google y guardará las credenciales exclusivamente en el almacén aislado de cada perfil:
+```sh
+agydra login fam-principal
+agydra login fam-desarrollo
+agydra login fam-agentes
+agydra login fam-investigacion
+```
+*(Tip: Ejecuta `agydra list` para confirmar que cada perfil muestre su correo electrónico correspondiente y el estado `authenticated`).*
+
+#### Paso 3: Despacho automático y rotación con `agydra -r`
+Olvídate de gestionar cuotas y límites manualmente. Con `-r` (`--random`), `agydra` asigna cada comando al perfil autenticado, desocupado y menos recientemente usado del pool:
+```sh
+# Terminal 1: Selecciona automáticamente fam-desarrollo
+agydra -r "Refactoriza el middleware de autenticación para usar JWT"
+
+# Terminal 2 (simultáneo): fam-desarrollo está ocupado; agydra despacha automáticamente a fam-agentes
+agydra -r "Genera suite de pruebas de integración para la API"
+
+# ¿Alcanzaste el límite de 5 horas en una cuenta? Lanza con -r:
+agydra -r "Continúa la auditoría del repositorio"  # Asigna al instante la siguiente cuenta libre
+```
+
+#### Paso 4: Monitorea todo el pool con `agydra usage`
+Supervisa en tiempo real las cuotas de tokens y temporizadores de reinicio de todas tus cuentas desde una sola pantalla:
+```sh
+agydra usage
+```
+```text
+#  PERFIL            EMAIL                         GEMINI WK   GEMINI 5H   3P WK       3P 5H
+1  fam-principal     dev.lead@gmail.com            92%         100%        85%         100%
+2  fam-desarrollo    code.worker@gmail.com         84%         25%         70%         40%
+3  fam-agentes       agent.runner@gmail.com        78%         90%         65%         85%
+4  fam-investigacion research.bot@gmail.com        100%        100%        100%        100%
+```
+
+Para un análisis granular de una cuenta cercana a su límite, consulta las barras gráficas y la cuenta regresiva exacta de reinicio:
+```sh
+agydra usage fam-desarrollo
+```
+```text
+profile   : fam-desarrollo
+email     : code.worker@gmail.com
+
+Gemini Models
+  Weekly Quota                [==================  ]  84.0%  reset in 4d 18h
+  5-Hour Rate Limit           [=====               ]  25.0%  reset in 1h 12m
 ```
 
 ---
@@ -347,7 +416,7 @@ agydra/                     # Estructura plana (cero dependencias de terceros)
 ├── orphans.py              # Auditoría inversa del almacén y limpiador de huérfanos
 ├── usage.py                # Inspector de cuotas y parseador de límites de tasa
 ├── bootstrap.py            # Instalador idempotente de venv y shim en PATH
-├── tests/                  # 525 pruebas automáticas unitarias y de integración
+├── tests/                  # 540 pruebas automáticas unitarias y de integración
 ├── README.md               # Documentación en inglés
 ├── README.es.md            # Documentación en español
 ├── AGENTS.md               # Convenciones de desarrollo e invariantes arquitectónicos
@@ -361,10 +430,10 @@ La suite de pruebas valida entornos simulados, casos límite y todas las platafo
 
 ```sh
 python3 -W error::ResourceWarning -m pytest tests/ -q
-# 522 passed, 3 skipped (en macOS) en ~40s (0 advertencias)
+# 537 passed, 3 skipped (en macOS) en ~45s (0 advertencias)
 
 python3 -m unittest discover -s tests -q
-# Ran 525 tests en ~36s - OK
+# Ran 540 tests en ~45s - OK
 ```
 
 ---
@@ -382,7 +451,7 @@ python3 -m unittest discover -s tests -q
 ¡Agradecemos las contribuciones de la comunidad! Por favor respeta nuestros invariantes centrales:
 1. **Cero dependencias de terceros en runtime:** Usa estrictamente la librería estándar de Python (`sys`, `os`, `pathlib`, `fcntl`, `tempfile`, etc.).
 2. **Paridad multiplataforma:** Los cambios deben ejecutarse de forma idéntica en macOS, Linux y Windows.
-3. **Verificación exhaustiva:** Ejecuta los 525 tests antes de abrir un pull request.
+3. **Verificación exhaustiva:** Ejecuta los 540 tests antes de abrir un pull request.
 4. **Coherencia arquitectónica:** Revisa [AGENTS.md](AGENTS.md) para conocer las directrices completas.
 
 ---

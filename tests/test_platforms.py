@@ -395,5 +395,145 @@ class TestNormalizeWindowsArgv(unittest.TestCase):
             )
 
 
+class TestRealHome(unittest.TestCase):
+    def test_real_home_uses_env_override(self):
+        with mock.patch.dict(os.environ, {"AGYDRA_REAL_HOME": "/tmp/custom_real_home"}):
+            self.assertEqual(platforms.real_home(), Path("/tmp/custom_real_home"))
+
+    def test_real_home_falls_back_to_path_home(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGYDRA_REAL_HOME", None)
+            self.assertEqual(platforms.real_home(), Path.home())
+
+
+class TestCanonicalPath(unittest.TestCase):
+    def test_canonical_path_existing_directory(self):
+        root = Path(__file__).resolve().parent.parent
+        self.assertEqual(platforms.canonical_path(root), root)
+
+    def test_canonical_path_nonexistent_returns_resolved(self):
+        nonexistent = Path("/nonexistent/fake/path/here")
+        self.assertEqual(platforms.canonical_path(nonexistent), nonexistent.resolve())
+
+    def test_canonical_path_preserves_or_fixes_casing(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            cased_dir = base / "CamelCaseDir"
+            cased_dir.mkdir()
+            cased_file = cased_dir / "TestFile.txt"
+            cased_file.write_text("hello", encoding="utf-8")
+
+            self.assertEqual(platforms.canonical_path(cased_file), cased_file)
+
+            probe = base / "CaseProbe"
+            probe.mkdir()
+            try:
+                is_case_insensitive = (base / "caseprobe").is_dir()
+            finally:
+                probe.rmdir()
+
+            if is_case_insensitive:
+                # Lowercase input
+                lower_path = base / "camelcasedir" / "testfile.txt"
+                self.assertEqual(platforms.canonical_path(lower_path), cased_file)
+
+                # Uppercase input
+                upper_path = base / "CAMELCASEDIR" / "TESTFILE.TXT"
+                self.assertEqual(platforms.canonical_path(upper_path), cased_file)
+
+                # Mixed-case input
+                mixed_path = base / "cAmElCaSeDiR" / "tEsTfIlE.tXt"
+                self.assertEqual(platforms.canonical_path(mixed_path), cased_file)
+
+    def test_canonical_path_fallback_recovers_casing(self):
+        """Cross-platform fallback loop (os.scandir over parts) must recover
+        exact on-disk casing for lowercase, uppercase, and mixed-case inputs
+        even when macOS fcntl is disabled or unavailable."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            cased_dir = base / "CamelCaseDir"
+            cased_dir.mkdir()
+            cased_file = cased_dir / "TestFile.txt"
+            cased_file.write_text("hello", encoding="utf-8")
+
+            probe = base / "CaseProbe"
+            probe.mkdir()
+            try:
+                is_case_insensitive = (base / "caseprobe").is_dir()
+            finally:
+                probe.rmdir()
+
+            if is_case_insensitive:
+                with mock.patch.object(platforms, "is_macos", return_value=False):
+                    # Lowercase
+                    lower_path = base / "camelcasedir" / "testfile.txt"
+                    self.assertEqual(platforms.canonical_path(lower_path), cased_file)
+
+                    # Uppercase
+                    upper_path = base / "CAMELCASEDIR" / "TESTFILE.TXT"
+                    self.assertEqual(platforms.canonical_path(upper_path), cased_file)
+
+                    # Mixed-case
+                    mixed_path = base / "cAmElCaSeDiR" / "tEsTfIlE.tXt"
+                    self.assertEqual(platforms.canonical_path(mixed_path), cased_file)
+
+    def test_canonical_path_fallback_oserror_in_scandir_swallowed(self):
+        """If os.scandir raises OSError during part traversal, canonical_path
+        must swallow it and continue gracefully with the unadjusted part."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            sample_file = base / "sample.txt"
+            sample_file.write_text("data", encoding="utf-8")
+
+            def mock_scandir(_path):
+                raise PermissionError("simulated permission denied")
+
+            with mock.patch.object(platforms, "is_macos", return_value=False), \
+                    mock.patch("os.scandir", mock_scandir):
+                res = platforms.canonical_path(sample_file)
+                self.assertEqual(res, sample_file)
+
+    def test_canonical_path_macos_fcntl_error_falls_back_to_scandir(self):
+        """When running on macOS and fcntl.fcntl fails (e.g. OSError), canonical_path
+        must fall back to the scandir-based recovery and still resolve exact casing."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            cased_dir = base / "CamelCaseDir"
+            cased_dir.mkdir()
+            cased_file = cased_dir / "TestFile.txt"
+            cased_file.write_text("hello", encoding="utf-8")
+
+            probe = base / "CaseProbe"
+            probe.mkdir()
+            try:
+                is_case_insensitive = (base / "caseprobe").is_dir()
+            finally:
+                probe.rmdir()
+
+            if is_case_insensitive:
+                with mock.patch.object(platforms, "is_macos", return_value=True), \
+                        mock.patch("fcntl.fcntl", side_effect=OSError("F_GETPATH failed")):
+                    lower_path = base / "camelcasedir" / "testfile.txt"
+                    upper_path = base / "CAMELCASEDIR" / "TESTFILE.TXT"
+                    self.assertEqual(platforms.canonical_path(lower_path), cased_file)
+                    self.assertEqual(platforms.canonical_path(upper_path), cased_file)
+
+    def test_canonical_path_symlink_resolution(self):
+        """canonical_path resolves symlinks and canonicalizes the target casing."""
+        if platforms.is_windows():
+            self.skipTest("POSIX symlink test")
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td).resolve()
+            target_dir = base / "TargetDir"
+            target_dir.mkdir()
+            target_file = target_dir / "TargetFile.txt"
+            target_file.write_text("content", encoding="utf-8")
+
+            link = base / "link_to_file"
+            link.symlink_to(target_file)
+
+            self.assertEqual(platforms.canonical_path(link), target_file)
+
+
 if __name__ == "__main__":
     unittest.main()

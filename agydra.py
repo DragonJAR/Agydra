@@ -47,7 +47,6 @@ def _venv_script(repo: str) -> str:
 
 
 def main() -> int:
-    repo = Path(os.path.dirname(os.path.abspath(__file__)))
     if tuple(sys.version_info[:2]) < MIN_PYTHON:
         return _fail(
             f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required, found "
@@ -55,18 +54,21 @@ def main() -> int:
             "install Python 3.9 or newer and re-run this file",
         )
 
+    here = Path(__file__).resolve().parent
+    sys.path.insert(0, str(here))
     import platforms
 
+    repo = platforms.canonical_path(here)
     script = _venv_script(repo)
 
     if not os.path.isfile(script):
-        sys.path.insert(0, str(repo))
         try:
             import bootstrap
         except ImportError as exc:
             return _fail(f"cannot import bootstrap from {repo}: {exc}")
         print("agydra.py: no installation detected — running setup...")
-        code = bootstrap.run()
+        force = "-f" in sys.argv[1:] or "--force" in sys.argv[1:]
+        code = bootstrap.run(root=repo, force=force)
         if code != 0:
             return code
         if not os.path.isfile(script):

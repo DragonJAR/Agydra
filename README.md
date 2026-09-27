@@ -13,37 +13,44 @@
   <a href="README.es.md"><img src="https://img.shields.io/badge/Read_in-Español-blue" alt="Read in Español"></a>
 </p>
 
-> **One `agy` installation, many isolated Google accounts.** `agydra` is a multi-profile launcher for the `agy` CLI (Google Antigravity) that gives every profile its own private OAuth session via a per-profile home overlay. The real `~/.gemini` is never touched and `agy` is never intercepted. Built strictly with the Python standard library (**Python ≥ 3.9, zero third-party runtime dependencies**): one clean, DRY core with thin per-OS adapters for macOS, Linux, and Windows.
+> **One `agy` installation, infinite isolated Google accounts, zero token bottlenecks.** `agydra` is a multi-profile manager and workload dispatcher for the `agy` CLI (Google Antigravity). Conceived specifically to unlock the immense value of **Google Family Plans (Google One AI Premium / Google AI Pro)**—where every family member account enjoys completely independent AI quotas and rate limits—`agydra` eliminates `agy`'s single-`~/.gemini` constraint through lightweight, per-profile home overlays. The real `~/.gemini` is never touched and `agy` is never patched or intercepted. Built strictly with the Python standard library (**Python ≥ 3.9, zero third-party runtime dependencies**): one clean, DRY core with native OS adapters for macOS, Linux, and Windows.
 
 ---
 
 ## 💡 Why Agydra?
 
-The `agy` CLI derives its data store (`~/.gemini`) directly from the user's home directory. If you manage multiple Google accounts (e.g. personal, corporate, client-specific, or test accounts), switching between them ordinarily forces repeated logins, clobbers cached OAuth tokens, and risks executing prompts under the wrong identity.
+### 🎯 The Genesis: Unlocking the Google Family Plan Advantage
 
-`agydra` solves this cleanly at the operating system level:
+Unlike most AI providers whose subscriptions are strictly individual and billed per-seat without shared family tiers, **Google offers a game-changing Family Group feature for Google One AI Premium / Google AI Pro**. A single family subscription can be shared among up to 5 additional accounts (6 total family members).
+
+Crucially: **every individual account in the family group receives its own separate, dedicated AI model quotas and 5-hour rate limits**.
+
+For developers, researchers, and agentic workflows, this represents an extraordinary, 100% policy-compliant opportunity: **multiplying your total available AI compute by 5x to 6x under a single subscription at no extra cost**.
+
+### 🚧 The Blocker: `agy`'s Hardcoded Single-Store Architecture
+
+Despite Google's generous family quota model, the official Antigravity CLI (`agy`) was architected with a critical limitation: it derives its configuration and OAuth tokens exclusively from a single hardcoded path in the user's home directory: `~/.gemini`.
+
+This created a severe operational bottleneck:
+- **Destructive account switching:** To leverage another family account, you had to re-run the OAuth flow in your browser, overwriting previous credentials and destroying active session context.
+- **Zero concurrency:** You could never run parallel builds, tests, or autonomous subagents across separate accounts simultaneously because all executions competed for the exact same `~/.gemini` files and keychain entries.
+- **Wasted quotas:** When an intense coding session hit a 5-hour rate limit on one account, your entire development workflow ground to a halt—even though your other family accounts sat completely idle with 100% available capacity.
+
+### 🚀 The Solution: Legitimate Multi-Account Pooling with Agydra
+
+`agydra` was created specifically to eliminate this bottleneck and transform individual Google accounts into a unified, high-availability AI compute pool:
 
 ```
 agy                 → generic session, uses the real ~/.gemini (untouched)
-agydra -p work ...  → same agy binary, but HOME points to an isolated profile overlay
+agydra -p fam-dev   → same agy binary, but HOME points to an isolated profile overlay
 ```
 
-- **Zero credential mixing:** Each profile authenticates into its own isolated store.
-- **Concurrent multi-account execution:** Run parallel tasks across distinct accounts simultaneously without token conflicts.
-- **No binary patching or proxying:** `agy` runs unmodified; isolation is achieved purely via environment redirection and filesystem overlays.
-- **Kernel-held advisory locks:** Profile sessions are protected by OS-level file locks that release automatically even after a crash or hard termination.
-
-### 💰 The Google Family Plan Advantage: 5x AI Quota, 100% Policy-Compliant
-
-Unlike most AI providers (where subscriptions are strictly individual and charged per-seat without shared family tiers), **Google is one of the very few platforms that offers a Family Group plan (Google One AI Premium / Google AI Pro)**, allowing a single subscription to be shared among up to 5 member accounts.
-
-Crucially: **every member account receives its own distinct, individual AI model quotas and rate limits**.
-
-This unlocks a high-leverage, completely legitimate setup:
-- **Maximum Cost-Efficiency:** Under a single family subscription, you can configure up to 5 dedicated Google accounts (e.g., personal development, deep research, automated agent tasks, client experiments), effectively multiplying your total AI quota by 5 at a fraction of the cost.
-- **100% Compliant with Terms of Service:** Zero risk of policy violations. There is no scraping, no reverse-engineered API proxying, and no shared token hacks. Every profile authenticates independently via standard OAuth through Google's official `agy` CLI.
-- **Automated Account Pooling:** Using `agydra -r`, you can dispatch tasks across your pool of family accounts; if one account temporarily hits a rate limit, `agydra` automatically routes work to the next idle profile.
-- **Single-Pane Quota Visibility:** Run `agydra usage` to monitor remaining quotas and reset countdowns across every account in your pool from a single terminal view.
+- **100% Policy-Compliant Multi-Account Pooling:** No reverse-engineered APIs, no scraping, and no shared token hacks. Every profile authenticates independently via standard Google OAuth through the official `agy` CLI.
+- **Zero Credential Mixing:** Each profile maintains private tokens in an isolated store (`<store>/profiles/<name>/data`), completely decoupled from host files.
+- **Concurrent Multi-Account Execution:** Run tasks in parallel across separate accounts simultaneously with zero token collisions.
+- **Kernel-Held Advisory Locks:** Profiles are protected by OS-level file locks (`fcntl.flock` / `msvcrt.locking`) that release automatically even after crashes or SIGKILL.
+- **Automated Workload Dispatching (`-r`):** Route commands to the least-recently-used, idle profile automatically—seamlessly working around single-account rate limits.
+- **Unified Quota Visibility (`usage`):** Monitor live quotas, 5-hour rate windows, and exact reset countdowns across your entire family pool in a single view.
 
 ---
 
@@ -89,6 +96,68 @@ agydra login work
 
 # 3. Launch agy with your new profile
 agydra -p work "Explain quantum computing in three sentences"
+```
+
+### 3. ⭐ Stellar Use Case: Building a 5x Family Plan Account Pool
+
+Here is the complete end-to-end journey to configure and orchestrate an automated multi-account pool from a Google Family Group (Google One AI Premium / Google AI Pro):
+
+#### Step 1: Create your family profiles
+Set up isolated profiles for your family member accounts (e.g., dedicated to coding, research, and autonomous agents):
+```sh
+agydra create fam-main     -d "Family Plan - Primary Account"
+agydra create fam-dev      -d "Family Plan - Coding & Refactoring"
+agydra create fam-agents   -d "Family Plan - Autonomous Agents"
+agydra create fam-research -d "Family Plan - Deep Research"
+```
+
+#### Step 2: Authenticate each account once
+Run the standard OAuth login for each profile. Your default browser opens Google's official authentication page and securely stores tokens in each profile's isolated overlay:
+```sh
+agydra login fam-main
+agydra login fam-dev
+agydra login fam-agents
+agydra login fam-research
+```
+*(Tip: Run `agydra list` to confirm that all profiles display their associated email address and show `authenticated`).*
+
+#### Step 3: Dispatch & auto-rotate with `agydra -r`
+Never worry about managing rate limits manually. Using `-r` (`--random`), `agydra` automatically dispatches each command to the least-recently-used, idle authenticated profile:
+```sh
+# Terminal 1: Automatically picks fam-dev
+agydra -r "Refactor the authentication middleware to use JWT"
+
+# Terminal 2 (simultaneous): fam-dev is busy; agydra automatically routes to fam-agents!
+agydra -r "Generate end-to-end integration tests for the API"
+
+# Hit a 5-hour rate limit on an account? Simply launch with -r:
+agydra -r "Continue repository audit"  # Instantly routes to the next available account
+```
+
+#### Step 4: Monitor your entire pool with `agydra usage`
+Inspect real-time token quotas and reset timers across every account in your pool from a single terminal:
+```sh
+agydra usage
+```
+```text
+#  PROFILE       EMAIL                         GEMINI WK   GEMINI 5H   3P WK       3P 5H
+1  fam-main      dev.lead@gmail.com            92%         100%        85%         100%
+2  fam-dev       code.worker@gmail.com         84%         25%         70%         40%
+3  fam-agents    agent.runner@gmail.com        78%         90%         65%         85%
+4  fam-research  research.bot@gmail.com        100%        100%        100%        100%
+```
+
+For granular insights into an account nearing its rate limit, check exact reset countdowns and graphical progress bars:
+```sh
+agydra usage fam-dev
+```
+```text
+profile   : fam-dev
+email     : code.worker@gmail.com
+
+Gemini Models
+  Weekly Quota                [==================  ]  84.0%  reset in 4d 18h
+  5-Hour Rate Limit           [=====               ]  25.0%  reset in 1h 12m
 ```
 
 ---
@@ -347,7 +416,7 @@ agydra/                     # Flat package structure (zero third-party dependenc
 ├── orphans.py              # Reverse store audit and orphan cleaner
 ├── usage.py                # Quota inspector and rate-limit parser
 ├── bootstrap.py            # Idempotent venv & PATH shim installer
-├── tests/                  # 525 automated unit and integration tests
+├── tests/                  # 540 automated unit and integration tests
 ├── README.md               # English documentation
 ├── README.es.md            # Spanish documentation
 ├── AGENTS.md               # Developer conventions & architectural invariants
@@ -361,10 +430,10 @@ The test suite validates mock environments, edge cases, and all platforms withou
 
 ```sh
 python3 -W error::ResourceWarning -m pytest tests/ -q
-# 522 passed, 3 skipped (on macOS) in ~40s (0 warnings)
+# 537 passed, 3 skipped (on macOS) in ~45s (0 warnings)
 
 python3 -m unittest discover -s tests -q
-# Ran 525 tests in ~36s - OK
+# Ran 540 tests in ~45s - OK
 ```
 
 ---
@@ -382,7 +451,7 @@ python3 -m unittest discover -s tests -q
 We welcome community contributions! Please adhere to our core project invariants:
 1. **Zero third-party runtime dependencies:** Use strictly the Python standard library (`sys`, `os`, `pathlib`, `fcntl`, `tempfile`, etc.).
 2. **Cross-platform parity:** Changes must run identically on macOS, Linux, and Windows.
-3. **Comprehensive verification:** Run all 525 tests before opening a pull request.
+3. **Comprehensive verification:** Run all 540 tests before opening a pull request.
 4. **Architectural consistency:** Consult [AGENTS.md](AGENTS.md) for full architectural guidelines.
 
 ---
