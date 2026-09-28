@@ -182,6 +182,36 @@ def detect_codex_email(data_dir: Path) -> Optional[str]:
     return None
 
 
+def detect_codex_plan(data_dir: Path) -> Optional[str]:
+    """Extract ChatGPT plan type or API key status from Codex auth.json."""
+    path = Path(data_dir) / CODEX_AUTH_FILE
+    if not path.is_file():
+        return None
+    raw = store.read_json_object(path, tolerant=True)
+    if not isinstance(raw, dict):
+        return None
+    tokens = raw.get("tokens")
+    if isinstance(tokens, dict):
+        id_token = tokens.get("id_token")
+        if id_token and isinstance(id_token, str):
+            claims = _decode_jwt_payload(id_token)
+            auth_claim = claims.get("https://api.openai.com/auth")
+            if isinstance(auth_claim, dict):
+                plan_type = auth_claim.get("chatgpt_plan_type")
+                if isinstance(plan_type, str) and plan_type:
+                    plan_map = {
+                        "plus": "ChatGPT Plus",
+                        "team": "ChatGPT Team",
+                        "pro": "ChatGPT Pro",
+                        "enterprise": "ChatGPT Enterprise",
+                        "free": "ChatGPT Free",
+                    }
+                    return plan_map.get(plan_type.lower(), f"ChatGPT {plan_type.capitalize()}")
+    if raw.get("OPENAI_API_KEY"):
+        return "OpenAI API Key"
+    return None
+
+
 def detect_email_source(
     data_dir: Path,
     store=None,

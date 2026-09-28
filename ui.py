@@ -100,16 +100,31 @@ def paint_each(
     return separator.join(chunks)
 
 
+def visible_width(text: str) -> int:
+    """Calculate the terminal cell width of text, ignoring ANSI escape codes."""
+    import unicodedata
+
+    plain = strip_ansi(text)
+    w = 0
+    for ch in plain:
+        eaw = unicodedata.east_asian_width(ch)
+        if eaw in ("F", "W"):
+            w += 2
+        else:
+            w += 1
+    return w
+
+
 def pad(painted: str, width: int) -> str:
     """Left-align a possibly painted cell to a visible width of ``width``.
 
     ``paint`` wraps text in ANSI codes whose bytes an f-string ``:<width``
     spec counts as content, silently shifting every following column. This
-    is its companion: pad by visible width (``strip_ansi``) and, when the
+    is its companion: pad by visible width (``visible_width``) and, when the
     cell ends in a reset code, place filler spaces before the trailing RESET
     so styling covers the cell and resets cleanly at the end of the padded cell.
     """
-    visible = len(strip_ansi(painted))
+    visible = visible_width(painted)
     filler = " " * max(width - visible, 0)
     if painted.endswith(RESET):
         return painted[:-len(RESET)] + filler + RESET

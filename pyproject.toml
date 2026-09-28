@@ -49,6 +49,7 @@ py-modules = [
     "cli",
     "doctor",
     "engines",
+    "i18n",
     "isolation",
     "keychain",
     "locks",

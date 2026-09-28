@@ -377,8 +377,28 @@ def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "ag
             if not link_points_to(data_link, data_dir):
                 raise
 
+    if engine == "codex":
+        _disable_codex_daemon_auto_start(data_dir)
+
     _mirror_dir(real_home, overlay, 0, ctx)
     return overlay
+
+
+def _disable_codex_daemon_auto_start(data_dir: Path) -> None:
+    """Ensure daemon_auto_start = false in Codex config.toml to avoid SUN_LEN socket limits."""
+    cfg = data_dir / "config.toml"
+    if not cfg.exists():
+        try:
+            cfg.write_text("[features]\ndaemon_auto_start = false\n", encoding="utf-8")
+        except OSError:
+            pass
+        return
+    try:
+        content = cfg.read_text(encoding="utf-8")
+        if "daemon_auto_start" not in content:
+            cfg.write_text(content.rstrip() + "\n\n[features]\ndaemon_auto_start = false\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def isolated_env(

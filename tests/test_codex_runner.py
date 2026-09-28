@@ -37,8 +37,16 @@ class TestCodexRunner(BaseCase):
         self.assertEqual(plan.profile, "cx-work")
         self.assertEqual(plan.engine, "codex")
         self.assertEqual(plan.binary, self.codex_bin)
-        self.assertEqual(plan.args, ["exec", "test"])
+        self.assertEqual(plan.args, ["--no-daemon", "exec", "test"])
         self.assertEqual(plan.env_home_var, platforms.home_redirect_var())
+
+    def test_build_plan_injects_no_daemon_for_codex(self):
+        self.store.create("cx-nd", engine="codex")
+        plan = runner.build_plan(self.store, [], flag_ref="cx-nd")
+        self.assertEqual(plan.args, ["--no-daemon"])
+
+        plan2 = runner.build_plan(self.store, ["--no-daemon", "status"], flag_ref="cx-nd")
+        self.assertEqual(plan2.args, ["--no-daemon", "status"])
 
     def test_run_bypasses_keychain_for_codex(self):
         self.store.create("cx-work", engine="codex")
