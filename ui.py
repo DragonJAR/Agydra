@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 
 from platforms import is_windows
 
@@ -83,7 +83,7 @@ def strip_ansi(text: str) -> str:
 
 
 def paint_each(
-    parts: Sequence[tuple[str, str | tuple[str, ...]]],
+    parts: Sequence[tuple[str, Union[str, tuple[str, ...]]]],
     *,
     separator: str = "",
     stream: Optional[object] = None,

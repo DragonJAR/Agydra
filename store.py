@@ -16,7 +16,7 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import platforms
 import vocab
@@ -273,7 +273,7 @@ def rmtree(path: Path) -> None:
 
 
 class Store:
-    def __init__(self, root: Optional[Path | str] = None) -> None:
+    def __init__(self, root: Optional[Union[Path, str]] = None) -> None:
         self.root = Path(root) if root is not None else platforms.base_dir()
         self.profiles_dir = self.root / "profiles"
         self.overlays_dir = self.root / platforms.OVERLAYS_DIRNAME

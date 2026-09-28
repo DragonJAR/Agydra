@@ -47,14 +47,17 @@ class _DoctorContext:
 def _check_binary(store: Store, ctx: "_DoctorContext"):
     config = store.load_config()
     agy_bin = platforms.resolve_agy_binary(config.agy_binary)
+    has_profiles = bool(ctx.scan[0])
+    has_agy_profile = any(getattr(p, "engine", "agy") == "agy" for p in ctx.scan[0]) if has_profiles else True
     has_codex_profile = any(getattr(p, "engine", "agy") == "codex" for p in ctx.scan[0])
     lines = []
     status = OK
-    if agy_bin is None:
-        status = FAIL
-        lines.append(f"agy binary not found (install agy or set {platforms.AGY_BIN_ENV})")
-    else:
-        lines.append(f"agy binary: {agy_bin}")
+    if has_agy_profile:
+        if agy_bin is None:
+            status = FAIL
+            lines.append(f"agy binary not found (install agy or set {platforms.AGY_BIN_ENV})")
+        else:
+            lines.append(f"agy binary: {agy_bin}")
     if has_codex_profile:
         codex_bin = platforms.resolve_codex_binary(config.codex_binary)
         if codex_bin is None:
@@ -187,7 +190,7 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
         return FAIL, "isolation broken: " + "; ".join(failures)
     if recoverable:
         return WARN, (
-            "isolation recoverable: real directory at overlay .gemini for "
+            "isolation recoverable: real directory instead of link in overlay for "
             + ", ".join(recoverable)
             + " (data intact — run `agydra doctor --fix` to migrate it "
             "into the profile store and relink)"
@@ -202,7 +205,7 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
 
 
 def _check_schema_canary(store: Store, ctx: "_DoctorContext"):
-    """Confirm profiles actually contain agy's data layout (schema unchanged).
+    """Confirm profiles actually contain engine data layout (schema unchanged).
 
     The authoritative on-disk layout is ``<data>/antigravity-cli/`` (the token
     file lives inside it) or ``<data>/auth.json`` for codex. Consumes the doctor-wide scan.
@@ -218,10 +221,10 @@ def _check_schema_canary(store: Store, ctx: "_DoctorContext"):
         return WARN, "schema canary pending (no profiles to inspect)"
     if not any_data:
         return WARN, (
-            "no agy data layout found in profiles yet; run 'agydra login <profile>' "
+            "no session data layout found in profiles yet; run 'agydra login <profile>' "
             "and re-run doctor to confirm tokens land in the profile store"
         )
-    return OK, "profile stores contain agy data layout (schema canary passed)"
+    return OK, "profile stores contain engine data layout (schema canary passed)"
 
 
 def _check_keychain(store: Store, ctx: "_DoctorContext"):
