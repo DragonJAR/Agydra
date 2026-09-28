@@ -11,9 +11,7 @@ import account
 import cli
 import engines
 import isolation
-import models
 import platforms
-import runner
 import store
 import usage
 
@@ -66,7 +64,7 @@ class TestGrokEngine(unittest.TestCase):
         self.assertEqual(platforms.resolve_grok_binary(), fake_bin)
 
     def test_auth_detection_oidc_tier(self):
-        profile = self.store.create("grok-user", engine="grok")
+        self.store.create("grok-user", engine="grok")
         data_dir = self.store.profile_data_dir("grok-user", engine="grok")
         jwt = _make_dummy_jwt({"email": "elon@x.ai", "tier": 4})
         auth_payload = {
@@ -84,7 +82,7 @@ class TestGrokEngine(unittest.TestCase):
         self.assertEqual(account.auth_state(data_dir, self.store, "grok-user", engine="grok"), "authenticated")
 
     def test_auth_detection_api_key(self):
-        profile = self.store.create("grok-api", engine="grok")
+        self.store.create("grok-api", engine="grok")
         data_dir = self.store.profile_data_dir("grok-api", engine="grok")
         auth_payload = {"XAI_API_KEY": "xai-test-key-12345"}
         (data_dir / "auth.json").write_text(json.dumps(auth_payload), encoding="utf-8")
@@ -103,7 +101,7 @@ class TestGrokEngine(unittest.TestCase):
         self.assertIsNone(account.detect_grok_plan(data_dir))
 
     def test_overlay_creation_and_env(self):
-        profile = self.store.create("gk", engine="grok")
+        self.store.create("gk", engine="grok")
         data_dir = self.store.profile_data_dir("gk", engine="grok")
         (data_dir / "config.toml").write_text("[ui]\nscreen_mode = 'minimal'\n", encoding="utf-8")
 
@@ -229,7 +227,6 @@ class TestGrokEngine(unittest.TestCase):
     def test_query_grok_usage_mocked_network(self):
         import urllib.error
         from unittest.mock import patch
-        from datetime import datetime, timezone
 
         self.store.create("grok-mock", engine="grok")
         data_dir = self.store.profile_data_dir("grok-mock", engine="grok")
@@ -274,7 +271,6 @@ class TestGrokEngine(unittest.TestCase):
     def test_cli_usage_grok_table_and_recs(self):
         import io
         from unittest.mock import patch
-        from datetime import datetime, timezone
 
         self.store.create("grok-active", engine="grok")
         data_dir = self.store.profile_data_dir("grok-active", engine="grok")

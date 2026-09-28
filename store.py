@@ -130,6 +130,11 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
     _atomic_replace(path, lambda fh, tmp: fh.write(data))
 
 
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """Write text atomically via ``atomic_write_bytes``."""
+    atomic_write_bytes(path, text.encode(encoding))
+
+
 def _replace_with_retry(src: str, dst: Path, attempts: int = 3) -> None:
     """os.replace with short retries: Windows AV/indexers transiently hold
     freshly written files with PermissionError; a brief backoff avoids a
@@ -511,7 +516,10 @@ class Store:
         if config.default_profile == name:
             remaining = self.names()
             config.default_profile = remaining[0] if remaining else None
-            self.save_config(config)
+            try:
+                self.save_config(config)
+            except StoreError as exc:
+                warn(f"could not update default profile after deleting {name!r} ({exc})")
         return backup_path
 
     BACKUP_RETENTION = 5
@@ -569,11 +577,11 @@ class Store:
             if not backup_owner(name, path.name):
                 continue
             try:
-                stamped.append((path.stat().st_mtime, path))
+                stamped.append((path.stat().st_mtime, str(path), path))
             except OSError:
                 continue
         stamped.sort()
-        victims = [p for _, p in (stamped[:-keep] if keep > 0 else stamped)]
+        victims = [p for _, _, p in (stamped[:-keep] if keep > 0 else stamped)]
         for old in victims:
             try:
                 if old.exists():

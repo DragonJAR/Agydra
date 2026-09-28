@@ -457,7 +457,7 @@ def cmd_create(store: Store, args) -> int:
     config = store.load_config()
     if config.settings.get("copy_settings_on_create", True) and engine == "agy":
         default = store.default_name()
-        if default and default != profile.name:
+        if default and default != profile.name and store.get(default).engine == "agy":
             _share_config(store, default, [profile.name])
     print(f"created profile: {profile.name}")
     print(f"authenticate it with: agydra login {profile.name}")
@@ -612,7 +612,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
     show_account = True
 
     def calc_row_w(acct_w, b_w, s_win, s_acct):
-        w = idx_w + 1 + name_w
+        w = idx_w + 2 + name_w
         if s_acct:
             w += acct_w
         avail_w = b_w + 6
@@ -791,13 +791,13 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                     status_str = paint(f"({result.error})", "dim")
                 print(row_cx + pad(status_str, quota_w) + plan)
             elif not result.groups:
-                if result.error and "offline" in result.error.lower():
+                if result.error:
                     status_str = paint("─ " + i18n.t("usage.unavailable", default="unavailable"), "dim")
                 else:
                     status_str = paint(i18n.t("auth.authenticated", default="authenticated"), "green")
-                if best_codex_name is None:
-                    best_codex_name = profile.name
-                    best_codex_plan = plan
+                    if best_codex_name is None:
+                        best_codex_name = profile.name
+                        best_codex_plan = plan
                 print(row_cx + pad(status_str, quota_w) + plan)
             else:
                 summary = usage.extract_model_summary(result.groups)
@@ -810,7 +810,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                     best_codex_val = cx_avail
                     best_codex_name = profile.name
                     best_codex_plan = plan
-                elif best_codex_name is None:
+                elif best_codex_name is None and cx_avail is not None:
                     best_codex_name = profile.name
                     best_codex_plan = plan
 
@@ -873,13 +873,13 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                     status_str = paint(f"({result.error})", "dim")
                 print(row_gx + pad(status_str, quota_w) + plan)
             elif not result.groups:
-                if result.error and "offline" in result.error.lower():
+                if result.error:
                     status_str = paint("─ " + i18n.t("usage.unavailable", default="unavailable"), "dim")
                 else:
                     status_str = paint(i18n.t("auth.authenticated", default="authenticated"), "green")
-                if best_grok_name is None:
-                    best_grok_name = profile.name
-                    best_grok_plan = plan
+                    if best_grok_name is None:
+                        best_grok_name = profile.name
+                        best_grok_plan = plan
                 print(row_gx + pad(status_str, quota_w) + plan)
             else:
                 summary = usage.extract_model_summary(result.groups)
@@ -890,7 +890,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                     best_grok_val = gx_avail
                     best_grok_name = profile.name
                     best_grok_plan = plan
-                elif best_grok_name is None:
+                elif best_grok_name is None and gx_avail is not None:
                     best_grok_name = profile.name
                     best_grok_plan = plan
 
@@ -908,19 +908,19 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                 print(row_gx + gx_disp + gx_reset_str + plan)
 
     recs = []
-    if best_gem_name is not None and best_gem_val >= 0:
+    if best_gem_name is not None and best_gem_val > 0:
         recs.append(f"Gemini → {best_gem_name} {round(best_gem_val * 100)}%")
-    if best_claude_name is not None and best_claude_val >= 0:
+    if best_claude_name is not None and best_claude_val > 0:
         recs.append(f"Claude/GPT → {best_claude_name} {round(best_claude_val * 100)}%")
     if best_codex_name is not None:
-        if best_codex_val >= 0:
+        if best_codex_val > 0:
             recs.append(f"Codex → {best_codex_name} {round(best_codex_val * 100)}%")
-        else:
+        elif best_codex_val < 0:
             recs.append(f"Codex → {best_codex_name} ({best_codex_plan})")
     if best_grok_name is not None:
-        if best_grok_val >= 0:
+        if best_grok_val > 0:
             recs.append(f"Grok → {best_grok_name} {round(best_grok_val * 100)}%")
-        else:
+        elif best_grok_val < 0:
             recs.append(f"Grok → {best_grok_name} ({best_grok_plan or 'Active'})")
 
     if recs:
@@ -958,7 +958,7 @@ def _cmd_usage_detail(store: Store, args) -> int:
         if not result.ok:
             if result.error and result.error != "not authenticated":
                 _error(f"usage unavailable: {result.error}")
-            return 0
+            return 1
         if not result.groups:
             return 0
 
@@ -1033,7 +1033,7 @@ def cmd_delete(store: Store, args) -> int:
         return _finish_delete(store, args.ref, args.no_backup)
     _assert_free(store, name, "deleting the profile")
     profile = store.get(name)
-    email = profile.email or account.detect_email(store.profile_data_dir(name), store, name) or "?"
+    email = profile.email or account.detect_email(store.profile_data_dir(name, engine=profile.engine), store, name, engine=profile.engine) or "?"
     if not _confirm(f"delete profile {name!r} ({email})?", args.force):
         print("cancelled")
         return 1
@@ -1333,7 +1333,7 @@ _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
 
 def _report_error(exc: BaseException) -> int:
     """Single error-mapping table shared by both dispatch paths."""
-    if isinstance(exc, (StoreError, IsolationError, BootstrapError)):
+    if isinstance(exc, (StoreError, IsolationError, BootstrapError, ValueError)):
         _error(str(exc))
         return 1
     if isinstance(exc, EOFError):
@@ -1563,7 +1563,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return args.func(store, args)
         except (
             StoreError, IsolationError, BootstrapError, EOFError, OSError,
-            KeyboardInterrupt,
+            KeyboardInterrupt, ValueError,
         ) as exc:
             return _report_error(exc)
 
@@ -1593,7 +1593,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             engine=engine_str,
         )
         return runner.run(plan, store=store, dry_run=bool(values["dry-run"]))
-    except (StoreError, IsolationError, OSError, KeyboardInterrupt) as exc:
+    except (StoreError, IsolationError, OSError, KeyboardInterrupt, ValueError) as exc:
         return _report_error(exc)
 
 

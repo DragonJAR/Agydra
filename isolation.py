@@ -102,6 +102,10 @@ def link_points_to(link: Path, target: Path) -> bool:
     try:
         if not _is_link(link):
             return False
+        id_link = _identity(link)
+        id_target = _identity(target)
+        if id_link is not None and id_target is not None and id_link == id_target:
+            return True
         if link.resolve() == target.resolve():
             return True
         if platforms.is_windows():
@@ -390,17 +394,35 @@ def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "ag
 
 def _disable_codex_daemon_auto_start(data_dir: Path) -> None:
     """Ensure daemon_auto_start = false in Codex config.toml to avoid SUN_LEN socket limits."""
+    import re
+
     cfg = data_dir / "config.toml"
     if not cfg.exists():
         try:
-            cfg.write_text("[features]\ndaemon_auto_start = false\n", encoding="utf-8")
+            store.atomic_write_text(cfg, "[features]\ndaemon_auto_start = false\n")
         except OSError:
             pass
         return
     try:
         content = cfg.read_text(encoding="utf-8")
-        if "daemon_auto_start" not in content:
-            cfg.write_text(content.rstrip() + "\n\n[features]\ndaemon_auto_start = false\n", encoding="utf-8")
+        if "daemon_auto_start" in content:
+            new_content = re.sub(
+                r"(daemon_auto_start\s*=\s*)(true|1)",
+                r"\g<1>false",
+                content,
+            )
+        elif re.search(r"^\s*\[features\]", content, re.MULTILINE):
+            new_content = re.sub(
+                r"(^\s*\[features\]\s*\n)",
+                r"\1daemon_auto_start = false\n",
+                content,
+                flags=re.MULTILINE,
+            )
+        else:
+            new_content = content.rstrip() + "\n\n[features]\ndaemon_auto_start = false\n"
+
+        if new_content != content:
+            store.atomic_write_text(cfg, new_content)
     except OSError:
         pass
 
@@ -451,7 +473,7 @@ def sandbox_wrap(argv: List[str]) -> List[str]:
     Only called on Linux when ``use_linux_sandbox`` is enabled and bwrap is
     present. The same overlay-based HOME redirection applies inside.
     """
-    uid = os.getuid()
+    uid = getattr(os, "getuid", lambda: 1000)()
     bus_dir = f"/run/user/{uid}/bus"
     keyring_dir = f"/run/user/{uid}/keyring"
     wrapped = [

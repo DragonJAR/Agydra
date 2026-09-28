@@ -13,7 +13,7 @@ Uso::
 
     import i18n
     i18n.resolve_language(store, flag_lang=args.lang)   # una sola vez al arranque
-    print(i18n.t("profile.created", name="work"))        # cadenas con placeholders
+    print(i18n.t("cmd.create.ok", name="work"))         # cadenas con placeholders
 
 Convenciones de claves:
   - Punto como separador de espacio de nombres (``"cmd.create.help"``).
@@ -40,7 +40,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'lang.set_ok': 'Language set to English and saved.',
         'lang.unknown': 'Unknown language {lang!r}. Supported: {supported}.',
         'lang.env_override': 'Language forced by AGYDRA_LANG={lang}.',
-        'launcher.description': 'agydra — profile manager for agy and codex.\n\nRun without arguments to launch agy with the default profile.\nUse -p <name> to pick a specific one, -r to pick a free one.',
+        'launcher.description': 'Agydra — profile manager for agy, codex, and grok.\n\nRun without arguments to launch agy with the default profile.\nUse -p <name> to pick a specific one, -r to pick a free one.',
         'launcher.hint_no_profiles': 'No profiles yet. Create one with: agydra create <name>',
         'launcher.profile_busy': 'Profile {name!r} is busy: another live session is using it.',
         'launcher.no_free_profile': 'No free authenticated profile available. Use -r or create a new one with: agydra create <name>',
@@ -86,7 +86,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'cmd.default.show': 'Default profile: {name}',
         'cmd.default.none': 'No default profile is set.',
         'cmd.default.not_found': 'Profile {name!r} not found.',
-        'cmd.use.help': "Alias for 'default': set the default profile.",
+        'cmd.use.help': 'Pin a profile to the current directory (.agydra marker).',
         'cmd.rename.help': 'Rename a profile.',
         'cmd.rename.ok': 'Profile {old!r} renamed to {new!r}.',
         'cmd.rename.not_found': 'Profile {name!r} not found.',
@@ -119,16 +119,16 @@ _STRINGS: dict[str, dict[str, str]] = {
         'cmd.usage.fetch_error': 'Could not retrieve usage: {error}',
         'cmd.usage.no_data': 'No usage data available yet.',
         'cmd.usage.bar_label': 'Tokens used',
-        'cmd.setup.help': 'Install or update the agydra shim and venv.',
-        'cmd.setup.ok': 'agydra installed successfully.',
-        'cmd.setup.already_ok': 'agydra is already up to date.',
+        'cmd.setup.help': 'Install or update the Agydra shim and venv.',
+        'cmd.setup.ok': 'Agydra installed successfully.',
+        'cmd.setup.already_ok': 'Agydra is already up to date.',
         'cmd.setup.dry_run_header': '--- dry-run: would perform ---',
         'cmd.setup.foreign_shim': "Foreign file at {path}. Inspect and remove it, or re-run 'agydra setup --force'.",
         'cmd.lang.help': 'Set the display language (en / es).',
         'cmd.lang.ok': 'Language set to {lang!r} and saved.',
         'cmd.lang.unknown': 'Unknown language {lang!r}. Supported: {supported}.',
         'cmd.lang.current': 'Current language: {lang}',
-        'cmd.version.help': 'Print the agydra version and exit.',
+        'cmd.version.help': 'Print the Agydra version and exit.',
         'cmd.help.help': 'Show this help message and exit.',
         'auth.authenticated': 'authenticated',
         'auth.not_authenticated': 'not authenticated',
@@ -218,7 +218,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'lang.set_ok': 'Idioma cambiado a Español y guardado.',
         'lang.unknown': 'Idioma desconocido {lang!r}. Soportados: {supported}.',
         'lang.env_override': 'Idioma forzado por AGYDRA_LANG={lang}.',
-        'launcher.description': 'agydra — gestor de perfiles para agy y codex.\n\nSin argumentos lanza agy con el perfil predeterminado.\nUsa -p <nombre> para elegir uno, -r para tomar uno libre.',
+        'launcher.description': 'Agydra — gestor de perfiles para agy, codex y grok.\n\nSin argumentos lanza agy con el perfil predeterminado.\nUsa -p <nombre> para elegir uno, -r para tomar uno libre.',
         'launcher.hint_no_profiles': 'Aún no hay perfiles. Crea uno con: agydra create <nombre>',
         'launcher.profile_busy': 'El perfil {name!r} está ocupado: otra sesión activa lo está usando.',
         'launcher.no_free_profile': 'No hay ningún perfil autenticado y libre. Usa -r o crea uno nuevo con: agydra create <nombre>',
@@ -264,7 +264,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'cmd.default.show': 'Perfil predeterminado: {name}',
         'cmd.default.none': 'No hay perfil predeterminado configurado.',
         'cmd.default.not_found': 'Perfil {name!r} no encontrado.',
-        'cmd.use.help': "Alias de 'default': establece el perfil predeterminado.",
+        'cmd.use.help': 'Fijar un perfil en el directorio actual (marcador .agydra).',
         'cmd.rename.help': 'Renombrar un perfil.',
         'cmd.rename.ok': 'Perfil {old!r} renombrado a {new!r}.',
         'cmd.rename.not_found': 'Perfil {name!r} no encontrado.',
@@ -297,16 +297,16 @@ _STRINGS: dict[str, dict[str, str]] = {
         'cmd.usage.fetch_error': 'No se pudo obtener el uso: {error}',
         'cmd.usage.no_data': 'Aún no hay datos de uso disponibles.',
         'cmd.usage.bar_label': 'Tokens usados',
-        'cmd.setup.help': 'Instalar o actualizar el shim y el entorno virtual de agydra.',
-        'cmd.setup.ok': 'agydra instalado correctamente.',
-        'cmd.setup.already_ok': 'agydra ya está actualizado.',
+        'cmd.setup.help': 'Instalar o actualizar el shim y el entorno virtual de Agydra.',
+        'cmd.setup.ok': 'Agydra instalado correctamente.',
+        'cmd.setup.already_ok': 'Agydra ya está actualizado.',
         'cmd.setup.dry_run_header': '--- simulación: se realizaría ---',
         'cmd.setup.foreign_shim': "Archivo ajeno en {path}. Inspecciónalo y elimínalo, o vuelve a ejecutar 'agydra setup --force'.",
         'cmd.lang.help': 'Establecer el idioma de la interfaz (en / es).',
         'cmd.lang.ok': 'Idioma establecido en {lang!r} y guardado.',
         'cmd.lang.unknown': 'Idioma desconocido {lang!r}. Soportados: {supported}.',
         'cmd.lang.current': 'Idioma actual: {lang}',
-        'cmd.version.help': 'Mostrar la versión de agydra y salir.',
+        'cmd.version.help': 'Mostrar la versión de Agydra y salir.',
         'cmd.help.help': 'Mostrar este mensaje de ayuda y salir.',
         'auth.authenticated': 'autenticado',
         'auth.not_authenticated': 'no autenticado',
@@ -452,11 +452,19 @@ def _normalize(lang: str) -> Optional[str]:
 
 
 def _locale_lang() -> str:
-    """Detecta el idioma del sistema vía ``locale.getlocale()``.
+    """Detecta el idioma del sistema evaluando LC_ALL, LC_MESSAGES, LANG y locale.getlocale().
 
-Retorna ``'es'`` si el locale empieza por ``'es'``; ``'en'`` en cualquier
-otro caso (incluyendo locales no determinados o errores de la API).
-"""
+    Retorna ``'es'`` si el locale empieza por ``'es'``; ``'en'`` en cualquier
+    otro caso (incluyendo locales no determinados o errores de la API).
+    """
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        val = os.environ.get(var)
+        if val:
+            val_clean = val.strip().lower()
+            if val_clean.startswith("es"):
+                return "es"
+            if val_clean.startswith("en"):
+                return "en"
     try:
         loc, _ = locale.getlocale()
         if loc and loc.lower().startswith("es"):

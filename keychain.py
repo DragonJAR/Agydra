@@ -840,6 +840,13 @@ def rename_profile_slot(store, old_name: str, new_name: str) -> None:
         old.replace(new)
     except OSError as exc:
         warn(f"could not rename keychain slot for {old_name!r} ({exc})")
+    if supported():
+        try:
+            target = _ensure_target_keychain(store)
+            delete_slot(profile_slot(old_name), target)
+            delete_slot(profile_slot(new_name), target)
+        except (KeychainError, OSError):
+            pass
 
 
 def purge_profile_slot(store, name: str) -> None:

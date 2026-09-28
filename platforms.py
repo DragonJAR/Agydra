@@ -190,6 +190,8 @@ def canonical_path(path: Path) -> Path:
     p = Path(path).resolve()
     if not p.exists():
         return p
+    if is_linux():
+        return p
     if is_macos():
         try:
             import fcntl

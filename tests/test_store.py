@@ -515,6 +515,31 @@ class TestStore(BaseCase):
                 store.resolve_ref(invalid)
             self.assertNotIn("create it with", str(ctx.exception))
 
+    def test_prune_backups_identical_mtime(self):
+        """Ensure _prune_backups does not crash on Python < 3.12 when backups
+        have identical mtime."""
+        store = Store()
+        store.create("work")
+        stamp = store_mod._backup_stamp()
+        p1 = store.backups_dir / f"work-{stamp}.zip"
+        p2 = store.backups_dir / f"work-{stamp}.2.zip"
+        p3 = store.backups_dir / f"work-{stamp}.3.zip"
+        store.backups_dir.mkdir(parents=True, exist_ok=True)
+        p1.write_bytes(b"zip1")
+        p2.write_bytes(b"zip2")
+        p3.write_bytes(b"zip3")
+        # Explicitly set identical mtime
+        import os
+        now = 1700000000.0
+        os.utime(p1, (now, now))
+        os.utime(p2, (now, now))
+        os.utime(p3, (now, now))
+
+        # Keep 1, should prune 2 without raising TypeError
+        store._prune_backups("work", keep=1)
+        remaining = list(store.backups_dir.glob("work-*.zip"))
+        self.assertEqual(len(remaining), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

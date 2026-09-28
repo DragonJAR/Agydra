@@ -49,5 +49,8 @@ $RECYCLE.BIN/
 # --- Agent tooling ---
 .atl/
 
-# --- Planning artifacts (implemented, kept out of the repo) ---
-PLAN-agy-multisesion.md
+# --- Markdown files (do not upload any .md except READMEs) ---
+*.md
+!README.md
+!README.*.md
+!README*.md

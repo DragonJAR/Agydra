@@ -13,7 +13,7 @@ import account
 import isolation
 import keychain
 import platforms
-from store import Store
+from store import Store, StoreError
 from ui import paint, warn
 
 OK = "ok"
@@ -175,16 +175,14 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
     failures = []
     recoverable = []
     pending = []
+    profiles_by_name = {p.name: p for p in ctx.scan[0]}
     for name in profiles:
         data_dir = store.profile_data_dir(name)
         if not data_dir.is_dir():
             failures.append(f"{name}: data dir missing")
             continue
-        try:
-            p = store.get(name)
-            engine_name = getattr(p, "engine", "agy") or "agy"
-        except Exception:
-            engine_name = "agy"
+        p = profiles_by_name.get(name)
+        engine_name = (getattr(p, "engine", "agy") or "agy") if p else "agy"
         driver = engines.get_engine(engine_name)
         link_name = driver.data_dir_name
         overlay = store.overlays_dir / name
@@ -452,15 +450,13 @@ def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
     never disagree about what is on the menu."""
     import engines
 
+    profiles_by_name = {p.name: p for p in ctx.scan[0]}
     lines: List[str] = []
     for name in ctx.names:
         if not store.exists(name):
             continue
-        try:
-            p = store.get(name)
-            engine_name = getattr(p, "engine", "agy") or "agy"
-        except Exception:
-            engine_name = "agy"
+        p = profiles_by_name.get(name)
+        engine_name = (getattr(p, "engine", "agy") or "agy") if p else "agy"
         driver = engines.get_engine(engine_name)
         link = store.overlays_dir / name / driver.data_dir_name
         if link.exists() and not isolation._is_link(link):
@@ -489,14 +485,12 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
     """One self-heal pass for everything ``doctor --fix`` covers."""
     import engines
 
+    profiles_by_name = {p.name: p for p in ctx.scan[0]}
     for name in ctx.names:
         if not store.exists(name):
             continue
-        try:
-            p = store.get(name)
-            engine_name = getattr(p, "engine", "agy") or "agy"
-        except Exception:
-            engine_name = "agy"
+        p = profiles_by_name.get(name)
+        engine_name = (getattr(p, "engine", "agy") or "agy") if p else "agy"
         driver = engines.get_engine(engine_name)
         data_dir = store.profile_data_dir(name)
         link = store.overlays_dir / name / driver.data_dir_name
@@ -525,11 +519,14 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
     if default and default not in current_names:
         config = store.load_config()
         config.default_profile = None
-        store.save_config(config)
-        print(
-            paint("[fix]", "cyan", "bold")
-            + f" cleared dangling default profile {default!r}"
-        )
+        try:
+            store.save_config(config)
+            print(
+                paint("[fix]", "cyan", "bold")
+                + f" cleared dangling default profile {default!r}"
+            )
+        except (StoreError, OSError) as exc:
+            warn(f"could not clear dangling default profile {default!r} ({exc})")
     keychain_path = keychain._ensure_target_keychain(store) if keychain.supported() else None
     for orphan in keychain.orphan_slots(store, current_names, keychain_path=keychain_path):
         try:

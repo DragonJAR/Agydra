@@ -146,6 +146,12 @@ class LockHandle:
         self._fd = fd
         self._released = False
 
+    def __enter__(self) -> "LockHandle":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.release()
+
     def release(self) -> None:
         if self._released:
             return

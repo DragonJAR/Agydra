@@ -118,14 +118,14 @@ def resolve(
         def_prof = store.get(default)
         if not target_engine or def_prof.engine == target_engine:
             return Resolution(store.resolve_ref(default), "default profile")
-        if all_profiles:
+        if eligible:
             warn(
                 f"default profile {default!r} is for engine {def_prof.engine!r}; "
                 f"falling back to the first {target_engine} profile"
             )
 
     if eligible:
-        return Resolution(eligible[0].name, f"first {target_engine or 'agy'} profile")
+        return Resolution(eligible[0].name, f"first {eligible[0].engine} profile")
 
     if not all_profiles:
         raise StoreError(
@@ -199,15 +199,26 @@ def pick_free_profile(
 
     names = [p.name for p in profiles]
     if not names:
+        if engine is not None:
+            raise StoreError(
+                f"no profiles found for engine {target_engine!r}; "
+                f"create them with: agydra create <name> -e {target_engine}"
+            )
         raise StoreError(_NO_PROFILES)
 
     if not force and len(names) < MIN_PROFILES:
+        if engine is not None:
+            raise StoreError(
+                f"only 1 profile exists for engine {target_engine!r}; "
+                f"auto-rotation (-r) needs at least {MIN_PROFILES} profiles — "
+                f"create another with: agydra create <name> -e {target_engine}"
+            )
         raise StoreError(_TOO_FEW)
 
     authenticated = [
         p for p in profiles
         if account.auth_state(
-            store.profile_data_dir(p.name),
+            store.profile_data_dir(p.name, engine=getattr(p, "engine", "agy")),
             store,
             p.name,
             engine=getattr(p, "engine", "agy"),

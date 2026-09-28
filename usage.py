@@ -53,6 +53,7 @@ multi-profile report.
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import urllib.error
 import urllib.request
@@ -136,7 +137,7 @@ def _parse_reset_time(raw: object) -> Optional[datetime]:
             return None
     if not isinstance(raw, str) or not raw:
         return None
-    text = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    text = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
@@ -153,13 +154,14 @@ def _parse_bucket(raw: object) -> Optional[UsageBucket]:
     if not isinstance(bucket_id, str) or not bucket_id:
         return None
     fraction = raw.get("remaining_fraction")
-    if not isinstance(fraction, (int, float)) or isinstance(fraction, bool):
+    if not isinstance(fraction, (int, float)) or isinstance(fraction, bool) or not math.isfinite(fraction):
         return None
+    clamped = max(0.0, min(1.0, float(fraction)))
     return UsageBucket(
         id=bucket_id,
         name=str(raw.get("name") or bucket_id),
         window=str(raw.get("window") or ""),
-        remaining_fraction=float(fraction),
+        remaining_fraction=clamped,
         reset_time=_parse_reset_time(raw.get("reset_time")),
     )
 
@@ -255,14 +257,9 @@ def parse_codex_usage_payload(
     prim = rate_limit.get("primary_window")
     if isinstance(prim, dict):
         used = prim.get("used_percent")
-        if isinstance(used, (int, float)) and not isinstance(used, bool):
+        if isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used):
             rem = max(0.0, min(1.0, (100.0 - float(used)) / 100.0))
-            reset_at = prim.get("reset_at")
-            reset_dt = (
-                datetime.fromtimestamp(reset_at, tz=timezone.utc)
-                if isinstance(reset_at, (int, float))
-                else None
-            )
+            reset_dt = _parse_reset_time(prim.get("reset_at"))
             buckets.append(
                 UsageBucket(
                     id="codex-5h",
@@ -276,14 +273,9 @@ def parse_codex_usage_payload(
     sec = rate_limit.get("secondary_window")
     if isinstance(sec, dict):
         used = sec.get("used_percent")
-        if isinstance(used, (int, float)) and not isinstance(used, bool):
+        if isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used):
             rem = max(0.0, min(1.0, (100.0 - float(used)) / 100.0))
-            reset_at = sec.get("reset_at")
-            reset_dt = (
-                datetime.fromtimestamp(reset_at, tz=timezone.utc)
-                if isinstance(reset_at, (int, float))
-                else None
-            )
+            reset_dt = _parse_reset_time(sec.get("reset_at"))
             buckets.append(
                 UsageBucket(
                     id="codex-weekly",
@@ -372,19 +364,29 @@ def query_codex_usage(
     try:
         payload = fetch_codex_usage_payload(access_token, timeout=timeout)
     except urllib.error.HTTPError as exc:
-        if exc.code == 401 and refresh_token:
-            new_access_token = _do_refresh()
-            if new_access_token:
-                try:
-                    payload = fetch_codex_usage_payload(new_access_token, timeout=timeout)
-                except Exception as inner_exc:
+        if exc.code == 401:
+            if refresh_token:
+                new_access_token = _do_refresh()
+                if new_access_token:
+                    try:
+                        payload = fetch_codex_usage_payload(new_access_token, timeout=timeout)
+                    except Exception as inner_exc:
+                        return UsageResult(
+                            name=name,
+                            ok=True,
+                            engine="codex",
+                            email=detected_email,
+                            plan=detected_plan or "ChatGPT Plus",
+                            error=f"usage unavailable ({inner_exc})",
+                        )
+                else:
                     return UsageResult(
                         name=name,
-                        ok=True,
+                        ok=False,
                         engine="codex",
                         email=detected_email,
-                        plan=detected_plan or "ChatGPT Plus",
-                        error=f"usage unavailable ({inner_exc})",
+                        plan=detected_plan,
+                        error="session expired (401)",
                     )
             else:
                 return UsageResult(
@@ -484,7 +486,7 @@ def parse_grok_billing_payload(
         return [], None
 
     used_pct = cfg.get("creditUsagePercent")
-    if not isinstance(used_pct, (int, float)) or isinstance(used_pct, bool):
+    if not isinstance(used_pct, (int, float)) or isinstance(used_pct, bool) or not math.isfinite(used_pct):
         ondemand_used = (
             cfg.get("onDemandUsed", {}).get("val")
             if isinstance(cfg.get("onDemandUsed"), dict)
@@ -497,7 +499,11 @@ def parse_grok_billing_payload(
         )
         if (
             isinstance(ondemand_used, (int, float))
+            and not isinstance(ondemand_used, bool)
+            and math.isfinite(ondemand_used)
             and isinstance(ondemand_cap, (int, float))
+            and not isinstance(ondemand_cap, bool)
+            and math.isfinite(ondemand_cap)
             and ondemand_cap > 0
         ):
             used_pct = (float(ondemand_used) / float(ondemand_cap)) * 100.0
@@ -800,6 +806,14 @@ def usage_color(remaining_fraction: float) -> str:
 
 def format_mini_bar(remaining_fraction: float, width: int = 10) -> str:
     """Format a compact fixed-width gauge using filled and empty blocks: e.g. '███░░░░░░░'."""
+    if width <= 0:
+        return ""
+    if (
+        not isinstance(remaining_fraction, (int, float))
+        or isinstance(remaining_fraction, bool)
+        or not math.isfinite(remaining_fraction)
+    ):
+        return "░" * width
     clamped = max(0.0, min(1.0, float(remaining_fraction)))
     filled = round(clamped * width)
     return "█" * filled + "░" * (width - filled)
@@ -824,9 +838,9 @@ def extract_model_summary(groups: List[UsageGroup]) -> dict:
             key = "codex"
         elif any(k in lower_name for k in ("grok", "xai")):
             key = "grok"
-        elif summary["gemini"]["available"] is None:
+        elif summary["gemini"]["weekly"] is None and summary["gemini"]["five_h"] is None:
             key = "gemini"
-        elif summary["claude"]["available"] is None:
+        elif summary["claude"]["weekly"] is None and summary["claude"]["five_h"] is None:
             key = "claude"
 
         if key is None:
@@ -841,6 +855,9 @@ def extract_model_summary(groups: List[UsageGroup]) -> dict:
             elif "5h" in win or "5h" in bid:
                 summary[key]["five_h"] = bucket.remaining_fraction
                 summary[key]["five_h_reset"] = bucket.reset_time
+            elif summary[key]["weekly"] is None:
+                summary[key]["weekly"] = bucket.remaining_fraction
+                summary[key]["weekly_reset"] = bucket.reset_time
 
     for key in ("gemini", "claude", "codex", "grok"):
         w = summary[key]["weekly"]
@@ -949,7 +966,11 @@ def format_countdown(reset_time: Optional[datetime], *, now: Optional[datetime] 
     """
     if reset_time is None:
         return "-"
+    if reset_time.tzinfo is None:
+        reset_time = reset_time.replace(tzinfo=timezone.utc)
     now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     total_seconds = int((reset_time - now).total_seconds())
     if total_seconds <= 0:
         return "now"

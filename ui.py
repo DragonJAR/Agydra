@@ -107,6 +107,8 @@ def visible_width(text: str) -> int:
     plain = strip_ansi(text)
     w = 0
     for ch in plain:
+        if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+            continue
         eaw = unicodedata.east_asian_width(ch)
         if eaw in ("F", "W"):
             w += 2

@@ -91,6 +91,18 @@ class TestFindOrphans(BaseCase):
         self.assertEqual(scan.describe(), [])
         self.assertEqual(scan.describe_actions(), [])
 
+    def test_ignores_non_directory_and_hidden_in_overlays(self):
+        # Create non-directory and hidden files inside overlays_dir
+        (self.store.overlays_dir / ".DS_Store").write_bytes(b"junk")
+        (self.store.overlays_dir / "stray_file.txt").write_bytes(b"junk")
+        # Empty lock name .lock
+        (locks.lock_dir(self.store) / ".lock").touch()
+
+        scan = orphans.find_orphans(self.store, self.store.names())
+        self.assertNotIn(".DS_Store", scan.overlays)
+        self.assertNotIn("stray_file.txt", scan.overlays)
+        self.assertNotIn("", scan.locks)
+
 
 class TestRemoveOrphans(BaseCase):
     def setUp(self):

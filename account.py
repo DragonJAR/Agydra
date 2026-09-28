@@ -231,6 +231,7 @@ def save_codex_tokens(data_dir: Path, tokens_data: dict) -> bool:
     raw["last_refresh"] = _utcnow_iso()
     try:
         store._atomic_write_json(path, raw)
+        return True
     except Exception:
         return False
 
@@ -332,6 +333,18 @@ def detect_grok_plan(data_dir: Path) -> Optional[str]:
         return "Grok (xAI)"
     if isinstance(raw, dict) and raw.get("XAI_API_KEY"):
         return "xAI API Key"
+    cfg_path = Path(data_dir) / GROK_CONFIG_FILE
+    if cfg_path.is_file():
+        try:
+            content = cfg_path.read_text(encoding="utf-8", errors="replace")
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith("api_key") and "=" in line:
+                    val = line.split("=", 1)[1].strip().strip('"\'')
+                    if val:
+                        return "xAI API Key"
+        except OSError:
+            pass
     return None
 
 
