@@ -48,6 +48,7 @@ py-modules = [
     "bootstrap",
     "cli",
     "doctor",
+    "engines",
     "isolation",
     "keychain",
     "locks",

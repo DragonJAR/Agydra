@@ -215,6 +215,29 @@ Inspect environment variables, filesystem redirections, and target arguments wit
 agydra -np work "What is my current environment?"
 ```
 
+### 6. Multi-Engine Support: Google Antigravity + OpenAI Codex
+
+`agydra` features a strategy-pattern driver architecture supporting both **Google Antigravity (`agy`)** and **OpenAI Codex CLI (`codex`)**:
+
+```sh
+# Create isolated Codex profiles
+agydra create openai-work -e codex -d "Company OpenAI account"
+agydra create openai-personal -e codex -d "Personal ChatGPT Plus account"
+
+# Authenticate each Codex profile once (launches isolated `codex login`)
+agydra login openai-work
+agydra login openai-personal
+
+# Launch codex with a specific profile
+agydra -p openai-work "Refactor auth middleware to Python 3.12 syntax"
+
+# Automatically rotate across idle, authenticated Codex accounts
+agydra -e codex -r "Run full test suite review"
+```
+
+- **Complete Daemon & Socket Isolation:** Codex launches background daemon processes (`app-server-daemon`) communicating over local sockets. `agydra` isolates `$CODEX_HOME` directly to `<store>/overlays/<profile>/.codex`, preventing cross-profile socket or context leaks.
+- **Zero Keychain Conflicts:** Codex uses file-based tokens (`auth.json`). `agydra` automatically bypasses macOS Keychain swapping for Codex profiles.
+
 ---
 
 ## 🧭 Command & Flag Reference
@@ -225,12 +248,12 @@ Any management subcommand also accepts `--NAME` or `-NAME` syntax (e.g. `agydra 
 
 | Command | Aliases | Description |
 |---|---|---|
-| `agydra [FLAGS] <agy args...>` | — | Default launcher: executes `agy` with the resolved profile. |
-| `agydra list` | `ls`, `l` | Displays table of profiles: number, email, default marker, auth status, busy state, last use. |
-| `agydra create NAME [-d DESC]` | `c` | Creates an isolated profile store. |
-| `agydra login [NAME\|#] [-f] [-n]` | `in` | Runs `agy` OAuth flow isolated to that profile (`-f` force re-login; `-n` dry-run). |
-| `agydra import NAME\|# [-s DIR]` | `imp` | **Copies** (never moves) an existing `~/.gemini` into a profile (`-s` overrides source directory). |
-| `agydra status [-n]` | `st` | Shows active profile, resolution reason, binary path, email, auth state, and lock status. |
+| `agydra [FLAGS] <args...>` | — | Default launcher: executes `agy` or `codex` with the resolved profile. |
+| `agydra list` | `ls`, `l` | Displays table of profiles: number, email, default marker, auth status, busy state, engine, last use. |
+| `agydra create NAME [-d DESC] [-e ENGINE]` | `c` | Creates an isolated profile store (`-e` sets engine: `agy` [default] or `codex`). |
+| `agydra login [NAME\|#] [-f] [-n]` | `in` | Runs engine login flow isolated to that profile (`agy` OAuth or `codex login`; `-f` force re-login; `-n` dry-run). |
+| `agydra import NAME\|# [-s DIR]` | `imp` | **Copies** (never moves) an existing data dir into a profile (`-s` overrides source directory). |
+| `agydra status [-n]` | `st` | Shows active profile, engine, resolution reason, binary path, email, auth state, and lock status. |
 | `agydra default [NAME\|#]` | `d` | Views or sets the global default fallback profile. |
 | `agydra use NAME\|#` | `u` | Writes a `.agydra` marker file pinning the profile to the current working directory. |
 | `agydra rename A B` | `mv` | Renames a profile and updates default references (refuses busy profiles). |
@@ -242,14 +265,15 @@ Any management subcommand also accepts `--NAME` or `-NAME` syntax (e.g. `agydra 
 
 ### Launcher Flags
 
-Launcher flags must be placed **before** arguments intended for `agy`:
+Launcher flags must be placed **before** arguments intended for the engine:
 
 | Flag | Long Form | Description |
 |:---:|---|---|
 | `-p NAME\|#` | `--profile` | Target profile specified by name or 1-based index (from `agydra list`). |
 | `-r` | `--random` | Automatically picks the least-recently-used idle, authenticated profile (requires 2+ profiles). |
-| `-n` | `--dry-run` | Prints execution plan, paths, and environment without launching `agy`. |
-| `-b PATH` | `--binary` | Overrides the `agy` executable path for this invocation. |
+| `-e ENGINE` | `--engine` | Target CLI engine (`agy` [default] or `codex`). Filters candidate profiles for `-r`. |
+| `-n` | `--dry-run` | Prints execution plan, paths, and environment without launching the tool. |
+| `-b PATH` | `--binary` | Overrides the engine executable path for this invocation. |
 | `-f` | `--force` | Skips session lock acquisition; enables concurrent runs or emergency access on a locked profile. |
 
 ### 🔀 Common Flag Combinations

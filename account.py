@@ -133,24 +133,73 @@ def email_from_raw(raw: dict) -> Optional[str]:
     return email if isinstance(email, str) and email else None
 
 
+CODEX_AUTH_FILE = "auth.json"
+CODEX_CONFIG_FILE = "config.json"
+
+
+def inspect_codex_auth(data_dir: Path) -> Optional[dict]:
+    """Inspect auth details for a Codex profile, or None if unauthenticated."""
+    path = Path(data_dir) / CODEX_AUTH_FILE
+    if not path.is_file():
+        return None
+    raw = store.read_json_object(path, tolerant=True)
+    if not isinstance(raw, dict):
+        return None
+    tokens = raw.get("tokens")
+    if isinstance(tokens, dict) and (
+        tokens.get("access_token") or tokens.get("id_token") or tokens.get("refresh_token")
+    ):
+        return {
+            "auth_type": "chatgpt",
+            "access_token": tokens.get("access_token"),
+            "refresh_token": tokens.get("refresh_token"),
+            "id_token": tokens.get("id_token"),
+        }
+    if raw.get("OPENAI_API_KEY"):
+        return {
+            "auth_type": "api_key",
+            "api_key": raw.get("OPENAI_API_KEY"),
+        }
+    return None
+
+
+def detect_codex_email(data_dir: Path) -> Optional[str]:
+    """Extract email claim from Codex auth.json id_token JWT if present."""
+    path = Path(data_dir) / CODEX_AUTH_FILE
+    if not path.is_file():
+        return None
+    raw = store.read_json_object(path, tolerant=True)
+    if not isinstance(raw, dict):
+        return None
+    tokens = raw.get("tokens")
+    if isinstance(tokens, dict):
+        id_token = tokens.get("id_token")
+        if id_token and isinstance(id_token, str):
+            claims = _decode_jwt_payload(id_token)
+            email = claims.get("email")
+            if isinstance(email, str) and email:
+                return email
+    return None
+
+
 def detect_email_source(
     data_dir: Path,
     store=None,
     name: Optional[str] = None,
+    engine: str = "agy",
 ) -> "tuple[Optional[str], Optional[str]]":
     """Like ``detect_email``, but also reports where the email came from.
 
     Returns ``(email, source)``, where ``source`` is ``"disk"`` (the
-    profile's own on-disk token file -- a real completed agy session) or
+    profile's own on-disk token file -- a real completed session) or
     ``"keychain"`` (its private keychain slot backup, a bare `.secret`
     read with no corroborating on-disk evidence). Both are ``None`` when
     no token yields an email claim at all.
-
-    ``sync_profile_email`` uses the source to decide whether a freshly
-    detected email is trustworthy enough to overwrite an already-cached
-    one; plain ``detect_email`` callers that only need the email keep
-    calling that instead.
     """
+    if engine == "codex":
+        email = detect_codex_email(data_dir)
+        return email, ("disk" if email else None)
+
     data_dir = Path(data_dir)
     for raw, source in _iter_tokens(data_dir, store, name):
         email = email_from_raw(raw)
@@ -163,18 +212,15 @@ def detect_email(
     data_dir: Path,
     store=None,
     name: Optional[str] = None,
+    engine: str = "agy",
 ) -> Optional[str]:
     """Best-effort email for the authenticated identity of a profile.
 
     The email only appears inside the id_token JWT; if a given layout
     carries no id_token at all, this returns None and the caller keeps
     whatever is already cached in profile metadata.
-
-    ``store``/``name`` (optional, like ``auth_state``) also enable the
-    macOS keychain-slot fallback for profiles that have no on-disk token
-    file at all -- see ``_keychain_obj``.
     """
-    email, _source = detect_email_source(data_dir, store, name)
+    email, _source = detect_email_source(data_dir, store, name, engine=engine)
     return email
 
 
@@ -182,12 +228,15 @@ def auth_state(
     data_dir: Path,
     store=None,
     name: Optional[str] = None,
+    engine: str = "agy",
 ) -> str:
     """'authenticated' | 'not-authenticated' from whichever backend is live.
 
-    ``store``/``name`` enable the precise per-profile keychain lookup on
-    macOS; without them only the on-disk token file is consulted.
+    Supports both Google agy (disk/keychain) and OpenAI Codex (auth.json).
     """
+    if engine == "codex":
+        return "authenticated" if inspect_codex_auth(data_dir) is not None else "not-authenticated"
+
     data_dir = Path(data_dir)
     for raw, _source in _iter_tokens(data_dir, store, name):
         token = _token_payload(raw)

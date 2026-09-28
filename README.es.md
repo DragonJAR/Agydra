@@ -215,6 +215,29 @@ Inspecciona variables de entorno, redirecciones del sistema de archivos y argume
 agydra -np trabajo "¿Cuál es mi entorno actual?"
 ```
 
+### 6. Soporte Multi-Motor: Google Antigravity + OpenAI Codex
+
+`agydra` incorpora una arquitectura de controladores basada en el patrón Strategy que soporta tanto **Google Antigravity (`agy`)** como la CLI de **OpenAI Codex (`codex`)**:
+
+```sh
+# Crea perfiles aislados para Codex
+agydra create openai-trabajo -e codex -d "Cuenta de empresa de OpenAI"
+agydra create openai-personal -e codex -d "Cuenta personal ChatGPT Plus"
+
+# Autentica cada perfil de Codex una sola vez (ejecuta `codex login` aislado)
+agydra login openai-trabajo
+agydra login openai-personal
+
+# Lanza codex con un perfil específico
+agydra -p openai-trabajo "Refactoriza el middleware de autenticación a Python 3.12"
+
+# Rota automáticamente entre cuentas de Codex autenticadas y desocupadas
+agydra -e codex -r "Revisión completa de la suite de pruebas"
+```
+
+- **Aislamiento Total de Demonios y Sockets:** Codex inicia demonios en segundo plano (`app-server-daemon`) que interactúan mediante sockets locales. `agydra` aísla `$CODEX_HOME` directamente en `<store>/overlays/<perfil>/.codex`, impidiendo colisiones de sockets y filtraciones de contexto entre cuentas.
+- **Cero Fricción en el Keychain:** Codex gestiona tokens en ficheros locales (`auth.json`). `agydra` omite automáticamente las operaciones de Keychain en macOS para perfiles de Codex.
+
 ---
 
 ## 🧭 Referencia de Comandos y Parámetros
@@ -225,12 +248,12 @@ Cualquier subcomando de gestión acepta también la sintaxis `--NOMBRE` o `-NOMB
 
 | Comando | Alias | Descripción |
 |---|---|---|
-| `agydra [FLAGS] <args de agy...>` | — | Lanzador por defecto: ejecuta `agy` con el perfil resuelto. |
-| `agydra list` | `ls`, `l` | Muestra tabla de perfiles: número, email, marca default, estado de auth, ocupado, último uso. |
-| `agydra create NOMBRE [-d DESC]` | `c` | Crea el almacén de un perfil aislado. |
-| `agydra login [NOMBRE\|#] [-f] [-n]` | `in` | Corre el flujo OAuth de `agy` aislado a ese perfil (`-f` fuerza re-login; `-n` dry-run). |
-| `agydra import NOMBRE\|# [-s DIR]` | `imp` | **Copia** (nunca mueve) un `~/.gemini` existente a un perfil (`-s` sobreescribe el directorio origen). |
-| `agydra status [-n]` | `st` | Muestra perfil activo, razón de resolución, binario, email, estado de auth y lock. |
+| `agydra [FLAGS] <args...>` | — | Lanzador por defecto: ejecuta `agy` o `codex` con el perfil resuelto. |
+| `agydra list` | `ls`, `l` | Muestra tabla de perfiles: número, email, marca default, estado de auth, ocupado, motor, último uso. |
+| `agydra create NOMBRE [-d DESC] [-e MOTOR]` | `c` | Crea el almacén de un perfil aislado (`-e` define el motor: `agy` [por defecto] o `codex`). |
+| `agydra login [NOMBRE\|#] [-f] [-n]` | `in` | Corre el flujo de login aislado a ese perfil (`agy` OAuth o `codex login`; `-f` fuerza re-login; `-n` dry-run). |
+| `agydra import NOMBRE\|# [-s DIR]` | `imp` | **Copia** (nunca mueve) un almacén existente a un perfil (`-s` sobreescribe el directorio origen). |
+| `agydra status [-n]` | `st` | Muestra perfil activo, motor, razón de resolución, binario, email, estado de auth y lock. |
 | `agydra default [NOMBRE\|#]` | `d` | Consulta o establece el perfil por defecto global. |
 | `agydra use NOMBRE\|#` | `u` | Escribe un marcador `.agydra` fijando el perfil al directorio actual. |
 | `agydra rename A B` | `mv` | Renombra un perfil y actualiza referencias por defecto (rechaza perfiles ocupados). |
@@ -242,14 +265,15 @@ Cualquier subcomando de gestión acepta también la sintaxis `--NOMBRE` o `-NOMB
 
 ### Parámetros del Lanzador
 
-Los flags del lanzador deben especificarse **antes** de los argumentos destinados a `agy`:
+Los flags del lanzador deben especificarse **antes** de los argumentos destinados al motor:
 
 | Flag Corto | Flag Largo | Descripción |
 |:---:|---|---|
 | `-p NOMBRE\|#` | `--profile` | Perfil objetivo por nombre o número 1-based (de `agydra list`). |
 | `-r` | `--random` | Elige automáticamente el perfil libre, autenticado y menos usado (requiere 2+ perfiles). |
-| `-n` | `--dry-run` | Imprime el plan de lanzamiento, rutas y entorno sin ejecutar `agy`. |
-| `-b RUTA` | `--binary` | Sobreescribe la ruta del ejecutable `agy` para esta llamada. |
+| `-e MOTOR` | `--engine` | Motor CLI objetivo (`agy` [por defecto] o `codex`). Filtra candidatos para `-r`. |
+| `-n` | `--dry-run` | Imprime el plan de lanzamiento, rutas y entorno sin ejecutar la herramienta. |
+| `-b RUTA` | `--binary` | Sobreescribe la ruta del ejecutable del motor para esta llamada. |
 | `-f` | `--force` | Omite la adquisición del lock de sesión; permite ejecuciones paralelas o de emergencia sobre perfiles ocupados. |
 
 ### 🔀 Combinaciones Comunes de Parámetros

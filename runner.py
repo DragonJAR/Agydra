@@ -36,6 +36,7 @@ class LaunchPlan:
     env_home_var: str
     env_home_value: Path
     use_sandbox: bool
+    engine: str = "agy"
     launch_as_child: bool = False
     random_pick: bool = False
     binary_override: Optional[str] = None
@@ -46,6 +47,7 @@ class LaunchPlan:
     def describe(self) -> str:
         lines = [
             f"profile : {self.profile} ({self.reason})",
+            f"engine  : {self.engine}",
             f"binary  : {self.binary}",
             f"argv    : {self.binary} {' '.join(self.args)}".rstrip(),
             f"overlay : {self.overlay}",
@@ -65,21 +67,26 @@ def build_plan(
     launch_as_child: bool = False,
     cwd: Optional[Path] = None,
     force: bool = False,
+    engine: Optional[str] = None,
 ) -> LaunchPlan:
-    """Resolve everything needed to launch agy without mutating anything."""
+    """Resolve everything needed to launch the tool without mutating anything."""
+    import engines
+
     cwd = Path(cwd) if cwd is not None else None
     if random_pick:
-        resolution = resolver.pick_free_profile(store, cwd=cwd, force=force)
+        resolution = resolver.pick_free_profile(store, cwd=cwd, force=force, engine=engine)
     else:
         resolution = resolver.resolve(store, flag_ref=flag_ref, cwd=cwd)
     profile = store.get(resolution.name)
+    driver = engines.get_engine(profile.engine)
 
     config = store.load_config()
-    binary = platforms.resolve_agy_binary(binary_override or config.agy_binary)
+    config_bin = getattr(config, driver.config_binary_attr, None)
+    binary = driver.resolve_binary(binary_override or config_bin)
     if binary is None:
         raise StoreError(
-            "could not find the agy binary; install agy first, or point agydra "
-            f"to it with --binary <path> or the {platforms.AGY_BIN_ENV} env var"
+            f"could not find the {driver.binary_name} binary; install {driver.binary_name} first, "
+            f"or point agydra to it with --binary <path> or the {driver.env_bin_var} env var"
         )
 
     overlay = store.overlays_dir / profile.name
@@ -100,6 +107,7 @@ def build_plan(
         env_home_var=platforms.home_redirect_var(),
         env_home_value=overlay,
         use_sandbox=use_sandbox,
+        engine=driver.name,
         launch_as_child=launch_as_child,
         random_pick=random_pick,
         binary_override=binary_override,
@@ -114,6 +122,10 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
         print(plan.describe())
         return 0
 
+    import contextlib
+    import engines
+
+    driver = engines.get_engine(plan.engine)
     store = store or Store()
 
     handle: Optional[locks.LockHandle] = None
@@ -131,7 +143,7 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
                 break
             if not plan.random_pick or (plan.reason and plan.reason.startswith("project marker")):
                 pid = locks.lock_holder_pid(store, plan.profile)
-                holder = f" (agy PID {pid})" if pid else ""
+                holder = f" ({driver.binary_name} PID {pid})" if pid else ""
                 if plan.reason and plan.reason.startswith("project marker"):
                     suggestion = (
                         f"pinned by {plan.reason}; wait for it to finish "
@@ -158,6 +170,7 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
                 binary_override=plan.binary_override, random_pick=True,
                 launch_as_child=plan.launch_as_child,
                 cwd=plan.cwd,
+                engine=plan.engine,
             )
 
     try:
@@ -166,10 +179,11 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
         store.save(profile)
 
         data_dir = store.profile_data_dir(plan.profile)
-        overlay = isolation.build_overlay(plan.profile, data_dir, store.root)
+        overlay = isolation.build_overlay(plan.profile, data_dir, store.root, engine=plan.engine)
         env = isolation.isolated_env(
             overlay,
             extra={resolver.PROFILE_ENV: plan.profile},
+            engine=plan.engine,
             config_windows_redirect_home=plan.windows_redirect_home,
         )
 
@@ -182,9 +196,12 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
         raise
 
     try:
-        with keychain.launch_guard(
-            store, plan.profile, capture=plan.launch_as_child
-        ):
+        guard = (
+            keychain.launch_guard(store, plan.profile, capture=plan.launch_as_child)
+            if driver.needs_keychain
+            else contextlib.nullcontext()
+        )
+        with guard:
             if platforms.is_windows():
                 rc = platforms.launch_argv(argv, env)
                 # Discard terminal-query replies the agy TUI left unread in

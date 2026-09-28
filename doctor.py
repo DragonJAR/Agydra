@@ -44,12 +44,25 @@ class _DoctorContext:
     keychain_orphans: Optional[List[str]] = None
 
 
-def _check_binary(store: Store, _ctx: "_DoctorContext"):
+def _check_binary(store: Store, ctx: "_DoctorContext"):
     config = store.load_config()
-    binary = platforms.resolve_agy_binary(config.agy_binary)
-    if binary is None:
-        return FAIL, f"agy binary not found (install agy or set {platforms.AGY_BIN_ENV})"
-    return OK, f"agy binary: {binary}"
+    agy_bin = platforms.resolve_agy_binary(config.agy_binary)
+    has_codex_profile = any(getattr(p, "engine", "agy") == "codex" for p in ctx.scan[0])
+    lines = []
+    status = OK
+    if agy_bin is None:
+        status = FAIL
+        lines.append(f"agy binary not found (install agy or set {platforms.AGY_BIN_ENV})")
+    else:
+        lines.append(f"agy binary: {agy_bin}")
+    if has_codex_profile:
+        codex_bin = platforms.resolve_codex_binary(config.codex_binary)
+        if codex_bin is None:
+            status = FAIL
+            lines.append(f"codex binary not found (install codex or set {platforms.CODEX_BIN_ENV})")
+        else:
+            lines.append(f"codex binary: {codex_bin}")
+    return status, "\n".join(lines)
 
 
 def _check_store(store: Store, _ctx: "_DoctorContext"):
@@ -83,8 +96,9 @@ def _check_profiles(store: Store, ctx: "_DoctorContext"):
             problems.append(f"{p.name}: data dir missing ({data_dir})")
             lines.append(f"  - {p.name}: DATA DIR MISSING")
             continue
+        engine = getattr(p, "engine", "agy") or "agy"
         state = account.auth_state(
-            data_dir, store, p.name,
+            data_dir, store, p.name, engine=engine,
         )
         lines.append(f"  - {p.name}: {state}")
     default = store.default_name()
@@ -134,6 +148,8 @@ def _check_locks(store: Store, ctx: "_DoctorContext"):
 
 def _check_isolation(store: Store, ctx: "_DoctorContext"):
     """Verify the overlay mechanism end-to-end for every profile."""
+    import engines
+
     profiles = ctx.names
     if not profiles:
         return WARN, "isolation not checked (no profiles)"
@@ -146,19 +162,27 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
         if not data_dir.is_dir():
             failures.append(f"{name}: data dir missing")
             continue
+        try:
+            p = store.get(name)
+            engine_name = getattr(p, "engine", "agy") or "agy"
+        except Exception:
+            engine_name = "agy"
+        driver = engines.get_engine(engine_name)
+        link_name = driver.data_dir_name
         overlay = store.overlays_dir / name
-        gemini_link = overlay / platforms.AGY_DATA_DIR_NAME
-        if not gemini_link.exists() and not isolation._is_link(gemini_link):
+        data_link = overlay / link_name
+        if not data_link.exists() and not isolation._is_link(data_link):
             pending.append(name)
             continue
-        if gemini_link.exists() and not isolation._is_link(gemini_link):
+        if data_link.exists() and not isolation._is_link(data_link):
             recoverable.append(name)
             continue
-        if not isolation.link_points_to(gemini_link, data_dir):
-            if gemini_link.resolve() == real_gemini.resolve():
-                failures.append(f"{name}: overlay .gemini points to REAL store")
+        if not isolation.link_points_to(data_link, data_dir):
+            real_data = platforms.codex_data_dir() if engine_name == "codex" else real_gemini
+            if data_link.resolve() == real_data.resolve():
+                failures.append(f"{name}: overlay {link_name} points to REAL store")
             else:
-                failures.append(f"{name}: overlay .gemini points elsewhere")
+                failures.append(f"{name}: overlay {link_name} points elsewhere")
     if failures:
         return FAIL, "isolation broken: " + "; ".join(failures)
     if recoverable:
@@ -181,12 +205,13 @@ def _check_schema_canary(store: Store, ctx: "_DoctorContext"):
     """Confirm profiles actually contain agy's data layout (schema unchanged).
 
     The authoritative on-disk layout is ``<data>/antigravity-cli/`` (the token
-    file lives inside it). Consumes the doctor-wide scan — no re-glob of
-    the store here.
+    file lives inside it) or ``<data>/auth.json`` for codex. Consumes the doctor-wide scan.
     """
     names = ctx.names
     any_data = any(
         (store.profile_data_dir(n) / account.AGY_CLI_DIR).exists()
+        or (store.profile_data_dir(n) / account.CODEX_AUTH_FILE).exists()
+        or (store.profile_data_dir(n) / account.CODEX_CONFIG_FILE).exists()
         for n in names
     )
     if not names:
@@ -398,20 +423,23 @@ def _fix_orphans(store: Store, names: Sequence[str]) -> None:
 def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
     """What ``doctor --fix`` would change, in human-readable form. Single
     source of truth so the confirmation gate and the live-apply step can
-    never disagree about what is on the menu.
+    never disagree about what is on the menu."""
+    import engines
 
-    Reads the orphan scan/keychain-orphan results the check pass already
-    cached on ``ctx`` (``_check_orphans``/``_check_keychain``) instead of
-    recomputing them here -- nothing has mutated disk between the check
-    pass and this preview, so a third scan would be 100% redundant. Falls
-    back to computing them when ``ctx`` was not run through a check pass
-    first (e.g. a caller invoking this directly)."""
     lines: List[str] = []
     for name in ctx.names:
-        gemini_link = store.overlays_dir / name / platforms.AGY_DATA_DIR_NAME
-        if gemini_link.exists() and not isolation._is_link(gemini_link):
+        if not store.exists(name):
+            continue
+        try:
+            p = store.get(name)
+            engine_name = getattr(p, "engine", "agy") or "agy"
+        except Exception:
+            engine_name = "agy"
+        driver = engines.get_engine(engine_name)
+        link = store.overlays_dir / name / driver.data_dir_name
+        if link.exists() and not isolation._is_link(link):
             lines.append(
-                f"migrate overlay data for {name!r} into the profile store and relink .gemini"
+                f"migrate overlay data for {name!r} into the profile store and relink {driver.data_dir_name}"
             )
     default = store.default_name()
     if default and default not in ctx.names:
@@ -432,36 +460,34 @@ def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
 
 
 def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
-    """One self-heal pass for everything ``doctor --fix`` covers.
+    """One self-heal pass for everything ``doctor --fix`` covers."""
+    import engines
 
-    Each step reuses existing primitives (no link/keychain re-implementation):
-      1. Real-dir overlay entries -> migrate contents into the profile store
-         and let ``build_overlay`` relink (recovers the alpha-class breakage).
-      2. Dangling default profile -> cleared (otherwise ``resolve_ref`` and
-         the launcher would reject every operation).
-      3. System keychain orphan slots -> purged via ``keychain.delete_slot``;
-         the shared slot is never a candidate (``orphan_slots`` filters it).
-      4. File-backed orphans (dead profiles' overlays, locks, keychain
-         backups, backups) -> delegated to ``_fix_orphans``.
-    By the time this runs, the user has already confirmed in ``cmd_doctor``.
-    """
     for name in ctx.names:
+        if not store.exists(name):
+            continue
+        try:
+            p = store.get(name)
+            engine_name = getattr(p, "engine", "agy") or "agy"
+        except Exception:
+            engine_name = "agy"
+        driver = engines.get_engine(engine_name)
         data_dir = store.profile_data_dir(name)
-        gemini_link = store.overlays_dir / name / platforms.AGY_DATA_DIR_NAME
-        if gemini_link.exists() and not isolation._is_link(gemini_link):
+        link = store.overlays_dir / name / driver.data_dir_name
+        if link.exists() and not isolation._is_link(link):
             try:
-                isolation.migrate_real_dir_to_store(gemini_link, data_dir)
+                isolation.migrate_real_dir_to_store(link, data_dir)
             except (isolation.IsolationError, OSError) as exc:
                 warn(f"could not migrate overlay data for {name!r} ({exc})")
                 continue
             try:
-                isolation.build_overlay(name, data_dir, store.root)
+                isolation.build_overlay(name, data_dir, store.root, engine=engine_name)
             except (isolation.IsolationError, OSError) as exc:
                 warn(f"could not relink overlay for {name!r} ({exc})")
                 continue
             print(
                 paint("[fix]", "cyan", "bold")
-                + f" migrated overlay data for {name!r} and relinked .gemini"
+                + f" migrated overlay data for {name!r} and relinked {driver.data_dir_name}"
             )
     # Fresh names at purge time, never the pre-confirmation ``ctx.names``
     # snapshot: the confirmation prompt in ``cmd_doctor`` can pause for an

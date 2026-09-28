@@ -127,7 +127,10 @@ _NOT_AUTHENTICATED = (
 
 
 def pick_free_profile(
-    store, cwd: Optional[Path] = None, force: bool = False,
+    store,
+    cwd: Optional[Path] = None,
+    force: bool = False,
+    engine: Optional[str] = None,
 ) -> Resolution:
     """Pick the free-est authenticated profile for ``-r``/``--random``.
 
@@ -147,6 +150,14 @@ def pick_free_profile(
     are preserved — a marker or "no tokens yet" profile still refuses.
     """
     profiles = store.list()
+    if engine is not None:
+        target_engine = engine.strip().lower()
+        profiles = [p for p in profiles if getattr(p, "engine", "agy") == target_engine]
+    else:
+        agy_profiles = [p for p in profiles if getattr(p, "engine", "agy") == "agy"]
+        if agy_profiles:
+            profiles = agy_profiles
+
     names = [p.name for p in profiles]
     if not names:
         raise StoreError(_NO_PROFILES)
@@ -161,7 +172,10 @@ def pick_free_profile(
     authenticated = [
         p for p in profiles
         if account.auth_state(
-            store.profile_data_dir(p.name), store, p.name,
+            store.profile_data_dir(p.name),
+            store,
+            p.name,
+            engine=getattr(p, "engine", "agy"),
         )
         == "authenticated"
     ]

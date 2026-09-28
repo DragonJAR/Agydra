@@ -168,6 +168,7 @@ class _MirrorContext(NamedTuple):
     store_resolved: Path
     store_identity: _Identity
     agy_data_identity: _Identity
+    codex_data_identity: Optional[_Identity] = None
 
 
 def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorContext) -> None:
@@ -176,7 +177,7 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
 
     For each child of ``real_dir`` (identified by filesystem identity, i.e.
     ``(st_dev, st_ino)``, never by string comparison — see ``_identity``):
-    - agy's real data dir or the store root itself: skipped — never linked,
+    - agy's real data dir, codex's real data dir, or the store root itself: skipped — never linked,
       never entered.
     - the next ancestor in the chain (the entry that leads to the store
       root): the overlay counterpart is forced to be a REAL directory
@@ -211,7 +212,11 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
         identity = _identity(entry)
         if identity is None:
             continue
-        if identity == ctx.agy_data_identity or identity == ctx.store_identity:
+        if (
+            identity == ctx.agy_data_identity
+            or (ctx.codex_data_identity is not None and identity == ctx.codex_data_identity)
+            or identity == ctx.store_identity
+        ):
             continue
         link = overlay_dir / entry.name
         if next_identity is not None and identity == next_identity:
@@ -326,57 +331,72 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
         ) from exc
 
 
-def build_overlay(name: str, data_dir: Path, store_root: Path) -> Path:
+def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "agy") -> Path:
     """(Re)build the overlay for a profile and return its path.
 
-    - ``<overlay>/.gemini`` links to ``data_dir`` (the profile store).
-    - Every other real-home entry is mirrored: agy's real data dir and the
+    - ``<overlay>/<driver.data_dir_name>`` links to ``data_dir`` (the profile store).
+    - Every other real-home entry is mirrored: agy's and codex's real data dirs and the
       store root are skipped, entries on the ancestor chain to the store
       root become real directories (recursively mirrored, see
       ``_mirror_dir``), everything else is linked whole.
     """
+    import engines
+
+    driver = engines.get_engine(engine)
     data_dir = Path(data_dir)
     store_root = Path(store_root)
     real_home = platforms.real_home()
     overlay = platforms.ensure_dir(store_root / platforms.OVERLAYS_DIRNAME / name)
     store_resolved = store_root.resolve()
     _, chain_identities = _ancestor_chain(real_home, store_root)
+    real_codex = platforms.codex_data_dir(real_home)
     ctx = _MirrorContext(
         chain_identities=chain_identities,
         store_resolved=store_resolved,
         store_identity=chain_identities[-1] if chain_identities else _identity(store_root),
         agy_data_identity=_identity(platforms.agy_data_dir(real_home)),
+        codex_data_identity=_identity(real_codex) if real_codex.exists() else None,
     )
 
-    gemini_link = overlay / platforms.AGY_DATA_DIR_NAME
-    if _is_link(gemini_link) and not link_points_to(gemini_link, data_dir):
-        gemini_link.unlink()
-    if gemini_link.exists() and not _is_link(gemini_link):
+    data_link = overlay / driver.data_dir_name
+    if _is_link(data_link) and not link_points_to(data_link, data_dir):
+        data_link.unlink()
+    if data_link.exists() and not _is_link(data_link):
         raise IsolationError(
-            f"overlay entry {gemini_link} is a real directory/file, not the "
+            f"overlay entry {data_link} is a real directory/file, not the "
             "expected link to the profile store; refusing to break "
             "isolation — run `agydra doctor --fix` to migrate its contents "
             "into the profile store and relink automatically (preserves data), "
             "or remove it manually / recreate the profile "
             "(destructive: discards whatever the overlay directory contains)"
         )
-    if not _is_link(gemini_link):
+    if not _is_link(data_link):
         try:
-            _link(data_dir, gemini_link)
+            _link(data_dir, data_link)
         except FileExistsError:
-            if not link_points_to(gemini_link, data_dir):
+            if not link_points_to(data_link, data_dir):
                 raise
 
     _mirror_dir(real_home, overlay, 0, ctx)
     return overlay
 
 
-def isolated_env(overlay: Path, extra: dict, config_windows_redirect_home: bool = False) -> dict:
-    """Environment for the agy child process with the home redirected."""
+def isolated_env(
+    overlay: Path,
+    extra: dict,
+    engine: str = "agy",
+    config_windows_redirect_home: bool = False,
+) -> dict:
+    """Environment for the child process with the home redirected."""
+    import engines
+
+    driver = engines.get_engine(engine)
     env = dict(os.environ)
     real_home = platforms.real_home()
     env["AGYDRA_REAL_HOME"] = str(real_home)
     env[platforms.home_redirect_var()] = str(overlay)
+    if driver.env_home_var:
+        env[driver.env_home_var] = str(overlay / driver.data_dir_name)
     if platforms.is_windows() and config_windows_redirect_home:
         env["HOME"] = str(overlay)
     for xdg_var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):

@@ -33,6 +33,7 @@ class Profile:
     last_used: Optional[str] = None
     description: str = ""
     email: Optional[str] = None
+    engine: str = "agy"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -42,12 +43,14 @@ class Profile:
             "last_used": self.last_used,
             "description": self.description,
             "email": self.email,
+            "engine": self.engine,
         }
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "Profile":
         last_used = raw.get("last_used")
         email = raw.get("email")
+        engine = raw.get("engine")
         return cls(
             name=str(raw["name"]),
             seq=int(raw.get("seq") or 0),
@@ -55,6 +58,7 @@ class Profile:
             last_used=str(last_used) if last_used is not None else None,
             description=str(raw.get("description") or ""),
             email=str(email) if email is not None else None,
+            engine=str(engine) if engine else "agy",
         )
 
     def touch(self) -> None:
@@ -75,13 +79,17 @@ class Config:
     default_profile: Optional[str] = None
     settings: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_SETTINGS))
     agy_binary: Optional[str] = None
+    codex_binary: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "default_profile": self.default_profile,
             "settings": dict(self.settings),
             "agy_binary": self.agy_binary,
         }
+        if self.codex_binary is not None:
+            d["codex_binary"] = self.codex_binary
+        return d
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "Config":
@@ -101,10 +109,16 @@ class Config:
             raise ValueError(
                 f"agy_binary must be a string, got {type(agy_binary).__name__}"
             )
+        codex_binary = raw.get("codex_binary")
+        if codex_binary is not None and not isinstance(codex_binary, str):
+            raise ValueError(
+                f"codex_binary must be a string, got {type(codex_binary).__name__}"
+            )
         settings = dict(DEFAULT_SETTINGS)
         settings.update(raw_settings or {})
         return cls(
             default_profile=default_profile,
             settings=settings,
             agy_binary=agy_binary,
+            codex_binary=codex_binary,
         )

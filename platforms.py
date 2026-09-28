@@ -19,6 +19,8 @@ APP_NAME = "agydra"
 BASE_DIR_ENV = "AGYDRA_HOME"
 AGY_BIN_ENV = "AGYDRA_AGY_BIN"
 AGY_DATA_DIR_NAME = ".gemini"
+CODEX_BIN_ENV = "AGYDRA_CODEX_BIN"
+CODEX_DATA_DIR_NAME = ".codex"
 OVERLAYS_DIRNAME = "overlays"
 
 
@@ -104,13 +106,17 @@ def _probe_pathext(p: Path) -> Optional[Path]:
     return None
 
 
-def resolve_agy_binary(explicit: Optional[str] = None) -> Optional[Path]:
-    """Locate the real agy binary without fragile heuristics.
+def resolve_binary(
+    binary_name: str,
+    env_var: Optional[str] = None,
+    explicit: Optional[str] = None,
+) -> Optional[Path]:
+    """Locate an executable binary without fragile heuristics.
 
-    Order: explicit flag → ``AGYDRA_AGY_BIN`` → ``shutil.which("agy")``.
-    Returns ``None`` when not found.
+    Order: explicit flag → env var → shutil.which(binary_name).
+    Returns None when not found.
     """
-    candidate = explicit or os.environ.get(AGY_BIN_ENV)
+    candidate = explicit or (os.environ.get(env_var) if env_var else None)
     if candidate:
         p = Path(candidate).expanduser()
         if p.is_file() and (is_windows() or os.access(p, os.X_OK)):
@@ -124,8 +130,31 @@ def resolve_agy_binary(explicit: Optional[str] = None) -> Optional[Path]:
                 if probed:
                     return probed
         return None
-    found = shutil.which("agy")
+    found = shutil.which(binary_name)
     return Path(found) if found else None
+
+
+def resolve_agy_binary(explicit: Optional[str] = None) -> Optional[Path]:
+    """Locate the real agy binary without fragile heuristics.
+
+    Order: explicit flag → ``AGYDRA_AGY_BIN`` → ``shutil.which("agy")``.
+    Returns ``None`` when not found.
+    """
+    return resolve_binary("agy", AGY_BIN_ENV, explicit)
+
+
+def resolve_codex_binary(explicit: Optional[str] = None) -> Optional[Path]:
+    """Locate the real codex binary without fragile heuristics.
+
+    Order: explicit flag → ``AGYDRA_CODEX_BIN`` → ``shutil.which("codex")``.
+    Returns ``None`` when not found.
+    """
+    return resolve_binary("codex", CODEX_BIN_ENV, explicit)
+
+
+def codex_data_dir(home: Optional[Path] = None) -> Path:
+    """Codex's data directory (``.codex``) under the given home."""
+    return (Path(home) if home is not None else real_home()) / CODEX_DATA_DIR_NAME
 
 
 def ensure_dir(path: Path) -> Path:

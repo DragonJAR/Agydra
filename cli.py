@@ -66,6 +66,10 @@ _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
         "-r", "--random", False, None,
         "pick a free authenticated profile automatically (needs 2+ profiles)",
     ),
+    "engine": (
+        "-e", "--engine", True, "ENGINE",
+        "target CLI engine: agy (default) or codex",
+    ),
     "dry-run": (
         "-n", "--dry-run", False, None,
         "print the launch plan (argv + env) without executing anything",
@@ -411,17 +415,18 @@ def cmd_list(store: Store, _args) -> int:
     width = max(width, len(_PROFILE_LABEL))
     header = (
         f"{'#':<3}{_PROFILE_LABEL:<{width + 2}}{'EMAIL':<{_EMAIL_COL_WIDTH}}{'AUTH':<20}"
-        f"{'DEFAULT':<9}{'BUSY':<6}LAST USED"
+        f"{'DEFAULT':<9}{'BUSY':<6}{'ENGINE':<9}LAST USED"
     )
     print(paint(header, "bold"))
     for idx, profile in enumerate(profiles, start=1):
         busy = locks.is_locked(store, profile.name)
+        engine = getattr(profile, "engine", "agy") or "agy"
         if busy:
             email = profile.email or "-"
         else:
             email = account.sync_profile_email(store, profile.name) or profile.email or "-"
         state = account.auth_state(
-            store.profile_data_dir(profile.name), store, profile.name,
+            store.profile_data_dir(profile.name), store, profile.name, engine=engine,
         )
         is_default = paint("*", "green", "bold") if profile.name == default else ""
         state_color = "green" if state == "authenticated" else None
@@ -430,15 +435,16 @@ def cmd_list(store: Store, _args) -> int:
         last = paint(profile.last_used or "-", "dim")
         print(
             f"{idx:<3}{profile.name:<{width + 2}}{email:<{_EMAIL_COL_WIDTH}}"
-            f"{pad(state_shown, 20)}{pad(is_default, 9)}{pad(busy_shown, 6)}{last}"
+            f"{pad(state_shown, 20)}{pad(is_default, 9)}{pad(busy_shown, 6)}{pad(engine, 9)}{last}"
         )
     return 0
 
 
 def cmd_create(store: Store, args) -> int:
-    profile = store.create(args.name, description=args.description or "")
+    engine = getattr(args, "engine", "agy") or "agy"
+    profile = store.create(args.name, description=args.description or "", engine=engine)
     config = store.load_config()
-    if config.settings.get("copy_settings_on_create", True):
+    if config.settings.get("copy_settings_on_create", True) and engine == "agy":
         default = store.default_name()
         if default and default != profile.name:
             _share_config(store, default, [profile.name])
@@ -448,25 +454,34 @@ def cmd_create(store: Store, args) -> int:
 
 
 def cmd_login(store: Store, args) -> int:
+    import engines
+
     if args.ref is None:
         name = resolver.resolve(store).name
     else:
         name = store.resolve_ref(args.ref)
     _assert_free(store, name, "logging in")
+    profile = store.get(name)
+    engine = getattr(profile, "engine", "agy") or "agy"
     data_dir = store.profile_data_dir(name)
-    state = account.auth_state(data_dir, store, name)
+    state = account.auth_state(data_dir, store, name, engine=engine)
     if state == "authenticated" and not args.dry_run and not getattr(args, "force", False):
-        email = account.detect_email(data_dir, store, name)
+        email = account.detect_email(data_dir, store, name, engine=engine)
         if not _confirm(
             f"profile {name!r} already authenticated as {email or '?'} — re-login?",
             False,
         ):
             print("cancelled")
             return 1
-    plan = runner.build_plan(store, [], flag_ref=name, launch_as_child=True)
+    driver = engines.get_engine(engine)
+    login_args = list(driver.login_args) if hasattr(driver, "login_args") else []
+    plan = runner.build_plan(store, login_args, flag_ref=name, launch_as_child=True)
     if not args.dry_run:
-        print(f"launching agy for login under profile {plan.profile!r}...")
-        print("complete the OAuth flow in the browser; tokens land in the profile store")
+        print(f"launching {driver.binary_name} for login under profile {plan.profile!r}...")
+        if engine == "codex":
+            print("complete the Codex authentication flow; tokens land in the profile store")
+        else:
+            print("complete the OAuth flow in the browser; tokens land in the profile store")
     return runner.run(plan, store=store, dry_run=args.dry_run)
 
 
@@ -481,9 +496,11 @@ def cmd_status(store: Store, args) -> int:
         return 0
     data_dir = store.profile_data_dir(plan.profile)
     profile = store.get(plan.profile)
-    email = profile.email or account.detect_email(data_dir, store, plan.profile) or "-"
-    state = account.auth_state(data_dir, store, plan.profile)
+    engine = getattr(profile, "engine", "agy") or "agy"
+    email = profile.email or account.detect_email(data_dir, store, plan.profile, engine=engine) or "-"
+    state = account.auth_state(data_dir, store, plan.profile, engine=engine)
     print(f"profile   : {plan.profile}")
+    print(f"engine    : {engine}")
     print(f"reason    : {plan.reason}")
     print(f"binary    : {plan.binary}")
     print(f"email     : {email}")
@@ -704,6 +721,8 @@ def cmd_share_config(store: Store, args) -> int:
 
 
 def cmd_import(store: Store, args) -> int:
+    import engines
+
     ref = args.ref
     looks_like_path = ref.startswith(("/", "~", ".", "\\")) or re.match(
         r"^[a-zA-Z]:[\\/]", ref
@@ -717,16 +736,19 @@ def cmd_import(store: Store, args) -> int:
         )
     name = store.resolve_ref(ref)
     _assert_free(store, name, "importing into it")
+    profile = store.get(name)
+    engine = getattr(profile, "engine", "agy") or "agy"
+    driver = engines.get_engine(engine)
     if args.source is not None:
         real = Path(args.source).expanduser()
         if not real.is_dir():
             raise StoreError(f"source directory not found: {real}")
     else:
-        real = platforms.agy_data_dir()
+        real = platforms.codex_data_dir() if engine == "codex" else platforms.agy_data_dir()
     if not real.is_dir():
         raise StoreError(
-            f"no generic agy data directory found at {real} — log in once with "
-            "plain `agy` to create it, then retry: agydra import " + name
+            f"no generic {driver.binary_name} data directory found at {real} — log in once with "
+            f"plain `{driver.binary_name}` to create it, then retry: agydra import " + name
         )
     data_dir = store.profile_data_dir(name)
     if data_dir.exists() and any(data_dir.iterdir()):
@@ -747,7 +769,8 @@ def cmd_import(store: Store, args) -> int:
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
-    keychain.capture_shared_slot_for_import(store, name, data_dir)
+    if driver.needs_keychain:
+        keychain.capture_shared_slot_for_import(store, name, data_dir)
     print(f"imported generic data into profile {name!r}: {data_dir}")
     return 0
 
@@ -969,6 +992,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.add_argument(
                 "-d", "--description", help="free-form note stored with the profile"
             )
+            parser.add_argument(
+                "-e", "--engine", choices=["agy", "codex"], default="agy",
+                help="engine for this profile: agy (default) or codex",
+            )
             parser.set_defaults(func=cmd_create)
         elif sub == "login":
             parser.add_argument(
@@ -1084,6 +1111,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 2
         if not flags.swallowed:
             _warn_late_flags(values, raw)
+        engine_opt = values.get("engine")
+        if engine_opt is not None:
+            import engines
+            engine_str = str(engine_opt).strip().lower()
+            if engine_str not in engines.SUPPORTED_ENGINES:
+                _error(f"unsupported engine {engine_str!r}; choose from {', '.join(engines.SUPPORTED_ENGINES)}")
+                return 2
+        else:
+            engine_str = None
         plan = runner.build_plan(
             store,
             agy_args,
@@ -1091,6 +1127,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             binary_override=values["binary"],
             random_pick=bool(values["random"]),
             force=bool(values["force"]),
+            engine=engine_str,
         )
         return runner.run(plan, store=store, dry_run=bool(values["dry-run"]))
     except (StoreError, IsolationError, OSError, KeyboardInterrupt) as exc:

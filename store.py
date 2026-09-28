@@ -354,8 +354,13 @@ class Store:
     def exists(self, name: str) -> bool:
         return self.profile_meta_path(name).exists()
 
-    def create(self, name: str, description: str = "") -> Profile:
+    def create(self, name: str, description: str = "", engine: str = "agy") -> Profile:
         self.validate_name(name)
+        import engines
+        try:
+            driver = engines.get_engine(engine)
+        except ValueError as exc:
+            raise StoreError(str(exc)) from exc
         config = self.load_config()
         config_writable = self._config_writable()
         profile_dir = self.profile_dir(name)
@@ -365,12 +370,13 @@ class Store:
             profile_dir.mkdir()
         except FileExistsError:
             raise StoreError(f"profile {name!r} already exists") from None
-        import keychain
+        if driver.needs_keychain:
+            import keychain
 
-        keychain.purge_profile_slot(self, name)
+            keychain.purge_profile_slot(self, name)
         existing = self.list()
         seq = (max((p.seq for p in existing), default=0)) + 1
-        profile = Profile(name=name, seq=seq, description=description)
+        profile = Profile(name=name, seq=seq, description=description, engine=driver.name)
         platforms.ensure_dir(data_dir)
         _atomic_write_json(self.profile_meta_path(name), profile.to_dict())
         if not config.default_profile:
