@@ -81,6 +81,7 @@ class Config:
     settings: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_SETTINGS))
     agy_binary: Optional[str] = None
     codex_binary: Optional[str] = None
+    grok_binary: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -90,6 +91,8 @@ class Config:
         }
         if self.codex_binary is not None:
             d["codex_binary"] = self.codex_binary
+        if self.grok_binary is not None:
+            d["grok_binary"] = self.grok_binary
         return d
 
     @classmethod
@@ -115,6 +118,11 @@ class Config:
             raise ValueError(
                 f"codex_binary must be a string, got {type(codex_binary).__name__}"
             )
+        grok_binary = raw.get("grok_binary")
+        if grok_binary is not None and not isinstance(grok_binary, str):
+            raise ValueError(
+                f"grok_binary must be a string, got {type(grok_binary).__name__}"
+            )
         settings = dict(DEFAULT_SETTINGS)
         settings.update(raw_settings or {})
         return cls(
@@ -122,4 +130,5 @@ class Config:
             settings=settings,
             agy_binary=agy_binary,
             codex_binary=codex_binary,
+            grok_binary=grok_binary,
         )

@@ -32,18 +32,29 @@ class TestEngineDriverRegistry(BaseCase):
         self.assertEqual(driver.config_binary_attr, "codex_binary")
         self.assertEqual(driver.login_args, ("login",))
 
+    def test_grok_engine_properties(self):
+        driver = engines.get_engine("grok")
+        self.assertEqual(driver.name, "grok")
+        self.assertEqual(driver.binary_name, "grok")
+        self.assertEqual(driver.data_dir_name, ".grok")
+        self.assertFalse(driver.needs_keychain)
+        self.assertEqual(driver.env_home_var, "GROK_HOME")
+        self.assertEqual(driver.config_binary_attr, "grok_binary")
+        self.assertEqual(driver.login_args, ("login",))
+
     def test_case_insensitive_lookup(self):
         self.assertEqual(engines.get_engine("CODEX").name, "codex")
         self.assertEqual(engines.get_engine("Agy").name, "agy")
+        self.assertEqual(engines.get_engine("GrOk").name, "grok")
 
     def test_unknown_engine_raises_value_error(self):
         with self.assertRaises(ValueError) as ctx:
-            engines.get_engine("claude")
+            engines.get_engine("unknown_cli")
         self.assertIn("unknown engine", str(ctx.exception))
 
     def test_all_engines_returns_registered(self):
         all_eng = engines.all_engines()
-        self.assertEqual({e.name for e in all_eng}, {"agy", "codex"})
+        self.assertEqual({e.name for e in all_eng}, {"agy", "codex", "grok"})
 
     def test_resolve_binary_explicit(self):
         driver = engines.get_engine("codex")

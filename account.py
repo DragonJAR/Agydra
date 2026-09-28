@@ -231,9 +231,108 @@ def save_codex_tokens(data_dir: Path, tokens_data: dict) -> bool:
     raw["last_refresh"] = _utcnow_iso()
     try:
         store._atomic_write_json(path, raw)
-        return True
     except Exception:
         return False
+
+
+GROK_AUTH_FILE = "auth.json"
+GROK_CONFIG_FILE = "config.toml"
+
+
+def _first_grok_credential(raw: dict) -> Optional[dict]:
+    """Find the active authentication record in Grok auth.json."""
+    if not isinstance(raw, dict):
+        return None
+    for _k, v in raw.items():
+        if isinstance(v, dict) and (v.get("key") or v.get("refresh_token") or v.get("email")):
+            return v
+    return None
+
+
+def inspect_grok_auth(data_dir: Path) -> Optional[dict]:
+    """Inspect auth details for a Grok profile, or None if unauthenticated."""
+    path = Path(data_dir) / GROK_AUTH_FILE
+    if path.is_file():
+        raw = store.read_json_object(path, tolerant=True)
+        cred = _first_grok_credential(raw)
+        if cred is not None:
+            return {
+                "auth_type": cred.get("auth_mode") or "oidc",
+                "key": cred.get("key"),
+                "token": cred.get("key"),
+                "refresh_token": cred.get("refresh_token"),
+                "email": cred.get("email"),
+                "user_id": cred.get("user_id"),
+                "first_name": cred.get("first_name"),
+            }
+        if isinstance(raw, dict) and raw.get("XAI_API_KEY"):
+            return {
+                "auth_type": "api_key",
+                "api_key": raw.get("XAI_API_KEY"),
+            }
+    cfg_path = Path(data_dir) / GROK_CONFIG_FILE
+    if cfg_path.is_file():
+        try:
+            content = cfg_path.read_text(encoding="utf-8", errors="replace")
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith("api_key") and "=" in line:
+                    val = line.split("=", 1)[1].strip().strip('"\'')
+                    if val:
+                        return {"auth_type": "api_key", "api_key": val}
+        except OSError:
+            pass
+    return None
+
+
+def detect_grok_email(data_dir: Path) -> Optional[str]:
+    """Extract email from Grok auth.json."""
+    path = Path(data_dir) / GROK_AUTH_FILE
+    if not path.is_file():
+        return None
+    raw = store.read_json_object(path, tolerant=True)
+    cred = _first_grok_credential(raw)
+    if cred is not None:
+        email = cred.get("email")
+        if isinstance(email, str) and email:
+            return email
+        key = cred.get("key")
+        if isinstance(key, str) and key:
+            claims = _decode_jwt_payload(key)
+            jwt_email = claims.get("email")
+            if isinstance(jwt_email, str) and jwt_email:
+                return jwt_email
+    return None
+
+
+def detect_grok_plan(data_dir: Path) -> Optional[str]:
+    """Extract Grok subscription plan or tier."""
+    path = Path(data_dir) / GROK_AUTH_FILE
+    if not path.is_file():
+        return None
+    raw = store.read_json_object(path, tolerant=True)
+    cred = _first_grok_credential(raw)
+    if cred is not None:
+        sub_tier = cred.get("subscription_tier")
+        if isinstance(sub_tier, str) and sub_tier:
+            return sub_tier.capitalize() if not sub_tier.lower().startswith("super") else "SuperGrok"
+        key = cred.get("key")
+        if isinstance(key, str) and key:
+            claims = _decode_jwt_payload(key)
+            tier = claims.get("tier")
+            if tier is not None:
+                tier_str = str(tier)
+                tier_map = {
+                    "4": "SuperGrok",
+                    "3": "Grok Pro",
+                    "2": "Grok Basic",
+                    "1": "Grok Free",
+                }
+                return tier_map.get(tier_str, f"Grok Tier {tier_str}")
+        return "Grok (xAI)"
+    if isinstance(raw, dict) and raw.get("XAI_API_KEY"):
+        return "xAI API Key"
+    return None
 
 
 def detect_email_source(
@@ -252,6 +351,9 @@ def detect_email_source(
     """
     if engine == "codex":
         email = detect_codex_email(data_dir)
+        return email, ("disk" if email else None)
+    if engine == "grok":
+        email = detect_grok_email(data_dir)
         return email, ("disk" if email else None)
 
     data_dir = Path(data_dir)
@@ -286,10 +388,12 @@ def auth_state(
 ) -> str:
     """'authenticated' | 'not-authenticated' from whichever backend is live.
 
-    Supports both Google agy (disk/keychain) and OpenAI Codex (auth.json).
+    Supports Google agy (disk/keychain), OpenAI Codex (auth.json), and xAI Grok (auth.json).
     """
     if engine == "codex":
         return "authenticated" if inspect_codex_auth(data_dir) is not None else "not-authenticated"
+    if engine == "grok":
+        return "authenticated" if inspect_grok_auth(data_dir) is not None else "not-authenticated"
 
     data_dir = Path(data_dir)
     for raw, _source in _iter_tokens(data_dir, store, name):

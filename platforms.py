@@ -21,6 +21,8 @@ AGY_BIN_ENV = "AGYDRA_AGY_BIN"
 AGY_DATA_DIR_NAME = ".gemini"
 CODEX_BIN_ENV = "AGYDRA_CODEX_BIN"
 CODEX_DATA_DIR_NAME = ".codex"
+GROK_BIN_ENV = "AGYDRA_GROK_BIN"
+GROK_DATA_DIR_NAME = ".grok"
 OVERLAYS_DIRNAME = "overlays"
 
 
@@ -155,6 +157,20 @@ def resolve_codex_binary(explicit: Optional[str] = None) -> Optional[Path]:
 def codex_data_dir(home: Optional[Path] = None) -> Path:
     """Codex's data directory (``.codex``) under the given home."""
     return (Path(home) if home is not None else real_home()) / CODEX_DATA_DIR_NAME
+
+
+def resolve_grok_binary(explicit: Optional[str] = None) -> Optional[Path]:
+    """Locate the real grok binary without fragile heuristics.
+
+    Order: explicit flag → ``AGYDRA_GROK_BIN`` → ``shutil.which("grok")``.
+    Returns ``None`` when not found.
+    """
+    return resolve_binary("grok", GROK_BIN_ENV, explicit)
+
+
+def grok_data_dir(home: Optional[Path] = None) -> Path:
+    """Grok's data directory (``.grok``) under the given home."""
+    return (Path(home) if home is not None else real_home()) / GROK_DATA_DIR_NAME
 
 
 def ensure_dir(path: Path) -> Path:

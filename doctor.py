@@ -50,21 +50,36 @@ def _check_binary(store: Store, ctx: "_DoctorContext"):
     has_profiles = bool(ctx.scan[0])
     has_agy_profile = any(getattr(p, "engine", "agy") == "agy" for p in ctx.scan[0]) if has_profiles else True
     has_codex_profile = any(getattr(p, "engine", "agy") == "codex" for p in ctx.scan[0])
+    has_grok_profile = any(getattr(p, "engine", "agy") == "grok" for p in ctx.scan[0])
     lines = []
     status = OK
+    active_count = sum([has_agy_profile, has_codex_profile, has_grok_profile])
+    if active_count > 1:
+        lines.append("binaries:")
+        prefix = "  - "
+    else:
+        prefix = ""
+
     if has_agy_profile:
         if agy_bin is None:
             status = FAIL
-            lines.append(f"agy binary not found (install agy or set {platforms.AGY_BIN_ENV})")
+            lines.append(f"{prefix}agy binary not found (install agy or set {platforms.AGY_BIN_ENV})")
         else:
-            lines.append(f"agy binary: {agy_bin}")
+            lines.append(f"{prefix}agy binary: {agy_bin}")
     if has_codex_profile:
         codex_bin = platforms.resolve_codex_binary(config.codex_binary)
         if codex_bin is None:
             status = FAIL
-            lines.append(f"codex binary not found (install codex or set {platforms.CODEX_BIN_ENV})")
+            lines.append(f"{prefix}codex binary not found (install codex or set {platforms.CODEX_BIN_ENV})")
         else:
-            lines.append(f"codex binary: {codex_bin}")
+            lines.append(f"{prefix}codex binary: {codex_bin}")
+    if has_grok_profile:
+        grok_bin = platforms.resolve_grok_binary(config.grok_binary)
+        if grok_bin is None:
+            status = FAIL
+            lines.append(f"{prefix}grok binary not found (install grok or set {platforms.GROK_BIN_ENV})")
+        else:
+            lines.append(f"{prefix}grok binary: {grok_bin}")
     return status, "\n".join(lines)
 
 
@@ -181,7 +196,12 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
             recoverable.append(name)
             continue
         if not isolation.link_points_to(data_link, data_dir):
-            real_data = platforms.codex_data_dir() if engine_name == "codex" else real_gemini
+            if engine_name == "codex":
+                real_data = platforms.codex_data_dir()
+            elif engine_name == "grok":
+                real_data = platforms.grok_data_dir()
+            else:
+                real_data = real_gemini
             if data_link.resolve() == real_data.resolve():
                 failures.append(f"{name}: overlay {link_name} points to REAL store")
             else:
@@ -208,13 +228,16 @@ def _check_schema_canary(store: Store, ctx: "_DoctorContext"):
     """Confirm profiles actually contain engine data layout (schema unchanged).
 
     The authoritative on-disk layout is ``<data>/antigravity-cli/`` (the token
-    file lives inside it) or ``<data>/auth.json`` for codex. Consumes the doctor-wide scan.
+    file lives inside it), ``<data>/auth.json`` for codex, or ``<data>/auth.json``
+    for grok. Consumes the doctor-wide scan.
     """
     names = ctx.names
     any_data = any(
         (store.profile_data_dir(n) / account.AGY_CLI_DIR).exists()
         or (store.profile_data_dir(n) / account.CODEX_AUTH_FILE).exists()
         or (store.profile_data_dir(n) / account.CODEX_CONFIG_FILE).exists()
+        or (store.profile_data_dir(n) / account.GROK_AUTH_FILE).exists()
+        or (store.profile_data_dir(n) / account.GROK_CONFIG_FILE).exists()
         for n in names
     )
     if not names:

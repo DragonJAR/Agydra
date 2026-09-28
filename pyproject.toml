@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agydra"
 dynamic = ["version"]
-description = "Multi-profile manager and workload dispatcher for AI developer CLIs (Google Antigravity and OpenAI Codex) on macOS, Linux, and Windows"
+description = "Multi-profile manager and workload dispatcher for AI developer CLIs (Google Antigravity, OpenAI Codex, and xAI Grok) on macOS, Linux, and Windows"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -17,6 +17,8 @@ keywords = [
     "agy",
     "codex",
     "openai",
+    "grok",
+    "xai",
     "cli",
     "multi-profile",
     "oauth",
