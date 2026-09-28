@@ -680,6 +680,83 @@ class TestCodexUsage(BaseCase):
         self.assertEqual(saved_auth["tokens"]["refresh_token"], "new_ref")
 
 
+class TestUsageRobustnessAndEdgeCases(unittest.TestCase):
+    def test_parse_reset_time_lowercase_z(self):
+        dt = usage._parse_reset_time("2026-10-01T07:43:10z")
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.year, 2026)
+
+    def test_parse_reset_time_invalid_values(self):
+        self.assertIsNone(usage._parse_reset_time(True))
+        self.assertIsNone(usage._parse_reset_time(False))
+        self.assertIsNone(usage._parse_reset_time("not-a-date"))
+        self.assertIsNone(usage._parse_reset_time(None))
+        self.assertIsNone(usage._parse_reset_time(1e25))
+
+    def test_parse_bucket_robustness(self):
+        self.assertIsNone(usage._parse_bucket({"id": "b1", "remaining_fraction": True}))
+        self.assertIsNone(usage._parse_bucket({"id": "b1", "remaining_fraction": float("nan")}))
+        self.assertIsNone(usage._parse_bucket({"id": "b1", "remaining_fraction": float("inf")}))
+        # Negative remaining_fraction is clamped to 0.0
+        b_neg = usage._parse_bucket({"id": "b1", "remaining_fraction": -0.5})
+        self.assertIsNotNone(b_neg)
+        self.assertEqual(b_neg.remaining_fraction, 0.0)
+
+    def test_parse_codex_usage_payload_robustness(self):
+        payload = {
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": float("nan"),
+                    "reset_at": True,
+                },
+                "secondary_window": {
+                    "used_percent": 150,
+                    "reset_at": 1e25,
+                },
+            }
+        }
+        groups, plan, email = usage.parse_codex_usage_payload(payload)
+        # NaN used_percent is rejected so primary_window is skipped, secondary_window clamps to 0.0
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0].buckets), 1)
+        self.assertEqual(groups[0].buckets[0].id, "codex-weekly")
+        self.assertEqual(groups[0].buckets[0].remaining_fraction, 0.0)
+        self.assertIsNone(groups[0].buckets[0].reset_time)
+
+    def test_extract_model_summary_unrecognized_groups(self):
+        # Two custom groups with non-standard names
+        groups = [
+            usage.UsageGroup(
+                name="Custom Engine A",
+                buckets=[usage.UsageBucket("c1", "Custom 1", "weekly", 0.7, None)],
+            ),
+            usage.UsageGroup(
+                name="Custom Engine B",
+                buckets=[usage.UsageBucket("c2", "Custom 2", "5h", 0.4, None)],
+            ),
+        ]
+        summary = usage.extract_model_summary(groups)
+        self.assertEqual(summary["gemini"]["weekly"], 0.7)
+        self.assertEqual(summary["gemini"]["available"], 0.7)
+        self.assertEqual(summary["claude"]["five_h"], 0.4)
+        self.assertEqual(summary["claude"]["available"], 0.4)
+
+    def test_format_mini_bar_edge_cases(self):
+        self.assertEqual(usage.format_mini_bar(float("nan"), 10), "░░░░░░░░░░")
+        self.assertEqual(usage.format_mini_bar(float("inf"), 10), "░░░░░░░░░░")
+        self.assertEqual(usage.format_mini_bar(-0.5, 10), "░░░░░░░░░░")
+        self.assertEqual(usage.format_mini_bar(1.5, 10), "██████████")
+        self.assertEqual(usage.format_mini_bar(0.5, 0), "")
+
+    def test_format_countdown_naive_datetime(self):
+        from datetime import datetime
+        naive = datetime(2026, 12, 31, 23, 59)
+        # Does not raise TypeError
+        cd = usage.format_countdown(naive)
+        self.assertIsInstance(cd, str)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

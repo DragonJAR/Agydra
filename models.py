@@ -48,11 +48,14 @@ class Profile:
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "Profile":
+        name = raw.get("name")
+        if name is None or not isinstance(name, str):
+            raise ValueError(f"profile name must be a string, got {type(name).__name__}")
         last_used = raw.get("last_used")
         email = raw.get("email")
         engine = raw.get("engine")
         return cls(
-            name=str(raw["name"]),
+            name=name,
             seq=int(raw.get("seq") or 0),
             created=str(raw.get("created") or _utcnow_iso()),
             last_used=str(last_used) if last_used is not None else None,

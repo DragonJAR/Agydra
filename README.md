@@ -1,7 +1,7 @@
-# agydra
+# Agydra
 
 <p align="center">
-  <img src="logo.png" alt="agydra logo">
+  <img src="logo.png" alt="Agydra logo">
 </p>
 
 <p align="center">
@@ -13,7 +13,7 @@
   <a href="README.es.md"><img src="https://img.shields.io/badge/Read_in-Español-blue" alt="Read in Español"></a>
 </p>
 
-> **One installation, infinite isolated AI accounts, zero token bottlenecks.** `agydra` is a multi-profile manager and workload dispatcher for **Google Antigravity (`agy`)**, **OpenAI Codex (`codex`)**, and **xAI Grok (`grok`)**. Conceived to unlock the immense value of multi-account pooling and family tiers—where every account enjoys completely independent AI quotas and rate limits—`agydra` eliminates single-store constraints through lightweight, isolated per-profile environments. Your host credentials remain completely untouched, and CLI engines are never patched or intercepted. Built strictly with the Python standard library (**Python ≥ 3.9, zero third-party runtime dependencies**): one clean, DRY core with native OS adapters for macOS, Linux, and Windows.
+> **One installation, infinite isolated AI accounts, zero token bottlenecks.** **Agydra** is a multi-profile manager and workload dispatcher for **Google Antigravity (`agy`)**, **OpenAI Codex (`codex`)**, and **xAI Grok (`grok`)**. Conceived to unlock the immense value of multi-account pooling and family tiers—where every account enjoys completely independent AI quotas and rate limits—**Agydra** eliminates single-store constraints through lightweight, isolated per-profile environments. Your host credentials remain completely untouched, and CLI engines are never patched or intercepted. Built strictly with the Python standard library (**Python ≥ 3.9, zero third-party runtime dependencies**): one clean, DRY core with native OS adapters for macOS, Linux, and Windows.
 
 ---
 
@@ -38,7 +38,7 @@ This created a severe operational bottleneck:
 
 ### 🚀 The Solution: Legitimate Multi-Account Pooling with Agydra
 
-`agydra` was created specifically to eliminate this bottleneck and transform individual Google accounts into a unified, high-availability AI compute pool:
+**Agydra** was created specifically to eliminate this bottleneck and transform individual Google accounts into a unified, high-availability AI compute pool:
 
 ```
 agy                 → generic session, uses the real ~/.gemini (untouched)
@@ -152,12 +152,12 @@ agydra login fam-research
 *(Tip: Run `agydra list` to confirm that all profiles display their associated email address and show `authenticated`).*
 
 #### Step 3: Dispatch & auto-rotate with `agydra -r`
-Never worry about managing rate limits manually. Using `-r` (`--random`), `agydra` automatically dispatches each command to the least-recently-used, idle authenticated profile:
+Never worry about managing rate limits manually. Using `-r` (`--random`), Agydra automatically dispatches each command to the least-recently-used, idle authenticated profile:
 ```sh
 # Terminal 1: Automatically picks fam-dev
 agydra -r "Refactor the authentication middleware to use JWT"
 
-# Terminal 2 (simultaneous): fam-dev is busy; agydra automatically routes to fam-agents!
+# Terminal 2 (simultaneous): fam-dev is busy; Agydra automatically routes to fam-agents!
 agydra -r "Generate end-to-end integration tests for the API"
 
 # Hit a 5-hour rate limit on an account? Simply launch with -r:
@@ -222,7 +222,7 @@ Never worry about passing `-p` on every prompt. Pin a profile to a repository or
 cd ~/projects/payment-gateway
 agydra use client-acme
 
-# All future agydra commands inside this tree automatically use 'client-acme'
+# All future Agydra commands inside this tree automatically use 'client-acme'
 agydra "Summarize recent commits"
 agydra status
 ```
@@ -268,7 +268,7 @@ agydra -np work "What is my current environment?"
 
 ### 6. Multi-Engine Support: Google Antigravity + OpenAI Codex + xAI Grok
 
-`agydra` features a strategy-pattern driver architecture supporting **Google Antigravity (`agy`)**, **OpenAI Codex (`codex`)**, and **xAI Grok (`grok`)**:
+**Agydra** features a strategy-pattern driver architecture supporting **Google Antigravity (`agy`)**, **OpenAI Codex (`codex`)**, and **xAI Grok (`grok`)**:
 
 ```sh
 # Create isolated Codex and Grok profiles (-e codex / -e grok)
@@ -294,15 +294,15 @@ agydra "Optimize memory allocations in parser"
 ```
 
 - **Full Flag & Subcommand Forwarding (Transparent CLI Parity):** Every arbitrary flag, subflag, and subshell command is forwarded directly to the target CLI. Commands such as `agydra -p codex --yolo`, `agydra -p grok -m grok-beta "prompt"`, or `agydra -p grok sessions` work seamlessly with full engine isolation.
-- **Isolated Storage via `$CODEX_HOME` and `$GROK_HOME`:** The official Codex and Grok CLIs derive their state from `$CODEX_HOME` and `$GROK_HOME`. `agydra` isolates these variables directly to profile overlays (symlinked to `<store>/profiles/<profile>/data`), completely protecting your user home (`~/.codex`, `~/.grok`) from pollution.
-- **xAI Grok Leader Socket Isolation (`GROK_LEADER_SOCKET`):** Grok's local leader daemon uses a domain socket. `agydra` isolates `GROK_LEADER_SOCKET` within each profile overlay (`<overlay>/.grok/leader.sock`), preventing cross-profile hijacking and socket collisions with host sessions.
-- **Seamless Daemonless Default for Codex (Zero Socket & Lock Leaks):** On POSIX/macOS systems, domain socket paths have a hard limit (`SUN_LEN` = 104 bytes). `agydra` enforces `--no-daemon` by default and sets `features.daemon_auto_start = false` in `config.toml`, guaranteeing instant kernel lock releases on exit.
-- **Zero Keychain Conflicts & Native Plan Inspection:** Both Codex and Grok store credentials on disk in `auth.json`. `agydra` inspects token claims (`email` and subscription plans: `ChatGPT Plus/Pro`, `SuperGrok`, `Grok Pro`, or API keys) directly and bypasses macOS Keychain swapping for these engines.
+- **Isolated Storage via `$CODEX_HOME` and `$GROK_HOME`:** The official Codex and Grok CLIs derive their state from `$CODEX_HOME` and `$GROK_HOME`. **Agydra** isolates these variables directly to profile overlays (symlinked to `<store>/profiles/<profile>/data`), completely protecting your user home (`~/.codex`, `~/.grok`) from pollution.
+- **xAI Grok Leader Socket Isolation (`GROK_LEADER_SOCKET`):** Grok's local leader daemon uses a domain socket. **Agydra** isolates `GROK_LEADER_SOCKET` within each profile overlay (`<overlay>/.grok/leader.sock`), preventing cross-profile hijacking and socket collisions with host sessions.
+- **Seamless Daemonless Default for Codex (Zero Socket & Lock Leaks):** On POSIX/macOS systems, domain socket paths have a hard limit (`SUN_LEN` = 104 bytes). **Agydra** enforces `--no-daemon` by default and sets `features.daemon_auto_start = false` in `config.toml`, guaranteeing instant kernel lock releases on exit.
+- **Zero Keychain Conflicts & Native Plan Inspection:** Both Codex and Grok store credentials on disk in `auth.json`. **Agydra** inspects token claims (`email` and subscription plans: `ChatGPT Plus/Pro`, `SuperGrok`, `Grok Pro`, or API keys) directly and bypasses macOS Keychain swapping for these engines.
 - **Secure Configuration Sharing (`share-config`):** Profile sharing copies configuration definitions (`config.toml`, `settings.json`, `mcp.json`) across profiles while strictly guaranteeing session tokens (`auth.json`) are never copied.
 
 ### 7. Multi-Language Support / Internationalization (`agydra lang` / `--lang`)
 
-`agydra` provides native internationalization across English (`en`) and Spanish (`es`). Setting your language preference automatically persists it to `agydra.json`, remembering it for all future executions without needing to re-specify it:
+**Agydra** provides native internationalization across English (`en`) and Spanish (`es`). Setting your language preference automatically persists it to `agydra.json`, remembering it for all future executions without needing to re-specify it:
 
 ```sh
 # Set language to Spanish persistently (stored in configuration)
@@ -360,8 +360,8 @@ Any management subcommand also accepts `--NAME` or `-NAME` syntax (e.g. `agydra 
 |---|---|---|
 | `agydra setup [-n]` | `install` | Idempotent setup: verifies venv, installs console script, and configures PATH shim. |
 | `agydra lang [CODE]` | `language`, `idioma`, `locale` | Views or sets the persistent CLI display language (`en`, `es`). |
-| `agydra version` | `-v`, `--version` | Displays agydra version, Python version, and operating system. |
-| `agydra help [COMMAND]` | `-h`, `--help` | Shows help information for agydra or a specific subcommand. |
+| `agydra version` | `-v`, `--version` | Displays Agydra version, Python version, and operating system. |
+| `agydra help [COMMAND]` | `-h`, `--help` | Shows help information for Agydra or a specific subcommand. |
 
 ### Launcher Flags
 
@@ -397,7 +397,7 @@ Short flags bundle following standard POSIX conventions (`-nr` == `-n -r`):
 
 ### Profile Resolution Cascade
 
-When launching without `-p`, `agydra` resolves the active profile deterministically (first match wins):
+When launching without `-p`, Agydra resolves the active profile deterministically (first match wins):
 
 ```
 1. --profile / -p flag
@@ -436,7 +436,7 @@ Agydra Store (<store root>/)
 ```
 
 ### 1. Home Overlay Mechanics
-- `agydra` creates an isolated directory structure at `<store>/overlays/<profile>`.
+- **Agydra** creates an isolated directory structure at `<store>/overlays/<profile>`.
 - For `agy`, `<overlay>/.gemini` links directly to `<store>/profiles/<profile>/data`.
 - For `codex`, `CODEX_HOME` points directly to `<overlay>/.codex`, which links to `<store>/profiles/<profile>/data`.
 - For `grok`, `GROK_HOME` points directly to `<overlay>/.grok` (linked to `<store>/profiles/<profile>/data`), and `GROK_LEADER_SOCKET` is isolated to `<overlay>/.grok/leader.sock`.
@@ -458,7 +458,7 @@ Agydra Store (<store root>/)
 
 ### 4. Strategy Pattern Engine Drivers & Daemonless Default
 - **Driver Decoupling:** `AgyEngine`, `CodexEngine`, and `GrokEngine` isolate executable discovery, argument adaptation, data path layout, and identity claim parsing.
-- **Automatic Daemonless Execution:** Codex CLI natively launches a background `app-server-daemon` over a UNIX domain socket. In deep profile stores, socket paths exceed the POSIX/macOS limit (`SUN_LEN` = 104 bytes), crashing with `path must be shorter than SUN_LEN`. In addition, background daemons inherit file descriptors and keep profile locks permanently busy. `agydra` eliminates this automatically by passing `--no-daemon` on every Codex run and configuring `features.daemon_auto_start = false` in `config.toml`. Execution is synchronous, reliable, and releases locks instantly upon completion.
+- **Automatic Daemonless Execution:** Codex CLI natively launches a background `app-server-daemon` over a UNIX domain socket. In deep profile stores, socket paths exceed the POSIX/macOS limit (`SUN_LEN` = 104 bytes), crashing with `path must be shorter than SUN_LEN`. In addition, background daemons inherit file descriptors and keep profile locks permanently busy. **Agydra** eliminates this automatically by passing `--no-daemon` on every Codex run and configuring `features.daemon_auto_start = false` in `config.toml`. Execution is synchronous, reliable, and releases locks instantly upon completion.
 
 ---
 
@@ -561,7 +561,7 @@ agydra/                     # Flat package structure (zero third-party dependenc
 ├── orphans.py              # Reverse store audit and orphan cleaner
 ├── usage.py                # Quota inspector and rate-limit parser
 ├── bootstrap.py            # Idempotent venv & PATH shim installer
-├── tests/                  # 589 automated unit and integration tests
+├── tests/                  # 646 automated unit and integration tests
 ├── README.md               # English documentation
 ├── README.es.md            # Spanish documentation
 ├── AGENTS.md               # Developer conventions & architectural invariants
@@ -575,18 +575,18 @@ The test suite validates mock environments, edge cases, and all platforms withou
 
 ```sh
 python3 -W error::ResourceWarning -m pytest tests/ -q
-# 572 passed, 3 skipped (on macOS) in ~45s (0 warnings)
+# 643 passed, 3 skipped in ~50s (0 warnings)
 
 python3 -m unittest discover -s tests -q
-# Ran 575 tests in ~45s - OK
+# Ran 646 tests in ~50s - OK
 ```
 
 ---
 
 ## ⚠️ Limitations
 
-- `agydra` manages **profiles and sessions**, not the installation or updates of the `agy` or `codex` binaries themselves.
-- Isolation relies on each engine's environment variables (`HOME`/`USERPROFILE` for `agy`, `CODEX_HOME` for `codex`). If a future version of either binary alters this behavior, `agydra doctor`'s schema canary detects it immediately and alerts you.
+- **Agydra** manages **profiles and sessions**, not the installation or updates of the `agy`, `codex`, or `grok` binaries themselves.
+- Isolation relies on each engine's environment variables (`HOME`/`USERPROFILE` for `agy`, `CODEX_HOME` for `codex`, `GROK_HOME` for `grok`). If a future version of any binary alters this behavior, **Agydra Doctor**'s schema canary detects it immediately and alerts you.
 - Windows-specific branches are verified on native Windows; on Unix systems they are validated via isolated unit test suites.
 
 ---
@@ -596,7 +596,7 @@ python3 -m unittest discover -s tests -q
 We welcome community contributions! Please adhere to our core project invariants:
 1. **Zero third-party runtime dependencies:** Use strictly the Python standard library (`sys`, `os`, `pathlib`, `fcntl`, `tempfile`, etc.).
 2. **Cross-platform parity:** Changes must run identically on macOS, Linux, and Windows.
-3. **Comprehensive verification:** Run all 563 tests before opening a pull request.
+3. **Comprehensive verification:** Run all 646 tests before opening a pull request.
 4. **Architectural consistency:** Consult [AGENTS.md](AGENTS.md) for full architectural guidelines.
 
 ---
@@ -615,4 +615,4 @@ Created with ❤️ by **Jaime Andrés Restrepo** — [DragonJAR.org](https://ww
 
 ---
 
-*Disclaimer: `agydra` is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Google. `agy` and Antigravity are trademarks of Google LLC. Use accounts and tokens in compliance with Google's Terms of Service.*
+*Disclaimer: **Agydra** is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Google. `agy` and Antigravity are trademarks of Google LLC. Use accounts and tokens in compliance with Google's Terms of Service.*

@@ -113,6 +113,8 @@ def find_orphans(store, names: Iterable[str]) -> OrphanScan:
     overlays_dir = store.overlays_dir
     if overlays_dir.is_dir():
         for entry in sorted(overlays_dir.iterdir()):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
             if entry.name not in known:
                 scan.overlays.append(entry.name)
 
@@ -120,7 +122,7 @@ def find_orphans(store, names: Iterable[str]) -> OrphanScan:
     if lock_dir.is_dir():
         for entry in sorted(lock_dir.glob(f"*{locks.LOCK_SUFFIX}")):
             name = entry.name[: -len(locks.LOCK_SUFFIX)]
-            if name in known or locks.is_locked(store, name):
+            if not name or name in known or locks.is_locked(store, name):
                 continue
             scan.locks.append(name)
 

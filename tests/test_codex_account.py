@@ -87,6 +87,22 @@ class TestCodexAccount(BaseCase):
         state = account.auth_state(data_dir, engine="codex")
         self.assertEqual(state, "not-authenticated")
 
+    def test_save_codex_tokens_success_and_failure(self):
+        data_dir = self._tmp / "save_tokens_dir"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        # Missing auth.json -> returns False
+        self.assertFalse(account.save_codex_tokens(data_dir, {"access_token": "tok"}))
+
+        # Existing auth.json -> returns True
+        (data_dir / "auth.json").write_text("{}", encoding="utf-8")
+        res = account.save_codex_tokens(data_dir, {"access_token": "new-tok", "id_token": "id-123"})
+        self.assertTrue(res)
+
+        updated = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
+        self.assertEqual(updated["tokens"]["access_token"], "new-tok")
+        self.assertEqual(updated["tokens"]["id_token"], "id-123")
+        self.assertIn("last_refresh", updated)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,10 +39,10 @@ class EngineDriver:
         )
 
     def auth_state(self, data_dir: Path, store: Any = None, profile_name: str = "") -> str:
-        raise NotImplementedError
+        return account.auth_state(data_dir, store=store, name=profile_name, engine=self.name)
 
     def detect_email(self, data_dir: Path, store: Any = None, profile_name: str = "") -> Optional[str]:
-        raise NotImplementedError
+        return account.detect_email(data_dir, store=store, name=profile_name, engine=self.name)
 
     def prepare_args(self, args: Sequence[str]) -> List[str]:
         return list(args)
@@ -63,12 +63,6 @@ class AgyEngine(EngineDriver):
             login_args=(),
         )
 
-    def auth_state(self, data_dir: Path, store: Any = None, profile_name: str = "") -> str:
-        return account.auth_state(data_dir, store=store, name=profile_name, engine="agy")
-
-    def detect_email(self, data_dir: Path, store: Any = None, profile_name: str = "") -> Optional[str]:
-        return account.detect_email(data_dir, store=store, name=profile_name, engine="agy")
-
 
 class CodexEngine(EngineDriver):
     """Driver for OpenAI Codex CLI (codex)."""
@@ -84,12 +78,6 @@ class CodexEngine(EngineDriver):
             config_binary_attr="codex_binary",
             login_args=("login",),
         )
-
-    def auth_state(self, data_dir: Path, store: Any = None, profile_name: str = "") -> str:
-        return account.auth_state(data_dir, store=store, name=profile_name, engine="codex")
-
-    def detect_email(self, data_dir: Path, store: Any = None, profile_name: str = "") -> Optional[str]:
-        return account.detect_email(data_dir, store=store, name=profile_name, engine="codex")
 
     def prepare_args(self, args: Sequence[str]) -> List[str]:
         res = list(args)
@@ -112,12 +100,6 @@ class GrokEngine(EngineDriver):
             config_binary_attr="grok_binary",
             login_args=("login",),
         )
-
-    def auth_state(self, data_dir: Path, store: Any = None, profile_name: str = "") -> str:
-        return account.auth_state(data_dir, store=store, name=profile_name, engine="grok")
-
-    def detect_email(self, data_dir: Path, store: Any = None, profile_name: str = "") -> Optional[str]:
-        return account.detect_email(data_dir, store=store, name=profile_name, engine="grok")
 
 
 _REGISTRY: Dict[str, EngineDriver] = {

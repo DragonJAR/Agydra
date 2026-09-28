@@ -1,7 +1,7 @@
-# agydra
+# Agydra
 
 <p align="center">
-  <img src="logo.png" alt="logo de agydra">
+  <img src="logo.png" alt="logo de Agydra">
 </p>
 
 <p align="center">
@@ -13,7 +13,7 @@
   <a href="README.md"><img src="https://img.shields.io/badge/Read%20in-English-0078D4?logo=readme&logoColor=white" alt="Read in English"></a>
 </p>
 
-> **Una sola instalación, múltiples cuentas de IA totalmente aisladas y cero cuellos de botella.** `agydra` es un gestor multi-perfil y despachador de cargas para **Google Antigravity (`agy`)**, **OpenAI Codex (`codex`)** y **xAI Grok (`grok`)**. Concebido para desbloquear el inmenso potencial del pooling multi-cuenta y los planes familiares —donde cada cuenta miembro dispone de cuotas de tokens y límites de tasa (rate limits) 100% independientes—, `agydra` elimina la restricción de un único almacén central mediante entornos ligeros y aislados por perfil. Tus credenciales reales jamás se alteran y los binarios oficiales nunca se interceptan ni parchean. Desarrollado estrictamente con la librería estándar de Python (**Python ≥ 3.9, cero dependencias de terceros en runtime**): un núcleo limpio y DRY con adaptadores nativos para macOS, Linux y Windows.
+> **Una sola instalación, múltiples cuentas de IA totalmente aisladas y cero cuellos de botella.** **Agydra** es un gestor multi-perfil y despachador de cargas para **Google Antigravity (`agy`)**, **OpenAI Codex (`codex`)** y **xAI Grok (`grok`)**. Concebido para desbloquear el inmenso potencial del pooling multi-cuenta y los planes familiares —donde cada cuenta miembro dispone de cuotas de tokens y límites de tasa (rate limits) 100% independientes—, **Agydra** elimina la restricción de un único almacén central mediante entornos ligeros y aislados por perfil. Tus credenciales reales jamás se alteran y los binarios oficiales nunca se interceptan ni parchean. Desarrollado estrictamente con la librería estándar de Python (**Python ≥ 3.9, cero dependencias de terceros en runtime**): un núcleo limpio y DRY con adaptadores nativos para macOS, Linux y Windows.
 
 ---
 
@@ -38,7 +38,7 @@ Esta restricción generaba un grave cuello de botella operativo:
 
 ### 🚀 La Solución: Pooling Multi-Cuenta Legítimo con Agydra
 
-`agydra` fue concebida precisamente para derribar esta barrera y convertir un conjunto de cuentas familiares de Google en un pool unificado de alta disponibilidad para desarrollo con IA:
+**Agydra** fue concebida precisamente para derribar esta barrera y convertir un conjunto de cuentas familiares de Google en un pool unificado de alta disponibilidad para desarrollo con IA:
 
 ```
 agy                 → sesión genérica, utiliza el ~/.gemini real (intacto)
@@ -152,12 +152,12 @@ agydra login fam-investigacion
 *(Tip: Ejecuta `agydra list` para confirmar que cada perfil muestre su correo electrónico correspondiente y el estado `authenticated`).*
 
 #### Paso 3: Despacho automático y rotación con `agydra -r`
-Olvídate de gestionar cuotas y límites manualmente. Con `-r` (`--random`), `agydra` asigna cada comando al perfil autenticado, desocupado y menos recientemente usado del pool:
+Olvídate de gestionar cuotas y límites manualmente. Con `-r` (`--random`), Agydra asigna cada comando al perfil autenticado, desocupado y menos recientemente usado del pool:
 ```sh
 # Terminal 1: Selecciona automáticamente fam-desarrollo
 agydra -r "Refactoriza el middleware de autenticación para usar JWT"
 
-# Terminal 2 (simultáneo): fam-desarrollo está ocupado; agydra despacha automáticamente a fam-agentes
+# Terminal 2 (simultáneo): fam-desarrollo está ocupado; Agydra despacha automáticamente a fam-agentes
 agydra -r "Genera suite de pruebas de integración para la API"
 
 # ¿Alcanzaste el límite de 5 horas en una cuenta? Lanza con -r:
@@ -222,7 +222,7 @@ Olvídate de pasar `-p` en cada comando. Fija un perfil a un repositorio o carpe
 cd ~/proyectos/pasarela-pagos
 agydra use cliente-acme
 
-# Todos los comandos agydra dentro de este árbol usarán automáticamente 'cliente-acme'
+# Todos los comandos de Agydra dentro de este árbol usarán automáticamente 'cliente-acme'
 agydra "Resume los commits recientes"
 agydra status
 ```
@@ -268,7 +268,7 @@ agydra -np trabajo "¿Cuál es mi entorno actual?"
 
 ### 6. Soporte Multi-Motor: Google Antigravity + OpenAI Codex + xAI Grok
 
-`agydra` incorpora una arquitectura de controladores basada en el patrón Strategy que soporta **Google Antigravity (`agy`)**, **OpenAI Codex (`codex`)** y **xAI Grok (`grok`)**:
+**Agydra** incorpora una arquitectura de controladores basada en el patrón Strategy que soporta **Google Antigravity (`agy`)**, **OpenAI Codex (`codex`)** y **xAI Grok (`grok`)**:
 
 ```sh
 # Crea perfiles aislados para Codex y Grok (-e codex / -e grok)
@@ -294,15 +294,15 @@ agydra "Optimiza la gestión de memoria en el parser"
 ```
 
 - **Paso Transparente de Flags y Subcomandos (Paridad Total de CLI):** Cualquier flag, subflag o subcomando se entrega íntegramente a la CLI destino. Comandos como `agydra -p codex --yolo`, `agydra -p grok -m grok-beta "prompt"` o `agydra -p grok sessions` se ejecutan sin fricción bajo el perfil aislado correspondiente.
-- **Almacén Aislado mediante `$CODEX_HOME` y `$GROK_HOME`:** Las CLIs oficiales de Codex y Grok derivan su estado de `$CODEX_HOME` y `$GROK_HOME`. `agydra` aísla estas variables directamente en los overlays de perfil (enlazados a `<store>/profiles/<perfil>/data`), protegiendo totalmente tu directorio de usuario (`~/.codex`, `~/.grok`) contra sobreescrituras.
-- **Aislamiento de Sockets de Grok (`GROK_LEADER_SOCKET`):** El demonio local de Grok interactúa mediante un domain socket. `agydra` aísla `GROK_LEADER_SOCKET` en el overlay de cada perfil (`<overlay>/.grok/leader.sock`), previniendo secuestros o colisiones con sockets del host.
-- **Ejecución sin Demonio para Codex (Cero Fallos de Socket y Fuga de Locks):** En POSIX/macOS, las rutas de sockets tienen un límite estricto (`SUN_LEN` = 104 bytes). `agydra` inyecta `--no-daemon` por defecto y configura `features.daemon_auto_start = false` en `config.toml`, garantizando liberación inmediata de locks.
-- **Cero Fricción en el Keychain e Inspección Nativa de Planes:** Tanto Codex como Grok gestionan credenciales en archivos locales (`auth.json`). `agydra` inspecciona directamente los tokens y claims JWT (`email` y planes: `ChatGPT Plus/Pro`, `SuperGrok`, `Grok Pro`, o API keys) y omite las operaciones de Keychain en macOS.
+- **Almacén Aislado mediante `$CODEX_HOME` y `$GROK_HOME`:** Las CLIs oficiales de Codex y Grok derivan su estado de `$CODEX_HOME` y `$GROK_HOME`. **Agydra** aísla estas variables directamente en los overlays de perfil (enlazados a `<store>/profiles/<perfil>/data`), protegiendo totalmente tu directorio de usuario (`~/.codex`, `~/.grok`) contra sobreescrituras.
+- **Aislamiento de Sockets de Grok (`GROK_LEADER_SOCKET`):** El demonio local de Grok interactúa mediante un domain socket. **Agydra** aísla `GROK_LEADER_SOCKET` en el overlay de cada perfil (`<overlay>/.grok/leader.sock`), previniendo secuestros o colisiones con sockets del host.
+- **Ejecución sin Demonio para Codex (Cero Fallos de Socket y Fuga de Locks):** En POSIX/macOS, las rutas de sockets tienen un límite estricto (`SUN_LEN` = 104 bytes). **Agydra** inyecta `--no-daemon` por defecto y configura `features.daemon_auto_start = false` en `config.toml`, garantizando liberación inmediata de locks.
+- **Cero Fricción en el Keychain e Inspección Nativa de Planes:** Tanto Codex como Grok gestionan credenciales en archivos locales (`auth.json`). **Agydra** inspecciona directamente los tokens y claims JWT (`email` y planes: `ChatGPT Plus/Pro`, `SuperGrok`, `Grok Pro`, o API keys) y omite las operaciones de Keychain en macOS.
 - **Compartición Segura de Configuración (`share-config`):** La sincronización entre cuentas copia archivos de configuración (`config.toml`, `settings.json`, `mcp.json`) garantizando que los tokens y credenciales de `auth.json` jamás sean copiados.
 
 ### 7. Soporte Multi-idioma / Internacionalización (`agydra lang` / `--lang`)
 
-`agydra` incluye soporte nativo de internacionalización en español (`es`) e inglés (`en`). Al configurar tu preferencia de idioma, esta queda automáticamente guardada y recordada en `agydra.json` para todas las ejecuciones futuras sin necesidad de volver a indicarla:
+**Agydra** incluye soporte nativo de internacionalización en español (`es`) e inglés (`en`). Al configurar tu preferencia de idioma, esta queda automáticamente guardada y recordada en `agydra.json` para todas las ejecuciones futuras sin necesidad de volver a indicarla:
 
 ```sh
 # Establece el idioma en español de forma persistente (guardado en configuración)
@@ -360,8 +360,8 @@ Cualquier subcomando de gestión acepta también la sintaxis `--NOMBRE` o `-NOMB
 |---|---|---|
 | `agydra setup [-n]` | `install` | Instalador idempotente: valida venv, instala script de consola y configura shim en PATH. |
 | `agydra lang [CÓDIGO]` | `language`, `idioma`, `locale` | Consulta o establece de forma persistente el idioma del CLI (`en`, `es`). |
-| `agydra version` | `-v`, `--version` | Muestra la versión de agydra, versión de Python y sistema operativo. |
-| `agydra help [COMANDO]` | `-h`, `--help` | Muestra información de ayuda para agydra o un subcomando específico. |
+| `agydra version` | `-v`, `--version` | Muestra la versión de Agydra, versión de Python y sistema operativo. |
+| `agydra help [COMANDO]` | `-h`, `--help` | Muestra información de ayuda para Agydra o un subcomando específico. |
 
 ### Parámetros del Lanzador
 
@@ -397,7 +397,7 @@ Los flags cortos se pueden agrupar según las convenciones estándar POSIX (`-nr
 
 ### Cascada de Resolución de Perfiles
 
-Al lanzar sin `-p`, `agydra` resuelve el perfil activo de forma determinista (la primera coincidencia gana):
+Al lanzar sin `-p`, Agydra resuelve el perfil activo de forma determinista (la primera coincidencia gana):
 
 ```
 1. Flag --profile / -p
@@ -436,11 +436,11 @@ Almacén Agydra (<store root>/)
 ```
 
 ### 1. Mecánica del Home Overlay
-- `agydra` crea una estructura aislada en `<store>/overlays/<perfil>`.
+- **Agydra** crea una estructura aislada en `<store>/overlays/<perfil>`.
 - Para `agy`, `<overlay>/.gemini` enlaza directamente a `<store>/profiles/<perfil>/data`.
 - Para `codex`, `CODEX_HOME` apunta directamente a `<overlay>/.codex`, que enlaza a `<store>/profiles/<perfil>/data`.
 - Para `grok`, `GROK_HOME` apunta directamente a `<overlay>/.grok` (enlazado a `<store>/profiles/<perfil>/data`) y `GROK_LEADER_SOCKET` se aísla en `<overlay>/.grok/leader.sock`.
-- Las entradas principales de configuración del usuario (`.ssh`, `.gitconfig`, entornos de terminal) se reflejan mediante symlinks (o junctions en Windows), asegurando que las herramientas de desarrollo funcionen con total normalidad.
+- Las entradas principales de configuración del usuario (`.ssh`, `.gitconfig`, entornos de terminal) se reflejan mediante symlinks (or junctions en Windows), asegurando que las herramientas de desarrollo funcionen con total normalidad.
 - Los directorios ancestros de la raíz del almacén (como `~/Library` en macOS) se reflejan como directorios reales para que el almacén mismo permanezca inaccesible desde el overlay.
 - Se inyecta `AGYDRA_REAL_HOME` en el proceso hijo, permitiendo que subshells y comandos secundarios ubiquen el home real del sistema.
 
@@ -458,7 +458,7 @@ Almacén Agydra (<store root>/)
 
 ### 4. Controladores de Motor con Patrón Strategy y Modo sin Demonio por Defecto
 - **Desacoplamiento de Motores:** `AgyEngine`, `CodexEngine` y `GrokEngine` aíslan la detección de binarios, adaptación de argumentos, diseño de rutas de datos y análisis de credenciales de identidad.
-- **Ejecución sin Demonio Automática:** El CLI de Codex inicia por defecto un demonio en segundo plano (`app-server-daemon`) mediante sockets UNIX. En almacenes anidados de perfiles, la ruta del socket supera el límite de POSIX/macOS (`SUN_LEN` = 104 bytes), provocando caídas con `path must be shorter than SUN_LEN`. Además, los demonios en segundo plano heredan descriptores de archivo y retienen locks indefinidamente. `agydra` erradica esto automáticamente pasando `--no-daemon` en cada ejecución de Codex y configurando `features.daemon_auto_start = false` en `config.toml`. La ejecución es síncrona, robusta y libera locks de forma instantánea al finalizar.
+- **Ejecución sin Demonio Automática:** El CLI de Codex inicia por defecto un demonio en segundo plano (`app-server-daemon`) mediante sockets UNIX. En almacenes anidados de perfiles, la ruta del socket supera el límite de POSIX/macOS (`SUN_LEN` = 104 bytes), provocando caídas con `path must be shorter than SUN_LEN`. Además, los demonios en segundo plano heredan descriptores de archivo y retienen locks indefinidamente. **Agydra** erradica esto automáticamente pasando `--no-daemon` en cada ejecución de Codex y configurando `features.daemon_auto_start = false` en `config.toml`. La ejecución es síncrona, robusta y libera locks de forma instantánea al finalizar.
 
 ---
 
@@ -561,7 +561,7 @@ agydra/                     # Estructura plana (cero dependencias de terceros)
 ├── orphans.py              # Auditoría inversa del almacén y limpiador de huérfanos
 ├── usage.py                # Inspector de cuotas y parseador de límites de tasa
 ├── bootstrap.py            # Instalador idempotente de venv y shim en PATH
-├── tests/                  # 589 pruebas automáticas unitarias y de integración
+├── tests/                  # 646 pruebas automáticas unitarias y de integración
 ├── README.md               # Documentación en inglés
 ├── README.es.md            # Documentación en español
 ├── AGENTS.md               # Convenciones de desarrollo e invariantes arquitectónicos
@@ -575,18 +575,18 @@ La suite de pruebas valida entornos simulados, casos límite y todas las platafo
 
 ```sh
 python3 -W error::ResourceWarning -m pytest tests/ -q
-# 572 passed, 3 skipped (en macOS) en ~45s (0 advertencias)
+# 643 passed, 3 skipped en ~50s (0 advertencias)
 
 python3 -m unittest discover -s tests -q
-# Ran 575 tests en ~45s - OK
+# Ran 646 tests en ~50s - OK
 ```
 
 ---
 
 ## ⚠️ Limitaciones
 
-- `agydra` gestiona **perfiles y sesiones**, no la instalación ni las actualizaciones de los binarios `agy` o `codex`.
-- El aislamiento depende de las variables de entorno de cada motor (`HOME`/`USERPROFILE` para `agy`, `CODEX_HOME` para `codex`). Si una versión futura de cualquiera de los binarios altera este comportamiento, el canario de esquema de `agydra doctor` lo detecta inmediatamente y te avisa.
+- **Agydra** gestiona **perfiles y sesiones**, no la instalación ni las actualizaciones de los binarios `agy`, `codex` o `grok`.
+- El aislamiento depende de las variables de entorno de cada motor (`HOME`/`USERPROFILE` para `agy`, `CODEX_HOME` para `codex`, `GROK_HOME` para `grok`). Si una versión futura de cualquiera de los binarios altera este comportamiento, el canario de esquema de **Agydra Doctor** lo detecta inmediatamente y te avisa.
 - Las ramas específicas de Windows se verifican en Windows nativo; en sistemas Unix se validan mediante la suite de pruebas unitarias aisladas.
 
 ---
@@ -596,7 +596,7 @@ python3 -m unittest discover -s tests -q
 ¡Agradecemos las contribuciones de la comunidad! Por favor respeta nuestros invariantes centrales:
 1. **Cero dependencias de terceros en runtime:** Usa estrictamente la librería estándar de Python (`sys`, `os`, `pathlib`, `fcntl`, `tempfile`, etc.).
 2. **Paridad multiplataforma:** Los cambios deben ejecutarse de forma idéntica en macOS, Linux y Windows.
-3. **Verificación exhaustiva:** Ejecuta los 563 tests antes de abrir un pull request.
+3. **Verificación exhaustiva:** Ejecuta los 646 tests antes de abrir un pull request.
 4. **Coherencia arquitectónica:** Revisa [AGENTS.md](AGENTS.md) para conocer las directrices completas.
 
 ---
@@ -615,4 +615,4 @@ Creado con ❤️ por **Jaime Andrés Restrepo** — [DragonJAR.org](https://www
 
 ---
 
-*Aviso: `agydra` es un proyecto comunitario independiente y no está afiliado, respaldado ni patrocinado por Google. `agy` y Antigravity son marcas registradas de Google LLC. Utiliza tus cuentas y tokens cumpliendo los Términos de Servicio de Google.*
+*Aviso: **Agydra** es un proyecto comunitario independiente y no está afiliado, respaldado ni patrocinado por Google. `agy` y Antigravity son marcas registradas de Google LLC. Utiliza tus cuentas y tokens cumpliendo los Términos de Servicio de Google.*
