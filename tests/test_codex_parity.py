@@ -15,6 +15,8 @@ import account
 import cli
 import engines
 import runner
+import usage
+from unittest import mock
 from conftest import BaseCase, _make_jwt
 from store import Store
 
@@ -134,6 +136,31 @@ class TestCodexParity(BaseCase):
         self.assertIsNotNone(backup_path)
         self.assertTrue(backup_path.is_file())
         self.assertFalse(self.store.exists("codexrenamed"))
+
+    @mock.patch("usage.fetch_codex_usage_payload")
+    def test_codex_usage_query_parity(self, mock_fetch):
+        mock_fetch.return_value = {
+            "email": "codex@domain.com",
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {"used_percent": 10, "reset_at": 1790000000},
+                "secondary_window": {"used_percent": 25, "reset_at": 1790100000},
+            },
+        }
+        self.store.create("cx_usage", engine="codex")
+        d = self.store.profile_data_dir("cx_usage", engine="codex")
+        (d / "auth.json").write_text(json.dumps({
+            "tokens": {"access_token": "valid_token"}
+        }), encoding="utf-8")
+
+        res = usage.query_profile_usage(self.store, "cx_usage")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.engine, "codex")
+        self.assertEqual(res.email, "codex@domain.com")
+        self.assertEqual(res.plan, "ChatGPT Plus")
+        self.assertEqual(len(res.groups), 1)
+        self.assertEqual(res.groups[0].name, "OpenAI Codex")
+        self.assertEqual(len(res.groups[0].buckets), 2)
 
 
 if __name__ == "__main__":

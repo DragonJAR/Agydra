@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import keychain
 import usage
@@ -534,6 +535,149 @@ class TestUsageRenderingHelpers(unittest.TestCase):
         self.assertEqual(summary["claude"]["weekly"], 0.46)
         self.assertEqual(summary["claude"]["five_h"], 1.0)
         self.assertEqual(summary["claude"]["available"], 0.46)
+
+    def test_extract_model_summary_includes_codex(self):
+        from datetime import datetime, timezone
+
+        t1 = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+        t2 = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
+        groups = [
+            usage.UsageGroup(
+                name="OpenAI Codex",
+                buckets=[
+                    usage.UsageBucket("codex-5h", "5 Hours", "5h", 0.95, t1),
+                    usage.UsageBucket("codex-weekly", "Weekly", "weekly", 0.80, t2),
+                ],
+            )
+        ]
+        summary = usage.extract_model_summary(groups)
+        self.assertEqual(summary["codex"]["five_h"], 0.95)
+        self.assertEqual(summary["codex"]["weekly"], 0.80)
+        self.assertEqual(summary["codex"]["available"], 0.80)
+        self.assertEqual(summary["codex"]["reset_time"], t2)
+
+    def test_parse_codex_usage_payload_success(self):
+        payload = {
+            "email": "user@example.com",
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 15,
+                    "reset_at": 1790619410,
+                },
+                "secondary_window": {
+                    "used_percent": 30,
+                    "reset_at": 1791052833,
+                },
+            },
+        }
+        groups, plan, email = usage.parse_codex_usage_payload(payload)
+        self.assertEqual(email, "user@example.com")
+        self.assertEqual(plan, "ChatGPT Plus")
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].name, "OpenAI Codex")
+        b_5h = groups[0].buckets[0]
+        b_wk = groups[0].buckets[1]
+        self.assertEqual(b_5h.id, "codex-5h")
+        self.assertAlmostEqual(b_5h.remaining_fraction, 0.85)
+        self.assertEqual(b_wk.id, "codex-weekly")
+        self.assertAlmostEqual(b_wk.remaining_fraction, 0.70)
+
+    def test_parse_codex_usage_payload_empty_or_malformed(self):
+        groups, plan, email = usage.parse_codex_usage_payload({})
+        self.assertEqual(groups, [])
+        self.assertIsNone(plan)
+        self.assertIsNone(email)
+
+        groups, plan, email = usage.parse_codex_usage_payload("not a dict")
+        self.assertEqual(groups, [])
+
+
+class TestCodexUsage(BaseCase):
+    @mock.patch("usage.fetch_codex_usage_payload")
+    def test_query_codex_usage_success(self, mock_fetch):
+        mock_fetch.return_value = {
+            "email": "test@domain.com",
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {"used_percent": 10, "reset_at": 1790000000},
+                "secondary_window": {"used_percent": 20, "reset_at": 1790100000},
+            },
+        }
+        auth_data = {
+            "tokens": {
+                "access_token": "acc_tok",
+                "refresh_token": "ref_tok",
+            }
+        }
+        data_dir = self._tmp / "codex_data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
+
+        res = usage.query_codex_usage(data_dir, "cx_prof")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.engine, "codex")
+        self.assertEqual(res.email, "test@domain.com")
+        self.assertEqual(res.plan, "ChatGPT Pro")
+        self.assertEqual(len(res.groups), 1)
+
+    @mock.patch("usage.fetch_codex_usage_payload")
+    def test_query_codex_usage_offline_fallback(self, mock_fetch):
+        import urllib.error
+
+        mock_fetch.side_effect = urllib.error.URLError("No route to host")
+        auth_data = {
+            "tokens": {
+                "access_token": "acc_tok",
+                "id_token": _make_jwt({"email": "offline@example.com"}),
+            }
+        }
+        data_dir = self._tmp / "codex_data_offline"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
+
+        res = usage.query_codex_usage(data_dir, "cx_offline")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.email, "offline@example.com")
+        self.assertEqual(res.groups, [])
+        self.assertIn("offline", res.error)
+
+    @mock.patch("usage.refresh_codex_tokens")
+    @mock.patch("usage.fetch_codex_usage_payload")
+    def test_query_codex_usage_token_refresh_on_401(self, mock_fetch, mock_refresh):
+        import urllib.error
+
+        mock_fetch.side_effect = [
+            urllib.error.HTTPError("http://...", 401, "Unauthorized", {}, None),
+            {
+                "email": "refreshed@example.com",
+                "plan_type": "team",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 5, "reset_at": 1790000000},
+                },
+            },
+        ]
+        mock_refresh.return_value = {
+            "access_token": "new_acc",
+            "refresh_token": "new_ref",
+        }
+        auth_data = {
+            "tokens": {
+                "access_token": "old_acc",
+                "refresh_token": "old_ref",
+            }
+        }
+        data_dir = self._tmp / "codex_data_ref"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
+
+        res = usage.query_codex_usage(data_dir, "cx_ref")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.plan, "ChatGPT Team")
+        self.assertEqual(mock_fetch.call_count, 2)
+        saved_auth = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved_auth["tokens"]["access_token"], "new_acc")
+        self.assertEqual(saved_auth["tokens"]["refresh_token"], "new_ref")
 
 
 if __name__ == "__main__":
