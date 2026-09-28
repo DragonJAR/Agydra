@@ -78,7 +78,6 @@ class TestCodexRunner(BaseCase):
         self.assertIn(res_codex.name, ["cx1", "cx2"])
 
     def test_cli_create_with_engine(self):
-        parser = cli.build_parser()
         rc = cli.main(["create", "my-codex", "-e", "codex", "-d", "OpenAI account"])
         self.assertEqual(rc, 0)
 
@@ -127,6 +126,38 @@ class TestCodexRunner(BaseCase):
         email = account.sync_profile_email(self.store, "cx-sync")
         self.assertEqual(email, "codex-user@dragonjar.org")
         self.assertEqual(self.store.get("cx-sync").email, "codex-user@dragonjar.org")
+
+    def test_resolver_resolve_env_var_other_engine_falls_through(self):
+        self.store.create("agy-main", engine="agy")
+        self.store.create("cx-main", engine="codex")
+        res = resolver.resolve(
+            self.store,
+            env={"AGYDRA_PROFILE": "agy-main"},
+            engine="codex",
+        )
+        self.assertEqual(res.name, "cx-main")
+
+    def test_cli_status_with_engine_and_ref(self):
+        self.store.create("cx-stat", engine="codex")
+        rc1 = cli.main(["status", "cx-stat"])
+        self.assertEqual(rc1, 0)
+        rc2 = cli.main(["status", "-e", "codex"])
+        self.assertEqual(rc2, 0)
+
+    def test_doctor_check_binary_only_codex_profiles_no_agy(self):
+        import doctor
+        # Clear agy profiles, keep only codex
+        codex_store = Store(self._tmp / "codex-only-store")
+        codex_store.create("cx-only", engine="codex")
+        (codex_store.profile_data_dir("cx-only") / "auth.json").write_text("{}", encoding="utf-8")
+        ctx = doctor._build_ctx(codex_store)
+
+        # Even with agy binary missing, check_binary must pass since no agy profiles exist
+        with mock.patch.dict(os.environ, {"AGYDRA_AGY_BIN": "/nonexistent/agy"}):
+            status, msg = doctor._check_binary(codex_store, ctx)
+            self.assertEqual(status, doctor.OK)
+            self.assertIn("codex binary:", msg)
+            self.assertNotIn("agy binary not found", msg)
 
 
 if __name__ == "__main__":

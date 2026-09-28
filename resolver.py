@@ -93,12 +93,10 @@ def resolve(
         name = store.resolve_ref(env_ref)
         if target_engine is not None:
             prof = store.get(name)
-            if prof.engine != target_engine:
-                raise StoreError(
-                    f"profile {name!r} uses engine {prof.engine!r}, "
-                    f"but engine {target_engine!r} was requested"
-                )
-        return Resolution(name, f"environment {PROFILE_ENV}={env_ref}")
+            if prof.engine == target_engine:
+                return Resolution(name, f"environment {PROFILE_ENV}={env_ref}")
+        else:
+            return Resolution(name, f"environment {PROFILE_ENV}={env_ref}")
 
     marker = _marker_resolution(store, cwd)
     if marker is not None:

@@ -492,8 +492,10 @@ def cmd_login(store: Store, args) -> int:
 
 
 def cmd_status(store: Store, args) -> int:
+    ref = getattr(args, "ref", None) or getattr(args, "profile", None)
+    engine = getattr(args, "engine", None)
     try:
-        plan = runner.build_plan(store, [])
+        plan = runner.build_plan(store, [], flag_ref=ref, engine=engine)
     except StoreError as exc:
         _error(str(exc))
         return 1
@@ -639,7 +641,6 @@ def _cmd_usage_compact(store: Store, _args) -> int:
 
     disp_w = bar_w + 6
     gem_col_w = disp_w + (13 if show_windows else 0)
-    claude_col_w = disp_w + (9 if show_windows else 0)
     prefix_w = idx_w + 1 + name_w + (account_w if show_account else 0)
 
     best_gem_val = -1.0
@@ -1367,6 +1368,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             parser.set_defaults(func=cmd_login)
         elif sub == "status":
+            parser.add_argument(
+                "ref", nargs="?",
+                help="profile name or number to inspect (default: resolved profile)",
+            )
+            parser.add_argument(
+                "-p", "--profile", dest="profile",
+                help="profile name or number to inspect",
+            )
+            parser.add_argument(
+                "-e", "--engine", choices=["agy", "codex"],
+                help="target engine: agy or codex",
+            )
             parser.add_argument(
                 "-n", "--dry-run", action="store_true",
                 help="print the launch plan (profile, binary, env) as-is",

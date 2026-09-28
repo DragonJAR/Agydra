@@ -15,7 +15,7 @@ import base64
 import binascii
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import platforms
 import store
@@ -241,7 +241,7 @@ def detect_email_source(
     store=None,
     name: Optional[str] = None,
     engine: str = "agy",
-) -> "tuple[Optional[str], Optional[str]]":
+) -> Tuple[Optional[str], Optional[str]]:
     """Like ``detect_email``, but also reports where the email came from.
 
     Returns ``(email, source)``, where ``source`` is ``"disk"`` (the

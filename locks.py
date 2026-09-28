@@ -202,7 +202,7 @@ def _same_file(fd: int, path: Path) -> bool:
 _MAX_LOCK_ATTEMPTS = 3
 
 
-def try_lock(store, name: str) -> LockHandle | None:
+def try_lock(store, name: str) -> Optional[LockHandle]:
     """Try to take the session lock for ``name``.
 
     Returns a handle, or ``None`` when another live session holds it, OR

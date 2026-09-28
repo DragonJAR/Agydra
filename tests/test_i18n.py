@@ -1,18 +1,15 @@
 """Unit tests for the i18n module and language CLI features."""
 import os
-import shutil
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import cli
 import i18n
 from conftest import BaseCase
-from models import DEFAULT_SETTINGS, Config
+from models import DEFAULT_SETTINGS
 from store import Store
 
 

@@ -429,7 +429,7 @@ class ShimInstall(unittest.TestCase):
                 res_true = bootstrap.ensure_path_shim(proj, logs.append, force=True)
             self.assertIsNone(res_false)
             self.assertIsNone(res_true)
-            self.assertTrue(any("Windows: add the venv Scripts dir to PATH" in l for l in logs))
+            self.assertTrue(any("Windows: add the venv Scripts dir to PATH" in msg for msg in logs))
 
     def test_refresh_stale_managed_shim_with_and_without_force(self):
         """A stale managed shim (with SHIM_MARKER) is refreshed both with and without force."""
@@ -447,7 +447,7 @@ class ShimInstall(unittest.TestCase):
                 res = bootstrap.ensure_path_shim(proj, logs.append, force=False)
                 self.assertEqual(res, expected)
                 self.assertIn(str(bootstrap.console_script(proj)), expected.read_text(encoding="utf-8"))
-                self.assertTrue(any("refreshing stale shim" in l for l in logs))
+                self.assertTrue(any("refreshing stale shim" in msg for msg in logs))
 
                 logs.clear()
                 shim.write_text(stale_content, encoding="utf-8")
@@ -571,8 +571,8 @@ class RunDispatch(unittest.TestCase):
                     bootstrap.install_editable = real_install_editable
 
                 self.assertEqual(code, 1)
-                self.assertTrue(any("refusing to overwrite foreign file" in l for l in captured))
-                self.assertTrue(any("(or use --force)" in l for l in captured))
+                self.assertTrue(any("refusing to overwrite foreign file" in msg for msg in captured))
+                self.assertTrue(any("(or use --force)" in msg for msg in captured))
 
     def test_run_succeeds_on_foreign_shim_with_force(self):
         """bootstrap.run(..., force=True) overwrites a foreign shim and completes setup."""
@@ -601,7 +601,7 @@ class RunDispatch(unittest.TestCase):
 
                 self.assertEqual(code, 0)
                 self.assertIn(bootstrap.SHIM_MARKER, expected.read_text(encoding="utf-8"))
-                self.assertTrue(any("setup: agydra is installed and ready" in l for l in captured))
+                self.assertTrue(any("setup: agydra is installed and ready" in msg for msg in captured))
 
 
 class RunHelperOSError(unittest.TestCase):
