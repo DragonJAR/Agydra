@@ -240,7 +240,7 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
         if identity in ctx.chain_identities:
             continue
         try:
-            resolved = entry.resolve()
+            resolved = platforms.canonical_path(entry)
         except OSError:
             continue
         if resolved.is_relative_to(ctx.store_resolved):
@@ -347,7 +347,7 @@ def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "ag
     store_root = Path(store_root)
     real_home = platforms.real_home()
     overlay = platforms.ensure_dir(store_root / platforms.OVERLAYS_DIRNAME / name)
-    store_resolved = store_root.resolve()
+    store_resolved = platforms.canonical_path(store_root)
     _, chain_identities = _ancestor_chain(real_home, store_root)
     real_codex = platforms.codex_data_dir(real_home)
     ctx = _MirrorContext(
@@ -404,8 +404,8 @@ def isolated_env(
         if not value:
             continue
         try:
-            resolved = Path(value).expanduser().resolve()
-            home_resolved = real_home.resolve()
+            resolved = platforms.canonical_path(Path(value).expanduser())
+            home_resolved = platforms.canonical_path(real_home)
         except OSError:
             continue
         if resolved == home_resolved or home_resolved in resolved.parents:

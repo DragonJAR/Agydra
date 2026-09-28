@@ -70,39 +70,73 @@ def resolve(
     flag_ref: Optional[str] = None,
     cwd: Optional[Path] = None,
     env: Optional[dict] = None,
+    engine: Optional[str] = None,
 ) -> Resolution:
     """Resolve which profile to use. Raises StoreError when none applies."""
     env = env if env is not None else os.environ
     cwd = Path(cwd) if cwd is not None else Path.cwd()
+    target_engine = engine.strip().lower() if engine else None
 
     if flag_ref is not None:
-        return Resolution(store.resolve_ref(flag_ref), f"flag --profile={flag_ref}")
+        name = store.resolve_ref(flag_ref)
+        if target_engine is not None:
+            prof = store.get(name)
+            if prof.engine != target_engine:
+                raise StoreError(
+                    f"profile {name!r} uses engine {prof.engine!r}, "
+                    f"but engine {target_engine!r} was requested"
+                )
+        return Resolution(name, f"flag --profile={flag_ref}")
 
     env_ref = env.get(PROFILE_ENV)
     if env_ref:
-        return Resolution(store.resolve_ref(env_ref), f"environment {PROFILE_ENV}={env_ref}")
+        name = store.resolve_ref(env_ref)
+        if target_engine is not None:
+            prof = store.get(name)
+            if prof.engine != target_engine:
+                raise StoreError(
+                    f"profile {name!r} uses engine {prof.engine!r}, "
+                    f"but engine {target_engine!r} was requested"
+                )
+        return Resolution(name, f"environment {PROFILE_ENV}={env_ref}")
 
     marker = _marker_resolution(store, cwd)
     if marker is not None:
-        return marker
+        if target_engine is not None:
+            prof = store.get(marker.name)
+            if prof.engine == target_engine:
+                return marker
+        else:
+            return marker
+
+    all_profiles = store.list()
+    if target_engine:
+        eligible = [p for p in all_profiles if p.engine == target_engine]
+    else:
+        eligible = [p for p in all_profiles if p.engine == "agy"] or all_profiles
 
     default = store.default_name()
-    if default:
-        if store.exists(default):
+    if default and store.exists(default):
+        def_prof = store.get(default)
+        if not target_engine or def_prof.engine == target_engine:
             return Resolution(store.resolve_ref(default), "default profile")
-        if store.names():
+        if all_profiles:
             warn(
-                f"default profile {default!r} does not exist; falling back to "
-                "the first profile (fix with: agydra default <name>)"
+                f"default profile {default!r} is for engine {def_prof.engine!r}; "
+                f"falling back to the first {target_engine} profile"
             )
 
-    names = store.names()
-    if names:
-        return Resolution(names[0], "first profile")
+    if eligible:
+        return Resolution(eligible[0].name, f"first {target_engine or 'agy'} profile")
 
+    if not all_profiles:
+        raise StoreError(
+            "no profiles exist yet; create one with: agydra create <name>, "
+            "then authenticate it with: agydra login <name>"
+        )
     raise StoreError(
-        "no profiles exist yet; create one with: agydra create <name>, "
-        "then authenticate it with: agydra login <name>"
+        f"no profiles found for engine {target_engine!r}; "
+        f"create one with: agydra create <name> -e {target_engine}"
     )
 
 
@@ -149,6 +183,13 @@ def pick_free_profile(
     session holds its lock. The auth filter and the marker precedence
     are preserved — a marker or "no tokens yet" profile still refuses.
     """
+    marker = _marker_resolution(store, Path(cwd) if cwd is not None else Path.cwd())
+    if marker is not None:
+        if engine is not None and getattr(store.get(marker.name), "engine", "agy") != engine.strip().lower():
+            pass
+        else:
+            return marker
+
     profiles = store.list()
     if engine is not None:
         target_engine = engine.strip().lower()
@@ -161,10 +202,6 @@ def pick_free_profile(
     names = [p.name for p in profiles]
     if not names:
         raise StoreError(_NO_PROFILES)
-
-    marker = _marker_resolution(store, Path(cwd) if cwd is not None else Path.cwd())
-    if marker is not None:
-        return marker
 
     if not force and len(names) < MIN_PROFILES:
         raise StoreError(_TOO_FEW)

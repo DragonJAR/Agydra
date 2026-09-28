@@ -209,10 +209,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"agydra {__version__}")
     for _key, (short, long_, takes_value, metavar, help_text) in _LAUNCH_FLAGS.items():
+        aliases = (short, long_, "--rotate") if _key == "random" else (short, long_)
         if takes_value:
-            parser.add_argument(short, long_, metavar=metavar, help=help_text)
+            parser.add_argument(*aliases, metavar=metavar, help=help_text)
         else:
-            parser.add_argument(short, long_, action="store_true", help=help_text)
+            parser.add_argument(*aliases, action="store_true", help=help_text)
     return parser
 
 
@@ -237,7 +238,7 @@ def _match_flag(token: str) -> Optional[List[Tuple[str, object, int]]]:
                 return [(key, token.split("=", 1)[1], 1)]
             if len(token) > len(short) and token.startswith(short):
                 return [(key, token[len(short):], 1)]
-        elif token == short or token == long_:
+        elif token == short or token == long_ or (key == "random" and token == "--rotate"):
             return [(key, True, 1)]
     if token.startswith("-") and not token.startswith("--") and len(token) >= 3:
         matches: List[Tuple[str, object, int]] = []
@@ -420,13 +421,13 @@ def cmd_list(store: Store, _args) -> int:
     print(paint(header, "bold"))
     for idx, profile in enumerate(profiles, start=1):
         busy = locks.is_locked(store, profile.name)
-        engine = getattr(profile, "engine", "agy") or "agy"
+        engine = profile.engine
         if busy:
             email = profile.email or "-"
         else:
             email = account.sync_profile_email(store, profile.name) or profile.email or "-"
         state = account.auth_state(
-            store.profile_data_dir(profile.name), store, profile.name, engine=engine,
+            store.profile_data_dir(profile.name, engine=engine), store, profile.name, engine=engine,
         )
         is_default = paint("*", "green", "bold") if profile.name == default else ""
         state_color = "green" if state == "authenticated" else None
@@ -462,8 +463,8 @@ def cmd_login(store: Store, args) -> int:
         name = store.resolve_ref(args.ref)
     _assert_free(store, name, "logging in")
     profile = store.get(name)
-    engine = getattr(profile, "engine", "agy") or "agy"
-    data_dir = store.profile_data_dir(name)
+    engine = profile.engine
+    data_dir = store.profile_data_dir(name, engine=engine)
     state = account.auth_state(data_dir, store, name, engine=engine)
     if state == "authenticated" and not args.dry_run and not getattr(args, "force", False):
         email = account.detect_email(data_dir, store, name, engine=engine)
@@ -494,9 +495,9 @@ def cmd_status(store: Store, args) -> int:
     if getattr(args, "dry_run", False):
         print(plan.describe())
         return 0
-    data_dir = store.profile_data_dir(plan.profile)
     profile = store.get(plan.profile)
-    engine = getattr(profile, "engine", "agy") or "agy"
+    engine = profile.engine
+    data_dir = store.profile_data_dir(plan.profile, engine=engine)
     email = profile.email or account.detect_email(data_dir, store, plan.profile, engine=engine) or "-"
     state = account.auth_state(data_dir, store, plan.profile, engine=engine)
     print(f"profile   : {plan.profile}")
@@ -737,7 +738,7 @@ def cmd_import(store: Store, args) -> int:
     name = store.resolve_ref(ref)
     _assert_free(store, name, "importing into it")
     profile = store.get(name)
-    engine = getattr(profile, "engine", "agy") or "agy"
+    engine = profile.engine
     driver = engines.get_engine(engine)
     if args.source is not None:
         real = Path(args.source).expanduser()
@@ -750,7 +751,7 @@ def cmd_import(store: Store, args) -> int:
             f"no generic {driver.binary_name} data directory found at {real} — log in once with "
             f"plain `{driver.binary_name}` to create it, then retry: agydra import " + name
         )
-    data_dir = store.profile_data_dir(name)
+    data_dir = store.profile_data_dir(name, engine=engine)
     if data_dir.exists() and any(data_dir.iterdir()):
         raise StoreError(
             f"profile {name!r} already has data ({data_dir}); "
@@ -778,10 +779,11 @@ def cmd_import(store: Store, args) -> int:
 def cmd_use(store: Store, args) -> int:
     """Write the project marker ``.agydra`` so this directory pins a profile."""
     name = store.resolve_ref(args.ref)
+    profile = store.get(name)
     marker = Path.cwd() / resolver.MARKER_FILE
     atomic_write_bytes(marker, (name + "\n").encode("utf-8"))
     print(f"pinned {marker} -> profile {name!r}")
-    print(f"agy launches in this directory will use {name!r} automatically")
+    print(f"{profile.engine} launches in this directory will use {name!r} automatically")
     return 0
 
 

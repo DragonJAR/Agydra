@@ -329,7 +329,7 @@ class Store:
     def profile_meta_path(self, name: str) -> Path:
         return self.profile_dir(name) / "profile.json"
 
-    def profile_data_dir(self, name: str) -> Path:
+    def profile_data_dir(self, name: str, engine: str = "agy") -> Path:
         return self.profile_dir(name) / "data"
 
     @staticmethod

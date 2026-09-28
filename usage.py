@@ -170,8 +170,16 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     docstring), so skipping it shortens real elapsed time, not just log
     noise.
     """
-    data_dir = store.profile_data_dir(name)
-    if auth_state(data_dir, store, name) != "authenticated":
+    profile = store.get(name)
+    engine = profile.engine
+    if engine != "agy":
+        return UsageResult(
+            name=name,
+            ok=False,
+            error=f"quota inspection is only available for 'agy' engine (profile engine is '{engine}')",
+        )
+    data_dir = store.profile_data_dir(name, engine=engine)
+    if auth_state(data_dir, store, name, engine=engine) != "authenticated":
         return UsageResult(name=name, ok=False, error="not authenticated")
 
     config = store.load_config()

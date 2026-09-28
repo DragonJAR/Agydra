@@ -263,6 +263,12 @@ class TestGatherUsageReportSurvivesPerProfileFailures(_UsageBase):
         self.assertIn("overlay error", results[0].error)
         self.assertTrue(results[1].ok, results[1].error)
 
+    def test_query_profile_usage_gracefully_skips_codex_engine(self):
+        self.store.create("cx", engine="codex")
+        res = usage.query_profile_usage(self.store, "cx")
+        self.assertFalse(res.ok)
+        self.assertIn("only available for 'agy' engine", res.error)
+
     def test_unexpected_exception_from_query_does_not_abort_the_report(self):
         self.store.create("beta")
         self._authenticate("beta")

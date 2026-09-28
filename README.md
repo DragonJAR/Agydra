@@ -424,6 +424,7 @@ Global configuration resides at `<store root>/agydra.json`:
 agydra/                     # Flat package structure (zero third-party dependencies)
 ├── agydra.py               # Bootstrap entrypoint & version definition
 ├── models.py               # Profile & Config data models
+├── engines.py              # Strategy Pattern multi-engine drivers (AgyEngine, CodexEngine)
 ├── platforms.py            # OS path detection, binary discovery, and process execution
 ├── ui.py                   # Terminal ANSI formatting and output styling
 ├── banner.py               # Terminal banner rendering
@@ -440,7 +441,7 @@ agydra/                     # Flat package structure (zero third-party dependenc
 ├── orphans.py              # Reverse store audit and orphan cleaner
 ├── usage.py                # Quota inspector and rate-limit parser
 ├── bootstrap.py            # Idempotent venv & PATH shim installer
-├── tests/                  # 540 automated unit and integration tests
+├── tests/                  # 563 automated unit and integration tests
 ├── README.md               # English documentation
 ├── README.es.md            # Spanish documentation
 ├── AGENTS.md               # Developer conventions & architectural invariants
@@ -454,18 +455,18 @@ The test suite validates mock environments, edge cases, and all platforms withou
 
 ```sh
 python3 -W error::ResourceWarning -m pytest tests/ -q
-# 537 passed, 3 skipped (on macOS) in ~45s (0 warnings)
+# 560 passed, 3 skipped (on macOS) in ~35s (0 warnings)
 
 python3 -m unittest discover -s tests -q
-# Ran 540 tests in ~45s - OK
+# Ran 563 tests in ~35s - OK
 ```
 
 ---
 
 ## ⚠️ Limitations
 
-- `agydra` manages **profiles and sessions**, not the installation or updates of the `agy` binary itself.
-- Isolation relies on `agy` deriving its configuration directory from `HOME` (or `USERPROFILE`). If a future version of `agy` alters this behavior, `agydra doctor`'s schema canary detects it immediately and alerts you.
+- `agydra` manages **profiles and sessions**, not the installation or updates of the `agy` or `codex` binaries themselves.
+- Isolation relies on each engine's environment variables (`HOME`/`USERPROFILE` for `agy`, `CODEX_HOME` for `codex`). If a future version of either binary alters this behavior, `agydra doctor`'s schema canary detects it immediately and alerts you.
 - Windows-specific branches are verified on native Windows; on Unix systems they are validated via isolated unit test suites.
 
 ---
@@ -475,7 +476,7 @@ python3 -m unittest discover -s tests -q
 We welcome community contributions! Please adhere to our core project invariants:
 1. **Zero third-party runtime dependencies:** Use strictly the Python standard library (`sys`, `os`, `pathlib`, `fcntl`, `tempfile`, etc.).
 2. **Cross-platform parity:** Changes must run identically on macOS, Linux, and Windows.
-3. **Comprehensive verification:** Run all 540 tests before opening a pull request.
+3. **Comprehensive verification:** Run all 563 tests before opening a pull request.
 4. **Architectural consistency:** Consult [AGENTS.md](AGENTS.md) for full architectural guidelines.
 
 ---

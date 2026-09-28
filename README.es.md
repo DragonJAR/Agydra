@@ -424,6 +424,7 @@ La configuración global reside en `<store root>/agydra.json`:
 agydra/                     # Estructura plana (cero dependencias de terceros)
 ├── agydra.py               # Punto de entrada para bootstrap y definición de versión
 ├── models.py               # Modelos de datos Profile y Config
+├── engines.py              # Drivers multi-motor bajo patrón Strategy (AgyEngine, CodexEngine)
 ├── platforms.py            # Detección de rutas por SO, descubrimiento de binarios y ejecución
 ├── ui.py                   # Formato ANSI en terminal y estilos de salida
 ├── banner.py               # Renderizado del logo en terminal
@@ -440,7 +441,7 @@ agydra/                     # Estructura plana (cero dependencias de terceros)
 ├── orphans.py              # Auditoría inversa del almacén y limpiador de huérfanos
 ├── usage.py                # Inspector de cuotas y parseador de límites de tasa
 ├── bootstrap.py            # Instalador idempotente de venv y shim en PATH
-├── tests/                  # 540 pruebas automáticas unitarias y de integración
+├── tests/                  # 563 pruebas automáticas unitarias y de integración
 ├── README.md               # Documentación en inglés
 ├── README.es.md            # Documentación en español
 ├── AGENTS.md               # Convenciones de desarrollo e invariantes arquitectónicos
@@ -454,18 +455,18 @@ La suite de pruebas valida entornos simulados, casos límite y todas las platafo
 
 ```sh
 python3 -W error::ResourceWarning -m pytest tests/ -q
-# 537 passed, 3 skipped (en macOS) en ~45s (0 advertencias)
+# 560 passed, 3 skipped (en macOS) en ~35s (0 advertencias)
 
 python3 -m unittest discover -s tests -q
-# Ran 540 tests en ~45s - OK
+# Ran 563 tests en ~35s - OK
 ```
 
 ---
 
 ## ⚠️ Limitaciones
 
-- `agydra` gestiona **perfiles y sesiones**, no la instalación ni las actualizaciones del binario `agy`.
-- El aislamiento depende de que `agy` derive su directorio de configuración a partir de `HOME` (o `USERPROFILE`). Si una versión futura de `agy` cambia este comportamiento, el canario de esquema de `agydra doctor` lo detecta inmediatamente y te avisa.
+- `agydra` gestiona **perfiles y sesiones**, no la instalación ni las actualizaciones de los binarios `agy` o `codex`.
+- El aislamiento depende de las variables de entorno de cada motor (`HOME`/`USERPROFILE` para `agy`, `CODEX_HOME` para `codex`). Si una versión futura de cualquiera de los binarios altera este comportamiento, el canario de esquema de `agydra doctor` lo detecta inmediatamente y te avisa.
 - Las ramas específicas de Windows se verifican en Windows nativo; en sistemas Unix se validan mediante la suite de pruebas unitarias aisladas.
 
 ---
@@ -475,7 +476,7 @@ python3 -m unittest discover -s tests -q
 ¡Agradecemos las contribuciones de la comunidad! Por favor respeta nuestros invariantes centrales:
 1. **Cero dependencias de terceros en runtime:** Usa estrictamente la librería estándar de Python (`sys`, `os`, `pathlib`, `fcntl`, `tempfile`, etc.).
 2. **Paridad multiplataforma:** Los cambios deben ejecutarse de forma idéntica en macOS, Linux y Windows.
-3. **Verificación exhaustiva:** Ejecuta los 540 tests antes de abrir un pull request.
+3. **Verificación exhaustiva:** Ejecuta los 563 tests antes de abrir un pull request.
 4. **Coherencia arquitectónica:** Revisa [AGENTS.md](AGENTS.md) para conocer las directrices completas.
 
 ---

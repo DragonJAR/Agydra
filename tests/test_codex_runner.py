@@ -83,6 +83,43 @@ class TestCodexRunner(BaseCase):
         rc = cli.main(["-p", "cx-dev", "-n", "chat", "hello"])
         self.assertEqual(rc, 0)
 
+    def test_cli_rotate_flag_alias(self):
+        self.store.create("agy1", engine="agy")
+        self.store.create("agy2", engine="agy")
+        # Setup tokens so profiles are authenticated
+        token1 = self.store.profile_data_dir("agy1") / "antigravity-cli" / "antigravity-oauth-token"
+        token1.parent.mkdir(parents=True, exist_ok=True)
+        token1.write_text(json.dumps({"token": {"access_token": "tok1", "id_token": _make_jwt({"email": "a1@example.com"})}}), encoding="utf-8")
+        token2 = self.store.profile_data_dir("agy2") / "antigravity-cli" / "antigravity-oauth-token"
+        token2.parent.mkdir(parents=True, exist_ok=True)
+        token2.write_text(json.dumps({"token": {"access_token": "tok2", "id_token": _make_jwt({"email": "a2@example.com"})}}), encoding="utf-8")
+
+        rc = cli.main(["--rotate", "-n", "chat"])
+        self.assertEqual(rc, 0)
+
+    def test_resolver_resolve_with_engine(self):
+        self.store.create("agy1", engine="agy")
+        self.store.create("cx1", engine="codex")
+        res = resolver.resolve(self.store, engine="codex")
+        self.assertEqual(res.name, "cx1")
+
+    def test_resolver_resolve_engine_mismatch_raises(self):
+        self.store.create("agy1", engine="agy")
+        with self.assertRaises(StoreError) as ctx:
+            resolver.resolve(self.store, flag_ref="agy1", engine="codex")
+        self.assertIn("requested", str(ctx.exception))
+
+    def test_sync_profile_email_for_codex(self):
+        self.store.create("cx-sync", engine="codex")
+        auth_file = self.store.profile_data_dir("cx-sync") / "auth.json"
+        jwt_tok = _make_jwt({"email": "codex-user@dragonjar.org"})
+        auth_file.write_text(json.dumps({"tokens": {"id_token": jwt_tok}}), encoding="utf-8")
+
+        import account
+        email = account.sync_profile_email(self.store, "cx-sync")
+        self.assertEqual(email, "codex-user@dragonjar.org")
+        self.assertEqual(self.store.get("cx-sync").email, "codex-user@dragonjar.org")
+
 
 if __name__ == "__main__":
     unittest.main()

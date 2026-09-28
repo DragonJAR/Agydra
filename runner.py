@@ -76,7 +76,7 @@ def build_plan(
     if random_pick:
         resolution = resolver.pick_free_profile(store, cwd=cwd, force=force, engine=engine)
     else:
-        resolution = resolver.resolve(store, flag_ref=flag_ref, cwd=cwd)
+        resolution = resolver.resolve(store, flag_ref=flag_ref, cwd=cwd, engine=engine)
     profile = store.get(resolution.name)
     driver = engines.get_engine(profile.engine)
 

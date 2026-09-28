@@ -270,12 +270,13 @@ def sync_profile_email(store, name: str) -> Optional[str]:
     """
     import locks
 
-    email, source = detect_email_source(store.profile_data_dir(name), store, name)
+    profile = store.get(name)
+    engine = getattr(profile, "engine", "agy") or "agy"
+    email, source = detect_email_source(store.profile_data_dir(name, engine=engine), store, name, engine=engine)
     if not email:
         return None
     if locks.is_locked(store, name):
         return email
-    profile = store.get(name)
     if profile.email and profile.email != email and source == _SOURCE_KEYCHAIN:
         return None
     if profile.email != email:

@@ -315,7 +315,11 @@ def _kill_process_group(proc: "subprocess.Popen") -> None:
             pass
         return
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (OSError, AttributeError):
+            pgid = proc.pid
+        os.killpg(pgid, signal.SIGKILL)
     except OSError:
         try:
             proc.kill()
