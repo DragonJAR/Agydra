@@ -169,6 +169,7 @@ class _MirrorContext(NamedTuple):
     store_identity: _Identity
     agy_data_identity: _Identity
     codex_data_identity: Optional[_Identity] = None
+    grok_data_identity: Optional[_Identity] = None
 
 
 def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorContext) -> None:
@@ -215,6 +216,7 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
         if (
             identity == ctx.agy_data_identity
             or (ctx.codex_data_identity is not None and identity == ctx.codex_data_identity)
+            or (ctx.grok_data_identity is not None and identity == ctx.grok_data_identity)
             or identity == ctx.store_identity
         ):
             continue
@@ -350,12 +352,14 @@ def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "ag
     store_resolved = platforms.canonical_path(store_root)
     _, chain_identities = _ancestor_chain(real_home, store_root)
     real_codex = platforms.codex_data_dir(real_home)
+    real_grok = platforms.grok_data_dir(real_home)
     ctx = _MirrorContext(
         chain_identities=chain_identities,
         store_resolved=store_resolved,
         store_identity=chain_identities[-1] if chain_identities else _identity(store_root),
         agy_data_identity=_identity(platforms.agy_data_dir(real_home)),
         codex_data_identity=_identity(real_codex) if real_codex.exists() else None,
+        grok_data_identity=_identity(real_grok) if real_grok.exists() else None,
     )
 
     data_link = overlay / driver.data_dir_name
@@ -417,6 +421,8 @@ def isolated_env(
     env[platforms.home_redirect_var()] = str(overlay)
     if driver.env_home_var:
         env[driver.env_home_var] = str(overlay / driver.data_dir_name)
+    if engine == "grok":
+        env["GROK_LEADER_SOCKET"] = str(overlay / driver.data_dir_name / "leader.sock")
     if platforms.is_windows() and config_windows_redirect_home:
         env["HOME"] = str(overlay)
     for xdg_var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):

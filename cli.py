@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from agydra import __version__
 import account
 import banner
+import engines
 import i18n
 import keychain
 import locks
@@ -71,7 +72,7 @@ _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
     ),
     "engine": (
         "-e", "--engine", True, "ENGINE",
-        "target CLI engine: agy (default) or codex; filters candidate profiles for -r",
+        "target CLI engine: agy (default), codex, or grok; filters candidate profiles for -r",
     ),
     "dry-run": (
         "-n", "--dry-run", False, None,
@@ -205,9 +206,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="agydra",
         description=(
             "Multi-profile launcher and workload dispatcher for AI developer CLIs "
-            "(Google Antigravity 'agy' and OpenAI Codex 'codex').\n"
+            "(Google Antigravity 'agy', OpenAI Codex 'codex', and xAI Grok 'grok').\n"
             "'agydra -p <profile> <args...>' runs the engine with that profile's "
-            "isolated data store; host credentials (~/.gemini, ~/.codex) are never modified."
+            "isolated data store; host credentials (~/.gemini, ~/.codex, ~/.grok) are never modified."
         ),
         epilog="Created by Jaime Andrés Restrepo (DragonJAR.org) — https://www.dragonjar.org",
         formatter_class=ColoredHelpFormatter,
@@ -464,8 +465,6 @@ def cmd_create(store: Store, args) -> int:
 
 
 def cmd_login(store: Store, args) -> int:
-    import engines
-
     if args.ref is None:
         name = resolver.resolve(store).name
     else:
@@ -490,6 +489,8 @@ def cmd_login(store: Store, args) -> int:
         print(f"launching {driver.binary_name} for login under profile {plan.profile!r}...")
         if engine == "codex":
             print("complete the Codex authentication flow; tokens land in the profile store")
+        elif engine == "grok":
+            print("complete the Grok authentication flow; tokens land in the profile store")
         else:
             print("complete the OAuth flow in the browser; tokens land in the profile store")
     return runner.run(plan, store=store, dry_run=args.dry_run)
@@ -582,6 +583,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
 
     agy_entries = [(p, r) for p, r in zip(profiles, results) if p.engine == "agy"]
     codex_entries = [(p, r) for p, r in zip(profiles, results) if p.engine == "codex"]
+    grok_entries = [(p, r) for p, r in zip(profiles, results) if p.engine == "grok"]
 
     lbl_profile = i18n.t("usage.header_profile", default="PROFILE")
     lbl_account = i18n.t("usage.header_account", default="ACCOUNT")
@@ -654,6 +656,9 @@ def _cmd_usage_compact(store: Store, _args) -> int:
     best_codex_val = -1.0
     best_codex_name = None
     best_codex_plan = None
+    best_grok_val = -1.0
+    best_grok_name = None
+    best_grok_plan = None
     ineligible_profiles = []
 
     if agy_entries:
@@ -830,6 +835,78 @@ def _cmd_usage_compact(store: Store, _args) -> int:
 
                 print(row_cx + cx_disp + cx_win + cx_reset_str + plan)
 
+    if grok_entries:
+        if agy_entries or codex_entries:
+            print()
+        sec_title = "■ " + i18n.t("usage.section_grok", default="XAI GROK")
+        print(paint(sec_title, "bold"))
+        print()
+
+        lbl_plan = i18n.t("usage.header_plan", default="PLAN")
+
+        hdr_gx = f" {'#':<{idx_w}} {lbl_profile:<{name_w}}"
+        if show_account:
+            hdr_gx += f"{lbl_account:<{account_w}}"
+        hdr_gx += pad(lbl_avail, disp_w)
+        hdr_gx += pad("↻", 9)
+        hdr_gx += lbl_plan
+        print(paint(hdr_gx, "bold"))
+
+        start_idx = len(agy_entries) + len(codex_entries) + 1
+        quota_w = disp_w + 9
+        for offset, (profile, result) in enumerate(grok_entries):
+            idx = start_idx + offset
+            row_gx = f" {idx:<{idx_w}} {profile.name:<{name_w}}"
+            if show_account:
+                email_raw = profile.email or result.email or "-"
+                if account_mode == "truncated":
+                    row_gx += pad(_truncate_account(email_raw, max_len=12), account_w)
+                else:
+                    row_gx += pad(email_raw, account_w)
+
+            plan = result.plan or "-"
+
+            if not result.ok:
+                if result.error == "not authenticated":
+                    status_str = paint(i18n.t("auth.not_authenticated", default="not authenticated"), "dim")
+                else:
+                    status_str = paint(f"({result.error})", "dim")
+                print(row_gx + pad(status_str, quota_w) + plan)
+            elif not result.groups:
+                if result.error and "offline" in result.error.lower():
+                    status_str = paint("─ " + i18n.t("usage.unavailable", default="unavailable"), "dim")
+                else:
+                    status_str = paint(i18n.t("auth.authenticated", default="authenticated"), "green")
+                if best_grok_name is None:
+                    best_grok_name = profile.name
+                    best_grok_plan = plan
+                print(row_gx + pad(status_str, quota_w) + plan)
+            else:
+                summary = usage.extract_model_summary(result.groups)
+                gx_avail = summary["grok"]["available"]
+                gx_reset = summary["grok"]["reset_time"]
+
+                if gx_avail is not None and gx_avail > best_grok_val:
+                    best_grok_val = gx_avail
+                    best_grok_name = profile.name
+                    best_grok_plan = plan
+                elif best_grok_name is None:
+                    best_grok_name = profile.name
+                    best_grok_plan = plan
+
+                if gx_avail is not None:
+                    gx_bar = usage.format_mini_bar(gx_avail, width=bar_w)
+                    gx_pct = round(gx_avail * 100)
+                    gx_color = usage.usage_color(gx_avail)
+                    gx_disp = pad(paint(f"{gx_bar} {gx_pct:>2}", gx_color), disp_w)
+                else:
+                    gx_disp = pad(paint("-", "dim"), disp_w)
+
+                countdown = usage.format_countdown(gx_reset) if gx_reset else "-"
+                gx_reset_str = pad(paint(f"{countdown}", "dim"), 9)
+
+                print(row_gx + gx_disp + gx_reset_str + plan)
+
     recs = []
     if best_gem_name is not None and best_gem_val >= 0:
         recs.append(f"Gemini → {best_gem_name} {round(best_gem_val * 100)}%")
@@ -840,6 +917,11 @@ def _cmd_usage_compact(store: Store, _args) -> int:
             recs.append(f"Codex → {best_codex_name} {round(best_codex_val * 100)}%")
         else:
             recs.append(f"Codex → {best_codex_name} ({best_codex_plan})")
+    if best_grok_name is not None:
+        if best_grok_val >= 0:
+            recs.append(f"Grok → {best_grok_name} {round(best_grok_val * 100)}%")
+        else:
+            recs.append(f"Grok → {best_grok_name} ({best_grok_plan or 'Active'})")
 
     if recs:
         print()
@@ -863,7 +945,7 @@ def _cmd_usage_detail(store: Store, args) -> int:
     print(f"engine    : {profile.engine}")
     if profile.email or result.email:
         print(f"email     : {profile.email or result.email}")
-    if profile.engine == "codex":
+    if profile.engine in ("codex", "grok"):
         if result.plan:
             print(f"plan      : {result.plan}")
         state_str = (
@@ -872,7 +954,7 @@ def _cmd_usage_detail(store: Store, args) -> int:
             else i18n.t("auth.not_authenticated", default="not authenticated")
         )
         print(f"status    : {state_str}")
-        print(f"data dir  : {store.profile_data_dir(name, engine='codex')}")
+        print(f"data dir  : {store.profile_data_dir(name, engine=profile.engine)}")
         if not result.ok:
             if result.error and result.error != "not authenticated":
                 _error(f"usage unavailable: {result.error}")
@@ -1005,8 +1087,6 @@ def cmd_share_config(store: Store, args) -> int:
 
 
 def cmd_import(store: Store, args) -> int:
-    import engines
-
     ref = args.ref
     looks_like_path = ref.startswith(("/", "~", ".", "\\")) or re.match(
         r"^[a-zA-Z]:[\\/]", ref
@@ -1028,7 +1108,7 @@ def cmd_import(store: Store, args) -> int:
         if not real.is_dir():
             raise StoreError(f"source directory not found: {real}")
     else:
-        real = platforms.codex_data_dir() if engine == "codex" else platforms.agy_data_dir()
+        real = platforms.real_home() / driver.data_dir_name
     if not real.is_dir():
         raise StoreError(
             f"no generic {driver.binary_name} data directory found at {real} — log in once with "
@@ -1155,9 +1235,9 @@ def cmd_language(store: Store, args) -> int:
 
 _SUBCOMMAND_HELP: Dict[str, str] = {
     "list": "show all profiles (number, email, auth, engine, busy)",
-    "create": "create an isolated profile store (-e agy|codex)",
-    "login": "run engine authentication flow isolated to a profile (agy OAuth or codex login)",
-    "import": "copy generic data dir into a profile (~/.gemini or ~/.codex auto-detected)",
+    "create": "create an isolated profile store (-e agy|codex|grok)",
+    "login": "run engine authentication flow isolated to a profile (agy, codex, or grok)",
+    "import": "copy generic data dir into a profile (~/.gemini, ~/.codex, or ~/.grok auto-detected)",
     "status": "show resolved profile, engine, binary, and credentials (zero side effects)",
     "default": "get or set the fallback default profile",
     "use": "pin a profile to the current directory (.agydra marker)",
@@ -1209,14 +1289,16 @@ def _management_help() -> str:
 
 _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
     (
-        "first run (Google Antigravity & OpenAI Codex)",
+        "first run (Antigravity, Codex & Grok)",
         [
             ("agydra setup", "one-time install of the shim and venv"),
             ("agydra create work -d 'Google workspace'", "create an agy profile (default engine)"),
             ("agydra create cx -e codex -d 'OpenAI account'", "create a codex profile"),
+            ("agydra create gk -e grok -d 'xAI account'", "create a grok profile"),
             ("agydra login work", "Google OAuth flow isolated to 'work'"),
             ("agydra login cx", "Codex authentication isolated to 'cx'"),
-            ("agydra import main", "copy generic ~/.gemini or ~/.codex into 'main'"),
+            ("agydra login gk", "Grok authentication isolated to 'gk'"),
+            ("agydra import main", "copy generic ~/.gemini, ~/.codex, or ~/.grok into 'main'"),
         ],
     ),
     (
@@ -1224,9 +1306,11 @@ _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
         [
             ("agydra -p work 'your prompt'", "launch agy with 'work'"),
             ("agydra -p cx 'your prompt'", "launch codex with 'cx' (daemonless by default)"),
+            ("agydra -p gk 'your prompt'", "launch grok with 'gk'"),
             ("agydra 'your prompt'", "launch with the default profile"),
             ("agydra -r 'your prompt'", "pick a free authenticated agy profile automatically"),
             ("agydra -e codex -r 'your prompt'", "pick a free authenticated codex profile automatically"),
+            ("agydra -e grok -r 'your prompt'", "pick a free authenticated grok profile automatically"),
         ],
     ),
     (
@@ -1240,7 +1324,7 @@ _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
             ("agydra rename old new", "rename a profile (refuses busy)"),
             ("agydra delete old", "backup ZIP + delete a profile (refuses busy)"),
             ("agydra doctor", "diagnose installation, binaries, and overlays"),
-            ("agydra usage", "aggregate quota and plan usage across agy and codex profiles"),
+            ("agydra usage", "aggregate quota and plan usage across profiles"),
             ("agydra lang es", "persist display language as Spanish (or en)"),
         ],
     ),
@@ -1355,8 +1439,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "-d", "--description", help="free-form note stored with the profile"
             )
             parser.add_argument(
-                "-e", "--engine", choices=["agy", "codex"], default="agy",
-                help="engine for this profile: agy (default) or codex",
+                "-e", "--engine", choices=engines.SUPPORTED_ENGINES, default="agy",
+                help=f"engine for this profile: {', '.join(engines.SUPPORTED_ENGINES)} (default: agy)",
             )
             parser.set_defaults(func=cmd_create)
         elif sub == "login":
@@ -1382,8 +1466,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 help="profile name or number to inspect",
             )
             parser.add_argument(
-                "-e", "--engine", choices=["agy", "codex"],
-                help="target engine: agy or codex",
+                "-e", "--engine", choices=engines.SUPPORTED_ENGINES,
+                help=f"target engine: {', '.join(engines.SUPPORTED_ENGINES)}",
             )
             parser.add_argument(
                 "-n", "--dry-run", action="store_true",
@@ -1493,7 +1577,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _warn_late_flags(values, raw)
         engine_opt = values.get("engine")
         if engine_opt is not None:
-            import engines
             engine_str = str(engine_opt).strip().lower()
             if engine_str not in engines.SUPPORTED_ENGINES:
                 _error(f"unsupported engine {engine_str!r}; choose from {', '.join(engines.SUPPORTED_ENGINES)}")

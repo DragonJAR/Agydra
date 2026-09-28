@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import account
 import platforms
 
-SUPPORTED_ENGINES = ("agy", "codex")
+SUPPORTED_ENGINES = ("agy", "codex", "grok")
 DEFAULT_ENGINE = "agy"
 
 
@@ -98,9 +98,32 @@ class CodexEngine(EngineDriver):
         return res
 
 
+class GrokEngine(EngineDriver):
+    """Driver for xAI Grok CLI (grok)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="grok",
+            binary_name="grok",
+            data_dir_name=platforms.GROK_DATA_DIR_NAME,
+            env_home_var="GROK_HOME",
+            env_bin_var=platforms.GROK_BIN_ENV,
+            needs_keychain=False,
+            config_binary_attr="grok_binary",
+            login_args=("login",),
+        )
+
+    def auth_state(self, data_dir: Path, store: Any = None, profile_name: str = "") -> str:
+        return account.auth_state(data_dir, store=store, name=profile_name, engine="grok")
+
+    def detect_email(self, data_dir: Path, store: Any = None, profile_name: str = "") -> Optional[str]:
+        return account.detect_email(data_dir, store=store, name=profile_name, engine="grok")
+
+
 _REGISTRY: Dict[str, EngineDriver] = {
     "agy": AgyEngine(),
     "codex": CodexEngine(),
+    "grok": GrokEngine(),
 }
 
 

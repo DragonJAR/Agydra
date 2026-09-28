@@ -73,6 +73,10 @@ OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 OPENAI_REFRESH_URL = "https://auth.openai.com/oauth/token"
 OPENAI_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
+GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+GROK_SETTINGS_URL = "https://cli-chat-proxy.grok.com/v1/settings"
+GROK_TOKEN_AUTH_HEADER = "xai-grok-cli"
+
 ProgressCallback = Callable[[int, int, str], None]
 
 
@@ -113,14 +117,23 @@ class BucketColumn:
 
 
 def _parse_reset_time(raw: object) -> Optional[datetime]:
-    """Decode an ISO-8601 UTC ``reset_time`` (``...Z`` suffix).
+    """Decode an ISO-8601 UTC ``reset_time`` or unix timestamp.
 
     ``datetime.fromisoformat`` only accepts the trailing ``Z`` shorthand
     starting with Python 3.11; this project's floor is 3.9, so the ``Z``
-    is normalized to ``+00:00`` by hand before parsing. Malformed/missing
+    is normalized to ``+00:00`` by hand before parsing. Numeric timestamps
+    (seconds or milliseconds) are also supported. Malformed/missing
     values degrade to ``None`` rather than raising -- callers treat a
     bucket with no reset time as "unknown", never a hard error.
     """
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        try:
+            ts = float(raw)
+            if ts > 1e11:  # Milliseconds since epoch
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
     if not isinstance(raw, str) or not raw:
         return None
     text = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
@@ -424,6 +437,201 @@ def query_codex_usage(
     )
 
 
+def fetch_grok_billing_payload(token: str, *, timeout: float = 10.0) -> Optional[dict]:
+    """Query xAI Grok cli-chat-proxy billing endpoint using a Bearer token."""
+    req = urllib.request.Request(
+        GROK_BILLING_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "x-xai-token-auth": GROK_TOKEN_AUTH_HEADER,
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        return data if isinstance(data, dict) else None
+
+
+def fetch_grok_settings_payload(token: str, *, timeout: float = 4.0) -> Optional[dict]:
+    """Query xAI Grok cli-chat-proxy settings endpoint for subscription tier display."""
+    req = urllib.request.Request(
+        GROK_SETTINGS_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "x-xai-token-auth": GROK_TOKEN_AUTH_HEADER,
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def parse_grok_billing_payload(
+    payload: dict,
+) -> Tuple[List[UsageGroup], Optional[datetime]]:
+    """Parse Grok cli-chat-proxy/v1/billing JSON into UsageGroup and reset time."""
+    if not isinstance(payload, dict):
+        return [], None
+
+    cfg = payload.get("config")
+    if not isinstance(cfg, dict):
+        return [], None
+
+    used_pct = cfg.get("creditUsagePercent")
+    if not isinstance(used_pct, (int, float)) or isinstance(used_pct, bool):
+        ondemand_used = (
+            cfg.get("onDemandUsed", {}).get("val")
+            if isinstance(cfg.get("onDemandUsed"), dict)
+            else None
+        )
+        ondemand_cap = (
+            cfg.get("onDemandCap", {}).get("val")
+            if isinstance(cfg.get("onDemandCap"), dict)
+            else None
+        )
+        if (
+            isinstance(ondemand_used, (int, float))
+            and isinstance(ondemand_cap, (int, float))
+            and ondemand_cap > 0
+        ):
+            used_pct = (float(ondemand_used) / float(ondemand_cap)) * 100.0
+        else:
+            used_pct = None
+
+    if used_pct is None:
+        return [], None
+
+    rem = max(0.0, min(1.0, (100.0 - float(used_pct)) / 100.0))
+
+    reset_raw = None
+    curr_period = cfg.get("currentPeriod")
+    if isinstance(curr_period, dict):
+        reset_raw = curr_period.get("end")
+    if not reset_raw:
+        reset_raw = cfg.get("billingPeriodEnd")
+
+    reset_dt = _parse_reset_time(reset_raw) if reset_raw else None
+
+    bucket = UsageBucket(
+        id="grok-weekly",
+        name="Weekly",
+        window="weekly",
+        remaining_fraction=rem,
+        reset_time=reset_dt,
+    )
+    return [UsageGroup(name="xAI Grok", buckets=[bucket])], reset_dt
+
+
+def query_grok_usage(
+    data_dir: Path,
+    name: str,
+    *,
+    email: Optional[str] = None,
+    plan: Optional[str] = None,
+    timeout: float = DEFAULT_TIMEOUT_S,
+) -> UsageResult:
+    """Query xAI Grok usage and billing via cli-chat-proxy. Never raises."""
+    import account
+
+    auth_info = account.inspect_grok_auth(data_dir)
+    detected_plan = plan or account.detect_grok_plan(data_dir)
+    detected_email = email or account.detect_grok_email(data_dir)
+
+    if auth_info is None:
+        return UsageResult(
+            name=name,
+            ok=False,
+            engine="grok",
+            email=detected_email,
+            plan=detected_plan,
+            error="not authenticated",
+        )
+
+    if auth_info.get("auth_type") == "api_key":
+        return UsageResult(
+            name=name,
+            ok=True,
+            engine="grok",
+            email=detected_email,
+            plan=detected_plan or "xAI API Key",
+        )
+
+    token = auth_info.get("token") or auth_info.get("key")
+    if not token:
+        return UsageResult(
+            name=name,
+            ok=False,
+            engine="grok",
+            email=detected_email,
+            plan=detected_plan,
+            error="missing access token",
+        )
+
+    billing_payload = None
+    try:
+        billing_payload = fetch_grok_billing_payload(token, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return UsageResult(
+                name=name,
+                ok=False,
+                engine="grok",
+                email=detected_email,
+                plan=detected_plan,
+                error="session expired (401)",
+            )
+        else:
+            return UsageResult(
+                name=name,
+                ok=True,
+                engine="grok",
+                email=detected_email,
+                plan=detected_plan or "Grok (xAI)",
+                error=f"usage unavailable (HTTP {exc.code})",
+            )
+    except Exception as exc:
+        return UsageResult(
+            name=name,
+            ok=True,
+            engine="grok",
+            email=detected_email,
+            plan=detected_plan or "Grok (xAI)",
+            error=f"offline ({exc})",
+        )
+
+    final_plan = detected_plan
+    settings_payload = fetch_grok_settings_payload(token, timeout=min(timeout, 4.0))
+    if isinstance(settings_payload, dict):
+        tier_display = settings_payload.get("subscription_tier_display")
+        if isinstance(tier_display, str) and tier_display:
+            final_plan = tier_display
+
+    if not billing_payload:
+        return UsageResult(
+            name=name,
+            ok=True,
+            engine="grok",
+            email=detected_email,
+            plan=final_plan or "Grok (xAI)",
+        )
+
+    groups, _ = parse_grok_billing_payload(billing_payload)
+    return UsageResult(
+        name=name,
+        ok=True,
+        engine="grok",
+        email=detected_email,
+        plan=final_plan or "Grok (xAI)",
+        groups=groups,
+    )
+
+
 def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S) -> UsageResult:
     """Query one profile's quota usage or engine status. Never raises.
 
@@ -439,6 +647,14 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
 
     if engine == "codex":
         return query_codex_usage(
+            data_dir,
+            name,
+            email=profile.email,
+            timeout=timeout,
+        )
+
+    if engine == "grok":
+        return query_grok_usage(
             data_dir,
             name,
             email=profile.email,
@@ -590,11 +806,12 @@ def format_mini_bar(remaining_fraction: float, width: int = 10) -> str:
 
 
 def extract_model_summary(groups: List[UsageGroup]) -> dict:
-    """Extract quota availability for standard model families ('gemini', 'claude', 'codex')."""
+    """Extract quota availability for standard model families ('gemini', 'claude', 'codex', 'grok')."""
     summary = {
         "gemini": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
         "claude": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
         "codex": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
+        "grok": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
     }
     for group in groups:
         lower_name = group.name.lower()
@@ -605,6 +822,8 @@ def extract_model_summary(groups: List[UsageGroup]) -> dict:
             key = "claude"
         elif any(k in lower_name for k in ("codex", "openai")):
             key = "codex"
+        elif any(k in lower_name for k in ("grok", "xai")):
+            key = "grok"
         elif summary["gemini"]["available"] is None:
             key = "gemini"
         elif summary["claude"]["available"] is None:
@@ -623,7 +842,7 @@ def extract_model_summary(groups: List[UsageGroup]) -> dict:
                 summary[key]["five_h"] = bucket.remaining_fraction
                 summary[key]["five_h_reset"] = bucket.reset_time
 
-    for key in ("gemini", "claude", "codex"):
+    for key in ("gemini", "claude", "codex", "grok"):
         w = summary[key]["weekly"]
         f = summary[key]["five_h"]
         w_reset = summary[key].get("weekly_reset")
