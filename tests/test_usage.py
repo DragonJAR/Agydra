@@ -263,11 +263,25 @@ class TestGatherUsageReportSurvivesPerProfileFailures(_UsageBase):
         self.assertIn("overlay error", results[0].error)
         self.assertTrue(results[1].ok, results[1].error)
 
-    def test_query_profile_usage_gracefully_skips_codex_engine(self):
+    def test_query_profile_usage_gracefully_handles_codex_engine(self):
         self.store.create("cx", engine="codex")
         res = usage.query_profile_usage(self.store, "cx")
         self.assertFalse(res.ok)
-        self.assertIn("only available for 'agy' engine", res.error)
+        self.assertEqual(res.engine, "codex")
+        self.assertEqual(res.error, "not authenticated")
+
+        # Now authenticate with a fake auth.json
+        data_dir = self.store.profile_data_dir("cx", engine="codex")
+        auth_file = data_dir / "auth.json"
+        auth_file.write_text(
+            json.dumps({"OPENAI_API_KEY": "sk-test-key"}),
+            encoding="utf-8",
+        )
+        res_auth = usage.query_profile_usage(self.store, "cx")
+        self.assertTrue(res_auth.ok)
+        self.assertEqual(res_auth.engine, "codex")
+        self.assertEqual(res_auth.plan, "OpenAI API Key")
+
 
     def test_unexpected_exception_from_query_does_not_abort_the_report(self):
         self.store.create("beta")
@@ -487,5 +501,41 @@ class TestUsageRenderingHelpers(unittest.TestCase):
         self.assertEqual(usage.format_countdown(now - timedelta(minutes=1), now=now), "now")
 
 
+    def test_format_mini_bar_renders_exact_proportions(self):
+        self.assertEqual(usage.format_mini_bar(0.0), "░░░░░░░░░░")
+        self.assertEqual(usage.format_mini_bar(1.0), "██████████")
+        self.assertEqual(usage.format_mini_bar(0.31), "███░░░░░░░")
+        self.assertEqual(usage.format_mini_bar(0.09), "█░░░░░░░░░")
+        self.assertEqual(usage.format_mini_bar(0.86), "█████████░")
+        self.assertEqual(usage.format_mini_bar(0.52), "█████░░░░░")
+        self.assertEqual(usage.format_mini_bar(0.74), "███████░░░")
+
+    def test_extract_model_summary_standard_groups(self):
+        groups = [
+            usage.UsageGroup(
+                name="Gemini Models",
+                buckets=[
+                    usage.UsageBucket("gemini-weekly", "W", "weekly", 0.85, None),
+                    usage.UsageBucket("gemini-5h", "5H", "5h", 0.93, None),
+                ],
+            ),
+            usage.UsageGroup(
+                name="Claude and GPT models",
+                buckets=[
+                    usage.UsageBucket("3p-weekly", "W", "weekly", 0.46, None),
+                    usage.UsageBucket("3p-5h", "5H", "5h", 1.0, None),
+                ],
+            ),
+        ]
+        summary = usage.extract_model_summary(groups)
+        self.assertEqual(summary["gemini"]["weekly"], 0.85)
+        self.assertEqual(summary["gemini"]["five_h"], 0.93)
+        self.assertEqual(summary["gemini"]["available"], 0.85)
+        self.assertEqual(summary["claude"]["weekly"], 0.46)
+        self.assertEqual(summary["claude"]["five_h"], 1.0)
+        self.assertEqual(summary["claude"]["available"], 0.46)
+
+
 if __name__ == "__main__":
     unittest.main()
+

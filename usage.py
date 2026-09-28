@@ -90,6 +90,10 @@ class UsageResult:
     ok: bool
     groups: List[UsageGroup] = field(default_factory=list)
     error: Optional[str] = None
+    engine: str = "agy"
+    email: Optional[str] = None
+    plan: Optional[str] = None
+    is_ineligible: bool = False
 
 
 @dataclass
@@ -162,7 +166,7 @@ def _parse_groups(raw: object) -> List[UsageGroup]:
 
 
 def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S) -> UsageResult:
-    """Query one profile's quota usage. Never raises.
+    """Query one profile's quota usage or engine status. Never raises.
 
     Short-circuits with NO subprocess spawned at all when the profile is
     not authenticated: a doomed query is a wasted round trip, and every
@@ -172,21 +176,38 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     """
     profile = store.get(name)
     engine = profile.engine
-    if engine != "agy":
+    data_dir = store.profile_data_dir(name, engine=engine)
+    state = auth_state(data_dir, store, name, engine=engine)
+
+    if engine == "codex":
+        import account
+        plan = account.detect_codex_plan(data_dir)
+        email = profile.email or account.detect_codex_email(data_dir)
+        if state != "authenticated":
+            return UsageResult(
+                name=name,
+                ok=False,
+                engine="codex",
+                email=email,
+                plan=plan,
+                error="not authenticated",
+            )
         return UsageResult(
             name=name,
-            ok=False,
-            error=f"quota inspection is only available for 'agy' engine (profile engine is '{engine}')",
+            ok=True,
+            engine="codex",
+            email=email,
+            plan=plan or "ChatGPT Plus",
         )
-    data_dir = store.profile_data_dir(name, engine=engine)
-    if auth_state(data_dir, store, name, engine=engine) != "authenticated":
-        return UsageResult(name=name, ok=False, error="not authenticated")
+
+    if state != "authenticated":
+        return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error="not authenticated")
 
     config = store.load_config()
     binary = platforms.resolve_agy_binary(config.agy_binary)
     if binary is None:
         return UsageResult(
-            name=name, ok=False,
+            name=name, ok=False, engine=engine, email=profile.email,
             error=f"agy binary not found (set {platforms.AGY_BIN_ENV} or PATH)",
         )
 
@@ -197,7 +218,7 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
         # filesystem errors (e.g. FileExistsError when a concurrent
         # session recreates the .gemini link mid-build) instead of the
         # typed IsolationError -- same failure point, same degradation.
-        return UsageResult(name=name, ok=False, error=f"overlay error: {exc}")
+        return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error=f"overlay error: {exc}")
 
     env = isolation.isolated_env(
         overlay,
@@ -218,26 +239,30 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
                 errors="replace",
             )
     except subprocess.TimeoutExpired:
-        return UsageResult(name=name, ok=False, error="timed out")
+        return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error="timed out")
     except (OSError, ValueError) as exc:
-        return UsageResult(name=name, ok=False, error=f"could not run agy: {exc}")
+        return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error=f"could not run agy: {exc}")
 
     if proc.returncode != 0:
         detail_lines = (proc.stderr or "").strip().splitlines()
         suffix = f": {detail_lines[0]}" if detail_lines else ""
+        err_msg = f"agy exited {proc.returncode}{suffix}"
+        ineligible = "eligibility check failed" in err_msg.lower() or "not eligible" in err_msg.lower()
         return UsageResult(
-            name=name, ok=False, error=f"agy exited {proc.returncode}{suffix}"
+            name=name, ok=False, engine=engine, email=profile.email, error=err_msg, is_ineligible=ineligible
         )
 
     try:
         payload = json.loads(proc.stdout)
     except (json.JSONDecodeError, TypeError):
-        return UsageResult(name=name, ok=False, error="non-JSON response")
+        return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error="non-JSON response")
 
     if not isinstance(payload, dict) or payload.get("status") != "SUCCESS":
         message = payload.get("error") if isinstance(payload, dict) else None
+        err_msg = str(message) if message else "not eligible"
+        ineligible = "eligibility" in err_msg.lower() or "not eligible" in err_msg.lower()
         return UsageResult(
-            name=name, ok=False, error=str(message) if message else "not eligible"
+            name=name, ok=False, engine=engine, email=profile.email, error=err_msg, is_ineligible=ineligible
         )
 
     command = payload.get("command")
@@ -245,9 +270,9 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     groups_raw = data.get("groups") if isinstance(data, dict) else None
     groups = _parse_groups(groups_raw)
     if not groups:
-        return UsageResult(name=name, ok=False, error="no usage data in response")
+        return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error="no usage data in response")
 
-    return UsageResult(name=name, ok=True, groups=groups)
+    return UsageResult(name=name, ok=True, engine=engine, email=profile.email, groups=groups)
 
 
 def gather_usage_report(
@@ -308,6 +333,55 @@ def usage_color(remaining_fraction: float) -> str:
     if remaining_fraction >= 0.2:
         return "yellow"
     return "red"
+
+
+def format_mini_bar(remaining_fraction: float, width: int = 10) -> str:
+    """Format a compact fixed-width gauge using filled and empty blocks: e.g. '███░░░░░░░'."""
+    clamped = max(0.0, min(1.0, float(remaining_fraction)))
+    filled = round(clamped * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def extract_model_summary(groups: List[UsageGroup]) -> dict:
+    """Extract quota availability for standard model families ('gemini' and 'claude')."""
+    summary = {
+        "gemini": {"weekly": None, "five_h": None, "available": None},
+        "claude": {"weekly": None, "five_h": None, "available": None},
+    }
+    for group in groups:
+        lower_name = group.name.lower()
+        key = None
+        if "gemini" in lower_name:
+            key = "gemini"
+        elif any(k in lower_name for k in ("claude", "gpt", "3p")):
+            key = "claude"
+        elif summary["gemini"]["available"] is None:
+            key = "gemini"
+        elif summary["claude"]["available"] is None:
+            key = "claude"
+
+        if key is None:
+            continue
+
+        for bucket in group.buckets:
+            win = bucket.window.lower()
+            bid = bucket.id.lower()
+            if "weekly" in win or "weekly" in bid:
+                summary[key]["weekly"] = bucket.remaining_fraction
+            elif "5h" in win or "5h" in bid:
+                summary[key]["five_h"] = bucket.remaining_fraction
+
+    for key in ("gemini", "claude"):
+        w = summary[key]["weekly"]
+        f = summary[key]["five_h"]
+        if w is not None and f is not None:
+            summary[key]["available"] = min(w, f)
+        elif w is not None:
+            summary[key]["available"] = w
+        elif f is not None:
+            summary[key]["available"] = f
+
+    return summary
 
 
 def _abbreviate_group(name: str) -> str:

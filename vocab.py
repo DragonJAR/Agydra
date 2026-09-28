@@ -24,6 +24,7 @@ SUBCOMMAND_ALIASES: Dict[str, Tuple[str, ...]] = {
     "doctor": ("doc",),
     "usage": ("us",),
     "setup": ("install",),
+    "language": ("lang", "idioma", "locale"),
     "help": ("h",),
     "version": (),
 }

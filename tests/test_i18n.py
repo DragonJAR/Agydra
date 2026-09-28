@@ -1,0 +1,98 @@
+"""Unit tests for the i18n module and language CLI features."""
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import cli
+import i18n
+from conftest import BaseCase
+from models import DEFAULT_SETTINGS, Config
+from store import Store
+
+
+class TestI18nModule(unittest.TestCase):
+    def setUp(self):
+        self.orig_active = i18n._get_active()
+        self.orig_env = os.environ.get("AGYDRA_LANG")
+
+    def tearDown(self):
+        i18n._set_active(self.orig_active)
+        if self.orig_env is not None:
+            os.environ["AGYDRA_LANG"] = self.orig_env
+        else:
+            os.environ.pop("AGYDRA_LANG", None)
+
+    def test_default_settings_has_lang_auto(self):
+        self.assertIn("lang", DEFAULT_SETTINGS)
+        self.assertEqual(DEFAULT_SETTINGS["lang"], "auto")
+
+    def test_translation_en_and_es(self):
+        i18n._set_active("en")
+        self.assertEqual(i18n.t("cmd.create.ok", name="test"), "Profile 'test' created.")
+        i18n._set_active("es")
+        self.assertEqual(i18n.t("cmd.create.ok", name="test"), "Perfil 'test' creado.")
+
+    def test_fallback_cascade(self):
+        i18n._set_active("es")
+        # Clave inexistente en es pero sí en default
+        self.assertEqual(i18n.t("non.existent.key", default="fallback"), "fallback")
+        # Clave inexistente en todos lados devuelve la clave
+        self.assertEqual(i18n.t("non.existent.key"), "non.existent.key")
+
+    def test_resolve_language_cascade(self):
+        # 1. flag_lang
+        self.assertEqual(i18n.resolve_language(flag_lang="es"), "es")
+        self.assertEqual(i18n._get_active(), "es")
+
+        # 2. env var
+        os.environ["AGYDRA_LANG"] = "en"
+        self.assertEqual(i18n.resolve_language(), "en")
+        self.assertEqual(i18n._get_active(), "en")
+
+        os.environ.pop("AGYDRA_LANG", None)
+
+    def test_set_language_validation(self):
+        with self.assertRaises(ValueError):
+            i18n.set_language(None, "invalid_lang")
+
+
+class TestI18nCli(BaseCase):
+    def test_global_flag_lang_persists(self):
+        res = self._run_cli("--lang", "es")
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Idioma cambiado a Español y guardado.", res.stdout)
+        cfg = Store(self.store_root).load_config()
+        self.assertEqual(cfg.settings.get("lang"), "es")
+
+    def test_global_flag_lang_with_equals(self):
+        res = self._run_cli("--lang=en")
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Language set to English and saved.", res.stdout)
+        cfg = Store(self.store_root).load_config()
+        self.assertEqual(cfg.settings.get("lang"), "en")
+
+    def test_subcommand_language_set_and_query(self):
+        res = self._run_cli("language", "es")
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Idioma establecido en 'es' y guardado.", res.stdout)
+
+        res_query = self._run_cli("language")
+        self.assertEqual(res_query.returncode, 0)
+        self.assertIn("Idioma actual: es", res_query.stdout)
+
+    def test_subcommand_aliases(self):
+        res = self._run_cli("lang", "en")
+        self.assertEqual(res.returncode, 0)
+        res_idioma = self._run_cli("idioma")
+        self.assertEqual(res_idioma.returncode, 0)
+        self.assertIn("Current language: en", res_idioma.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

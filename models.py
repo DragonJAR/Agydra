@@ -69,6 +69,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "use_linux_sandbox": False,
     "copy_settings_on_create": True,
     "windows_redirect_home": False,
+    "lang": "auto",
 }
 
 

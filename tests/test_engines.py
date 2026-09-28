@@ -55,6 +55,16 @@ class TestEngineDriverRegistry(BaseCase):
         resolved = driver.resolve_binary(str(explicit_bin))
         self.assertEqual(resolved, explicit_bin)
 
+    def test_prepare_args_agy_unchanged(self):
+        driver = engines.get_engine("agy")
+        self.assertEqual(driver.prepare_args(["chat"]), ["chat"])
+
+    def test_prepare_args_codex_injects_no_daemon(self):
+        driver = engines.get_engine("codex")
+        self.assertEqual(driver.prepare_args([]), ["--no-daemon"])
+        self.assertEqual(driver.prepare_args(["chat"]), ["--no-daemon", "chat"])
+        self.assertEqual(driver.prepare_args(["--no-daemon", "chat"]), ["--no-daemon", "chat"])
+
 
 if __name__ == "__main__":
     unittest.main()

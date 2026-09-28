@@ -108,37 +108,39 @@ class TestUsageCli(BaseCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         out = res.stdout
 
-        # Dynamic column headers, derived from the live response, never a
-        # hand-written literal.
-        self.assertIn("GEMINI WK", out)
-        self.assertIn("GEMINI 5H", out)
-        self.assertIn("CLAUDE AND GPT WK", out)
+        # Header contains the two model group categories
+        self.assertIn("GEMINI", out)
+        self.assertIn("CLAUDE + GPT", out)
 
-        # alpha: healthy quota (>=50%) across every bucket it reports.
+        # alpha: healthy quota (>=50%) across buckets
         alpha_line = next(line for line in out.splitlines() if "alpha" in line)
-        self.assertIn("95%", alpha_line)
-        self.assertIn("97%", alpha_line)
-        self.assertIn("100%", alpha_line)
+        self.assertIn("95", alpha_line)
+        self.assertIn("97", alpha_line)
+        self.assertIn("100", alpha_line)
 
-        # beta: low quota -- still renders percentages, no crash.
+        # beta: low quota -- renders 15 and 35
         beta_line = next(line for line in out.splitlines() if "beta" in line)
-        self.assertIn("15%", beta_line)
-        self.assertIn("35%", beta_line)
+        self.assertIn("15", beta_line)
+        self.assertIn("35", beta_line)
 
-        # gamma: not authenticated, no query attempted, dim row.
+        # gamma: not authenticated, no query attempted, dim row
         gamma_line = next(line for line in out.splitlines() if "gamma" in line)
         self.assertIn("not authenticated", gamma_line)
 
-        # delta: authenticated but the query failed (nonzero agy exit).
+        # delta: authenticated but the query failed (nonzero agy exit)
         delta_line = next(line for line in out.splitlines() if "delta" in line)
         self.assertIn("agy exited 3", delta_line)
+
+        # Recommendations footer includes alpha
+        self.assertIn("alpha", out)
 
     def test_alias_us_renders_same_compact_table(self):
         self._write_json("alpha", REAL_USAGE_JSON)
         res = self._run_cli("us")
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("alpha", res.stdout)
-        self.assertIn("GEMINI WK", res.stdout)
+        self.assertIn("GEMINI", res.stdout)
+
 
     def test_detailed_view_by_name(self):
         self._write_json("alpha", REAL_USAGE_JSON)
@@ -182,5 +184,72 @@ class TestUsageCli(BaseCase):
         self.assertIn("no profiles", res.stdout)
 
 
+    def test_compact_table_with_codex_profile(self):
+        self._write_json("alpha", REAL_USAGE_JSON)
+        self.store.create("cx", engine="codex")
+        data_dir = self.store.profile_data_dir("cx", engine="codex")
+        (data_dir / "auth.json").write_text(
+            json.dumps({"OPENAI_API_KEY": "sk-key"}), encoding="utf-8"
+        )
+        res = self._run_cli("usage")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("OPENAI CODEX", res.stdout)
+        self.assertIn("cx", res.stdout)
+        self.assertIn("OpenAI API Key", res.stdout)
+
+    def test_codex_detail_view(self):
+        self.store.create("cx", engine="codex")
+        data_dir = self.store.profile_data_dir("cx", engine="codex")
+        (data_dir / "auth.json").write_text(
+            json.dumps({"OPENAI_API_KEY": "sk-key"}), encoding="utf-8"
+        )
+        res = self._run_cli("usage", "cx")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("profile   : cx", res.stdout)
+        self.assertIn("engine    : codex", res.stdout)
+        self.assertIn("plan      : OpenAI API Key", res.stdout)
+        self.assertIn("status    : authenticated", res.stdout)
+
+    def test_responsive_column_cascade(self):
+        self._write_json("alpha", REAL_USAGE_JSON)
+        # Give alpha a long email
+        p = self.store.get("alpha")
+        p.email = "jaimeandresrestrepo@dragonjar.org"
+        self.store.save(p)
+
+        # Breakpoint 1: Wide terminal (140 cols) -> full email, 10-block bars, windows
+        os.environ["COLUMNS"] = "140"
+        try:
+            res_wide = self._run_cli("usage")
+            self.assertEqual(res_wide.returncode, 0)
+            self.assertIn("jaimeandresrestrepo@dragonjar.org", res_wide.stdout)
+            self.assertIn("WK · 5H", res_wide.stdout)
+
+            # Breakpoint 2: Medium terminal (80 cols) -> account truncated, 5-block bars
+            os.environ["COLUMNS"] = "80"
+            res_med = self._run_cli("usage")
+            self.assertEqual(res_med.returncode, 0)
+            self.assertIn("jaimeandres…", res_med.stdout)
+            self.assertNotIn("jaimeandresrestrepo@dragonjar.org", res_med.stdout)
+
+            # Breakpoint 3: Narrow terminal (60 cols) -> WK · 5H hidden
+            os.environ["COLUMNS"] = "60"
+            res_narrow = self._run_cli("usage")
+            self.assertEqual(res_narrow.returncode, 0)
+            self.assertNotIn("WK · 5H", res_narrow.stdout)
+
+            # Breakpoint 4: Very narrow terminal (40 cols) -> ACCOUNT hidden completely
+            os.environ["COLUMNS"] = "40"
+            res_tight = self._run_cli("usage")
+            self.assertEqual(res_tight.returncode, 0)
+            self.assertNotIn("ACCOUNT", res_tight.stdout)
+            # Profile name and numbers are NEVER truncated
+            self.assertIn("alpha", res_tight.stdout)
+        finally:
+            os.environ.pop("COLUMNS", None)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+

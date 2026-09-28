@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import sys
@@ -12,11 +13,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from agydra import __version__
 import account
 import banner
+import i18n
 import keychain
 import locks
 import platforms
 import resolver
 import runner
+import ui
 import usage
 import vocab
 from bootstrap import BootstrapError
@@ -68,7 +71,7 @@ _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
     ),
     "engine": (
         "-e", "--engine", True, "ENGINE",
-        "target CLI engine: agy (default) or codex",
+        "target CLI engine: agy (default) or codex; filters candidate profiles for -r",
     ),
     "dry-run": (
         "-n", "--dry-run", False, None,
@@ -76,7 +79,7 @@ _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
     ),
     "binary": (
         "-b", "--binary", True, "PATH",
-        "path to the real agy binary (overrides config and PATH lookup)",
+        "path to the engine executable (overrides config and PATH lookup)",
     ),
     "force": (
         "-f", "--force", False, None,
@@ -201,9 +204,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agydra",
         description=(
-            "Multi-profile launcher for the agy CLI. "
-            "'agydra -p <profile> <agy args...>' runs agy with that profile's "
-            "isolated OAuth store; the real ~/.gemini is never modified."
+            "Multi-profile launcher and workload dispatcher for AI developer CLIs "
+            "(Google Antigravity 'agy' and OpenAI Codex 'codex').\n"
+            "'agydra -p <profile> <args...>' runs the engine with that profile's "
+            "isolated data store; host credentials (~/.gemini, ~/.codex) are never modified."
         ),
         formatter_class=ColoredHelpFormatter,
     )
@@ -550,6 +554,14 @@ def cmd_usage(store: Store, args) -> int:
     return _cmd_usage_compact(store, args)
 
 
+def _truncate_account(email: Optional[str], max_len: int = 12) -> str:
+    if not email or email == "-":
+        return "-"
+    if len(email) <= max_len:
+        return email
+    return email[:max_len - 1] + "…"
+
+
 def _cmd_usage_compact(store: Store, _args) -> int:
     profiles = store.list()
     if not profiles:
@@ -561,34 +573,228 @@ def _cmd_usage_compact(store: Store, _args) -> int:
     finally:
         _clear_usage_progress(sys.stderr)
 
-    columns = usage.collect_bucket_columns(results)
-    name_width = max(max(len(n) for n in names), len(_PROFILE_LABEL))
-    col_widths = [max(_USAGE_MIN_COL_WIDTH, len(col.header) + 1) for col in columns]
-    total_col_width = sum(col_widths) or _USAGE_MIN_COL_WIDTH
+    agy_entries = [(p, r) for p, r in zip(profiles, results) if p.engine == "agy"]
+    codex_entries = [(p, r) for p, r in zip(profiles, results) if p.engine == "codex"]
 
-    header = f"{'#':<3}{_PROFILE_LABEL:<{name_width + 2}}{'EMAIL':<{_EMAIL_COL_WIDTH}}"
-    for column, width in zip(columns, col_widths):
-        header += f"{column.header:<{width}}"
-    print(paint(header, "bold"))
+    lbl_profile = i18n.t("usage.header_profile", default="PROFILE")
+    lbl_account = i18n.t("usage.header_account", default="ACCOUNT")
+    lbl_avail = i18n.t("usage.header_available", default="AVAILABLE")
+    lbl_windows = i18n.t("usage.header_windows", default="WK · 5H")
 
-    for idx, (profile, result) in enumerate(zip(profiles, results), start=1):
-        email = profile.email or "-"
-        row = f"{idx:<3}{profile.name:<{name_width + 2}}{email:<{_EMAIL_COL_WIDTH}}"
-        if result.ok:
-            cells = ""
-            for column, width in zip(columns, col_widths):
-                bucket = usage.bucket_by_id(result, column.id)
-                if bucket is None:
-                    cells += pad(paint("-", "dim"), width)
-                    continue
-                pct = f"{round(bucket.remaining_fraction * 100)}%"
-                cells += pad(paint(pct, usage.usage_color(bucket.remaining_fraction)), width)
-            print(row + cells)
-        elif result.error == "not authenticated":
-            print(row + pad(paint("not authenticated", "dim"), total_col_width))
-        else:
-            cells = "".join(pad(paint("-", "dim"), width) for width in col_widths)
-            print(row + cells + paint(f" ({result.error})", "dim"))
+    idx_w = max(3, len(str(len(profiles))) + 1)
+    name_w = max(max(len(p.name) for p in profiles), len(lbl_profile)) + 2
+
+    all_emails = [p.email or r.email or "-" for p, r in zip(profiles, results)]
+    natural_account_w = max(max(len(e) for e in all_emails), len(lbl_account)) + 2
+
+    is_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    term_width = None
+    col_env = os.environ.get("COLUMNS")
+    if col_env and col_env.isdigit():
+        term_width = int(col_env)
+        is_tty = True
+    elif is_tty:
+        term_width = shutil.get_terminal_size((120, 24)).columns
+
+    account_mode = "full"
+    account_w = natural_account_w
+    bar_w = 10
+    show_windows = True
+    show_account = True
+
+    def calc_row_w(acct_w, b_w, s_win, s_acct):
+        w = idx_w + 1 + name_w
+        if s_acct:
+            w += acct_w
+        avail_w = b_w + 6
+        w += avail_w
+        if s_win:
+            w += 13
+        w += avail_w
+        if s_win:
+            w += 9
+        return w
+
+    if is_tty and term_width is not None:
+        if calc_row_w(account_w, bar_w, show_windows, show_account) > term_width:
+            account_mode = "truncated"
+            account_w = 14
+            if calc_row_w(account_w, bar_w, show_windows, show_account) > term_width:
+                bar_w = 5
+                if calc_row_w(account_w, bar_w, show_windows, show_account) > term_width:
+                    show_windows = False
+                    if calc_row_w(account_w, bar_w, show_windows, show_account) > term_width:
+                        show_account = False
+                        account_mode = "hidden"
+
+    now_str = i18n.format_usage_timestamp()
+    meta_str = f"{len(profiles)} {i18n.t('usage.profiles_label', default='profiles')} · {now_str}"
+    target_w = calc_row_w(account_w, bar_w, show_windows, show_account)
+    if term_width is not None:
+        target_w = max(target_w, min(term_width, 100))
+    spacer = " " * max(2, target_w - 12 - ui.visible_width(meta_str))
+    print(f"agydra usage{spacer}{meta_str}")
+    print()
+
+    disp_w = bar_w + 6
+    gem_col_w = disp_w + (13 if show_windows else 0)
+    claude_col_w = disp_w + (9 if show_windows else 0)
+    prefix_w = idx_w + 1 + name_w + (account_w if show_account else 0)
+
+    best_gem_val = -1.0
+    best_gem_name = None
+    best_claude_val = -1.0
+    best_claude_name = None
+    best_codex_name = None
+    best_codex_plan = None
+    ineligible_profiles = []
+
+    if agy_entries:
+        sec_title = "■ " + i18n.t("usage.section_agy", default="ANTIGRAVITY")
+        top_hdr = pad(paint(sec_title, "bold"), prefix_w)
+        top_hdr += pad(paint("GEMINI", "bold"), gem_col_w)
+        top_hdr += paint("CLAUDE + GPT", "bold")
+        print(top_hdr)
+
+        sub_hdr = f" {'#':<{idx_w}} {lbl_profile:<{name_w}}"
+        if show_account:
+            sub_hdr += f"{lbl_account:<{account_w}}"
+        sub_hdr += pad(lbl_avail, disp_w)
+        if show_windows:
+            sub_hdr += pad(lbl_windows, 13)
+        sub_hdr += pad(lbl_avail, disp_w)
+        if show_windows:
+            sub_hdr += lbl_windows
+        print(paint(sub_hdr, "bold"))
+
+        for idx, (profile, result) in enumerate(agy_entries, start=1):
+            row_pfx = f" {idx:<{idx_w}} {profile.name:<{name_w}}"
+            if show_account:
+                email_raw = profile.email or result.email or "-"
+                if account_mode == "truncated":
+                    row_pfx += pad(_truncate_account(email_raw, max_len=12), account_w)
+                else:
+                    row_pfx += pad(email_raw, account_w)
+
+            if result.is_ineligible:
+                ineligible_profiles.append(profile.name)
+                not_el = paint(i18n.t("usage.not_eligible", default="✗ not eligible"), "red")
+                print(row_pfx + pad(not_el, gem_col_w) + not_el)
+            elif not result.ok:
+                if result.error == "not authenticated":
+                    not_auth = paint(i18n.t("auth.not_authenticated", default="not authenticated"), "dim")
+                    print(row_pfx + pad(not_auth, gem_col_w) + not_auth)
+                else:
+                    err_msg = paint(f"({result.error})", "dim")
+                    print(row_pfx + err_msg)
+            else:
+                summary = usage.extract_model_summary(result.groups)
+                g_avail = summary["gemini"]["available"]
+                g_wk = summary["gemini"]["weekly"]
+                g_5h = summary["gemini"]["five_h"]
+
+                c_avail = summary["claude"]["available"]
+                c_wk = summary["claude"]["weekly"]
+                c_5h = summary["claude"]["five_h"]
+
+                if g_avail is not None and g_avail > best_gem_val:
+                    best_gem_val = g_avail
+                    best_gem_name = profile.name
+                if c_avail is not None and c_avail > best_claude_val:
+                    best_claude_val = c_avail
+                    best_claude_name = profile.name
+
+                if g_avail is not None:
+                    g_bar = usage.format_mini_bar(g_avail, width=bar_w)
+                    g_pct = round(g_avail * 100)
+                    g_color = usage.usage_color(g_avail)
+                    g_disp = pad(paint(f"{g_bar} {g_pct:>2}", g_color), disp_w)
+                else:
+                    g_disp = pad(paint("-", "dim"), disp_w)
+
+                if show_windows:
+                    if g_wk is not None and g_5h is not None:
+                        g_win = pad(f"{round(g_wk * 100):>3} · {round(g_5h * 100):>3}", 13)
+                    else:
+                        g_win = pad(paint("-", "dim"), 13)
+                else:
+                    g_win = ""
+
+                if c_avail is not None:
+                    c_bar = usage.format_mini_bar(c_avail, width=bar_w)
+                    c_pct = round(c_avail * 100)
+                    c_color = usage.usage_color(c_avail)
+                    c_disp = pad(paint(f"{c_bar} {c_pct:>2}", c_color), disp_w)
+                else:
+                    c_disp = pad(paint("-", "dim"), disp_w)
+
+                if show_windows:
+                    if c_wk is not None and c_5h is not None:
+                        c_win = f"{round(c_wk * 100):>3} · {round(c_5h * 100):>3}"
+                    else:
+                        c_win = paint("-", "dim")
+                else:
+                    c_win = ""
+
+                print(row_pfx + g_disp + g_win + c_disp + c_win)
+
+    if codex_entries:
+        if agy_entries:
+            print()
+        sec_title = "■ " + i18n.t("usage.section_codex", default="OPENAI CODEX")
+        print(paint(sec_title, "bold"))
+
+        lbl_plan = i18n.t("usage.header_plan", default="PLAN")
+        lbl_status = i18n.t("usage.header_status", default="STATUS")
+        plan_w = 16
+
+        hdr_cx = f" {'#':<{idx_w}} {lbl_profile:<{name_w}}"
+        if show_account:
+            hdr_cx += f"{lbl_account:<{account_w}}"
+        hdr_cx += f"{lbl_plan:<{plan_w}}{lbl_status}"
+        print(paint(hdr_cx, "bold"))
+
+        start_idx = len(agy_entries) + 1
+        for offset, (profile, result) in enumerate(codex_entries):
+            idx = start_idx + offset
+            row_cx = f" {idx:<{idx_w}} {profile.name:<{name_w}}"
+            if show_account:
+                email_raw = profile.email or result.email or "-"
+                if account_mode == "truncated":
+                    row_cx += pad(_truncate_account(email_raw, max_len=12), account_w)
+                else:
+                    row_cx += pad(email_raw, account_w)
+
+            plan = result.plan or "-"
+            if result.ok:
+                status_str = paint(i18n.t("auth.authenticated", default="authenticated"), "green")
+                if best_codex_name is None:
+                    best_codex_name = profile.name
+                    best_codex_plan = plan
+            else:
+                status_str = paint(i18n.t("auth.not_authenticated", default="not authenticated"), "dim")
+            row_cx += f"{plan:<{plan_w}}{status_str}"
+            print(row_cx)
+
+    recs = []
+    if best_gem_name is not None and best_gem_val >= 0:
+        recs.append(f"Gemini → {best_gem_name} {round(best_gem_val * 100)}%")
+    if best_claude_name is not None and best_claude_val >= 0:
+        recs.append(f"Claude/GPT → {best_claude_name} {round(best_claude_val * 100)}%")
+    if best_codex_name is not None:
+        recs.append(f"Codex → {best_codex_name} ({best_codex_plan})")
+
+    if recs:
+        print()
+        use_now_lbl = i18n.t("usage.use_now", default="USE NOW")
+        use_now_pfx = paint(f"▸ {use_now_lbl}", "cyan", "bold")
+        recs_str = "   ".join(paint(r, "cyan") for r in recs)
+        print(f"{use_now_pfx}   {recs_str}")
+
+    if ineligible_profiles:
+        for inel_name in ineligible_profiles:
+            print(paint(f"{i18n.t('usage.ineligible_note', profile=inel_name)}", "yellow"))
+
     return 0
 
 
@@ -597,8 +803,17 @@ def _cmd_usage_detail(store: Store, args) -> int:
     profile = store.get(name)
     result = usage.query_profile_usage(store, name)
     print(f"profile   : {profile.name}")
-    if profile.email:
-        print(f"email     : {profile.email}")
+    print(f"engine    : {profile.engine}")
+    if profile.email or result.email:
+        print(f"email     : {profile.email or result.email}")
+    if profile.engine == "codex":
+        if result.plan:
+            print(f"plan      : {result.plan}")
+        state_str = i18n.t("auth.authenticated", default="authenticated") if result.ok else i18n.t("auth.not_authenticated", default="not authenticated")
+        print(f"status    : {state_str}")
+        print(f"data dir  : {store.profile_data_dir(name, engine='codex')}")
+        return 0
+
     if not result.ok:
         _error(f"usage unavailable: {result.error}")
         return 1
@@ -678,13 +893,14 @@ def cmd_delete(store: Store, args) -> int:
 
 
 def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
-    """Copy only settings.json + mcp.json between profile stores.
+    """Copy only settings.json + mcp.json + config.toml between profile stores.
 
     All targets are validated (existence, self-copy, live sessions) BEFORE
     the first byte is copied: a bad third target must not leave the first
     two half-copied."""
-    allowed = {"settings.json", "mcp.json"}
-    src_dir = store.profile_data_dir(src)
+    allowed = {"settings.json", "mcp.json", "config.toml"}
+    src_profile = store.get(src)
+    src_dir = store.profile_data_dir(src, engine=src_profile.engine)
     resolved: List[str] = []
     seen: set = set()
     for target in targets:
@@ -696,7 +912,8 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
         resolved.append(target_name)
     copied: List[str] = []
     for target_name in resolved:
-        target_dir = store.profile_data_dir(target_name)
+        target_profile = store.get(target_name)
+        target_dir = store.profile_data_dir(target_name, engine=target_profile.engine)
         for name in allowed:
             file = src_dir / name
             if file.is_file():
@@ -717,7 +934,7 @@ def cmd_share_config(store: Store, args) -> int:
         for entry in copied:
             print(f"copied: {entry}")
     elif not self_targets:
-        print("nothing to copy (missing settings.json/mcp.json in source)")
+        print("nothing to copy (missing settings.json/mcp.json/config.toml in source)")
     return 0
 
 
@@ -853,73 +1070,112 @@ def cmd_setup(_store: Store, args) -> int:
     return bootstrap.run(force=getattr(args, "force", False))
 
 
+def cmd_language(store: Store, args) -> int:
+    code = getattr(args, "code", None)
+    if code:
+        try:
+            i18n.set_language(store, code)
+        except (ValueError, StoreError) as exc:
+            _error(str(exc))
+            return 1
+        print(i18n.t("cmd.lang.ok", lang=code))
+    else:
+        current = i18n._get_active()
+        print(i18n.t("cmd.lang.current", lang=current))
+        supported = ", ".join(i18n.SUPPORTED_LANGS)
+        print(f"supported : {supported}")
+    return 0
+
+
 _SUBCOMMAND_HELP: Dict[str, str] = {
-    "list": "show all profiles (number, email, auth, busy)",
-    "create": "create a profile store",
-    "login": "run agy's OAuth flow isolated to a profile",
-    "import": "copy the generic ~/.gemini into a profile (source auto-detected)",
-    "status": "resolved profile + binary + auth info, zero side effects",
-    "default": "get or set the default profile",
+    "list": "show all profiles (number, email, auth, engine, busy)",
+    "create": "create an isolated profile store (-e agy|codex)",
+    "login": "run engine authentication flow isolated to a profile (agy OAuth or codex login)",
+    "import": "copy generic data dir into a profile (~/.gemini or ~/.codex auto-detected)",
+    "status": "show resolved profile, engine, binary, and credentials (zero side effects)",
+    "default": "get or set the fallback default profile",
     "use": "pin a profile to the current directory (.agydra marker)",
     "rename": "rename a profile (refuses busy)",
     "delete": "backup ZIP then delete a profile (refuses busy)",
-    "share-config": "copy settings.json + mcp.json between profiles",
-    "doctor": "diagnose the installation (--fix repairs overlays, dangling defaults, orphan slots/artifacts)",
-    "usage": "aggregate quota usage across profiles (or one, in detail)",
-    "setup": "one-command install of the shim",
+    "share-config": "copy settings.json + mcp.json + config.toml between profiles",
+    "doctor": "diagnose installation health (--fix repairs overlays, dangling defaults, orphan slots)",
+    "usage": "aggregate quota usage and inspect plans across profiles (or one, in detail)",
+    "setup": "one-command install of the shim and venv",
+    "language": "get or set the display language (en / es)",
     "help": "show this help",
     "version": "print the version",
 }
+
+_SUBCOMMAND_GROUPS: List[Tuple[str, List[str]]] = [
+    ("profiles & authentication", ["list", "create", "login", "import", "rename", "delete"]),
+    ("routing & directory pinning", ["default", "use", "status"]),
+    ("quotas & diagnostics", ["usage", "share-config", "doctor"]),
+    ("system & configuration", ["setup", "language", "version", "help"]),
+]
 
 
 def _management_help() -> str:
     lines = [paint("management:", "cyan", "bold")]
     lines.append("  (any name/alias below also works as --NAME or -NAME, e.g. --list/-list)")
-    for canonical, aliases in vocab.SUBCOMMAND_ALIASES.items():
-        spellings = "/".join((canonical, *aliases))
-        lines.append(
-            paint_each(
-                [
-                    (f"  {spellings:<24}", ("bold",)),
-                    (_SUBCOMMAND_HELP.get(canonical, ""), ()),
-                ],
-                separator="",
+    col_width = max(
+        len("/".join((can, *vocab.SUBCOMMAND_ALIASES.get(can, ()))))
+        for can in _SUBCOMMAND_HELP
+    ) + 2
+    col_width = max(col_width, 30)
+
+    for group_title, commands in _SUBCOMMAND_GROUPS:
+        lines.append("")
+        lines.append(paint(f"  {group_title}:", "bold"))
+        for canonical in commands:
+            aliases = vocab.SUBCOMMAND_ALIASES.get(canonical, ())
+            spellings = "/".join((canonical, *aliases))
+            lines.append(
+                paint_each(
+                    [
+                        (f"    {spellings:<{col_width}}", ("bold",)),
+                        (_SUBCOMMAND_HELP.get(canonical, ""), ()),
+                    ],
+                    separator="",
+                )
             )
-        )
     return "\n".join(lines)
 
 
 _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
     (
-        "first run",
+        "first run (Google Antigravity & OpenAI Codex)",
         [
-            ("agydra setup", "one-time install of the shim"),
-            ("agydra create work -d 'work account'", "create a profile"),
-            ("agydra login work", "OAuth flow isolated to 'work'"),
-            ("agydra import main", "copy ~/.gemini into 'main'"),
+            ("agydra setup", "one-time install of the shim and venv"),
+            ("agydra create work -d 'Google workspace'", "create an agy profile (default engine)"),
+            ("agydra create cx -e codex -d 'OpenAI account'", "create a codex profile"),
+            ("agydra login work", "Google OAuth flow isolated to 'work'"),
+            ("agydra login cx", "Codex authentication isolated to 'cx'"),
+            ("agydra import main", "copy generic ~/.gemini or ~/.codex into 'main'"),
         ],
     ),
     (
-        "daily use",
+        "daily use & multi-engine execution",
         [
-            ("agydra -p work", "launch agy with 'work'"),
-            ("agydra 'your prompt'", "launch agy with default profile"),
-            ("agydra -r", "pick a free authenticated profile"),
+            ("agydra -p work 'your prompt'", "launch agy with 'work'"),
+            ("agydra -p cx 'your prompt'", "launch codex with 'cx' (daemonless by default)"),
+            ("agydra 'your prompt'", "launch with the default profile"),
+            ("agydra -r 'your prompt'", "pick a free authenticated agy profile automatically"),
+            ("agydra -e codex -r 'your prompt'", "pick a free authenticated codex profile automatically"),
         ],
     ),
     (
-        "maintenance",
+        "routing, quotas & maintenance",
         [
-            ("agydra list", "show all profiles + auth state"),
-            ("agydra status -n", "resolved profile (no side effects)"),
-            ("agydra default work", "set 'work' as default"),
-            ("agydra use work", "pin 'work' to this directory"),
-            ("agydra share-config work lab", "copy settings.json + mcp.json"),
+            ("agydra list", "show all profiles, engine, auth state, and last use"),
+            ("agydra status -n", "inspect resolved profile & engine (no side effects)"),
+            ("agydra default work", "set 'work' as the global default profile"),
+            ("agydra use cx", "pin 'cx' (codex) to this project directory (.agydra)"),
+            ("agydra share-config work lab", "copy settings.json + mcp.json + config.toml between profiles"),
             ("agydra rename old new", "rename a profile (refuses busy)"),
-            ("agydra delete old", "backup ZIP + delete (refuses busy)"),
-            ("agydra doctor", "diagnose the installation"),
-            ("agydra usage", "quota usage across all profiles"),
-            ("agydra usage work", "detailed quota usage for 'work'"),
+            ("agydra delete old", "backup ZIP + delete a profile (refuses busy)"),
+            ("agydra doctor", "diagnose installation, binaries, and overlays"),
+            ("agydra usage", "aggregate quota and plan usage across agy and codex profiles"),
+            ("agydra lang es", "persist display language as Spanish (or en)"),
         ],
     ),
 ]
@@ -965,6 +1221,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     banner.show()
     raw = list(sys.argv[1:] if argv is None else argv)
     store = Store()
+
+    lang_val = None
+    filtered_raw: List[str] = []
+    i = 0
+    while i < len(raw):
+        token = raw[i]
+        if token == "--lang":
+            if i + 1 < len(raw) and not raw[i + 1].startswith("-"):
+                lang_val = raw[i + 1]
+                i += 2
+                continue
+        elif token.startswith("--lang="):
+            lang_val = token.split("=", 1)[1]
+            i += 1
+            continue
+        filtered_raw.append(token)
+        i += 1
+
+    if lang_val is not None:
+        try:
+            i18n.set_language(store, lang_val)
+        except ValueError as exc:
+            _error(str(exc))
+            return 2
+        except StoreError as exc:
+            _error(str(exc))
+            return 1
+        i18n.resolve_language(store, flag_lang=lang_val)
+        if not filtered_raw:
+            print(i18n.t("lang.set_ok"))
+            return 0
+        raw = filtered_raw
+    else:
+        i18n.resolve_language(store)
 
     if not raw:
         _print_top_level_help()
@@ -1096,6 +1386,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 help="force overwrite of foreign or existing shim at ~/.local/bin/agydra",
             )
             parser.set_defaults(func=cmd_setup)
+        elif sub == "language":
+            parser.add_argument(
+                "code", nargs="?", choices=["en", "es"],
+                help="language code: en or es (omit to show current)",
+            )
+            parser.set_defaults(func=cmd_language)
         args = parser.parse_args(rest)
         try:
             return args.func(store, args)

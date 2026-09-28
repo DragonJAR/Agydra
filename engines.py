@@ -44,6 +44,9 @@ class EngineDriver:
     def detect_email(self, data_dir: Path, store: Any = None, profile_name: str = "") -> Optional[str]:
         raise NotImplementedError
 
+    def prepare_args(self, args: Sequence[str]) -> List[str]:
+        return list(args)
+
 
 class AgyEngine(EngineDriver):
     """Driver for Google Antigravity (agy CLI)."""
@@ -87,6 +90,12 @@ class CodexEngine(EngineDriver):
 
     def detect_email(self, data_dir: Path, store: Any = None, profile_name: str = "") -> Optional[str]:
         return account.detect_email(data_dir, store=store, name=profile_name, engine="codex")
+
+    def prepare_args(self, args: Sequence[str]) -> List[str]:
+        res = list(args)
+        if "--no-daemon" not in res:
+            res.insert(0, "--no-daemon")
+        return res
 
 
 _REGISTRY: Dict[str, EngineDriver] = {

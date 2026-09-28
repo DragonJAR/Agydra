@@ -13,7 +13,7 @@
   <a href="README.es.md"><img src="https://img.shields.io/badge/Read_in-Español-blue" alt="Read in Español"></a>
 </p>
 
-> **One `agy` installation, infinite isolated Google accounts, zero token bottlenecks.** `agydra` is a multi-profile manager and workload dispatcher for the `agy` CLI (Google Antigravity). Conceived specifically to unlock the immense value of **Google Family Plans (Google One AI Premium / Google AI Pro)**—where every family member account enjoys completely independent AI quotas and rate limits—`agydra` eliminates `agy`'s single-`~/.gemini` constraint through lightweight, per-profile home overlays. The real `~/.gemini` is never touched and `agy` is never patched or intercepted. Built strictly with the Python standard library (**Python ≥ 3.9, zero third-party runtime dependencies**): one clean, DRY core with native OS adapters for macOS, Linux, and Windows.
+> **One installation, infinite isolated AI accounts, zero token bottlenecks.** `agydra` is a multi-profile manager and workload dispatcher for **Google Antigravity (`agy`)** and **OpenAI Codex (`codex`)**. Conceived to unlock the immense value of multi-account pooling and family tiers—where every account enjoys completely independent AI quotas and rate limits—`agydra` eliminates single-store constraints through lightweight, isolated per-profile environments. Your host credentials remain completely untouched, and CLI engines are never patched or intercepted. Built strictly with the Python standard library (**Python ≥ 3.9, zero third-party runtime dependencies**): one clean, DRY core with native OS adapters for macOS, Linux, and Windows.
 
 ---
 
@@ -61,7 +61,8 @@ agydra -p fam-dev   → same agy binary, but HOME points to an isolated profile 
 | Requirement | Notes |
 |---|---|
 | **Python ≥ 3.9** | Standard library only — zero third-party runtime dependencies. |
-| **`agy` CLI** | Must be installed and reachable on `PATH` (or specified via `-b` / config). |
+| **`agy` CLI** *(optional)* | Google Antigravity CLI. Must be on `PATH` (or specified via `-b` / config) when using `agy` profiles. |
+| **`codex` CLI** *(optional)* | OpenAI Codex CLI. Must be on `PATH` (or specified via `-b` / `AGYDRA_CODEX_BIN`) when using `codex` profiles. |
 | **bwrap** *(optional)* | Linux only: bubblewrap sandbox to mask DBus/keyring sockets (`use_linux_sandbox`). |
 
 ### 1. Installation
@@ -87,15 +88,30 @@ agydra doctor
 
 ### 2. First-Time Setup (Under 60 Seconds)
 
+**Google Antigravity (`agy` — default engine):**
+
 ```sh
 # 1. Create your isolated profile
-agydra create work -d "Corporate workspace"
+agydra create work -d "Corporate Google workspace"
 
 # 2. Complete the OAuth login flow once (tokens land in work's isolated store)
 agydra login work
 
 # 3. Launch agy with your new profile
 agydra -p work "Explain quantum computing in three sentences"
+```
+
+**OpenAI Codex (`codex` engine):**
+
+```sh
+# 1. Create your isolated Codex profile
+agydra create codex-work -e codex -d "Corporate OpenAI account"
+
+# 2. Complete the Codex login flow once (tokens land in codex-work's store)
+agydra login codex-work
+
+# 3. Launch codex with your new profile (daemonless by default, zero socket crashes)
+agydra -p codex-work "Review the latest git diff for security issues"
 ```
 
 ### 3. ⭐ Stellar Use Case: Building a 5x Family Plan Account Pool
@@ -135,29 +151,48 @@ agydra -r "Continue repository audit"  # Instantly routes to the next available 
 ```
 
 #### Step 4: Monitor your entire pool with `agydra usage`
-Inspect real-time token quotas and reset timers across every account in your pool from a single terminal:
+Inspect real-time token quotas, subscription plans, and reset timers across every account in your pool from a single terminal:
 ```sh
 agydra usage
 ```
 ```text
-#  PROFILE       EMAIL                         GEMINI WK   GEMINI 5H   3P WK       3P 5H
-1  fam-main      dev.lead@gmail.com            92%         100%        85%         100%
-2  fam-dev       code.worker@gmail.com         84%         25%         70%         40%
-3  fam-agents    agent.runner@gmail.com        78%         90%         65%         85%
-4  fam-research  research.bot@gmail.com        100%        100%        100%        100%
+agydra usage                                     9 profiles · Sun Sep 27 · 23:18
+
+■ ANTIGRAVITY               GEMINI                  CLAUDE + GPT
+ #   PROFILE   ACCOUNT       AVAILABLE  WK · 5H      AVAILABLE  WK · 5H
+ 1   alpha     lead.dev@gm…  ██░░░ 30    30 · 100    █░░░░ 26    26 · 100
+ 2   beta      coder.jr@gm…  ██░░░ 48    48 · 100    ██░░░ 47    47 · 100
+ 3   neta      agent.bot@g…  ████░ 85    85 ·  94    ██░░░ 46    46 · 100
+ 4   chido     audit.sec@g…  ✗ not eligible          ✗ not eligible
+ 5   chimba    team.ops@gm…  ██░░░ 42    42 ·  59    ███░░ 66    66 · 100
+ 6   parce     data.anal@g…  ████░ 74    74 ·  97    █░░░░ 18    18 · 100
+ 7   vacan     deep.res@gm…  ████░ 73    73 ·  99    █████ 100  100 · 100
+
+■ OPENAI CODEX
+ #   PROFILE   ACCOUNT       PLAN            STATUS
+ 8   codex     lead.dev@gm…  ChatGPT Plus    authenticated
+ 9   codexjar  corp.ops@dr…  ChatGPT Team    authenticated
+
+▸ USE NOW   Gemini → neta 85%   Claude/GPT → vacan 100%   Codex → codex (ChatGPT Plus)
+✗ chido: account not eligible for Antigravity. Check account status.
 ```
+
+The usage dashboard is fully responsive: it dynamically scales its columns down for narrower terminal windows (from full email to truncated email, 5-block bars, and condensed columns) without line wrapping.
 
 For granular insights into an account nearing its rate limit, check exact reset countdowns and graphical progress bars:
 ```sh
-agydra usage fam-dev
+agydra usage vacan
 ```
 ```text
-profile   : fam-dev
-email     : code.worker@gmail.com
+profile   : vacan
+email     : deep.res@gmail.com
 
 Gemini Models
-  Weekly Quota                [==================  ]  84.0%  reset in 4d 18h
-  5-Hour Rate Limit           [=====               ]  25.0%  reset in 1h 12m
+  Weekly Limit Remaining      [█████████░]  73.0%  reset in 4d 18h
+  Five Hour Limit Remaining   [██████████]  99.0%  reset in 3h 42m
+
+Claude and GPT models
+  Weekly Limit Remaining      [██████████] 100.0%  reset in 5d 02h
 ```
 
 ---
@@ -220,7 +255,7 @@ agydra -np work "What is my current environment?"
 `agydra` features a strategy-pattern driver architecture supporting both **Google Antigravity (`agy`)** and **OpenAI Codex CLI (`codex`)**:
 
 ```sh
-# Create isolated Codex profiles
+# Create isolated Codex profiles (-e codex)
 agydra create openai-work -e codex -d "Company OpenAI account"
 agydra create openai-personal -e codex -d "Personal ChatGPT Plus account"
 
@@ -233,10 +268,44 @@ agydra -p openai-work "Refactor auth middleware to Python 3.12 syntax"
 
 # Automatically rotate across idle, authenticated Codex accounts
 agydra -e codex -r "Run full test suite review"
+
+# Pin a directory to a Codex profile
+cd ~/projects/backend-rust
+agydra use openai-work
+agydra "Optimize memory allocations in parser"
 ```
 
-- **Complete Daemon & Socket Isolation:** Codex launches background daemon processes (`app-server-daemon`) communicating over local sockets. `agydra` isolates `$CODEX_HOME` directly to `<store>/overlays/<profile>/.codex`, preventing cross-profile socket or context leaks.
-- **Zero Keychain Conflicts:** Codex uses file-based tokens (`auth.json`). `agydra` automatically bypasses macOS Keychain swapping for Codex profiles.
+- **Full Flag & Subcommand Forwarding (Transparent CLI Parity):** Every arbitrary flag, subflag, and subshell command is forwarded directly to the Codex CLI alongside `--no-daemon`. Commands such as `agydra -p codex --yolo`, `agydra --force -r -e codex --dangerously-bypass-approvals-and-sandbox`, or `agydra -p codex exec --help` work seamlessly with full engine isolation.
+- **Seamless Daemonless Default (Zero Socket & Lock Leaks):** By default, OpenAI Codex spawns a background `app-server-daemon` communicating over a local UNIX domain socket. On POSIX/macOS systems, domain socket paths have a hard limit (`SUN_LEN` = 104 bytes). When nested inside deep profile stores, this crashes Codex with `path must be shorter than SUN_LEN`. In addition, background daemons inherit file descriptors, causing profile locks to stay stuck after process exit. `agydra` eliminates both issues out-of-the-box:
+  1. Enforces `--no-daemon` by default on all Codex invocations.
+  2. Automatically seeds `config.toml` with `[features]\ndaemon_auto_start = false` in the profile store.
+  3. Guarantees synchronous execution, immediate kernel lock release upon exit, and complete container compatibility.
+- **Isolated Storage via `$CODEX_HOME`:** The official Codex CLI derives its state from `$CODEX_HOME`. `agydra` isolates `$CODEX_HOME` directly to `<store>/overlays/<profile>/.codex` (symlinked to `<store>/profiles/<profile>/data`), completely protecting your user home (`~/.codex`) from pollution.
+- **Zero Keychain Conflicts & Native Plan Inspection:** Codex uses file-based tokens (`auth.json`). `agydra` inspects JWT `id_token` claims (`email` and subscription plan: `ChatGPT Plus`, `ChatGPT Team`, `ChatGPT Pro`, or `OpenAI API Key`) directly and bypasses macOS Keychain swapping for Codex profiles.
+- **Secure Configuration Sharing (`share-config`):** Profile sharing between Codex accounts copies custom `config.toml` definitions across profiles while strictly guaranteeing `auth.json` (session tokens) is never copied.
+
+### 7. Multi-Language Support / Internationalization (`agydra lang` / `--lang`)
+
+`agydra` provides native internationalization across English (`en`) and Spanish (`es`). Setting your language preference automatically persists it to `agydra.json`, remembering it for all future executions without needing to re-specify it:
+
+```sh
+# Set language to Spanish persistently (stored in configuration)
+agydra lang es
+# Or pass via global flag (also persists the choice)
+agydra --lang es list
+
+# View the currently active language and resolution source
+agydra lang
+
+# Switch back to English
+agydra lang en
+```
+
+You can also override the language temporarily per-session without mutating configuration using the `AGYDRA_LANG` environment variable:
+
+```sh
+AGYDRA_LANG=es agydra status
+```
 
 ---
 
@@ -246,22 +315,37 @@ agydra -e codex -r "Run full test suite review"
 
 Any management subcommand also accepts `--NAME` or `-NAME` syntax (e.g. `agydra --list` == `agydra list`).
 
+#### Profiles & Authentication
 | Command | Aliases | Description |
 |---|---|---|
-| `agydra [FLAGS] <args...>` | — | Default launcher: executes `agy` or `codex` with the resolved profile. |
 | `agydra list` | `ls`, `l` | Displays table of profiles: number, email, default marker, auth status, busy state, engine, last use. |
 | `agydra create NAME [-d DESC] [-e ENGINE]` | `c` | Creates an isolated profile store (`-e` sets engine: `agy` [default] or `codex`). |
 | `agydra login [NAME\|#] [-f] [-n]` | `in` | Runs engine login flow isolated to that profile (`agy` OAuth or `codex login`; `-f` force re-login; `-n` dry-run). |
 | `agydra import NAME\|# [-s DIR]` | `imp` | **Copies** (never moves) an existing data dir into a profile (`-s` overrides source directory). |
-| `agydra status [-n]` | `st` | Shows active profile, engine, resolution reason, binary path, email, auth state, and lock status. |
-| `agydra default [NAME\|#]` | `d` | Views or sets the global default fallback profile. |
-| `agydra use NAME\|#` | `u` | Writes a `.agydra` marker file pinning the profile to the current working directory. |
 | `agydra rename A B` | `mv` | Renames a profile and updates default references (refuses busy profiles). |
 | `agydra delete NAME\|# [-f] [--no-backup]` | `rm` | Creates an automatic safety backup ZIP in `backups/` and deletes profile (refuses busy profiles). |
+
+#### Routing & Directory Pinning
+| Command | Aliases | Description |
+|---|---|---|
+| `agydra default [NAME\|#]` | `d` | Views or sets the global default fallback profile. |
+| `agydra use [NAME\|#]` | `u` | Writes a `.agydra` marker file pinning the profile to the current working directory. |
+| `agydra status [-n]` | `st` | Shows active profile, engine, resolution reason, binary path, email, auth state, and lock status. |
+
+#### Quotas & Diagnostics
+| Command | Aliases | Description |
+|---|---|---|
+| `agydra usage [NAME\|#]` | `us` | Inspects live model quota and rate limit status across accounts (`agy`). |
 | `agydra share-config SRC TARGET...` | `share` | Safely copies `settings.json` and `mcp.json` from `SRC` to targets (never touches credentials). |
-| `agydra setup [-n]` | `install` | Idempotent setup: verifies venv, installs console script, and configures PATH shim. |
 | `agydra doctor [--fix] [-f]` | `doc` | Runs system diagnostics suite. `--fix` automatically repairs dangling links, orphan locks, and stale slots. |
-| `agydra usage [NAME\|#]` | `us` | Inspects live quota and rate limit status across accounts. |
+
+#### System & Configuration
+| Command | Aliases | Description |
+|---|---|---|
+| `agydra setup [-n]` | `install` | Idempotent setup: verifies venv, installs console script, and configures PATH shim. |
+| `agydra lang [CODE]` | `language`, `idioma`, `locale` | Views or sets the persistent CLI display language (`en`, `es`). |
+| `agydra version` | `-v`, `--version` | Displays agydra version, Python version, and operating system. |
+| `agydra help [COMMAND]` | `-h`, `--help` | Shows help information for agydra or a specific subcommand. |
 
 ### Launcher Flags
 
@@ -270,10 +354,11 @@ Launcher flags must be placed **before** arguments intended for the engine:
 | Flag | Long Form | Description |
 |:---:|---|---|
 | `-p NAME\|#` | `--profile` | Target profile specified by name or 1-based index (from `agydra list`). |
-| `-r` | `--random` | Automatically picks the least-recently-used idle, authenticated profile (requires 2+ profiles). |
+| `-r` | `--random` | Automatically picks the least-recently-used idle, authenticated profile (filters by `-e` if provided). |
 | `-e ENGINE` | `--engine` | Target CLI engine (`agy` [default] or `codex`). Filters candidate profiles for `-r`. |
-| `-n` | `--dry-run` | Prints execution plan, paths, and environment without launching the tool. |
-| `-b PATH` | `--binary` | Overrides the engine executable path for this invocation. |
+| `--lang CODE` | — | Sets and persists active CLI language (`en`, `es`). |
+| `-n` | `--dry-run` | Prints execution plan, paths, and environment without launching the engine. |
+| `-b PATH` | `--binary` | Overrides the engine executable path (`agy` or `codex`) for this invocation. |
 | `-f` | `--force` | Skips session lock acquisition; enables concurrent runs or emergency access on a locked profile. |
 
 ### 🔀 Common Flag Combinations
@@ -283,12 +368,14 @@ Short flags bundle following standard POSIX conventions (`-nr` == `-n -r`):
 | Combination | Equivalents | Purpose |
 |---|---|---|
 | `agydra -p work "prompt"` | `--profile=work`, `-pwork` | Launch `agy` with an explicit profile. |
-| `agydra -r "prompt"` | `--random` | Automatically grab an idle, authenticated account from the pool. |
+| `agydra -p codex-work "prompt"` | `--profile=codex-work` | Launch `codex` with an isolated profile (daemonless by default). |
+| `agydra -r "prompt"` | `--random` | Automatically grab an idle, authenticated `agy` account from the pool. |
+| `agydra -e codex -r "prompt"` | `--engine=codex --random` | Automatically grab an idle, authenticated `codex` account from the pool. |
 | `agydra -rf "prompt"` | `-r -f`, `--random --force` | Pick a free profile; if all are busy or only 1 profile exists, force launch anyway. |
 | `agydra -np work` | `-n -p work`, `--dry-run -p work` | Inspect launch plan (paths, environment, binary) without executing anything. |
 | `agydra -nr` | `-n -r`, `--dry-run --random` | Preview which free profile would be selected without running `agy`. |
 | `agydra -fp work` | `-f -p work`, `--force -p work` | Bypass active session lock for urgent parallel execution or after an abnormal crash. |
-| `agydra -b /path/agy -p work` | `--binary /path/agy -p work` | Test a specific or experimental `agy` binary with isolated credentials. |
+| `agydra -b /path/agy -p work` | `--binary /path/agy -p work` | Test a specific or experimental engine binary with isolated credentials. |
 | `agydra doctor --fix -f` | `agydra doc --fix --force` | Run automated repair of dangling profiles, orphan locks, and stale links non-interactively. |
 | `agydra delete old -f` | `agydra rm old --force` | Non-interactive deletion (creates safety ZIP backup first; still refuses a busy profile). |
 
@@ -313,21 +400,25 @@ When launching without `-p`, `agydra` resolves the active profile deterministica
 ```
 Host Home (~/)
 ├── .gitconfig, .ssh, .bashrc (shared seamlessly via symlinks/junctions)
-└── ~/.gemini (generic data, UNTOUCHED)
+├── ~/.gemini (generic Google Antigravity data, UNTOUCHED)
+└── ~/.codex  (generic OpenAI Codex data, UNTOUCHED)
 
 Agydra Store (<store root>/)
 ├── profiles/
-│   ├── work/data/        <── Real storage for work OAuth & settings
-│   └── personal/data/    <── Real storage for personal OAuth & settings
+│   ├── work/data/        <── Real storage for work (agy: ~/.gemini layout)
+│   └── codex-dev/data/   <── Real storage for codex (codex: ~/.codex layout)
 └── overlays/
-    └── work/             <── Injected HOME during agydra execution
-        ├── .gemini       ───> symlink to profiles/work/data
-        └── (symlinks to host tools: .gitconfig, .ssh, ...)
+    ├── work/             <── Injected HOME during agy execution
+    │   ├── .gemini       ───> symlink to profiles/work/data
+    │   └── (symlinks to host tools: .gitconfig, .ssh, ...)
+    └── codex-dev/        <── Injected CODEX_HOME pointing directly to overlay
+        └── .codex        ───> symlink to profiles/codex-dev/data
 ```
 
 ### 1. Home Overlay Mechanics
 - `agydra` creates an isolated directory structure at `<store>/overlays/<profile>`.
-- `<overlay>/.gemini` links directly to `<store>/profiles/<profile>/data`.
+- For `agy`, `<overlay>/.gemini` links directly to `<store>/profiles/<profile>/data`.
+- For `codex`, `CODEX_HOME` points directly to `<overlay>/.codex`, which links to `<store>/profiles/<profile>/data`.
 - Top-level user configuration entries (`.ssh`, `.gitconfig`, shell environments) are mirrored via symlinks (or junctions on Windows), ensuring developer tools function seamlessly.
 - Ancestor directories of the store root (such as `~/Library` on macOS) are mirrored as real directories so the store itself remains unreachable from within the overlay.
 - `AGYDRA_REAL_HOME` is injected into the child process, allowing nested subshells and child tools to locate the unredirected host home.
@@ -340,9 +431,13 @@ Agydra Store (<store root>/)
 
 | Platform | Mechanism | Details |
 |---|---|---|
-| **macOS** | Keychain Bridge | Bridges `agy`'s fixed `antigravity` keychain service to private per-profile slots (`agydra.<profile>`). Swaps credentials into the active slot for the run and restores them upon exit. All writes verify identity against the profile's known email claim. |
+| **macOS** | Keychain Bridge | Bridges `agy`'s fixed `antigravity` keychain service to private per-profile slots (`agydra.<profile>`). Swaps credentials into the active slot for the run and restores them upon exit. All writes verify identity against the profile's known email claim. Codex profiles bypass this bridge as a no-op. |
 | **Linux** | bwrap Sandbox | Optional bubblewrap sandboxing (`use_linux_sandbox=true`) masks DBus/keyring sockets to enforce absolute on-disk token isolation. Degrades gracefully with a warning if `bwrap` is absent. |
 | **Windows** | Native Junctions | Directory mirroring leverages NTFS junctions (`mklink /J`) and standard `Path.unlink()` without requiring Administrator privileges or Developer Mode. |
+
+### 4. Strategy Pattern Engine Drivers & Daemonless Default
+- **Driver Decoupling:** `AgyEngine` and `CodexEngine` isolate executable discovery, argument adaptation, data path layout, and identity claim parsing.
+- **Automatic Daemonless Execution:** Codex CLI natively launches a background `app-server-daemon` over a UNIX domain socket. In deep profile stores, socket paths exceed the POSIX/macOS limit (`SUN_LEN` = 104 bytes), crashing with `path must be shorter than SUN_LEN`. In addition, background daemons inherit file descriptors and keep profile locks permanently busy. `agydra` eliminates this automatically by passing `--no-daemon` on every Codex run and configuring `features.daemon_auto_start = false` in `config.toml`. Execution is synchronous, reliable, and releases locks instantly upon completion.
 
 ---
 
@@ -411,8 +506,10 @@ Global configuration resides at `<store root>/agydra.json`:
 | Variable | Purpose |
 |---|---|
 | `AGYDRA_PROFILE` | Sets default active profile (overridden by `-p` and `.agydra` marker). |
+| `AGYDRA_LANG` | Sets or overrides active CLI language (`en`, `es`). |
 | `AGYDRA_HOME` | Custom directory for the profile store and overlays. |
 | `AGYDRA_AGY_BIN` | Explicit path to the `agy` executable. |
+| `AGYDRA_CODEX_BIN` | Explicit path to the `codex` executable. |
 | `AGYDRA_NO_KEYCHAIN` | Disables macOS keychain swapping (fallback to on-disk token files only). |
 | `NO_COLOR` / `FORCE_COLOR` | Controls ANSI terminal styling. |
 
@@ -427,6 +524,7 @@ agydra/                     # Flat package structure (zero third-party dependenc
 ├── engines.py              # Strategy Pattern multi-engine drivers (AgyEngine, CodexEngine)
 ├── platforms.py            # OS path detection, binary discovery, and process execution
 ├── ui.py                   # Terminal ANSI formatting and output styling
+├── i18n.py                 # Multi-language catalog, locale resolution & atomic persistence
 ├── banner.py               # Terminal banner rendering
 ├── store.py                # Profile CRUD, atomic file operations, and ZIP backups
 ├── locks.py                # Kernel-held session locking (flock / msvcrt)
@@ -441,7 +539,7 @@ agydra/                     # Flat package structure (zero third-party dependenc
 ├── orphans.py              # Reverse store audit and orphan cleaner
 ├── usage.py                # Quota inspector and rate-limit parser
 ├── bootstrap.py            # Idempotent venv & PATH shim installer
-├── tests/                  # 563 automated unit and integration tests
+├── tests/                  # 575 automated unit and integration tests
 ├── README.md               # English documentation
 ├── README.es.md            # Spanish documentation
 ├── AGENTS.md               # Developer conventions & architectural invariants
@@ -455,10 +553,10 @@ The test suite validates mock environments, edge cases, and all platforms withou
 
 ```sh
 python3 -W error::ResourceWarning -m pytest tests/ -q
-# 560 passed, 3 skipped (on macOS) in ~35s (0 warnings)
+# 572 passed, 3 skipped (on macOS) in ~45s (0 warnings)
 
 python3 -m unittest discover -s tests -q
-# Ran 563 tests in ~35s - OK
+# Ran 575 tests in ~45s - OK
 ```
 
 ---

@@ -102,7 +102,7 @@ def build_plan(
         profile=profile.name,
         reason=resolution.reason,
         binary=binary,
-        args=list(agy_args),
+        args=driver.prepare_args(agy_args),
         overlay=overlay,
         env_home_var=platforms.home_redirect_var(),
         env_home_value=overlay,
