@@ -6,10 +6,10 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/Licencia-MIT-yellow.svg" alt="Licencia: MIT"></a>
-  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Versi%C3%B3n-1.0.0-blue.svg" alt="Versión"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Versi%C3%B3n-1.1.0-blue.svg" alt="Versión"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white" alt="Python"></a>
   <img src="https://img.shields.io/badge/Plataformas-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey.svg" alt="Plataformas">
-  <a href="https://www.DragonJAR.org"><img src="https://img.shields.io/badge/Autor-DragonJAR-orange.svg" alt="Autor: DragonJAR"></a>
+  <a href="https://www.DragonJAR.org"><img src="https://img.shields.io/badge/Autor-Jaime%20Andr%C3%A9s%20Restrepo%20(DragonJAR.org)-orange.svg" alt="Autor: Jaime Andrés Restrepo (DragonJAR.org)"></a>
   <a href="README.md"><img src="https://img.shields.io/badge/Read%20in-English-0078D4?logo=readme&logoColor=white" alt="Read in English"></a>
 </p>
 
@@ -582,10 +582,14 @@ python3 -m unittest discover -s tests -q
 ## 📄 Licencia
 
 Distribuido bajo la **Licencia MIT**. Consulta [LICENSE](LICENSE) para más detalles.
+## 👨‍💻 Autor y Mantenedor
 
-## 👨💻 Autor
-
-Desarrollado y mantenido por **[DragonJAR](https://www.DragonJAR.org)** — Seguridad, Comunidad y Herramientas Libres.
+Creado con ❤️ por **Jaime Andrés Restrepo** — [DragonJAR.org](https://www.dragonjar.org)
+- **Autor:** Jaime Andrés Restrepo
+- **Organización:** [DragonJAR](https://www.dragonjar.org) — Seguridad, Comunidad y Herramientas Libres
+- **Contacto:** contacto@dragonjar.org
+- **Sitio Web:** [https://www.dragonjar.org](https://www.dragonjar.org)
+- **GitHub:** [@DragonJAR](https://github.com/DragonJAR)
 
 ---
 

@@ -222,11 +222,13 @@ class TestCliParameterMatrix(BaseCase):
                 self.assertEqual(res.returncode, 0, res.stderr)
                 self.assertIn("usage: agydra", res.stdout)
 
+        import agydra
+
         for cmd in ("version", "--version"):
             with self.subTest(cmd=cmd):
                 res = self._run_cli(cmd)
                 self.assertEqual(res.returncode, 0, res.stderr)
-                self.assertIn("agydra 1.0.0", res.stdout)
+                self.assertIn(f"agydra {agydra.__version__}", res.stdout)
 
 
 if __name__ == "__main__":

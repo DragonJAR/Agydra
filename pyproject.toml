@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
-    { name = "DragonJAR", email = "contacto@dragonjar.org" },
+    { name = "Jaime Andrés Restrepo (DragonJAR)", email = "contacto@dragonjar.org" },
 ]
 keywords = [
     "antigravity",

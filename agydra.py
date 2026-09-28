@@ -22,6 +22,7 @@ from pathlib import Path
 
 VERSION = "1.1.0"
 __version__ = VERSION
+__author__ = "Jaime Andrés Restrepo (DragonJAR.org)"
 
 MIN_PYTHON = (3, 9)
 """Deliberately duplicated from ``bootstrap.MIN_PYTHON``: the version check
