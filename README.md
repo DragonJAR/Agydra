@@ -6,10 +6,10 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
-  <img src="https://img.shields.io/badge/version-1.0.0-green" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.1.0-green" alt="Version">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="Python">
   <img src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey" alt="Platforms">
-  <a href="https://www.DragonJAR.org"><img src="https://img.shields.io/badge/author-DragonJAR-orange" alt="Author: DragonJAR"></a>
+  <a href="https://www.DragonJAR.org"><img src="https://img.shields.io/badge/author-Jaime%20Andr%C3%A9s%20Restrepo%20(DragonJAR.org)-orange" alt="Author: Jaime Andrés Restrepo (DragonJAR.org)"></a>
   <a href="README.es.md"><img src="https://img.shields.io/badge/Read_in-Español-blue" alt="Read in Español"></a>
 </p>
 
@@ -582,10 +582,14 @@ We welcome community contributions! Please adhere to our core project invariants
 ## 📄 License
 
 Distributed under the **MIT License**. See [LICENSE](LICENSE) for details.
+## 👨‍💻 Author & Maintainer
 
-## 👨💻 Author
-
-Developed and maintained by **[DragonJAR](https://www.DragonJAR.org)** — Security, Community & Open Source Tools.
+Created with ❤️ by **Jaime Andrés Restrepo** — [DragonJAR.org](https://www.dragonjar.org)
+- **Author:** Jaime Andrés Restrepo
+- **Organization:** [DragonJAR](https://www.dragonjar.org) — Security, Community & Open Source Tools
+- **Contact:** contacto@dragonjar.org
+- **Website:** [https://www.dragonjar.org](https://www.dragonjar.org)
+- **GitHub:** [@DragonJAR](https://github.com/DragonJAR)
 
 ---
 

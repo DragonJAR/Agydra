@@ -209,6 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
             "'agydra -p <profile> <args...>' runs the engine with that profile's "
             "isolated data store; host credentials (~/.gemini, ~/.codex) are never modified."
         ),
+        epilog="Created by Jaime Andrés Restrepo (DragonJAR.org) — https://www.dragonjar.org",
         formatter_class=ColoredHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"agydra {__version__}")
@@ -1215,6 +1216,10 @@ def _print_top_level_help() -> None:
                     ]
                 )
             )
+    print()
+    print(paint("author & maintainer:", "cyan", "bold"))
+    print("  Jaime Andrés Restrepo — DragonJAR.org (contacto@dragonjar.org)")
+    print("  https://www.dragonjar.org  ·  https://github.com/DragonJAR/agydra")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
