@@ -1770,5 +1770,26 @@ class TestLaunchGuardExitRedundantRead(unittest.TestCase):
             self.assertEqual(read_count, 1)
 
 
+class TestWriteSlotSelfHealing(unittest.TestCase):
+    def test_write_slot_retries_on_rc_45_duplicate(self):
+        calls = []
+
+        def fake_run(args, input_bytes=None, **kwargs):
+            calls.append(list(args))
+            if args[0] == "add-generic-password" and len(calls) == 1:
+                return _rc(45)
+            return _rc(0)
+
+        with mock.patch.object(keychain, "_run", side_effect=fake_run):
+            keychain.write_slot("gemini", b"payload-bytes", Path("/tmp/fake.keychain"))
+
+        # Verify: first add-generic-password failed with 45, then delete-generic-password was invoked,
+        # then second add-generic-password succeeded cleanly.
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0][0], "add-generic-password")
+        self.assertEqual(calls[1][0], "delete-generic-password")
+        self.assertEqual(calls[2][0], "add-generic-password")
+
+
 if __name__ == "__main__":
     unittest.main()

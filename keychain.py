@@ -249,6 +249,18 @@ def write_slot(service: str, data: bytes, keychain_path: Optional[Path] = None) 
     if keychain_path is not None:
         args.append(str(keychain_path))
     result = _run(args)
+    if result.returncode == 45:
+        # macOS security quirk: `add-generic-password -U` can fail with errSecDuplicateItem (rc=45)
+        # when SecKeychainItemModifyContent fails to update an existing item in-place.
+        # Self-healing: delete the colliding entry and retry insertion cleanly.
+        try:
+            delete_slot(service, keychain_path)
+            retry = _run(args)
+            if retry.returncode == 0:
+                return
+            result = retry
+        except Exception:
+            pass
     if result.returncode != 0:
         raise KeychainError(
             f"keychain write failed (rc={result.returncode}): "
