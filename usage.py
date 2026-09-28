@@ -59,7 +59,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import isolation
 import keychain
@@ -215,7 +215,7 @@ def fetch_codex_usage_payload(access_token: str, *, timeout: float = 10.0) -> Op
 
 def parse_codex_usage_payload(
     payload: dict,
-) -> tuple[List[UsageGroup], Optional[str], Optional[str]]:
+) -> Tuple[List[UsageGroup], Optional[str], Optional[str]]:
     """Parse Codex backend-api/wham/usage JSON into UsageGroup and metadata."""
     if not isinstance(payload, dict):
         return [], None, None

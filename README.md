@@ -158,20 +158,22 @@ agydra usage
 ```text
 agydra usage                                     9 profiles · Sun Sep 27 · 23:18
 
-■ ANTIGRAVITY               GEMINI                  CLAUDE + GPT
- #   PROFILE   ACCOUNT       AVAILABLE  WK · 5H      AVAILABLE  WK · 5H
- 1   alpha     lead.dev@gm…  ██░░░ 30    30 · 100    █░░░░ 26    26 · 100
- 2   beta      coder.jr@gm…  ██░░░ 48    48 · 100    ██░░░ 47    47 · 100
- 3   neta      agent.bot@g…  ████░ 85    85 ·  94    ██░░░ 46    46 · 100
- 4   chido     audit.sec@g…  ✗ not eligible          ✗ not eligible
- 5   chimba    team.ops@gm…  ██░░░ 42    42 ·  59    ███░░ 66    66 · 100
- 6   parce     data.anal@g…  ████░ 74    74 ·  97    █░░░░ 18    18 · 100
- 7   vacan     deep.res@gm…  ████░ 73    73 ·  99    █████ 100  100 · 100
+■ ANTIGRAVITY                GEMINI                  CLAUDE + GPT
+
+ #   PROFILE   ACCOUNT        AVAILABLE  WK · 5H      AVAILABLE  WK · 5H
+ 1   alpha     lead.dev@gm…   ██░░░ 30    30 · 100    █░░░░ 26    26 · 100
+ 2   beta      coder.jr@gm…   ██░░░ 48    48 · 100    ██░░░ 47    47 · 100
+ 3   neta      agent.bot@g…   ████░ 85    85 ·  94    ██░░░ 46    46 · 100
+ 4   chido     audit.sec@g…   ✗ not eligible          ✗ not eligible
+ 5   chimba    team.ops@gm…   ██░░░ 42    42 ·  59    ███░░ 66    66 · 100
+ 6   parce     data.anal@g…   ████░ 74    74 ·  97    █░░░░ 18    18 · 100
+ 7   vacan     deep.res@gm…   ████░ 73    73 ·  99    █████ 100  100 · 100
 
 ■ OPENAI CODEX
- #   PROFILE   ACCOUNT       PLAN            AVAILABLE  WK · 5H      ↻
- 8   codex     lead.dev@gm…  ChatGPT Plus    █████ 99    99 · 100    5d 5h
- 9   codexjar  corp.ops@dr…  ChatGPT Team    █████ 99    99 · 100    5d 3h
+
+ #   PROFILE   ACCOUNT        AVAILABLE  WK · 5H      ↻        PLAN
+ 8   codex     lead.dev@gm…   █████ 99    99 · 100    5d 5h    ChatGPT Plus
+ 9   codexjar  corp.ops@dr…   █████ 99    99 · 100    5d 3h    ChatGPT Team
 
 ▸ USE NOW   Gemini → neta 85%   Claude/GPT → vacan 100%   Codex → codex 99%
 ✗ chido: account not eligible for Antigravity. Check account status.
