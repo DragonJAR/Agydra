@@ -641,7 +641,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
 
     disp_w = bar_w + 6
     gem_col_w = disp_w + (13 if show_windows else 0)
-    prefix_w = idx_w + 1 + name_w + (account_w if show_account else 0)
+    prefix_w = 2 + idx_w + name_w + (account_w if show_account else 0)
 
     best_gem_val = -1.0
     best_gem_name = None
@@ -746,21 +746,22 @@ def _cmd_usage_compact(store: Store, _args) -> int:
             print()
         sec_title = "■ " + i18n.t("usage.section_codex", default="OPENAI CODEX")
         print(paint(sec_title, "bold"))
+        print()
 
         lbl_plan = i18n.t("usage.header_plan", default="PLAN")
-        plan_w = 16
 
         hdr_cx = f" {'#':<{idx_w}} {lbl_profile:<{name_w}}"
         if show_account:
             hdr_cx += f"{lbl_account:<{account_w}}"
-        hdr_cx += pad(lbl_plan, plan_w)
         hdr_cx += pad(lbl_avail, disp_w)
         if show_windows:
             hdr_cx += pad(lbl_windows, 13)
-        hdr_cx += "↻"
+        hdr_cx += pad("↻", 9)
+        hdr_cx += lbl_plan
         print(paint(hdr_cx, "bold"))
 
         start_idx = len(agy_entries) + 1
+        quota_w = disp_w + (13 if show_windows else 0) + 9
         for offset, (profile, result) in enumerate(codex_entries):
             idx = start_idx + offset
             row_cx = f" {idx:<{idx_w}} {profile.name:<{name_w}}"
@@ -772,14 +773,13 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                     row_cx += pad(email_raw, account_w)
 
             plan = result.plan or "-"
-            plan_str = pad(plan, plan_w)
 
             if not result.ok:
                 if result.error == "not authenticated":
                     status_str = paint(i18n.t("auth.not_authenticated", default="not authenticated"), "dim")
                 else:
                     status_str = paint(f"({result.error})", "dim")
-                print(row_cx + plan_str + status_str)
+                print(row_cx + pad(status_str, quota_w) + plan)
             elif not result.groups:
                 if result.error and "offline" in result.error.lower():
                     status_str = paint("─ " + i18n.t("usage.unavailable", default="unavailable"), "dim")
@@ -788,7 +788,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                 if best_codex_name is None:
                     best_codex_name = profile.name
                     best_codex_plan = plan
-                print(row_cx + plan_str + status_str)
+                print(row_cx + pad(status_str, quota_w) + plan)
             else:
                 summary = usage.extract_model_summary(result.groups)
                 cx_avail = summary["codex"]["available"]
@@ -821,9 +821,9 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                     cx_win = ""
 
                 countdown = usage.format_countdown(cx_reset) if cx_reset else "-"
-                cx_reset_str = paint(f"{countdown}", "dim")
+                cx_reset_str = pad(paint(f"{countdown}", "dim"), 9)
 
-                print(row_cx + plan_str + cx_disp + cx_win + cx_reset_str)
+                print(row_cx + cx_disp + cx_win + cx_reset_str + plan)
 
     recs = []
     if best_gem_name is not None and best_gem_val >= 0:
