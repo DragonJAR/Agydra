@@ -158,7 +158,8 @@ agydra usage
 ```text
 agydra usage                                     9 perfiles · dom 27 sep · 23:18
 
-■ ANTIGRAVITY               GEMINI                  CLAUDE + GPT
+■ ANTIGRAVITY                GEMINI                  CLAUDE + GPT
+
  #   PERFIL    CUENTA        DISPONIBLE SEM · 5H     DISPONIBLE SEM · 5H
  1   alpha     jaimeandres…  ██░░░ 30    30 · 100    █░░░░ 26    26 · 100
  2   beta      valentinaip…  ██░░░ 48    48 · 100    ██░░░ 47    47 · 100
@@ -169,9 +170,10 @@ agydra usage                                     9 perfiles · dom 27 sep · 23:
  7   vacan     dragonjar.t…  ████░ 73    73 ·  99    █████ 100  100 · 100
 
 ■ OPENAI CODEX
- #   PERFIL    CUENTA        PLAN            DISPONIBLE SEM · 5H     ↻
- 8   codex     jaimeandres…  ChatGPT Plus    █████ 99    99 · 100    5d 5h
- 9   codexjar  contacto@dr…  ChatGPT Team    █████ 99    99 · 100    5d 3h
+
+ #   PERFIL    CUENTA        DISPONIBLE SEM · 5H     ↻        PLAN
+ 8   codex     jaimeandres…  █████ 99    99 · 100    5d 5h    ChatGPT Plus
+ 9   codexjar  contacto@dr…  █████ 99    99 · 100    5d 3h    ChatGPT Team
 
 ▸ USAR AHORA   Gemini → neta 85%   Claude/GPT → vacan 100%   Codex → codex 99%
 ✗ chido: cuenta no elegible para Antigravity. Hay que verificarla.

@@ -108,9 +108,12 @@ class TestUsageCli(BaseCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         out = res.stdout
 
-        # Header contains the two model group categories
+        # Header contains the two model group categories and empty line before subheaders
         self.assertIn("GEMINI", out)
         self.assertIn("CLAUDE + GPT", out)
+        lines = out.splitlines()
+        agy_sec_idx = next(i for i, line in enumerate(lines) if "ANTIGRAVITY" in line)
+        self.assertEqual(lines[agy_sec_idx + 1].strip(), "")
 
         # alpha: healthy quota (>=50%) across buckets
         alpha_line = next(line for line in out.splitlines() if "alpha" in line)

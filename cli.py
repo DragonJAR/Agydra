@@ -212,7 +212,11 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Created by Jaime Andrés Restrepo (DragonJAR.org) — https://www.dragonjar.org",
         formatter_class=ColoredHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version=f"agydra {__version__}")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"agydra {__version__} — Jaime Andrés Restrepo (DragonJAR.org)",
+    )
     for _key, (short, long_, takes_value, metavar, help_text) in _LAUNCH_FLAGS.items():
         aliases = (short, long_, "--rotate") if _key == "random" else (short, long_)
         if takes_value:
@@ -658,6 +662,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
         top_hdr += pad(paint("GEMINI", "bold"), gem_col_w)
         top_hdr += paint("CLAUDE + GPT", "bold")
         print(top_hdr)
+        print()
 
         sub_hdr = f" {'#':<{idx_w}} {lbl_profile:<{name_w}}"
         if show_account:
@@ -1332,7 +1337,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if sub == "version":
-        print(f"agydra {__version__}")
+        print(f"agydra {__version__} — Jaime Andrés Restrepo (DragonJAR.org)")
         return 0
 
     if sub is not None:

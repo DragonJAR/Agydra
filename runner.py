@@ -13,7 +13,7 @@ built inside ``run`` exclusively.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence
 
@@ -43,6 +43,7 @@ class LaunchPlan:
     force: bool = False
     windows_redirect_home: bool = False
     cwd: Optional[Path] = None
+    raw_args: List[str] = field(default_factory=list)
 
     def describe(self) -> str:
         lines = [
@@ -114,6 +115,7 @@ def build_plan(
         force=force,
         windows_redirect_home=bool(config.settings.get("windows_redirect_home")),
         cwd=cwd,
+        raw_args=list(agy_args),
     )
 
 
@@ -166,7 +168,7 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
                     "no free authenticated profile left after concurrent picks"
                 )
             plan = build_plan(
-                store, plan.args,
+                store, plan.raw_args,
                 binary_override=plan.binary_override, random_pick=True,
                 launch_as_child=plan.launch_as_child,
                 cwd=plan.cwd,

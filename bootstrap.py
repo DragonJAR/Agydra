@@ -27,7 +27,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 import platforms
 
@@ -55,7 +55,7 @@ def project_root(cwd: Optional[Path] = None) -> Path:
     like the project; otherwise the first candidate so callers can report it.
     """
     here = platforms.canonical_path(Path(__file__).resolve().parent)
-    candidates: list[Path] = []
+    candidates: List[Path] = []
     if cwd is not None:
         candidates.append(platforms.canonical_path(Path(cwd).resolve()))
     candidates.append(here)
