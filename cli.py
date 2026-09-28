@@ -646,6 +646,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
     best_gem_name = None
     best_claude_val = -1.0
     best_claude_name = None
+    best_codex_val = -1.0
     best_codex_name = None
     best_codex_plan = None
     ineligible_profiles = []
@@ -746,13 +747,16 @@ def _cmd_usage_compact(store: Store, _args) -> int:
         print(paint(sec_title, "bold"))
 
         lbl_plan = i18n.t("usage.header_plan", default="PLAN")
-        lbl_status = i18n.t("usage.header_status", default="STATUS")
         plan_w = 16
 
         hdr_cx = f" {'#':<{idx_w}} {lbl_profile:<{name_w}}"
         if show_account:
             hdr_cx += f"{lbl_account:<{account_w}}"
-        hdr_cx += f"{lbl_plan:<{plan_w}}{lbl_status}"
+        hdr_cx += pad(lbl_plan, plan_w)
+        hdr_cx += pad(lbl_avail, disp_w)
+        if show_windows:
+            hdr_cx += pad(lbl_windows, 13)
+        hdr_cx += "↻"
         print(paint(hdr_cx, "bold"))
 
         start_idx = len(agy_entries) + 1
@@ -767,15 +771,58 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                     row_cx += pad(email_raw, account_w)
 
             plan = result.plan or "-"
-            if result.ok:
-                status_str = paint(i18n.t("auth.authenticated", default="authenticated"), "green")
+            plan_str = pad(plan, plan_w)
+
+            if not result.ok:
+                if result.error == "not authenticated":
+                    status_str = paint(i18n.t("auth.not_authenticated", default="not authenticated"), "dim")
+                else:
+                    status_str = paint(f"({result.error})", "dim")
+                print(row_cx + plan_str + status_str)
+            elif not result.groups:
+                if result.error and "offline" in result.error.lower():
+                    status_str = paint("─ " + i18n.t("usage.unavailable", default="unavailable"), "dim")
+                else:
+                    status_str = paint(i18n.t("auth.authenticated", default="authenticated"), "green")
                 if best_codex_name is None:
                     best_codex_name = profile.name
                     best_codex_plan = plan
+                print(row_cx + plan_str + status_str)
             else:
-                status_str = paint(i18n.t("auth.not_authenticated", default="not authenticated"), "dim")
-            row_cx += f"{plan:<{plan_w}}{status_str}"
-            print(row_cx)
+                summary = usage.extract_model_summary(result.groups)
+                cx_avail = summary["codex"]["available"]
+                cx_wk = summary["codex"]["weekly"]
+                cx_5h = summary["codex"]["five_h"]
+                cx_reset = summary["codex"]["reset_time"]
+
+                if cx_avail is not None and cx_avail > best_codex_val:
+                    best_codex_val = cx_avail
+                    best_codex_name = profile.name
+                    best_codex_plan = plan
+                elif best_codex_name is None:
+                    best_codex_name = profile.name
+                    best_codex_plan = plan
+
+                if cx_avail is not None:
+                    cx_bar = usage.format_mini_bar(cx_avail, width=bar_w)
+                    cx_pct = round(cx_avail * 100)
+                    cx_color = usage.usage_color(cx_avail)
+                    cx_disp = pad(paint(f"{cx_bar} {cx_pct:>2}", cx_color), disp_w)
+                else:
+                    cx_disp = pad(paint("-", "dim"), disp_w)
+
+                if show_windows:
+                    if cx_wk is not None and cx_5h is not None:
+                        cx_win = pad(f"{round(cx_wk * 100):>3} · {round(cx_5h * 100):>3}", 13)
+                    else:
+                        cx_win = pad(paint("-", "dim"), 13)
+                else:
+                    cx_win = ""
+
+                countdown = usage.format_countdown(cx_reset) if cx_reset else "-"
+                cx_reset_str = paint(f"{countdown}", "dim")
+
+                print(row_cx + plan_str + cx_disp + cx_win + cx_reset_str)
 
     recs = []
     if best_gem_name is not None and best_gem_val >= 0:
@@ -783,7 +830,10 @@ def _cmd_usage_compact(store: Store, _args) -> int:
     if best_claude_name is not None and best_claude_val >= 0:
         recs.append(f"Claude/GPT → {best_claude_name} {round(best_claude_val * 100)}%")
     if best_codex_name is not None:
-        recs.append(f"Codex → {best_codex_name} ({best_codex_plan})")
+        if best_codex_val >= 0:
+            recs.append(f"Codex → {best_codex_name} {round(best_codex_val * 100)}%")
+        else:
+            recs.append(f"Codex → {best_codex_name} ({best_codex_plan})")
 
     if recs:
         print()
@@ -810,10 +860,19 @@ def _cmd_usage_detail(store: Store, args) -> int:
     if profile.engine == "codex":
         if result.plan:
             print(f"plan      : {result.plan}")
-        state_str = i18n.t("auth.authenticated", default="authenticated") if result.ok else i18n.t("auth.not_authenticated", default="not authenticated")
+        state_str = (
+            i18n.t("auth.authenticated", default="authenticated")
+            if result.ok
+            else i18n.t("auth.not_authenticated", default="not authenticated")
+        )
         print(f"status    : {state_str}")
         print(f"data dir  : {store.profile_data_dir(name, engine='codex')}")
-        return 0
+        if not result.ok:
+            if result.error and result.error != "not authenticated":
+                _error(f"usage unavailable: {result.error}")
+            return 0
+        if not result.groups:
+            return 0
 
     if not result.ok:
         _error(f"usage unavailable: {result.error}")

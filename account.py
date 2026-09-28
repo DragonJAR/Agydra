@@ -212,6 +212,30 @@ def detect_codex_plan(data_dir: Path) -> Optional[str]:
     return None
 
 
+def save_codex_tokens(data_dir: Path, tokens_data: dict) -> bool:
+    """Update tokens and last_refresh in Codex auth.json atomically."""
+    path = Path(data_dir) / CODEX_AUTH_FILE
+    if not path.is_file():
+        return False
+    raw = store.read_json_object(path, tolerant=True)
+    if not isinstance(raw, dict):
+        raw = {}
+    tokens = raw.get("tokens")
+    if not isinstance(tokens, dict):
+        tokens = {}
+    for key in ("access_token", "refresh_token", "id_token", "account_id"):
+        if key in tokens_data and tokens_data[key]:
+            tokens[key] = tokens_data[key]
+    raw["tokens"] = tokens
+    from models import _utcnow_iso
+    raw["last_refresh"] = _utcnow_iso()
+    try:
+        store._atomic_write_json(path, raw)
+        return True
+    except Exception:
+        return False
+
+
 def detect_email_source(
     data_dir: Path,
     store=None,

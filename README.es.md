@@ -169,11 +169,11 @@ agydra usage                                     9 perfiles · dom 27 sep · 23:
  7   vacan     data.anal@g…  ████░ 73    73 ·  99    █████ 100  100 · 100
 
 ■ OPENAI CODEX
- #   PERFIL    CUENTA        PLAN            ESTADO
- 8   codex     averylongte…  ChatGPT Plus    autenticado
- 9   codexjar  contacto@dr…  ChatGPT Team    autenticado
+ #   PERFIL    CUENTA        PLAN            DISPONIBLE SEM · 5H     ↻
+ 8   codex     averylongte…  ChatGPT Plus    █████ 99    99 · 100    5d 5h
+ 9   codexjar  contacto@dr…  ChatGPT Team    █████ 99    99 · 100    5d 3h
 
-▸ USAR AHORA   Gemini → neta 85%   Claude/GPT → vacan 100%   Codex → codex (ChatGPT Plus)
+▸ USAR AHORA   Gemini → neta 85%   Claude/GPT → vacan 100%   Codex → codex 99%
 ✗ chido: cuenta no elegible para Antigravity. Hay que verificarla.
 ```
 
@@ -335,7 +335,7 @@ Cualquier subcomando de gestión acepta también la sintaxis `--NOMBRE` o `-NOMB
 #### Cuotas y Diagnósticos
 | Comando | Alias | Descripción |
 |---|---|---|
-| `agydra usage [NOMBRE\|#]` | `us` | Inspecciona cuotas de modelos en vivo y estados de límite de tasa entre cuentas (`agy`). |
+| `agydra usage [NOMBRE\|#]` | `us` | Inspecciona cuotas de modelos en vivo y estados de límite de tasa entre cuentas (`agy` y `codex`). |
 | `agydra share-config ORIGEN DESTINO...` | `share` | Copia de forma segura `settings.json` y `mcp.json` desde `ORIGEN` (nunca credenciales). |
 | `agydra doctor [--fix] [-f]` | `doc` | Suite de diagnósticos. `--fix` repara automáticamente enlaces rotos, locks huérfanos y slots obsoletos. |
 
@@ -539,7 +539,7 @@ agydra/                     # Estructura plana (cero dependencias de terceros)
 ├── orphans.py              # Auditoría inversa del almacén y limpiador de huérfanos
 ├── usage.py                # Inspector de cuotas y parseador de límites de tasa
 ├── bootstrap.py            # Instalador idempotente de venv y shim en PATH
-├── tests/                  # 575 pruebas automáticas unitarias y de integración
+├── tests/                  # 589 pruebas automáticas unitarias y de integración
 ├── README.md               # Documentación en inglés
 ├── README.es.md            # Documentación en español
 ├── AGENTS.md               # Convenciones de desarrollo e invariantes arquitectónicos

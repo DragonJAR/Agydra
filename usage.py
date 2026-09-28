@@ -54,8 +54,11 @@ from __future__ import annotations
 
 import json
 import subprocess
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, List, Optional
 
 import isolation
@@ -65,6 +68,10 @@ import resolver
 from account import auth_state
 
 DEFAULT_TIMEOUT_S = 20
+
+OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+OPENAI_REFRESH_URL = "https://auth.openai.com/oauth/token"
+OPENAI_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -165,6 +172,258 @@ def _parse_groups(raw: object) -> List[UsageGroup]:
     return [g for g in (_parse_group(item) for item in raw) if g is not None]
 
 
+def refresh_codex_tokens(refresh_token: str, *, timeout: float = 10.0) -> Optional[dict]:
+    """Call OpenAI OAuth refresh endpoint to exchange refresh_token for a fresh access_token."""
+    body = json.dumps({
+        "client_id": OPENAI_CLIENT_ID,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        OPENAI_REFRESH_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, dict) and data.get("access_token"):
+                return data
+    except Exception:
+        return None
+    return None
+
+
+def fetch_codex_usage_payload(access_token: str, *, timeout: float = 10.0) -> Optional[dict]:
+    """Query OpenAI internal wham/usage endpoint using a Bearer access_token."""
+    req = urllib.request.Request(
+        OPENAI_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        return data if isinstance(data, dict) else None
+
+
+def parse_codex_usage_payload(
+    payload: dict,
+) -> tuple[List[UsageGroup], Optional[str], Optional[str]]:
+    """Parse Codex backend-api/wham/usage JSON into UsageGroup and metadata."""
+    if not isinstance(payload, dict):
+        return [], None, None
+
+    detected_email = payload.get("email") if isinstance(payload.get("email"), str) else None
+    raw_plan = payload.get("plan_type")
+    detected_plan = None
+    if isinstance(raw_plan, str) and raw_plan:
+        plan_map = {
+            "plus": "ChatGPT Plus",
+            "team": "ChatGPT Team",
+            "pro": "ChatGPT Pro",
+            "enterprise": "ChatGPT Enterprise",
+            "free": "ChatGPT Free",
+        }
+        detected_plan = plan_map.get(raw_plan.lower(), f"ChatGPT {raw_plan.capitalize()}")
+
+    rate_limit = payload.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        return [], detected_plan, detected_email
+
+    buckets: List[UsageBucket] = []
+
+    prim = rate_limit.get("primary_window")
+    if isinstance(prim, dict):
+        used = prim.get("used_percent")
+        if isinstance(used, (int, float)) and not isinstance(used, bool):
+            rem = max(0.0, min(1.0, (100.0 - float(used)) / 100.0))
+            reset_at = prim.get("reset_at")
+            reset_dt = (
+                datetime.fromtimestamp(reset_at, tz=timezone.utc)
+                if isinstance(reset_at, (int, float))
+                else None
+            )
+            buckets.append(
+                UsageBucket(
+                    id="codex-5h",
+                    name="5 Hours",
+                    window="5h",
+                    remaining_fraction=rem,
+                    reset_time=reset_dt,
+                )
+            )
+
+    sec = rate_limit.get("secondary_window")
+    if isinstance(sec, dict):
+        used = sec.get("used_percent")
+        if isinstance(used, (int, float)) and not isinstance(used, bool):
+            rem = max(0.0, min(1.0, (100.0 - float(used)) / 100.0))
+            reset_at = sec.get("reset_at")
+            reset_dt = (
+                datetime.fromtimestamp(reset_at, tz=timezone.utc)
+                if isinstance(reset_at, (int, float))
+                else None
+            )
+            buckets.append(
+                UsageBucket(
+                    id="codex-weekly",
+                    name="Weekly",
+                    window="weekly",
+                    remaining_fraction=rem,
+                    reset_time=reset_dt,
+                )
+            )
+
+    if not buckets:
+        return [], detected_plan, detected_email
+
+    return [UsageGroup(name="OpenAI Codex", buckets=buckets)], detected_plan, detected_email
+
+
+def query_codex_usage(
+    data_dir: Path,
+    name: str,
+    *,
+    email: Optional[str] = None,
+    plan: Optional[str] = None,
+    timeout: float = DEFAULT_TIMEOUT_S,
+) -> UsageResult:
+    """Query OpenAI Codex usage via backend-api/wham/usage. Never raises."""
+    import account
+
+    auth_info = account.inspect_codex_auth(data_dir)
+    detected_plan = plan or account.detect_codex_plan(data_dir)
+    detected_email = email or account.detect_codex_email(data_dir)
+
+    if auth_info is None:
+        return UsageResult(
+            name=name,
+            ok=False,
+            engine="codex",
+            email=detected_email,
+            plan=detected_plan,
+            error="not authenticated",
+        )
+
+    if auth_info.get("auth_type") == "api_key":
+        return UsageResult(
+            name=name,
+            ok=True,
+            engine="codex",
+            email=detected_email,
+            plan=detected_plan or "OpenAI API Key",
+        )
+
+    access_token = auth_info.get("access_token")
+    refresh_token = auth_info.get("refresh_token")
+
+    def _do_refresh() -> Optional[str]:
+        if not refresh_token:
+            return None
+        new_tokens = refresh_codex_tokens(refresh_token, timeout=timeout)
+        if new_tokens and new_tokens.get("access_token"):
+            account.save_codex_tokens(data_dir, new_tokens)
+            return new_tokens.get("access_token")
+        return None
+
+    if not access_token and refresh_token:
+        access_token = _do_refresh()
+        if not access_token:
+            return UsageResult(
+                name=name,
+                ok=False,
+                engine="codex",
+                email=detected_email,
+                plan=detected_plan,
+                error="token refresh failed",
+            )
+
+    if not access_token:
+        return UsageResult(
+            name=name,
+            ok=False,
+            engine="codex",
+            email=detected_email,
+            plan=detected_plan,
+            error="missing access token",
+        )
+
+    payload = None
+    try:
+        payload = fetch_codex_usage_payload(access_token, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401 and refresh_token:
+            new_access_token = _do_refresh()
+            if new_access_token:
+                try:
+                    payload = fetch_codex_usage_payload(new_access_token, timeout=timeout)
+                except Exception as inner_exc:
+                    return UsageResult(
+                        name=name,
+                        ok=True,
+                        engine="codex",
+                        email=detected_email,
+                        plan=detected_plan or "ChatGPT Plus",
+                        error=f"usage unavailable ({inner_exc})",
+                    )
+            else:
+                return UsageResult(
+                    name=name,
+                    ok=False,
+                    engine="codex",
+                    email=detected_email,
+                    plan=detected_plan,
+                    error="session expired (401)",
+                )
+        else:
+            return UsageResult(
+                name=name,
+                ok=True,
+                engine="codex",
+                email=detected_email,
+                plan=detected_plan or "ChatGPT Plus",
+                error=f"usage unavailable (HTTP {exc.code})",
+            )
+    except Exception as exc:
+        return UsageResult(
+            name=name,
+            ok=True,
+            engine="codex",
+            email=detected_email,
+            plan=detected_plan or "ChatGPT Plus",
+            error=f"offline ({exc})",
+        )
+
+    if not payload:
+        return UsageResult(
+            name=name,
+            ok=True,
+            engine="codex",
+            email=detected_email,
+            plan=detected_plan or "ChatGPT Plus",
+        )
+
+    groups, api_plan, api_email = parse_codex_usage_payload(payload)
+    final_plan = api_plan or detected_plan or "ChatGPT Plus"
+    final_email = api_email or detected_email
+
+    return UsageResult(
+        name=name,
+        ok=True,
+        engine="codex",
+        email=final_email,
+        plan=final_plan,
+        groups=groups,
+    )
+
+
 def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S) -> UsageResult:
     """Query one profile's quota usage or engine status. Never raises.
 
@@ -177,28 +436,16 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     profile = store.get(name)
     engine = profile.engine
     data_dir = store.profile_data_dir(name, engine=engine)
-    state = auth_state(data_dir, store, name, engine=engine)
 
     if engine == "codex":
-        import account
-        plan = account.detect_codex_plan(data_dir)
-        email = profile.email or account.detect_codex_email(data_dir)
-        if state != "authenticated":
-            return UsageResult(
-                name=name,
-                ok=False,
-                engine="codex",
-                email=email,
-                plan=plan,
-                error="not authenticated",
-            )
-        return UsageResult(
-            name=name,
-            ok=True,
-            engine="codex",
-            email=email,
-            plan=plan or "ChatGPT Plus",
+        return query_codex_usage(
+            data_dir,
+            name,
+            email=profile.email,
+            timeout=timeout,
         )
+
+    state = auth_state(data_dir, store, name, engine=engine)
 
     if state != "authenticated":
         return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error="not authenticated")
@@ -343,10 +590,11 @@ def format_mini_bar(remaining_fraction: float, width: int = 10) -> str:
 
 
 def extract_model_summary(groups: List[UsageGroup]) -> dict:
-    """Extract quota availability for standard model families ('gemini' and 'claude')."""
+    """Extract quota availability for standard model families ('gemini', 'claude', 'codex')."""
     summary = {
-        "gemini": {"weekly": None, "five_h": None, "available": None},
-        "claude": {"weekly": None, "five_h": None, "available": None},
+        "gemini": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
+        "claude": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
+        "codex": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
     }
     for group in groups:
         lower_name = group.name.lower()
@@ -355,6 +603,8 @@ def extract_model_summary(groups: List[UsageGroup]) -> dict:
             key = "gemini"
         elif any(k in lower_name for k in ("claude", "gpt", "3p")):
             key = "claude"
+        elif any(k in lower_name for k in ("codex", "openai")):
+            key = "codex"
         elif summary["gemini"]["available"] is None:
             key = "gemini"
         elif summary["claude"]["available"] is None:
@@ -368,18 +618,29 @@ def extract_model_summary(groups: List[UsageGroup]) -> dict:
             bid = bucket.id.lower()
             if "weekly" in win or "weekly" in bid:
                 summary[key]["weekly"] = bucket.remaining_fraction
+                summary[key]["weekly_reset"] = bucket.reset_time
             elif "5h" in win or "5h" in bid:
                 summary[key]["five_h"] = bucket.remaining_fraction
+                summary[key]["five_h_reset"] = bucket.reset_time
 
-    for key in ("gemini", "claude"):
+    for key in ("gemini", "claude", "codex"):
         w = summary[key]["weekly"]
         f = summary[key]["five_h"]
+        w_reset = summary[key].get("weekly_reset")
+        f_reset = summary[key].get("five_h_reset")
         if w is not None and f is not None:
-            summary[key]["available"] = min(w, f)
+            if f <= w:
+                summary[key]["available"] = f
+                summary[key]["reset_time"] = f_reset
+            else:
+                summary[key]["available"] = w
+                summary[key]["reset_time"] = w_reset
         elif w is not None:
             summary[key]["available"] = w
+            summary[key]["reset_time"] = w_reset
         elif f is not None:
             summary[key]["available"] = f
+            summary[key]["reset_time"] = f_reset
 
     return summary
 

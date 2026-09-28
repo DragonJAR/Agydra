@@ -169,11 +169,11 @@ agydra usage                                     9 profiles · Sun Sep 27 · 23:
  7   vacan     deep.res@gm…  ████░ 73    73 ·  99    █████ 100  100 · 100
 
 ■ OPENAI CODEX
- #   PROFILE   ACCOUNT       PLAN            STATUS
- 8   codex     lead.dev@gm…  ChatGPT Plus    authenticated
- 9   codexjar  corp.ops@dr…  ChatGPT Team    authenticated
+ #   PROFILE   ACCOUNT       PLAN            AVAILABLE  WK · 5H      ↻
+ 8   codex     lead.dev@gm…  ChatGPT Plus    █████ 99    99 · 100    5d 5h
+ 9   codexjar  corp.ops@dr…  ChatGPT Team    █████ 99    99 · 100    5d 3h
 
-▸ USE NOW   Gemini → neta 85%   Claude/GPT → vacan 100%   Codex → codex (ChatGPT Plus)
+▸ USE NOW   Gemini → neta 85%   Claude/GPT → vacan 100%   Codex → codex 99%
 ✗ chido: account not eligible for Antigravity. Check account status.
 ```
 
@@ -335,7 +335,7 @@ Any management subcommand also accepts `--NAME` or `-NAME` syntax (e.g. `agydra 
 #### Quotas & Diagnostics
 | Command | Aliases | Description |
 |---|---|---|
-| `agydra usage [NAME\|#]` | `us` | Inspects live model quota and rate limit status across accounts (`agy`). |
+| `agydra usage [NAME\|#]` | `us` | Inspects live model quota and rate limit status across accounts (`agy` and `codex`). |
 | `agydra share-config SRC TARGET...` | `share` | Safely copies `settings.json` and `mcp.json` from `SRC` to targets (never touches credentials). |
 | `agydra doctor [--fix] [-f]` | `doc` | Runs system diagnostics suite. `--fix` automatically repairs dangling links, orphan locks, and stale slots. |
 
@@ -539,7 +539,7 @@ agydra/                     # Flat package structure (zero third-party dependenc
 ├── orphans.py              # Reverse store audit and orphan cleaner
 ├── usage.py                # Quota inspector and rate-limit parser
 ├── bootstrap.py            # Idempotent venv & PATH shim installer
-├── tests/                  # 575 automated unit and integration tests
+├── tests/                  # 589 automated unit and integration tests
 ├── README.md               # English documentation
 ├── README.es.md            # Spanish documentation
 ├── AGENTS.md               # Developer conventions & architectural invariants
