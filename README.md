@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/version-1.1.0-green" alt="Version">
   <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="Python">
   <img src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey" alt="Platforms">
-  <a href="https://www.DragonJAR.org"><img src="https://img.shields.io/badge/author-Jaime%20Andr%C3%A9s%20Restrepo%20(DragonJAR.org)-orange" alt="Author: Jaime Andrés Restrepo (DragonJAR.org)"></a>
+  <a href="https://www.DragonJAR.org"><img src="https://img.shields.io/badge/author-DragonJAR.org-orange" alt="Author: DragonJAR.org"></a>
   <a href="README.es.md"><img src="https://img.shields.io/badge/Read_in-Español-blue" alt="Read in Español"></a>
 </p>
 
