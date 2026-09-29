@@ -17,6 +17,7 @@ and replaces stale ancestor links with real mirrored directories.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import stat
@@ -392,6 +393,77 @@ def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "ag
     return overlay
 
 
+# Usable bytes of sockaddr_un.sun_path. macOS is 104 including the trailing
+# NUL; Linux is 108. 103 is bindable on both. Windows has no such limit.
+_AF_UNIX_PATH_MAX = 103
+
+
+def grok_leader_socket(overlay: Path, data_dir_name: str = ".grok") -> str:
+    """Socket path for ``GROK_LEADER_SOCKET``.
+
+    ``<overlay>/.grok/leader.sock`` is used when that path fits in sun_path,
+    and always on Windows. A longer POSIX path cannot be bound, so the
+    socket moves to ``/tmp/agydra-<uid>/<hash>.sock`` (mode 0700, owned by
+    the user). The hash is of the overlay path, so profiles stay apart and
+    the socket never lands in the host ``~/.grok``.
+    """
+    preferred = overlay / data_dir_name / "leader.sock"
+    preferred_s = str(preferred)
+    if platforms.is_windows() or len(os.fsencode(preferred_s)) <= _AF_UNIX_PATH_MAX:
+        return preferred_s
+    uid = os.getuid()
+    digest = hashlib.sha256(os.fsencode(preferred_s)).hexdigest()[:16]
+    sock_dir = _private_unix_socket_dir(uid)
+    sock = sock_dir / f"{digest}.sock"
+    _reclaim_owned_socket(sock)
+    return str(sock)
+
+
+def _private_unix_socket_dir(uid: int) -> Path:
+    """Return ``/tmp/agydra-<uid>`` only when it is a private directory we own."""
+    path = Path(f"/tmp/agydra-{uid}")
+    try:
+        path.mkdir(mode=0o700, exist_ok=True)
+    except FileExistsError:
+        pass
+    _require_private_dir(path, uid)
+    if stat.S_IMODE(path.lstat().st_mode) != 0o700:
+        os.chmod(path, 0o700)
+        _require_private_dir(path, uid)
+        if stat.S_IMODE(path.lstat().st_mode) != 0o700:
+            raise IsolationError(f"refusing grok leader socket dir {path}: mode is not 0700")
+    return path
+
+
+def _require_private_dir(path: Path, uid: int) -> None:
+    try:
+        st = path.lstat()
+    except OSError as exc:
+        raise IsolationError(f"refusing grok leader socket dir {path}: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+        raise IsolationError(
+            f"refusing grok leader socket dir {path}: not a private directory owned by uid {uid}"
+        )
+
+
+def _reclaim_owned_socket(path: Path) -> None:
+    """Remove a leftover socket inode so the next bind can use the name.
+
+    Only a non-symlink socket owned by this uid is removed. A live session
+    already holds the profile lock before this runs.
+    """
+    try:
+        st = path.lstat()
+    except (FileNotFoundError, OSError):
+        return
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 def _disable_codex_daemon_auto_start(data_dir: Path) -> None:
     """Ensure daemon_auto_start = false in Codex config.toml to avoid SUN_LEN socket limits."""
     import re
@@ -444,7 +516,7 @@ def isolated_env(
     if driver.env_home_var:
         env[driver.env_home_var] = str(overlay / driver.data_dir_name)
     if engine == "grok":
-        env["GROK_LEADER_SOCKET"] = str(overlay / driver.data_dir_name / "leader.sock")
+        env["GROK_LEADER_SOCKET"] = grok_leader_socket(overlay, driver.data_dir_name)
     if platforms.is_windows() and config_windows_redirect_home:
         env["HOME"] = str(overlay)
     for xdg_var in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):

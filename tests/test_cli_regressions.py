@@ -41,6 +41,9 @@ class TestListColumnsAlignWithColor(BaseCase):
     def setUp(self):
         super().setUp()
         self.store = Store()
+        # NO_COLOR wins over FORCE_COLOR. Drop an inherited NO_COLOR so this
+        # class actually paints; BaseCase.tearDown restores the process env.
+        os.environ.pop("NO_COLOR", None)
         os.environ["FORCE_COLOR"] = "1"
 
     def test_row_columns_align_with_header_under_color(self):

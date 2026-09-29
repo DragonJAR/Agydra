@@ -532,7 +532,9 @@ class TestAliasesAndFlagTable(BaseCase):
         from cli import main
 
         old = os.environ.get("FORCE_COLOR")
+        old_no = os.environ.get("NO_COLOR")
         os.environ["FORCE_COLOR"] = "1"
+        os.environ.pop("NO_COLOR", None)
         try:
             buf = io.StringIO()
             with redirect_stdout(buf):
@@ -542,6 +544,10 @@ class TestAliasesAndFlagTable(BaseCase):
                 os.environ.pop("FORCE_COLOR", None)
             else:
                 os.environ["FORCE_COLOR"] = old
+            if old_no is None:
+                os.environ.pop("NO_COLOR", None)
+            else:
+                os.environ["NO_COLOR"] = old_no
         out = buf.getvalue()
         self.assertIn("\x1b[", out)
         from ui import strip_ansi

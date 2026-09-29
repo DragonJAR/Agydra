@@ -3,9 +3,12 @@ import base64
 import json
 import os
 import shutil
+import socket
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import account
 import cli
@@ -112,7 +115,70 @@ class TestGrokEngine(unittest.TestCase):
 
         env = isolation.isolated_env(overlay, {}, engine="grok")
         self.assertEqual(env.get("GROK_HOME"), str(overlay / ".grok"))
-        self.assertEqual(env.get("GROK_LEADER_SOCKET"), str(overlay / ".grok" / "leader.sock"))
+        preferred = str(overlay / ".grok" / "leader.sock")
+        sock = env.get("GROK_LEADER_SOCKET")
+        # macOS sun_path holds 103 usable bytes. A temp store under
+        # /var/folders already exceeds that; the socket must still bind.
+        if platforms.is_windows() or len(os.fsencode(preferred)) <= 103:
+            self.assertEqual(sock, preferred)
+        else:
+            self.assertNotEqual(sock, preferred)
+            self.assertLessEqual(len(os.fsencode(sock)), 103)
+            self.assertTrue(sock.startswith(f"/tmp/agydra-{os.getuid()}/"))
+            self.assertFalse(sock.startswith(str(self.home)))
+
+    def test_grok_leader_socket_stays_on_overlay_when_it_fits(self):
+        if platforms.is_windows():
+            self.skipTest("sun_path limit is POSIX-only")
+        overlay = Path("/tmp/agy-ov/gk")
+        preferred = str(overlay / ".grok" / "leader.sock")
+        self.assertLessEqual(len(os.fsencode(preferred)), 103)
+        env = isolation.isolated_env(overlay, {}, engine="grok")
+        self.assertEqual(env["GROK_HOME"], str(overlay / ".grok"))
+        self.assertEqual(env["GROK_LEADER_SOCKET"], preferred)
+
+    def test_grok_leader_socket_shortens_when_overlay_path_exceeds_sun_path(self):
+        if platforms.is_windows():
+            self.skipTest("sun_path limit is POSIX-only")
+        overlay = Path("/" + ("p" * 90) + "/work")
+        other = Path("/" + ("p" * 90) + "/lab")
+        preferred = str(overlay / ".grok" / "leader.sock")
+        self.assertGreater(len(os.fsencode(preferred)), 103)
+        env = isolation.isolated_env(overlay, {}, engine="grok")
+        again = isolation.isolated_env(overlay, {}, engine="grok")
+        other_env = isolation.isolated_env(other, {}, engine="grok")
+        sock = env["GROK_LEADER_SOCKET"]
+        self.assertEqual(again["GROK_LEADER_SOCKET"], sock)
+        self.assertNotEqual(other_env["GROK_LEADER_SOCKET"], sock)
+        self.assertNotEqual(sock, preferred)
+        self.assertLessEqual(len(os.fsencode(sock)), 103)
+        self.assertTrue(sock.startswith(f"/tmp/agydra-{os.getuid()}/"))
+        self.assertFalse(sock.startswith(str(self.home)))
+        self.assertNotIn(str(overlay), sock)
+        parent = Path(sock).parent
+        st = parent.lstat()
+        self.assertFalse(stat.S_ISLNK(st.st_mode))
+        self.assertTrue(stat.S_ISDIR(st.st_mode))
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o700)
+        self.assertEqual(st.st_uid, os.getuid())
+        bound = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            bound.bind(sock)
+        finally:
+            bound.close()
+            try:
+                os.unlink(sock)
+            except OSError:
+                pass
+
+    def test_windows_keeps_long_grok_leader_socket_in_overlay(self):
+        overlay = Path("C:/Users") / ("n" * 90) / "overlays" / "gk"
+        preferred = str(overlay / ".grok" / "leader.sock")
+        self.assertGreater(len(preferred), 103)
+        with mock.patch.object(platforms, "is_windows", return_value=True):
+            env = isolation.isolated_env(overlay, {}, engine="grok")
+        self.assertEqual(env["GROK_LEADER_SOCKET"], preferred)
+        self.assertEqual(env["GROK_HOME"], str(overlay / ".grok"))
 
     def test_usage_query(self):
         self.store.create("grok-query", engine="grok")
@@ -262,11 +328,21 @@ class TestGrokEngine(unittest.TestCase):
             self.assertEqual(res_offline.groups, [])
             self.assertIn("offline", res_offline.error)
 
-        # 3. 401 session expired
-        with patch("usage.fetch_grok_billing_payload", side_effect=urllib.error.HTTPError("http://...", 401, "Unauthorized", {}, None)):
+        # 3. 401 session expired. The error body must be closed: urllib's
+        # HTTPError warns at GC when the caller leaves it open.
+        expired = urllib.error.HTTPError("http://...", 401, "Unauthorized", {}, None)
+        closed: list[bool] = []
+
+        def _close() -> None:
+            closed.append(True)
+            urllib.error.HTTPError.close(expired)
+
+        expired.close = _close  # type: ignore[method-assign]
+        with patch("usage.fetch_grok_billing_payload", side_effect=expired):
             res_401 = usage.query_grok_usage(data_dir, "grok-mock")
             self.assertFalse(res_401.ok)
             self.assertEqual(res_401.error, "session expired (401)")
+        self.assertEqual(closed, [True])
 
     def test_cli_usage_grok_table_and_recs(self):
         import io

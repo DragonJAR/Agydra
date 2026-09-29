@@ -134,7 +134,8 @@ def email_from_raw(raw: dict) -> Optional[str]:
 
 
 CODEX_AUTH_FILE = "auth.json"
-CODEX_CONFIG_FILE = "config.json"
+# Codex itself, and isolation's daemonless writer, use config.toml.
+CODEX_CONFIG_FILE = "config.toml"
 
 
 def inspect_codex_auth(data_dir: Path) -> Optional[dict]:
