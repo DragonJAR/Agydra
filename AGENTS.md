@@ -20,6 +20,32 @@ This document serves as the authoritative single source of truth for architectur
 
 ---
 
+## 🎯 Core Engineering Directives
+
+Every modification, addition, or refactor must strictly adhere to four foundational engineering principles:
+
+1. **Reliability (Fail-Safe & Deterministic)**:
+   - Operations must be atomic and non-destructive. Never leave partial states, stale locks, or corrupted files on unexpected termination.
+   - Guard against external failures (disk full, network timeout, process crash) with clean exception boundaries and explicit, graceful failure modes.
+   - Maintain deterministic outcomes: identical inputs in identical environments must always produce identical states.
+
+2. **Efficiency (High Performance & Zero Waste)**:
+   - Minimize disk I/O, process forks, and network roundtrips.
+   - Avoid polling loops or busy-waiting when kernel-held primitives, file locks, or blocking I/O are available.
+   - Keep execution paths lightweight; never parse, compute, or allocate what is not immediately required.
+
+3. **Architectural Coherence (Idiomatic & Consistent)**:
+   - Respect established module separation of concerns: never bleed CLI/UI formatting into core business logic or engine isolation layers.
+   - Honor existing design patterns: Strategy Pattern in `engines.py`, Adapter/Facade in `platforms.py`, Atomic Repository in `store.py`.
+   - Adhere to the established naming conventions, strict type annotations, and stdlib idioms across all modules.
+
+4. **DRY Principle (Don't Repeat Yourself & Single Source of Truth)**:
+   - Centralize reusable logic in dedicated domain modules (`vocab.py`, `platforms.py`, `account.py`, `ui.py`, `i18n.py`).
+   - Never duplicate token extraction algorithms, path resolution rules, or regexes across different files.
+   - When introducing new behavior, refactor shared mechanics into common helpers before adding variations.
+
+---
+
 ## 🏛 Core Architectural Invariants
 
 ### R1. Zero Third-Party Runtime Dependencies (Stdlib Only)
@@ -165,6 +191,10 @@ Before proposing or committing changes, verify:
 - [ ] **Cross-platform**: All filesystem operations use `pathlib.Path` and are safe for Windows, macOS, and Linux.
 - [ ] **Atomic persistence**: Any file mutation uses temporary sibling writing and `os.replace`.
 - [ ] **Advisory locking**: Profile modifications respect the kernel-held lock contract.
+- [ ] **Reliability**: Explicit error handling, clean failure boundaries, zero unhandled edge cases or corrupt state.
+- [ ] **Efficiency**: Zero redundant I/O, no polling loops, lightweight process execution.
+- [ ] **Architectural coherence**: Code aligns with existing patterns, module boundaries, and type hints.
+- [ ] **DRY principle**: Logic reused from existing modules; zero duplicated parsing or helper routines.
 - [ ] **Test coverage**: New functionality includes targeted unit tests under `tests/`.
 - [ ] **Clean test pass**: Full test suite passes without warnings or regressions (`python3 -m pytest -q`).
 - [ ] **Conventional commits**: Commits follow `<type>: <description>` without AI attribution.
