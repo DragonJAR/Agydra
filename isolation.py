@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import socket
 import stat
 import subprocess
 from pathlib import Path
@@ -446,17 +447,51 @@ def _require_private_dir(path: Path, uid: int) -> None:
         )
 
 
-def _reclaim_owned_socket(path: Path) -> None:
-    """Remove a leftover socket inode so the next bind can use the name.
+def _leader_socket_is_listening(path: Path) -> bool:
+    """True when something accepts connections on ``path``.
 
-    Only a non-symlink socket owned by this uid is removed. A live session
-    already holds the profile lock before this runs.
+    ``ConnectionRefusedError`` is the only "nothing is listening" signal.
+    Any other error leaves the name alone: ``agydra -f`` skips the profile
+    lock, so a second ``isolated_env`` must not guess.
+    """
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(0.2)
+        probe.connect(os.fspath(path))
+        return True
+    except ConnectionRefusedError:
+        return False
+    except OSError:
+        return True
+    finally:
+        probe.close()
+
+
+def _reclaim_owned_socket(path: Path) -> None:
+    """Remove a socket name only when ``connect()`` is refused.
+
+    A listening grok leader keeps the name. Grok unlinks its own stale
+    socket after it wins the leader flock; this only drops a name that
+    already refuses connections, and only if the inode did not change.
     """
     try:
         st = path.lstat()
     except (FileNotFoundError, OSError):
         return
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+        return
+    if _leader_socket_is_listening(path):
+        return
+    try:
+        again = path.lstat()
+    except (FileNotFoundError, OSError):
+        return
+    if (
+        stat.S_ISLNK(again.st_mode)
+        or not stat.S_ISSOCK(again.st_mode)
+        or again.st_uid != os.getuid()
+        or again.st_ino != st.st_ino
+    ):
         return
     try:
         path.unlink()
