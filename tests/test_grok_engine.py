@@ -145,10 +145,8 @@ class TestGrokEngine(unittest.TestCase):
         preferred = str(overlay / ".grok" / "leader.sock")
         self.assertGreater(len(os.fsencode(preferred)), 103)
         env = isolation.isolated_env(overlay, {}, engine="grok")
-        again = isolation.isolated_env(overlay, {}, engine="grok")
         other_env = isolation.isolated_env(other, {}, engine="grok")
         sock = env["GROK_LEADER_SOCKET"]
-        self.assertEqual(again["GROK_LEADER_SOCKET"], sock)
         self.assertNotEqual(other_env["GROK_LEADER_SOCKET"], sock)
         self.assertNotEqual(sock, preferred)
         self.assertLessEqual(len(os.fsencode(sock)), 103)
@@ -161,10 +159,18 @@ class TestGrokEngine(unittest.TestCase):
         self.assertTrue(stat.S_ISDIR(st.st_mode))
         self.assertEqual(stat.S_IMODE(st.st_mode), 0o700)
         self.assertEqual(st.st_uid, os.getuid())
+        # Backlog must hold isolated_env's probe connect plus the assertion.
         bound = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             bound.bind(sock)
+            bound.listen(5)
+            again = isolation.isolated_env(overlay, {}, engine="grok")
+            self.assertEqual(again["GROK_LEADER_SOCKET"], sock)
+            client.settimeout(1.0)
+            client.connect(sock)
         finally:
+            client.close()
             bound.close()
             try:
                 os.unlink(sock)
