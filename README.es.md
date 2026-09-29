@@ -9,7 +9,7 @@
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/Versi%C3%B3n-1.1.0-blue.svg" alt="Versión"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white" alt="Python"></a>
   <img src="https://img.shields.io/badge/Plataformas-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey.svg" alt="Plataformas">
-  <a href="https://www.DragonJAR.org"><img src="https://img.shields.io/badge/Autor-Jaime%20Andr%C3%A9s%20Restrepo%20(DragonJAR.org)-orange.svg" alt="Autor: Jaime Andrés Restrepo (DragonJAR.org)"></a>
+  <a href="https://www.DragonJAR.org"><img src="https://img.shields.io/badge/author-DragonJAR.org-orange" alt="Author: DragonJAR.org"></a>
   <a href="README.md"><img src="https://img.shields.io/badge/Read%20in-English-0078D4?logo=readme&logoColor=white" alt="Read in English"></a>
 </p>
 
