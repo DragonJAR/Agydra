@@ -276,7 +276,7 @@ python3 -W error::ResourceWarning -m pytest tests/ -q
 python3 -m unittest discover -s tests -q
 ```
 
-The suite (646 tests) uses temporary stores and leaves the host home alone.
+The suite (650+ tests) uses temporary stores and leaves the host home alone.
 
 ---
 
