@@ -150,11 +150,33 @@ def inspect_codex_auth(data_dir: Path) -> Optional[dict]:
     if isinstance(tokens, dict) and (
         tokens.get("access_token") or tokens.get("id_token") or tokens.get("refresh_token")
     ):
+        account_id = None
+        for key in ("account_id", "accountId"):
+            val = tokens.get(key) or raw.get(key)
+            if isinstance(val, str) and val.strip():
+                account_id = val.strip()
+                break
+        if not account_id:
+            id_token = tokens.get("id_token")
+            if id_token and isinstance(id_token, str):
+                claims = _decode_jwt_payload(id_token)
+                auth_claim = claims.get("https://api.openai.com/auth")
+                if isinstance(auth_claim, dict):
+                    cid = auth_claim.get("chatgpt_account_id") or auth_claim.get("account_id")
+                    if isinstance(cid, str) and cid.strip():
+                        account_id = cid.strip()
+                if not account_id:
+                    for cid_key in ("chatgpt_account_id", "account_id", "org_id"):
+                        cid = claims.get(cid_key)
+                        if isinstance(cid, str) and cid.strip():
+                            account_id = cid.strip()
+                            break
         return {
             "auth_type": "chatgpt",
             "access_token": tokens.get("access_token"),
             "refresh_token": tokens.get("refresh_token"),
             "id_token": tokens.get("id_token"),
+            "account_id": account_id,
         }
     if raw.get("OPENAI_API_KEY"):
         return {
@@ -211,6 +233,12 @@ def detect_codex_plan(data_dir: Path) -> Optional[str]:
     if raw.get("OPENAI_API_KEY"):
         return "OpenAI API Key"
     return None
+
+
+def detect_codex_account_id(data_dir: Path) -> Optional[str]:
+    """Extract ChatGPT account or workspace ID from Codex auth.json if present."""
+    auth = inspect_codex_auth(data_dir)
+    return auth.get("account_id") if isinstance(auth, dict) else None
 
 
 def save_codex_tokens(data_dir: Path, tokens_data: dict) -> bool:
