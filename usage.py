@@ -187,6 +187,17 @@ def _parse_groups(raw: object) -> List[UsageGroup]:
     return [g for g in (_parse_group(item) for item in raw) if g is not None]
 
 
+def _close_http_error(exc: BaseException) -> None:
+    """Close an HTTP error body. urllib leaves that to the caller, and
+    ``HTTPError`` warns at garbage collection when it stays open.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            exc.close()
+        except Exception:
+            pass
+
+
 def refresh_codex_tokens(refresh_token: str, *, timeout: float = 10.0) -> Optional[dict]:
     """Call OpenAI OAuth refresh endpoint to exchange refresh_token for a fresh access_token."""
     body = json.dumps({
@@ -208,7 +219,8 @@ def refresh_codex_tokens(refresh_token: str, *, timeout: float = 10.0) -> Option
             data = json.loads(resp.read().decode("utf-8"))
             if isinstance(data, dict) and data.get("access_token"):
                 return data
-    except Exception:
+    except Exception as exc:
+        _close_http_error(exc)
         return None
     return None
 
@@ -364,6 +376,7 @@ def query_codex_usage(
     try:
         payload = fetch_codex_usage_payload(access_token, timeout=timeout)
     except urllib.error.HTTPError as exc:
+        _close_http_error(exc)
         if exc.code == 401:
             if refresh_token:
                 new_access_token = _do_refresh()
@@ -371,6 +384,7 @@ def query_codex_usage(
                     try:
                         payload = fetch_codex_usage_payload(new_access_token, timeout=timeout)
                     except Exception as inner_exc:
+                        _close_http_error(inner_exc)
                         return UsageResult(
                             name=name,
                             ok=True,
@@ -407,6 +421,7 @@ def query_codex_usage(
                 error=f"usage unavailable (HTTP {exc.code})",
             )
     except Exception as exc:
+        _close_http_error(exc)
         return UsageResult(
             name=name,
             ok=True,
@@ -470,7 +485,8 @@ def fetch_grok_settings_payload(token: str, *, timeout: float = 4.0) -> Optional
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return data if isinstance(data, dict) else None
-    except Exception:
+    except Exception as exc:
+        _close_http_error(exc)
         return None
 
 
@@ -583,6 +599,7 @@ def query_grok_usage(
     try:
         billing_payload = fetch_grok_billing_payload(token, timeout=timeout)
     except urllib.error.HTTPError as exc:
+        _close_http_error(exc)
         if exc.code == 401:
             return UsageResult(
                 name=name,
@@ -602,6 +619,7 @@ def query_grok_usage(
                 error=f"usage unavailable (HTTP {exc.code})",
             )
     except Exception as exc:
+        _close_http_error(exc)
         return UsageResult(
             name=name,
             ok=True,

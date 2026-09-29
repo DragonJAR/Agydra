@@ -647,8 +647,16 @@ class TestCodexUsage(BaseCase):
     def test_query_codex_usage_token_refresh_on_401(self, mock_fetch, mock_refresh):
         import urllib.error
 
+        expired = urllib.error.HTTPError("http://...", 401, "Unauthorized", {}, None)
+        closed: list[bool] = []
+
+        def _close() -> None:
+            closed.append(True)
+            urllib.error.HTTPError.close(expired)
+
+        expired.close = _close  # type: ignore[method-assign]
         mock_fetch.side_effect = [
-            urllib.error.HTTPError("http://...", 401, "Unauthorized", {}, None),
+            expired,
             {
                 "email": "refreshed@example.com",
                 "plan_type": "team",
@@ -677,6 +685,7 @@ class TestCodexUsage(BaseCase):
         self.assertEqual(mock_fetch.call_count, 2)
         saved_auth = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
         self.assertEqual(saved_auth["tokens"]["access_token"], "new_acc")
+        self.assertEqual(closed, [True])
         self.assertEqual(saved_auth["tokens"]["refresh_token"], "new_ref")
 
 

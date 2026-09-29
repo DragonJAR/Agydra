@@ -28,6 +28,21 @@ class TestDoctor(BaseCase):
         super().setUp()
         self.store = Store()
 
+    def test_codex_schema_canary_accepts_daemonless_config_toml(self):
+        """A Codex profile whose only layout file is the config.toml isolation
+        writes (daemon_auto_start = false) must pass the schema canary.
+        config.json is not the Codex config."""
+        self.store.create("cx", engine="codex")
+        data = self.store.profile_data_dir("cx", engine="codex")
+        (data / "config.toml").write_text(
+            "[features]\ndaemon_auto_start = false\n",
+            encoding="utf-8",
+        )
+        self.assertFalse((data / "config.json").exists())
+        self.assertFalse((data / "auth.json").exists())
+        status, message = doctor._check_schema_canary(self.store, self._ctx())
+        self.assertEqual(status, doctor.OK, message)
+
     def test_healthy_store_returns_zero(self):
         self.store.create("work")
         (self.store.profile_data_dir("work") / "antigravity-cli").mkdir()
