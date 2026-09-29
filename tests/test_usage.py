@@ -765,6 +765,109 @@ class TestUsageRobustnessAndEdgeCases(unittest.TestCase):
         self.assertIsInstance(cd, str)
 
 
+class TestCodexAndGrokEnhancedUsage(BaseCase):
+    def test_account_id_detection_and_header(self):
+        import account
+
+        data_dir = self._tmp / "codex_ws"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        jwt = _make_jwt({"email": "ws@example.com", "https://api.openai.com/auth": {"chatgpt_account_id": "org-jwt123"}})
+        auth_data = {
+            "tokens": {
+                "access_token": "acc_tok",
+                "id_token": jwt,
+            }
+        }
+        (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
+
+        info = account.inspect_codex_auth(data_dir)
+        self.assertIsNotNone(info)
+        self.assertEqual(info.get("account_id"), "org-jwt123")
+        self.assertEqual(account.detect_codex_account_id(data_dir), "org-jwt123")
+
+        with mock.patch("urllib.request.urlopen") as mock_open:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({"plan_type": "team", "rate_limit": {}}).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_open.return_value = mock_resp
+
+            usage.fetch_codex_usage_payload("acc_tok", account_id="org-jwt123")
+            self.assertEqual(mock_open.call_count, 1)
+            req = mock_open.call_args[0][0]
+            self.assertEqual(req.headers.get("Chatgpt-account-id"), "org-jwt123")
+
+    def test_parse_codex_additional_rate_limits(self):
+        payload = {
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {"used_percent": 10, "reset_at": 1780000000},
+                "secondary_window": {"used_percent": 20, "reset_at": 1780100000},
+            },
+            "additional_rate_limits": [
+                {
+                    "limit_name": "GPT 5.3 Spark",
+                    "rate_limit": {
+                        "primary_window": {"used_percent": 40, "reset_at": 1780000100},
+                        "secondary_window": {"used_percent": 50, "reset_at": 1780100100},
+                    },
+                }
+            ],
+        }
+        groups, plan, email = usage.parse_codex_usage_payload(payload)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].name, "OpenAI Codex")
+        b_ids = [b.id for b in groups[0].buckets]
+        self.assertIn("codex-5h", b_ids)
+        self.assertIn("codex-weekly", b_ids)
+        self.assertIn("codex-gpt-5.3-spark-5h", b_ids)
+        self.assertIn("codex-gpt-5.3-spark-weekly", b_ids)
+
+        spark_5h = next(b for b in groups[0].buckets if b.id == "codex-gpt-5.3-spark-5h")
+        self.assertAlmostEqual(spark_5h.remaining_fraction, 0.6)
+        self.assertEqual(spark_5h.window, "5h")
+
+    def test_parse_codex_spend_limit_and_credits(self):
+        payload = {
+            "plan_type": "team",
+            "credits": {"balance": 24.50},
+            "spend_control": {
+                "individual_limit": {
+                    "limit": 100.0,
+                    "used": 25.0,
+                    "remaining_percent": 75.0,
+                    "reset_at": 1780500000,
+                }
+            },
+        }
+        groups, plan, email = usage.parse_codex_usage_payload(payload)
+        self.assertEqual(plan, "ChatGPT Team ($24.50)")
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0].buckets), 1)
+        spend_b = groups[0].buckets[0]
+        self.assertEqual(spend_b.id, "codex-spend")
+        self.assertEqual(spend_b.window, "monthly")
+        self.assertAlmostEqual(spend_b.remaining_fraction, 0.75)
+
+    def test_parse_grok_product_usage(self):
+        payload = {
+            "config": {
+                "creditUsagePercent": 15.0,
+                "billingPeriodEnd": "2026-10-15T00:00:00Z",
+                "productUsage": [
+                    {"product": "Grok 3", "usagePercent": 10.0},
+                    {"product": "Grok Vision", "usagePercent": 5.0},
+                ],
+            }
+        }
+        groups, reset_dt = usage.parse_grok_billing_payload(payload)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].name, "xAI Grok")
+        b_ids = [b.id for b in groups[0].buckets]
+        self.assertEqual(b_ids, ["grok-weekly", "grok-grok-3", "grok-grok-vision"])
+        grok3 = next(b for b in groups[0].buckets if b.id == "grok-grok-3")
+        self.assertAlmostEqual(grok3.remaining_fraction, 0.9)
+
+
 if __name__ == "__main__":
     unittest.main()
 

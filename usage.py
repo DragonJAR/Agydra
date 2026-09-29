@@ -166,6 +166,29 @@ def _parse_bucket(raw: object) -> Optional[UsageBucket]:
     )
 
 
+def _parse_window_bucket(
+    raw_window: object,
+    *,
+    bucket_id: str,
+    name: str,
+    window: str,
+) -> Optional[UsageBucket]:
+    if not isinstance(raw_window, dict):
+        return None
+    used = raw_window.get("used_percent")
+    if not isinstance(used, (int, float)) or isinstance(used, bool) or not math.isfinite(used):
+        return None
+    rem = max(0.0, min(1.0, (100.0 - float(used)) / 100.0))
+    reset_dt = _parse_reset_time(raw_window.get("reset_at"))
+    return UsageBucket(
+        id=bucket_id,
+        name=name,
+        window=window,
+        remaining_fraction=rem,
+        reset_time=reset_dt,
+    )
+
+
 def _parse_group(raw: object) -> Optional[UsageGroup]:
     if not isinstance(raw, dict):
         return None
@@ -225,15 +248,23 @@ def refresh_codex_tokens(refresh_token: str, *, timeout: float = 10.0) -> Option
     return None
 
 
-def fetch_codex_usage_payload(access_token: str, *, timeout: float = 10.0) -> Optional[dict]:
+def fetch_codex_usage_payload(
+    access_token: str,
+    *,
+    account_id: Optional[str] = None,
+    timeout: float = 10.0,
+) -> Optional[dict]:
     """Query OpenAI internal wham/usage endpoint using a Bearer access_token."""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        "Accept": "application/json",
+    }
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
     req = urllib.request.Request(
         OPENAI_USAGE_URL,
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-            "Accept": "application/json",
-        },
+        headers=headers,
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
@@ -260,40 +291,95 @@ def parse_codex_usage_payload(
         }
         detected_plan = plan_map.get(raw_plan.lower(), f"ChatGPT {raw_plan.capitalize()}")
 
-    rate_limit = payload.get("rate_limit")
-    if not isinstance(rate_limit, dict):
-        return [], detected_plan, detected_email
+    credits_info = payload.get("credits")
+    if isinstance(credits_info, dict) and detected_plan:
+        balance = credits_info.get("balance")
+        if isinstance(balance, (int, float)) and not isinstance(balance, bool) and math.isfinite(balance):
+            detected_plan = f"{detected_plan} (${float(balance):.2f})"
+        elif isinstance(balance, str) and balance.strip():
+            try:
+                bal_f = float(balance.strip())
+                detected_plan = f"{detected_plan} (${bal_f:.2f})"
+            except ValueError:
+                pass
 
     buckets: List[UsageBucket] = []
 
-    prim = rate_limit.get("primary_window")
-    if isinstance(prim, dict):
-        used = prim.get("used_percent")
-        if isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used):
-            rem = max(0.0, min(1.0, (100.0 - float(used)) / 100.0))
-            reset_dt = _parse_reset_time(prim.get("reset_at"))
-            buckets.append(
-                UsageBucket(
-                    id="codex-5h",
-                    name="5 Hours",
-                    window="5h",
-                    remaining_fraction=rem,
-                    reset_time=reset_dt,
-                )
-            )
+    rate_limit = payload.get("rate_limit")
+    if isinstance(rate_limit, dict):
+        b_5h = _parse_window_bucket(
+            rate_limit.get("primary_window"),
+            bucket_id="codex-5h",
+            name="5 Hours",
+            window="5h",
+        )
+        if b_5h:
+            buckets.append(b_5h)
 
-    sec = rate_limit.get("secondary_window")
-    if isinstance(sec, dict):
-        used = sec.get("used_percent")
-        if isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used):
-            rem = max(0.0, min(1.0, (100.0 - float(used)) / 100.0))
-            reset_dt = _parse_reset_time(sec.get("reset_at"))
+        b_wk = _parse_window_bucket(
+            rate_limit.get("secondary_window"),
+            bucket_id="codex-weekly",
+            name="Weekly",
+            window="weekly",
+        )
+        if b_wk:
+            buckets.append(b_wk)
+
+    add_limits = payload.get("additional_rate_limits")
+    if isinstance(add_limits, list):
+        for item in add_limits:
+            if not isinstance(item, dict):
+                continue
+            limit_name = item.get("limit_name") or item.get("metered_feature")
+            if not isinstance(limit_name, str) or not limit_name.strip():
+                continue
+            clean_name = limit_name.strip()
+            slug = clean_name.lower().replace(" ", "-")
+            item_rl = item.get("rate_limit")
+            if isinstance(item_rl, dict):
+                b5 = _parse_window_bucket(
+                    item_rl.get("primary_window"),
+                    bucket_id=f"codex-{slug}-5h",
+                    name=f"{clean_name} 5h",
+                    window="5h",
+                )
+                if b5:
+                    buckets.append(b5)
+                bw = _parse_window_bucket(
+                    item_rl.get("secondary_window"),
+                    bucket_id=f"codex-{slug}-weekly",
+                    name=f"{clean_name} Weekly",
+                    window="weekly",
+                )
+                if bw:
+                    buckets.append(bw)
+
+    spend_limit = (
+        payload.get("individual_limit")
+        or (rate_limit.get("individual_limit") if isinstance(rate_limit, dict) else None)
+        or (payload.get("spend_control", {}).get("individual_limit") if isinstance(payload.get("spend_control"), dict) else None)
+    )
+    if isinstance(spend_limit, dict):
+        rem_pct = spend_limit.get("remaining_percent")
+        if not isinstance(rem_pct, (int, float)) or isinstance(rem_pct, bool) or not math.isfinite(rem_pct):
+            used = spend_limit.get("used")
+            limit = spend_limit.get("limit")
+            if (
+                isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used)
+                and isinstance(limit, (int, float)) and not isinstance(limit, bool) and math.isfinite(limit)
+                and limit > 0
+            ):
+                rem_pct = max(0.0, min(100.0, (1.0 - (float(used) / float(limit))) * 100.0))
+        if isinstance(rem_pct, (int, float)) and not isinstance(rem_pct, bool) and math.isfinite(rem_pct):
+            rem_fraction = max(0.0, min(1.0, float(rem_pct) / 100.0))
+            reset_raw = spend_limit.get("reset_at") or spend_limit.get("resets_at")
+            reset_dt = _parse_reset_time(reset_raw)
             buckets.append(
                 UsageBucket(
-                    id="codex-weekly",
-                    name="Weekly",
-                    window="weekly",
-                    remaining_fraction=rem,
+                    id="codex-spend",
+                    name="Spend Limit",
+                    window="monthly",
+                    remaining_fraction=rem_fraction,
                     reset_time=reset_dt,
                 )
             )
@@ -340,6 +426,7 @@ def query_codex_usage(
 
     access_token = auth_info.get("access_token")
     refresh_token = auth_info.get("refresh_token")
+    account_id = auth_info.get("account_id")
 
     def _do_refresh() -> Optional[str]:
         if not refresh_token:
@@ -374,7 +461,7 @@ def query_codex_usage(
 
     payload = None
     try:
-        payload = fetch_codex_usage_payload(access_token, timeout=timeout)
+        payload = fetch_codex_usage_payload(access_token, account_id=account_id, timeout=timeout)
     except urllib.error.HTTPError as exc:
         _close_http_error(exc)
         if exc.code == 401:
@@ -382,7 +469,7 @@ def query_codex_usage(
                 new_access_token = _do_refresh()
                 if new_access_token:
                     try:
-                        payload = fetch_codex_usage_payload(new_access_token, timeout=timeout)
+                        payload = fetch_codex_usage_payload(new_access_token, account_id=account_id, timeout=timeout)
                     except Exception as inner_exc:
                         _close_http_error(inner_exc)
                         return UsageResult(
@@ -547,7 +634,32 @@ def parse_grok_billing_payload(
         remaining_fraction=rem,
         reset_time=reset_dt,
     )
-    return [UsageGroup(name="xAI Grok", buckets=[bucket])], reset_dt
+    buckets = [bucket]
+
+    prod_usage = cfg.get("productUsage")
+    if isinstance(prod_usage, list):
+        for item in prod_usage:
+            if not isinstance(item, dict):
+                continue
+            prod_name = item.get("product")
+            if not isinstance(prod_name, str) or not prod_name.strip():
+                continue
+            clean_prod = prod_name.strip()
+            pct = item.get("usagePercent")
+            if isinstance(pct, (int, float)) and not isinstance(pct, bool) and math.isfinite(pct):
+                prod_rem = max(0.0, min(1.0, (100.0 - float(pct)) / 100.0))
+                slug = clean_prod.lower().replace(" ", "-")
+                buckets.append(
+                    UsageBucket(
+                        id=f"grok-{slug}",
+                        name=clean_prod,
+                        window="weekly",
+                        remaining_fraction=prod_rem,
+                        reset_time=reset_dt,
+                    )
+                )
+
+    return [UsageGroup(name="xAI Grok", buckets=buckets)], reset_dt
 
 
 def query_grok_usage(
