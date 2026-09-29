@@ -1,24 +1,40 @@
 # Developer & Agent Guide: Architecture & Invariants
 
-This document serves as the single source of truth for design invariants, architecture, and development conventions across the `agydra` codebase. Any human contributor or automated agent modifying this project must adhere to these principles.
+This document serves as the authoritative single source of truth for architectural invariants, design patterns, and engineering conventions across the `agydra` codebase. Any human contributor or automated agent modifying this project must strictly comply with these principles.
+
+---
+
+## ⚡ Executive Invariant Matrix
+
+| ID | Invariant | Enforcement Module | Primary Contract |
+|:---|:---|:---|:---|
+| **R1** | **Zero Runtime Dependencies** | `pyproject.toml` | Pure Python Standard Library only (`sys`, `os`, `pathlib`, `json`, `urllib`, etc.). Python >= 3.9. |
+| **R2** | **Engine Isolation & Overlays** | `isolation.py`, `engines.py` | Isolated home overlays for `agy` (`HOME`), `codex` (`CODEX_HOME`), and `grok` (`GROK_HOME` + `GROK_LEADER_SOCKET`). |
+| **R3** | **Kernel-Held Advisory Locks** | `locks.py` | Non-blocking OS advisory file locks (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows). No stale PID files. |
+| **R4** | **macOS Keychain Bridge** | `keychain.py` | Serialized private slot swapping around `agy` runs via `swap.lock`. Bypassed as no-op for disk-based `codex` and `grok`. |
+| **R5** | **Atomic Persistence** | `store.py` | Sibling temporary file write + atomic `os.replace`. Automatic ZIP backup before profile deletion. |
+| **R6** | **Strict Modern Token Schema** | `account.py` | Clean JWT claim parsing (`id_token`, `auth.json`, `token`). Zero legacy migrations. |
+| **R7** | **Idempotent Bootstrap** | `bootstrap.py` | User-space install (`~/.local/bin`), foreign binary guard with marker check, and `-n/--dry-run` inspection. |
+| **R8** | **Centralized i18n & Persistence** | `i18n.py` | Pure stdlib catalog, deterministic fallback cascade (`CLI > ENV > Config > System > English`), atomic persistence. |
+| **R9** | **Zero-Comment Code Contract** | All `*.py` modules | Self-documenting code with expressive naming and docstrings. Strictly zero `#` comments in Python source code. |
 
 ---
 
 ## 🏛 Core Architectural Invariants
 
 ### R1. Zero Third-Party Runtime Dependencies (Stdlib Only)
-- The runtime code (`*.py` modules in the root) must strictly use the Python Standard Library (`sys`, `os`, `pathlib`, `json`, `dataclasses`, `argparse`, `tempfile`, `fcntl`/`msvcrt`, `subprocess`, etc.).
-- Python version requirement is **Python >= 3.9**.
-- Never introduce third-party dependencies (`click`, `requests`, `pydantic`, etc.) into `pyproject.toml` runtime requirements.
+- The runtime code (`*.py` modules in the root) must strictly use the Python Standard Library (`sys`, `os`, `pathlib`, `json`, `dataclasses`, `argparse`, `tempfile`, `fcntl`/`msvcrt`, `urllib.request`, `subprocess`, etc.).
+- Python version floor is **Python >= 3.9**.
+- Never introduce third-party packages (`click`, `requests`, `pydantic`, `rich`, etc.) into `pyproject.toml` runtime requirements.
 - Packaging uses `setuptools` build backend with a flat `py-modules` layout.
 
 ### R2. Engine Data Redirection & Home Overlay Architecture
 - Agydra decouples CLI execution through engine drivers (`AgyEngine`, `CodexEngine`, and `GrokEngine` in `engines.py`).
-- The `agy` CLI derives its data store (`~/.gemini`) from user home (`HOME` on POSIX, `USERPROFILE` on Windows). For `agy`, `agydra` builds an isolated home overlay at `<store>/overlays/<profile>` where `<overlay>/.gemini` links to `<store>/profiles/<profile>/data`. Non-gemini home entries are symlinked (or junctioned on Windows).
-- The `codex` CLI is isolated via `CODEX_HOME` pointing directly to `<overlay>/.codex` (linked to `<store>/profiles/<profile>/data`), completely avoiding user home pollution.
-- The `grok` CLI is isolated via `GROK_HOME` pointing directly to `<overlay>/.grok` (linked to `<store>/profiles/<profile>/data`), with `GROK_LEADER_SOCKET` pointing to `<overlay>/.grok/leader.sock`, completely isolating sessions, local socket daemons, and disk credentials.
-- **Daemonless Codex Execution:** On POSIX/macOS, Codex's default daemon-mode communication attempts to create domain sockets whose path length exceeds `SUN_LEN` (104 bytes) in nested profile stores, and background daemons leak file-descriptor locks across invocations. `agydra` enforces synchronous, daemonless execution by default (auto-injecting `--no-daemon` and configuring `features.daemon_auto_start = false` in `config.toml`), guaranteeing instant lock releases on exit.
-- `AGYDRA_REAL_HOME` is injected by `isolation.py` pointing to the user's unredirected home. This prevents nested subshells or internal CLI invocations from creating nested overlays or failing to locate the root profile store.
+- **Antigravity (`agy`)**: Derives store (`~/.gemini`) from user home (`HOME` on POSIX, `USERPROFILE` on Windows). `agydra` builds an isolated home overlay at `<store>/overlays/<profile>` where `<overlay>/.gemini` links to `<store>/profiles/<profile>/data`. Non-gemini home entries are symlinked (or junctioned on Windows).
+- **Codex (`codex`)**: Isolated via `CODEX_HOME` pointing directly to `<overlay>/.codex` (linked to `<store>/profiles/<profile>/data`), avoiding user home pollution.
+- **Grok (`grok`)**: Isolated via `GROK_HOME` pointing directly to `<overlay>/.grok` (linked to `<store>/profiles/<profile>/data`), with `GROK_LEADER_SOCKET` pointing to `<overlay>/.grok/leader.sock`, isolating sessions, socket daemons, and disk credentials.
+- **Daemonless Codex Execution**: On POSIX/macOS, Codex's background daemons leak file-descriptor locks and trigger `SUN_LEN` socket overflow (104 bytes). `agydra` enforces synchronous, daemonless execution by default (`--no-daemon` and `features.daemon_auto_start = false` in `config.toml`).
+- **Unredirected Real Home (`AGYDRA_REAL_HOME`)**: Injected by `isolation.py` pointing to the user's authentic home directory. Prevents nested subshells or internal CLI invocations from creating nested overlays or losing the root store.
 
 ### R3. Kernel-Held Advisory Locks
 - Concurrent profile executions and destructive operations (renaming, deleting) are synchronized via OS-level advisory file locks on `<store>/locks/<profile>.lock`:
@@ -44,9 +60,9 @@ This document serves as the single source of truth for design invariants, archit
 - Profile deletion is non-destructive: an automatic ZIP backup of the profile is created in `<store>/backups/` before files are purged.
 
 ### R6. Modern Token Schema (No Legacy Migration)
-- `account.py` locates JWT `id_token` claims (`email` and `https://api.openai.com/auth.chatgpt_plan_type` or Grok `tier`) from session files:
+- `account.py` locates JWT `id_token` claims (`email`, `https://api.openai.com/auth.chatgpt_plan_type`, workspace `chatgpt_account_id`, or Grok `tier`) from session files:
   - For `agy`: inside the `token` envelope file in `antigravity-cli/`.
-  - For `codex`: inside `auth.json` under `tokens.id_token` or `OPENAI_API_KEY`.
+  - For `codex`: inside `auth.json` under `tokens.id_token`, workspace `tokens.account_id`, or `OPENAI_API_KEY`.
   - For `grok`: inside `auth.json` under OIDC credentials (`email` and `tier` claim in JWT `key`) or `XAI_API_KEY`.
 - Legacy schemas or non-standard structures are never migrated: clean failure modes and predictable state are prioritized.
 
@@ -68,6 +84,26 @@ This document serves as the single source of truth for design invariants, archit
   5. Default fallback (`en`).
   Any missing translation key in a target language automatically falls back to the canonical English string.
 - **Atomic Persistence:** When explicitly selected via CLI (`agydra --lang <code>` or `agydra lang <code>`), the preference is atomically persisted to `agydra.json` (via temporary sibling file and `os.replace`), remembering the choice for future invocations without requiring repeated flags.
+
+### R9. Zero-Comment Codebase Contract
+- Source code in runtime Python modules (`*.py`) must remain completely free of `#` inline and block comments.
+- Code must be self-explanatory through screaming architecture, clean function boundaries, strict typing hints, and formal docstrings.
+- Docstrings (`"""..."""`) and executable shebangs (`#!/usr/bin/env python3`) are standard and preserved.
+
+---
+
+## 🔍 Engine Isolation Matrix
+
+| Capability | Google Antigravity (`agy`) | OpenAI Codex (`codex`) | xAI Grok (`grok`) |
+|:---|:---|:---|:---|
+| **Driver Class** | `AgyEngine` | `CodexEngine` | `GrokEngine` |
+| **Data Directory** | `~/.gemini` | `~/.codex` | `~/.grok` |
+| **Isolation Variable** | `HOME` (overlay tree) | `CODEX_HOME` | `GROK_HOME` |
+| **Daemon Handling** | Process-bound | `--no-daemon` enforced | `GROK_LEADER_SOCKET` isolated |
+| **Credential Storage** | macOS Keychain (`antigravity`) / Disk | Disk (`auth.json`) | Disk (`auth.json`) |
+| **Keychain Bridge** | Active on macOS (`swap.lock`) | Bypassed (no-op) | Bypassed (no-op) |
+| **Usage Mechanism** | `agy --print /usage --output-format json` | Direct internal HTTP `/wham/usage` | Direct internal HTTP proxy `/v1/billing` |
+| **Workspace Support** | Handled natively by binary | `ChatGPT-Account-Id` header | Unified billing / On-demand |
 
 ---
 
@@ -110,9 +146,25 @@ agydra/
 1. **Cross-Platform Compatibility:**
    - Code must run identically on **macOS**, **Linux**, and **Windows**.
    - OS-specific differences must remain encapsulated in `platforms.py` and `isolation.py`.
-   - On Windows, directory junctions are handled by standard `Path.unlink()` (which invokes `RemoveDirectoryW` natively in Python >= 3.5). Do not re-add custom rmdir hacks.
+   - On Windows, directory junctions are handled by standard `Path.unlink()` (which invokes `RemoveDirectoryW` natively in Python >= 3.5). Never reintroduce ad-hoc `rmdir` command hacks.
    - Use `platforms.real_home()` rather than raw `Path.home()` when resolving user configuration or persistent directories to remain immune to `HOME` redirection.
+   - Respect Windows `PATHEXT` executable resolution via `platforms.resolve_executable_path()`.
 
 2. **Testing Discipline:**
    - All tests in `tests/` must pass cleanly via `python3 -m pytest -q` or `python3 -m unittest`.
    - Test suites must strictly sandbox environment variables (`HOME`, `LOCALAPPDATA`, `XDG_DATA_HOME`) and temporary directories. Tests must never touch the host user's actual files or shims.
+
+---
+
+## ✅ Contributor & Agent Checklist
+
+Before proposing or committing changes, verify:
+
+- [ ] **Zero dependencies**: No new packages added to `pyproject.toml`.
+- [ ] **Zero comments**: Python source files contain no `#` comments (excluding shebangs and docstrings).
+- [ ] **Cross-platform**: All filesystem operations use `pathlib.Path` and are safe for Windows, macOS, and Linux.
+- [ ] **Atomic persistence**: Any file mutation uses temporary sibling writing and `os.replace`.
+- [ ] **Advisory locking**: Profile modifications respect the kernel-held lock contract.
+- [ ] **Test coverage**: New functionality includes targeted unit tests under `tests/`.
+- [ ] **Clean test pass**: Full test suite passes without warnings or regressions (`python3 -m pytest -q`).
+- [ ] **Conventional commits**: Commits follow `<type>: <description>` without AI attribution.
