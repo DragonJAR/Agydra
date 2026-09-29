@@ -49,8 +49,9 @@ $RECYCLE.BIN/
 # --- Agent tooling ---
 .atl/
 
-# --- Markdown files (do not upload any .md except READMEs) ---
+# --- Markdown files (do not upload any .md except READMEs and AGENTS.md) ---
 *.md
 !README.md
 !README.*.md
 !README*.md
+!AGENTS.md

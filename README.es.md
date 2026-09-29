@@ -276,7 +276,7 @@ python3 -W error::ResourceWarning -m pytest tests/ -q
 python3 -m unittest discover -s tests -q
 ```
 
-La suite (646 pruebas) usa almacenes temporales y deja el home del host en paz.
+La suite (650+ pruebas) usa almacenes temporales y deja el home del host en paz.
 
 ---
 
