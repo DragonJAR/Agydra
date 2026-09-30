@@ -103,6 +103,85 @@ class TestGrokEngine(unittest.TestCase):
         self.assertIsNone(account.detect_grok_email(data_dir))
         self.assertIsNone(account.detect_grok_plan(data_dir))
 
+    def test_inspect_grok_auth_oidc_fields(self):
+        self.store.create("grok-oidc", engine="grok")
+        data_dir = self.store.profile_data_dir("grok-oidc", engine="grok")
+        auth_payload = {
+            "https://auth.x.ai::client_999": {
+                "email": "test@x.ai",
+                "key": "jwt_token_val",
+                "refresh_token": "ref_tok_val",
+                "oidc_issuer": "https://auth.x.ai",
+                "oidc_client_id": "client_999",
+                "expires_at": "2026-10-01T00:00:00.000000Z",
+                "user_id": "u_1",
+                "first_name": "Test",
+            }
+        }
+        (data_dir / "auth.json").write_text(json.dumps(auth_payload), encoding="utf-8")
+        info = account.inspect_grok_auth(data_dir)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["email"], "test@x.ai")
+        self.assertEqual(info["key"], "jwt_token_val")
+        self.assertEqual(info["token"], "jwt_token_val")
+        self.assertEqual(info["refresh_token"], "ref_tok_val")
+        self.assertEqual(info["oidc_issuer"], "https://auth.x.ai")
+        self.assertEqual(info["oidc_client_id"], "client_999")
+        self.assertEqual(info["expires_at"], "2026-10-01T00:00:00.000000Z")
+        self.assertEqual(info["user_id"], "u_1")
+        self.assertEqual(info["first_name"], "Test")
+
+    def test_save_grok_tokens(self):
+        non_existent = self._tmp / "does_not_exist"
+        self.assertFalse(account.save_grok_tokens(non_existent, {"access_token": "abc"}))
+
+        self.store.create("grok-save", engine="grok")
+        data_dir = self.store.profile_data_dir("grok-save", engine="grok")
+        (data_dir / "auth.json").write_text(json.dumps({"unrelated": 123}), encoding="utf-8")
+        self.assertFalse(account.save_grok_tokens(data_dir, {"access_token": "abc"}))
+
+        auth_payload = {
+            "https://auth.x.ai::client_1": {
+                "email": "save@x.ai",
+                "key": "old_key",
+                "refresh_token": "old_ref",
+            }
+        }
+        (data_dir / "auth.json").write_text(json.dumps(auth_payload), encoding="utf-8")
+
+        success = account.save_grok_tokens(
+            data_dir,
+            {
+                "access_token": "new_key",
+                "refresh_token": "new_ref",
+                "expires_in": 3600,
+            },
+        )
+        self.assertTrue(success)
+
+        updated = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
+        cred = updated["https://auth.x.ai::client_1"]
+        self.assertEqual(cred["key"], "new_key")
+        self.assertEqual(cred["refresh_token"], "new_ref")
+        self.assertEqual(cred["email"], "save@x.ai")
+        self.assertIn("expires_at", cred)
+        self.assertTrue(cred["expires_at"].endswith("Z"))
+        self.assertIn("create_time", cred)
+
+        success2 = account.save_grok_tokens(
+            data_dir,
+            {
+                "key": "direct_key",
+                "expires_at": "2026-12-31T23:59:59Z",
+            },
+        )
+        self.assertTrue(success2)
+        updated2 = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
+        cred2 = updated2["https://auth.x.ai::client_1"]
+        self.assertEqual(cred2["key"], "direct_key")
+        self.assertEqual(cred2["refresh_token"], "new_ref")
+        self.assertEqual(cred2["expires_at"], "2026-12-31T23:59:59Z")
+
     def test_overlay_creation_and_env(self):
         self.store.create("gk", engine="grok")
         data_dir = self.store.profile_data_dir("gk", engine="grok")

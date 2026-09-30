@@ -7,6 +7,8 @@ import json
 import os
 import sys
 import unittest
+import urllib.error
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -866,6 +868,177 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
         self.assertEqual(b_ids, ["grok-weekly", "grok-grok-3", "grok-grok-vision"])
         grok3 = next(b for b in groups[0].buckets if b.id == "grok-grok-3")
         self.assertAlmostEqual(grok3.remaining_fraction, 0.9)
+
+    def test_post_token_refresh_variants(self):
+        with mock.patch("urllib.request.urlopen") as mock_open:
+            resp_tok = mock.MagicMock()
+            resp_tok.read.return_value = json.dumps({"access_token": "acc_1"}).encode("utf-8")
+            resp_tok.__enter__.return_value = resp_tok
+            mock_open.return_value = resp_tok
+
+            res = usage._post_token_refresh("https://example.com/token", b"body", "application/json")
+            self.assertEqual(res, {"access_token": "acc_1"})
+
+            resp_key = mock.MagicMock()
+            resp_key.read.return_value = json.dumps({"key": "grok_jwt"}).encode("utf-8")
+            resp_key.__enter__.return_value = resp_key
+            mock_open.return_value = resp_key
+
+            res2 = usage._post_token_refresh("https://example.com/token", b"body", "application/json")
+            self.assertEqual(res2, {"key": "grok_jwt"})
+
+            resp_empty = mock.MagicMock()
+            resp_empty.read.return_value = json.dumps({"status": "no_tokens"}).encode("utf-8")
+            resp_empty.__enter__.return_value = resp_empty
+            mock_open.return_value = resp_empty
+
+            self.assertIsNone(usage._post_token_refresh("https://example.com/token", b"body", "application/json"))
+
+            mock_open.side_effect = urllib.error.URLError("connection refused")
+            self.assertIsNone(usage._post_token_refresh("https://example.com/token", b"body", "application/json"))
+
+    def test_refresh_tokens_delegation(self):
+        with mock.patch("usage._post_token_refresh") as mock_post:
+            mock_post.return_value = {"access_token": "fresh_codex"}
+            cx_res = usage.refresh_codex_tokens("cx_ref_123", timeout=12.0)
+            self.assertEqual(cx_res, {"access_token": "fresh_codex"})
+            self.assertEqual(mock_post.call_count, 1)
+            url, body, ctype = mock_post.call_args[0]
+            kwargs = mock_post.call_args[1]
+            self.assertEqual(url, usage.OPENAI_REFRESH_URL)
+            self.assertEqual(ctype, "application/json")
+            self.assertEqual(kwargs["timeout"], 12.0)
+            self.assertIn("Mozilla/5.0", kwargs["user_agent"])
+            body_dict = json.loads(body.decode("utf-8"))
+            self.assertEqual(body_dict["refresh_token"], "cx_ref_123")
+            self.assertEqual(body_dict["client_id"], usage.OPENAI_CLIENT_ID)
+
+        with mock.patch("usage._post_token_refresh") as mock_post:
+            mock_post.return_value = {"key": "fresh_grok_key"}
+            gk_res = usage.refresh_grok_tokens(
+                "gk_ref_456",
+                client_id="custom_cid",
+                issuer="https://auth.custom.x.ai/",
+                timeout=15.0,
+            )
+            self.assertEqual(gk_res, {"key": "fresh_grok_key"})
+            self.assertEqual(mock_post.call_count, 1)
+            url, body, ctype = mock_post.call_args[0]
+            kwargs = mock_post.call_args[1]
+            self.assertEqual(url, "https://auth.custom.x.ai/oauth2/token")
+            self.assertEqual(ctype, "application/x-www-form-urlencoded")
+            self.assertEqual(kwargs["timeout"], 15.0)
+            self.assertEqual(kwargs["user_agent"], "xai-grok-cli")
+            body_params = urllib.parse.parse_qs(body.decode("utf-8"))
+            self.assertEqual(body_params["refresh_token"], ["gk_ref_456"])
+            self.assertEqual(body_params["client_id"], ["custom_cid"])
+            self.assertEqual(body_params["grant_type"], ["refresh_token"])
+
+    @mock.patch("usage.refresh_grok_tokens")
+    @mock.patch("usage.fetch_grok_billing_payload")
+    @mock.patch("usage.fetch_grok_settings_payload")
+    def test_query_grok_usage_proactive_refresh(self, mock_settings, mock_billing, mock_refresh):
+        data_dir = self._tmp / "grok_proactive"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        auth_data = {
+            "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
+                "email": "grokuser@example.com",
+                "refresh_token": "initial_ref",
+            }
+        }
+        (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
+
+        mock_refresh.return_value = {
+            "key": "proactive_jwt",
+            "refresh_token": "updated_ref",
+        }
+        mock_billing.return_value = {
+            "config": {
+                "creditUsagePercent": 20.0,
+                "billingPeriodEnd": "2026-10-31T00:00:00Z",
+            }
+        }
+        mock_settings.return_value = {
+            "subscription_tier_display": "SuperGrok Pro",
+        }
+
+        res = usage.query_grok_usage(data_dir, "grok_pro")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.plan, "SuperGrok Pro")
+        self.assertEqual(mock_refresh.call_count, 1)
+        self.assertEqual(mock_billing.call_args[0][0], "proactive_jwt")
+        self.assertEqual(mock_settings.call_args[0][0], "proactive_jwt")
+
+        saved = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
+        entry = saved["https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"]
+        self.assertEqual(entry["key"], "proactive_jwt")
+        self.assertEqual(entry["refresh_token"], "updated_ref")
+
+        mock_refresh.return_value = None
+        (data_dir / "auth.json").write_text(json.dumps({
+            "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
+                "refresh_token": "bad_ref",
+            }
+        }), encoding="utf-8")
+        fail_res = usage.query_grok_usage(data_dir, "grok_fail")
+        self.assertFalse(fail_res.ok)
+        self.assertEqual(fail_res.error, "token refresh failed")
+
+    @mock.patch("usage.refresh_grok_tokens")
+    @mock.patch("usage.fetch_grok_billing_payload")
+    @mock.patch("usage.fetch_grok_settings_payload")
+    def test_query_grok_usage_reactive_401_refresh(self, mock_settings, mock_billing, mock_refresh):
+        data_dir = self._tmp / "grok_reactive"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        auth_data = {
+            "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
+                "key": "stale_token",
+                "refresh_token": "valid_ref",
+                "email": "elon@x.ai",
+            }
+        }
+        (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
+
+        expired = urllib.error.HTTPError("http://...", 401, "Unauthorized", {}, None)
+        closed = []
+
+        def _close_mock():
+            closed.append(True)
+            urllib.error.HTTPError.close(expired)
+
+        expired.close = _close_mock
+
+        mock_billing.side_effect = [
+            expired,
+            {
+                "config": {
+                    "creditUsagePercent": 10.0,
+                    "billingPeriodEnd": "2026-10-31T00:00:00Z",
+                }
+            },
+        ]
+        mock_refresh.return_value = {"access_token": "renewed_token"}
+        mock_settings.return_value = {"subscription_tier_display": "SuperGrok"}
+
+        res = usage.query_grok_usage(data_dir, "grok_rx")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.plan, "SuperGrok")
+        self.assertEqual(mock_billing.call_count, 2)
+        self.assertEqual(mock_billing.call_args[0][0], "renewed_token")
+        self.assertEqual(mock_settings.call_args[0][0], "renewed_token")
+        self.assertTrue(closed)
+
+        mock_billing.side_effect = [expired]
+        mock_refresh.return_value = None
+        fail_res = usage.query_grok_usage(data_dir, "grok_rx_fail")
+        self.assertFalse(fail_res.ok)
+        self.assertEqual(fail_res.error, "session expired (401)")
+
+        mock_billing.side_effect = [expired, RuntimeError("socket disconnect")]
+        mock_refresh.return_value = {"access_token": "renewed_token_2"}
+        inner_fail_res = usage.query_grok_usage(data_dir, "grok_rx_inner_fail")
+        self.assertTrue(inner_fail_res.ok)
+        self.assertIn("usage unavailable (socket disconnect)", inner_fail_res.error)
 
 
 if __name__ == "__main__":

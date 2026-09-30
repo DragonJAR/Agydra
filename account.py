@@ -134,7 +134,6 @@ def email_from_raw(raw: dict) -> Optional[str]:
 
 
 CODEX_AUTH_FILE = "auth.json"
-# Codex itself, and isolation's daemonless writer, use config.toml.
 CODEX_CONFIG_FILE = "config.toml"
 
 
@@ -294,6 +293,9 @@ def inspect_grok_auth(data_dir: Path) -> Optional[dict]:
                 "email": cred.get("email"),
                 "user_id": cred.get("user_id"),
                 "first_name": cred.get("first_name"),
+                "oidc_issuer": cred.get("oidc_issuer"),
+                "oidc_client_id": cred.get("oidc_client_id"),
+                "expires_at": cred.get("expires_at"),
             }
         if isinstance(raw, dict) and raw.get("XAI_API_KEY"):
             return {
@@ -375,6 +377,46 @@ def detect_grok_plan(data_dir: Path) -> Optional[str]:
         except OSError:
             pass
     return None
+
+
+def save_grok_tokens(data_dir: Path, tokens_data: dict) -> bool:
+    """Update active Grok credential tokens in auth.json atomically."""
+    try:
+        path = Path(data_dir) / GROK_AUTH_FILE
+        if not path.is_file():
+            return False
+        raw = store.read_json_object(path, tolerant=True)
+        if not isinstance(raw, dict):
+            return False
+        target_key = None
+        for k, v in raw.items():
+            if isinstance(v, dict) and (v.get("key") or v.get("refresh_token") or v.get("email")):
+                target_key = k
+                break
+        if target_key is None:
+            return False
+        cred = raw[target_key]
+        new_token = tokens_data.get("access_token") or tokens_data.get("key")
+        if new_token:
+            cred["key"] = new_token
+        new_refresh = tokens_data.get("refresh_token")
+        if new_refresh:
+            cred["refresh_token"] = new_refresh
+        expires_in = tokens_data.get("expires_in")
+        if isinstance(expires_in, (int, float)) and expires_in > 0:
+            from datetime import datetime, timedelta, timezone
+
+            exp_dt = datetime.now(timezone.utc) + timedelta(seconds=float(expires_in))
+            cred["expires_at"] = exp_dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        elif tokens_data.get("expires_at"):
+            cred["expires_at"] = str(tokens_data["expires_at"])
+        from models import _utcnow_iso
+
+        cred["create_time"] = _utcnow_iso()
+        store._atomic_write_json(path, raw)
+        return True
+    except Exception:
+        return False
 
 
 def detect_email_source(
