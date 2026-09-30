@@ -56,6 +56,7 @@ import json
 import math
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -77,6 +78,8 @@ OPENAI_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 GROK_SETTINGS_URL = "https://cli-chat-proxy.grok.com/v1/settings"
 GROK_TOKEN_AUTH_HEADER = "xai-grok-cli"
+GROK_DEFAULT_OIDC_ISSUER = "https://auth.x.ai"
+GROK_DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -130,7 +133,7 @@ def _parse_reset_time(raw: object) -> Optional[datetime]:
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
         try:
             ts = float(raw)
-            if ts > 1e11:  # Milliseconds since epoch
+            if ts > 1e11:
                 ts /= 1000.0
             return datetime.fromtimestamp(ts, tz=timezone.utc)
         except (ValueError, OSError, OverflowError):
@@ -221,6 +224,35 @@ def _close_http_error(exc: BaseException) -> None:
             pass
 
 
+def _post_token_refresh(
+    url: str,
+    body: bytes,
+    content_type: str,
+    *,
+    user_agent: str = "Mozilla/5.0",
+    timeout: float = 10.0,
+) -> Optional[dict]:
+    """Execute a token refresh POST request and parse JSON tokens response."""
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": content_type,
+            "User-Agent": user_agent,
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, dict) and (data.get("access_token") or data.get("key")):
+                return data
+    except Exception as exc:
+        _close_http_error(exc)
+        return None
+    return None
+
+
 def refresh_codex_tokens(refresh_token: str, *, timeout: float = 10.0) -> Optional[dict]:
     """Call OpenAI OAuth refresh endpoint to exchange refresh_token for a fresh access_token."""
     body = json.dumps({
@@ -228,24 +260,37 @@ def refresh_codex_tokens(refresh_token: str, *, timeout: float = 10.0) -> Option
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     }).encode("utf-8")
-    req = urllib.request.Request(
+    return _post_token_refresh(
         OPENAI_REFRESH_URL,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-            "Accept": "application/json",
-        },
+        body,
+        "application/json",
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        timeout=timeout,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if isinstance(data, dict) and data.get("access_token"):
-                return data
-    except Exception as exc:
-        _close_http_error(exc)
-        return None
-    return None
+
+
+def refresh_grok_tokens(
+    refresh_token: str,
+    *,
+    client_id: Optional[str] = None,
+    issuer: Optional[str] = None,
+    timeout: float = 10.0,
+) -> Optional[dict]:
+    """Call xAI Grok OIDC refresh endpoint to exchange refresh_token for fresh tokens."""
+    cid = client_id or GROK_DEFAULT_CLIENT_ID
+    iss = (issuer or GROK_DEFAULT_OIDC_ISSUER).rstrip("/")
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "client_id": cid,
+        "refresh_token": refresh_token,
+    }).encode("utf-8")
+    return _post_token_refresh(
+        f"{iss}/oauth2/token",
+        body,
+        "application/x-www-form-urlencoded",
+        user_agent="xai-grok-cli",
+        timeout=timeout,
+    )
 
 
 def fetch_codex_usage_payload(
@@ -697,6 +742,36 @@ def query_grok_usage(
         )
 
     token = auth_info.get("token") or auth_info.get("key")
+    refresh_token = auth_info.get("refresh_token")
+    oidc_client_id = auth_info.get("oidc_client_id")
+    oidc_issuer = auth_info.get("oidc_issuer")
+
+    def _do_refresh() -> Optional[str]:
+        if not refresh_token:
+            return None
+        new_tokens = refresh_grok_tokens(
+            refresh_token,
+            client_id=oidc_client_id,
+            issuer=oidc_issuer,
+            timeout=timeout,
+        )
+        if new_tokens and (new_tokens.get("access_token") or new_tokens.get("key")):
+            account.save_grok_tokens(data_dir, new_tokens)
+            return new_tokens.get("access_token") or new_tokens.get("key")
+        return None
+
+    if not token and refresh_token:
+        token = _do_refresh()
+        if not token:
+            return UsageResult(
+                name=name,
+                ok=False,
+                engine="grok",
+                email=detected_email,
+                plan=detected_plan,
+                error="token refresh failed",
+            )
+
     if not token:
         return UsageResult(
             name=name,
@@ -713,14 +788,40 @@ def query_grok_usage(
     except urllib.error.HTTPError as exc:
         _close_http_error(exc)
         if exc.code == 401:
-            return UsageResult(
-                name=name,
-                ok=False,
-                engine="grok",
-                email=detected_email,
-                plan=detected_plan,
-                error="session expired (401)",
-            )
+            if refresh_token:
+                new_token = _do_refresh()
+                if new_token:
+                    token = new_token
+                    try:
+                        billing_payload = fetch_grok_billing_payload(token, timeout=timeout)
+                    except Exception as inner_exc:
+                        _close_http_error(inner_exc)
+                        return UsageResult(
+                            name=name,
+                            ok=True,
+                            engine="grok",
+                            email=detected_email,
+                            plan=detected_plan or "Grok (xAI)",
+                            error=f"usage unavailable ({inner_exc})",
+                        )
+                else:
+                    return UsageResult(
+                        name=name,
+                        ok=False,
+                        engine="grok",
+                        email=detected_email,
+                        plan=detected_plan,
+                        error="session expired (401)",
+                    )
+            else:
+                return UsageResult(
+                    name=name,
+                    ok=False,
+                    engine="grok",
+                    email=detected_email,
+                    plan=detected_plan,
+                    error="session expired (401)",
+                )
         else:
             return UsageResult(
                 name=name,
@@ -757,7 +858,7 @@ def query_grok_usage(
             plan=final_plan or "Grok (xAI)",
         )
 
-    groups, _ = parse_grok_billing_payload(billing_payload)
+    groups, _reset_dt = parse_grok_billing_payload(billing_payload)
     return UsageResult(
         name=name,
         ok=True,
@@ -813,10 +914,6 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     try:
         overlay = isolation.build_overlay(name, data_dir, store.root)
     except (isolation.IsolationError, OSError) as exc:
-        # OSError covers the overlay-build races that surface as raw
-        # filesystem errors (e.g. FileExistsError when a concurrent
-        # session recreates the .gemini link mid-build) instead of the
-        # typed IsolationError -- same failure point, same degradation.
         return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error=f"overlay error: {exc}")
 
     env = isolation.isolated_env(
@@ -910,7 +1007,7 @@ def gather_usage_report(
             on_progress(index, total, name)
         try:
             results.append(query_profile_usage(store, name, timeout=timeout))
-        except Exception as exc:  # noqa: BLE001 - degrade, never abort
+        except Exception as exc:
             results.append(
                 UsageResult(name=name, ok=False,
                             error=f"unexpected error: {exc}")
