@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agydra"
 dynamic = ["version"]
-description = "Multi-profile manager and workload dispatcher for AI developer CLIs (Google Antigravity, OpenAI Codex, and xAI Grok) on macOS, Linux, and Windows"
+description = "Multi-profile manager and workload dispatcher for AI developer CLIs (Google Antigravity, OpenAI Codex, xAI Grok, and Anthropic Claude Code) on macOS, Linux, and Windows"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -19,6 +19,8 @@ keywords = [
     "openai",
     "grok",
     "xai",
+    "claude",
+    "anthropic",
     "cli",
     "multi-profile",
     "oauth",
@@ -51,6 +53,7 @@ py-modules = [
     "banner",
     "bootstrap",
     "cli",
+    "claude_usage",
     "doctor",
     "engines",
     "i18n",

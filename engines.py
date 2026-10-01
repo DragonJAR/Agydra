@@ -9,13 +9,51 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import account
 import platforms
 
-SUPPORTED_ENGINES = ("agy", "codex", "grok")
+SUPPORTED_ENGINES = ("agy", "codex", "grok", "claude")
 DEFAULT_ENGINE = "agy"
+
+CLAUDE_FOREIGN_AUTH_ENV = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_PROFILE",
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_SERVICE_ACCOUNT_ID",
+    "ANTHROPIC_WORKSPACE_ID",
+    "ANTHROPIC_IDENTITY_TOKEN",
+    "ANTHROPIC_IDENTITY_TOKEN_FILE",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_REGION_PREFIX",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "ANTHROPIC_CONFIG_DIR",
+)
+
+CLAUDE_INHERITED_STATE_ENV = (
+    platforms.CLAUDE_USAGE_SEQ_ENV,
+    platforms.CLAUDE_USAGE_GENERATION_ENV,
+)
+
+CLAUDE_FOREGROUND_ENV = (
+    ("CLAUDE_CODE_DISABLE_AGENT_VIEW", "1"),
+    ("CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF", "1"),
+)
 
 
 @dataclass(frozen=True)
@@ -30,6 +68,44 @@ class EngineDriver:
     needs_keychain: bool
     config_binary_attr: str
     login_args: Tuple[str, ...] = ()
+    uses_overlay: bool = True
+    foreign_auth_env: Tuple[str, ...] = ()
+    pinned_env: Tuple[Tuple[str, str], ...] = ()
+    inherited_state_env: Tuple[str, ...] = ()
+
+    def scrub_inherited_state(self, env: MutableMapping[str, str]) -> None:
+        """Drop per-launch state variables inherited from a parent session.
+
+        Runs BEFORE the caller's explicit ``extra`` is merged, so only values
+        the launcher itself injects for this profile can reach the child; a
+        failed or empty injection leaves the variable absent instead of
+        resurrecting a parent's (possibly other profile's) value.
+        """
+        for name in self.inherited_state_env:
+            env.pop(name, None)
+
+    def scrub_env(self, env: MutableMapping[str, str]) -> List[str]:
+        """Drop inherited identity-bearing variables; returns the names removed.
+
+        Only this driver's own ``foreign_auth_env`` is touched, so scrubbing
+        for one engine never alters the environment contract of another.
+        """
+        removed = [name for name in self.foreign_auth_env if name in env]
+        for name in removed:
+            del env[name]
+        return removed
+
+    def inherited_foreign_auth(self, env: Mapping[str, str]) -> List[str]:
+        return [name for name in self.foreign_auth_env if name in env]
+
+    def inspect_auth(
+        self,
+        binary: Optional[Path],
+        data_dir: Path,
+        env: Mapping[str, str],
+        timeout: Optional[float] = None,
+    ) -> Optional["account.ClaudeAuthStatus"]:
+        return None
 
     def resolve_binary(self, explicit: Optional[str] = None) -> Optional[Path]:
         return platforms.resolve_binary(
@@ -102,10 +178,45 @@ class GrokEngine(EngineDriver):
         )
 
 
+class ClaudeEngine(EngineDriver):
+    """Driver for Anthropic Claude Code (claude)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="claude",
+            binary_name="claude",
+            data_dir_name=platforms.CLAUDE_DATA_DIR_NAME,
+            env_home_var=platforms.CLAUDE_CONFIG_ENV,
+            env_bin_var=platforms.CLAUDE_BIN_ENV,
+            needs_keychain=False,
+            config_binary_attr="claude_binary",
+            login_args=("auth", "login"),
+            uses_overlay=False,
+            foreign_auth_env=CLAUDE_FOREIGN_AUTH_ENV,
+            pinned_env=CLAUDE_FOREGROUND_ENV,
+            inherited_state_env=CLAUDE_INHERITED_STATE_ENV,
+        )
+
+    def inspect_auth(
+        self,
+        binary: Optional[Path],
+        data_dir: Path,
+        env: Mapping[str, str],
+        timeout: Optional[float] = None,
+    ) -> Optional["account.ClaudeAuthStatus"]:
+        return account.inspect_claude_auth(
+            binary,
+            data_dir,
+            env,
+            timeout=account.CLAUDE_STATUS_TIMEOUT if timeout is None else timeout,
+        )
+
+
 _REGISTRY: Dict[str, EngineDriver] = {
     "agy": AgyEngine(),
     "codex": CodexEngine(),
     "grok": GrokEngine(),
+    "claude": ClaudeEngine(),
 }
 
 

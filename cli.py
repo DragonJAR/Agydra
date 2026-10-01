@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 from contextlib import ExitStack
+from datetime import datetime, timezone
 import os
 import re
 import shutil
@@ -97,7 +99,7 @@ _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
     ),
     "engine": (
         "-e", "--engine", True, "ENGINE",
-        "target CLI engine: agy (default), codex, or grok; filters candidate profiles for -r",
+        "target CLI engine: agy (default), codex, grok, or claude; filters candidate profiles for -r",
     ),
     "dry-run": (
         "-n", "--dry-run", False, None,
@@ -233,9 +235,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="agydra",
         description=(
             "Multi-profile launcher and workload dispatcher for AI developer CLIs "
-            "(Google Antigravity 'agy', OpenAI Codex 'codex', and xAI Grok 'grok').\n"
+            "(Google Antigravity 'agy', OpenAI Codex 'codex', xAI Grok 'grok', and Anthropic Claude Code 'claude').\n"
             "'agydra -p <profile> <args...>' runs the engine with that profile's "
-            "isolated data store; host credentials (~/.gemini, ~/.codex, ~/.grok) are never modified."
+            "isolated data store and native authentication."
         ),
         epilog="Created by Jaime Andrés Restrepo (DragonJAR.org) — https://www.dragonjar.org",
         formatter_class=ColoredHelpFormatter,
@@ -480,13 +482,18 @@ def cmd_list(store: Store, _args) -> int:
     for idx, profile in enumerate(profiles, start=1):
         busy = locks.is_locked(store, profile.name)
         engine = profile.engine
-        if busy:
-            email = profile.email or "-"
+        if engine == "claude":
+            native = account.claude_auth_status(store.profile_data_dir(profile.name, engine=engine), store)
+            email = native.email or "-"
+            state = native.auth_state_label
         else:
-            email = account.sync_profile_email(store, profile.name) or profile.email or "-"
-        state = account.auth_state(
-            store.profile_data_dir(profile.name, engine=engine), store, profile.name, engine=engine,
-        )
+            if busy:
+                email = profile.email or "-"
+            else:
+                email = account.sync_profile_email(store, profile.name) or profile.email or "-"
+            state = account.auth_state(
+                store.profile_data_dir(profile.name, engine=engine), store, profile.name, engine=engine,
+            )
         is_default = paint("*", "green", "bold") if profile.name == default else ""
         state_color = "green" if state == "authenticated" else None
         state_shown = paint(state, state_color) if state_color else state
@@ -530,9 +537,10 @@ def cmd_login(store: Store, args) -> int:
     profile = store.get(name)
     engine = profile.engine
     data_dir = store.profile_data_dir(name, engine=engine)
-    state = account.auth_state(data_dir, store, name, engine=engine)
+    native = account.claude_auth_status(data_dir, store) if engine == "claude" else None
+    state = native.auth_state_label if native else account.auth_state(data_dir, store, name, engine=engine)
     if state == "authenticated" and not args.dry_run and not getattr(args, "force", False):
-        email = account.detect_email(data_dir, store, name, engine=engine)
+        email = native.email if native else account.detect_email(data_dir, store, name, engine=engine)
         if not _confirm(
             f"profile {name!r} already authenticated as {email or '?'} — re-login?",
             False,
@@ -548,6 +556,8 @@ def cmd_login(store: Store, args) -> int:
             print("complete the Codex authentication flow; tokens land in the profile store")
         elif engine == "grok":
             print("complete the Grok authentication flow; tokens land in the profile store")
+        elif engine == "claude":
+            print(i18n.t("claude.login_native"))
         else:
             print("complete the OAuth flow in the browser; tokens land in the profile store")
     return runner.run(plan, store=store, dry_run=args.dry_run)
@@ -567,8 +577,13 @@ def cmd_status(store: Store, args) -> int:
     profile = store.get(plan.profile)
     engine = profile.engine
     data_dir = store.profile_data_dir(plan.profile, engine=engine)
-    email = profile.email or account.detect_email(data_dir, store, plan.profile, engine=engine) or "-"
-    state = account.auth_state(data_dir, store, plan.profile, engine=engine)
+    native = account.claude_auth_status(data_dir, store) if engine == "claude" else None
+    if native:
+        email = native.email or "-"
+        state = native.auth_state_label
+    else:
+        email = profile.email or account.detect_email(data_dir, store, plan.profile, engine=engine) or "-"
+        state = account.auth_state(data_dir, store, plan.profile, engine=engine)
     print(f"profile   : {plan.profile}")
     print(f"engine    : {engine}")
     print(f"reason    : {plan.reason}")
@@ -577,6 +592,12 @@ def cmd_status(store: Store, args) -> int:
     print(f"auth      : {state}")
     print(f"busy      : {'yes' if locks.is_locked(store, plan.profile) else 'no'}")
     print(f"store     : {data_dir}")
+    if native:
+        print(f"seq       : {profile.seq}")
+        if native.reason:
+            print(f"reason    : {native.reason}")
+        if native.state == "unknown":
+            _note(i18n.t("claude.binary_hint"))
     return 0
 
 
@@ -628,6 +649,18 @@ def _clear_usage_progress(stream, names: Sequence[str]) -> None:
 
 
 def cmd_usage(store: Store, args) -> int:
+    settings_ref = getattr(args, "claude_settings", None)
+    if settings_ref is not None:
+        name = store.resolve_ref_readonly(settings_ref)
+        profile = store.get_readonly(name)
+        if profile.engine != "claude":
+            raise StoreError(i18n.t("claude.settings_profile_required"))
+        command = platforms.shell_command([
+            sys.executable, "-m", "claude_usage", "--store", str(store.root),
+            "--seq", str(profile.seq), "--display",
+        ], forward_stdin=True)
+        print(json.dumps({"statusLine": {"type": "command", "command": command}}, indent=2))
+        return 0
     if args.ref is not None:
         return _cmd_usage_detail(store, args)
     return _cmd_usage_compact(store, args)
@@ -641,8 +674,81 @@ def _truncate_account(email: Optional[str], max_len: int = 12) -> str:
     return email[:max_len - 1] + "…"
 
 
+def _usage_availability_cell(fraction: Optional[float], bar_width: int, width: int) -> str:
+    if fraction is None:
+        return pad(paint("-", "dim"), width)
+    gauge = usage.format_mini_bar(fraction, width=bar_width)
+    return pad(paint(f"{gauge} {round(fraction * 100):>2}", usage.usage_color(fraction)), width)
+
+
+def _usage_windows_cell(weekly: Optional[float], five_hour: Optional[float], shown: bool) -> str:
+    if not shown:
+        return ""
+    if weekly is None or five_hour is None:
+        return pad(paint("-", "dim"), 13)
+    return pad(f"{round(weekly * 100):>3} · {round(five_hour * 100):>3}", 13)
+
+
+def _usage_error_cell(error: Optional[str]) -> str:
+    if error == "not authenticated":
+        return paint(i18n.t("auth.not_authenticated", default="not authenticated"), "dim")
+    return paint(f"({error})", "dim")
+
+
+def _usage_account_cell(profile, result, mode: str, width: int) -> str:
+    email = profile.email or result.email or "-"
+    if mode == "truncated":
+        email = _truncate_account(email, max_len=12)
+    return pad(email, width)
+
+
+def _usage_reset_cell(reset_time, width: int = 9) -> str:
+    countdown = usage.format_countdown(reset_time) if reset_time else "-"
+    return pad(paint(countdown, "dim"), width)
+
+
+_CLAUDE_UNTRUSTED_QUALITIES = frozenset({"stale", "ambiguous", "corrupt"})
+
+
+def _claude_usage_lines(result: "usage.UsageResult", bar_width: int) -> List[str]:
+    quality = result.quality or "unknown"
+    observed = result.observed_at
+    if isinstance(observed, str):
+        try:
+            observed = datetime.fromisoformat(observed.replace("Z", "+00:00"))
+        except ValueError:
+            observed = None
+    date = observed.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z") if observed else "-"
+    state = i18n.t(f"usage.snapshot_{quality}", default=i18n.t("usage.snapshot_unknown"))
+    lines = [
+        i18n.t("usage.snapshot_metadata", source=result.source or "-", state=state, observed=date),
+        i18n.t("usage.snapshot_notice"),
+    ]
+    now = datetime.now(timezone.utc)
+    for group in result.groups:
+        for bucket in group.buckets:
+            fraction = bucket.remaining_fraction
+            reset = bucket.reset_time
+            if quality in _CLAUDE_UNTRUSTED_QUALITIES or (reset is not None and reset <= now):
+                fraction = None
+            cell = _usage_availability_cell(fraction, bar_width, bar_width + 6).rstrip()
+            if fraction is None:
+                cell = i18n.t("usage.snapshot_unknown")
+            reset_cell = (
+                usage.format_countdown(reset)
+                if reset is not None and reset > now
+                else i18n.t("usage.snapshot_reset_unknown")
+            )
+            lines.append(i18n.t("usage.snapshot_window", name=bucket.name, cell=cell, reset=reset_cell))
+    if not result.groups:
+        lines.append(i18n.t("usage.snapshot_unavailable"))
+    if result.error:
+        lines.append(_usage_error_cell(result.error))
+    return lines
+
+
 def _cmd_usage_compact(store: Store, _args) -> int:
-    profiles = store.list()
+    profiles, _unreadable = store.scan_readonly()
     if not profiles:
         print("no profiles; create one with: agydra create <name>")
         return 0
@@ -657,6 +763,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
     agy_entries = [(p, r) for p, r in zip(profiles, results) if p.engine == "agy"]
     codex_entries = [(p, r) for p, r in zip(profiles, results) if p.engine == "codex"]
     grok_entries = [(p, r) for p, r in zip(profiles, results) if p.engine == "grok"]
+    claude_entries = [(p, r) for p, r in zip(profiles, results) if p.engine == "claude"]
 
     lbl_profile = i18n.t("usage.header_profile", default="PROFILE")
     lbl_account = i18n.t("usage.header_account", default="ACCOUNT")
@@ -790,29 +897,11 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                     best_claude_val = c_avail
                     best_claude_name = profile.name
 
-                if g_avail is not None:
-                    g_bar = usage.format_mini_bar(g_avail, width=bar_w)
-                    g_pct = round(g_avail * 100)
-                    g_color = usage.usage_color(g_avail)
-                    g_disp = pad(paint(f"{g_bar} {g_pct:>2}", g_color), disp_w)
-                else:
-                    g_disp = pad(paint("-", "dim"), disp_w)
+                g_disp = _usage_availability_cell(g_avail, bar_w, disp_w)
 
-                if show_windows:
-                    if g_wk is not None and g_5h is not None:
-                        g_win = pad(f"{round(g_wk * 100):>3} · {round(g_5h * 100):>3}", 13)
-                    else:
-                        g_win = pad(paint("-", "dim"), 13)
-                else:
-                    g_win = ""
+                g_win = _usage_windows_cell(g_wk, g_5h, show_windows)
 
-                if c_avail is not None:
-                    c_bar = usage.format_mini_bar(c_avail, width=bar_w)
-                    c_pct = round(c_avail * 100)
-                    c_color = usage.usage_color(c_avail)
-                    c_disp = pad(paint(f"{c_bar} {c_pct:>2}", c_color), disp_w)
-                else:
-                    c_disp = pad(paint("-", "dim"), disp_w)
+                c_disp = _usage_availability_cell(c_avail, bar_w, disp_w)
 
                 if show_windows:
                     if c_wk is not None and c_5h is not None:
@@ -824,161 +913,71 @@ def _cmd_usage_compact(store: Store, _args) -> int:
 
                 print(row_pfx + g_disp + g_win + c_disp + c_win)
 
+    def render_quota_section(entries, engine: str, start_idx: int, windows: bool):
+        print(paint("■ " + i18n.t(f"usage.section_{engine}"), "bold"))
+        print()
+        label_plan = i18n.t("usage.header_plan", default="PLAN")
+        header = f" {'#':<{idx_w}} {lbl_profile:<{name_w}}"
+        if show_account:
+            header += f"{lbl_account:<{account_w}}"
+        header += pad(lbl_avail, disp_w)
+        if windows:
+            header += pad(lbl_windows, 13)
+        header += pad("↻", 9) + label_plan
+        print(paint(header, "bold"))
+        quota_width = disp_w + (13 if windows else 0) + 9
+        best_value = -1.0
+        best_name = None
+        best_plan = None
+        for offset, (profile, result) in enumerate(entries):
+            row = f" {start_idx + offset:<{idx_w}} {profile.name:<{name_w}}"
+            if show_account:
+                row += _usage_account_cell(profile, result, account_mode, account_w)
+            plan = result.plan or "-"
+            if not result.ok:
+                print(row + pad(_usage_error_cell(result.error), quota_width) + plan)
+            elif not result.groups:
+                if result.error:
+                    cell = paint("─ " + i18n.t("usage.unavailable", default="unavailable"), "dim")
+                else:
+                    cell = paint(i18n.t("auth.authenticated", default="authenticated"), "green")
+                    if best_name is None:
+                        best_name, best_plan = profile.name, plan
+                print(row + pad(cell, quota_width) + plan)
+            else:
+                summary = usage.extract_model_summary(result.groups)[engine]
+                fraction = summary["available"]
+                if fraction is not None and (fraction > best_value or best_name is None):
+                    best_value, best_name, best_plan = fraction, profile.name, plan
+                cell = _usage_availability_cell(fraction, bar_w, disp_w)
+                window_cell = _usage_windows_cell(summary["weekly"], summary["five_h"], windows)
+                reset_cell = _usage_reset_cell(summary["reset_time"])
+                print(row + cell + window_cell + reset_cell + plan)
+        return best_value, best_name, best_plan
+
     if codex_entries:
         if agy_entries:
             print()
-        sec_title = "■ " + i18n.t("usage.section_codex", default="OPENAI CODEX")
-        print(paint(sec_title, "bold"))
-        print()
-
-        lbl_plan = i18n.t("usage.header_plan", default="PLAN")
-
-        hdr_cx = f" {'#':<{idx_w}} {lbl_profile:<{name_w}}"
-        if show_account:
-            hdr_cx += f"{lbl_account:<{account_w}}"
-        hdr_cx += pad(lbl_avail, disp_w)
-        if show_windows:
-            hdr_cx += pad(lbl_windows, 13)
-        hdr_cx += pad("↻", 9)
-        hdr_cx += lbl_plan
-        print(paint(hdr_cx, "bold"))
-
-        start_idx = len(agy_entries) + 1
-        quota_w = disp_w + (13 if show_windows else 0) + 9
-        for offset, (profile, result) in enumerate(codex_entries):
-            idx = start_idx + offset
-            row_cx = f" {idx:<{idx_w}} {profile.name:<{name_w}}"
-            if show_account:
-                email_raw = profile.email or result.email or "-"
-                if account_mode == "truncated":
-                    row_cx += pad(_truncate_account(email_raw, max_len=12), account_w)
-                else:
-                    row_cx += pad(email_raw, account_w)
-
-            plan = result.plan or "-"
-
-            if not result.ok:
-                if result.error == "not authenticated":
-                    status_str = paint(i18n.t("auth.not_authenticated", default="not authenticated"), "dim")
-                else:
-                    status_str = paint(f"({result.error})", "dim")
-                print(row_cx + pad(status_str, quota_w) + plan)
-            elif not result.groups:
-                if result.error:
-                    status_str = paint("─ " + i18n.t("usage.unavailable", default="unavailable"), "dim")
-                else:
-                    status_str = paint(i18n.t("auth.authenticated", default="authenticated"), "green")
-                    if best_codex_name is None:
-                        best_codex_name = profile.name
-                        best_codex_plan = plan
-                print(row_cx + pad(status_str, quota_w) + plan)
-            else:
-                summary = usage.extract_model_summary(result.groups)
-                cx_avail = summary["codex"]["available"]
-                cx_wk = summary["codex"]["weekly"]
-                cx_5h = summary["codex"]["five_h"]
-                cx_reset = summary["codex"]["reset_time"]
-
-                if cx_avail is not None and cx_avail > best_codex_val:
-                    best_codex_val = cx_avail
-                    best_codex_name = profile.name
-                    best_codex_plan = plan
-                elif best_codex_name is None and cx_avail is not None:
-                    best_codex_name = profile.name
-                    best_codex_plan = plan
-
-                if cx_avail is not None:
-                    cx_bar = usage.format_mini_bar(cx_avail, width=bar_w)
-                    cx_pct = round(cx_avail * 100)
-                    cx_color = usage.usage_color(cx_avail)
-                    cx_disp = pad(paint(f"{cx_bar} {cx_pct:>2}", cx_color), disp_w)
-                else:
-                    cx_disp = pad(paint("-", "dim"), disp_w)
-
-                if show_windows:
-                    if cx_wk is not None and cx_5h is not None:
-                        cx_win = pad(f"{round(cx_wk * 100):>3} · {round(cx_5h * 100):>3}", 13)
-                    else:
-                        cx_win = pad(paint("-", "dim"), 13)
-                else:
-                    cx_win = ""
-
-                countdown = usage.format_countdown(cx_reset) if cx_reset else "-"
-                cx_reset_str = pad(paint(f"{countdown}", "dim"), 9)
-
-                print(row_cx + cx_disp + cx_win + cx_reset_str + plan)
-
+        best_codex_val, best_codex_name, best_codex_plan = render_quota_section(
+            codex_entries, "codex", len(agy_entries) + 1, show_windows
+        )
     if grok_entries:
         if agy_entries or codex_entries:
             print()
-        sec_title = "■ " + i18n.t("usage.section_grok", default="XAI GROK")
-        print(paint(sec_title, "bold"))
+        best_grok_val, best_grok_name, best_grok_plan = render_quota_section(
+            grok_entries, "grok", len(agy_entries) + len(codex_entries) + 1, False
+        )
+
+    if claude_entries:
+        if agy_entries or codex_entries or grok_entries:
+            print()
+        print(paint("■ " + i18n.t("usage.section_claude_code"), "bold"))
         print()
-
-        lbl_plan = i18n.t("usage.header_plan", default="PLAN")
-
-        hdr_gx = f" {'#':<{idx_w}} {lbl_profile:<{name_w}}"
-        if show_account:
-            hdr_gx += f"{lbl_account:<{account_w}}"
-        hdr_gx += pad(lbl_avail, disp_w)
-        hdr_gx += pad("↻", 9)
-        hdr_gx += lbl_plan
-        print(paint(hdr_gx, "bold"))
-
-        start_idx = len(agy_entries) + len(codex_entries) + 1
-        quota_w = disp_w + 9
-        for offset, (profile, result) in enumerate(grok_entries):
-            idx = start_idx + offset
-            row_gx = f" {idx:<{idx_w}} {profile.name:<{name_w}}"
-            if show_account:
-                email_raw = profile.email or result.email or "-"
-                if account_mode == "truncated":
-                    row_gx += pad(_truncate_account(email_raw, max_len=12), account_w)
-                else:
-                    row_gx += pad(email_raw, account_w)
-
-            plan = result.plan or "-"
-
-            if not result.ok:
-                if result.error == "not authenticated":
-                    status_str = paint(i18n.t("auth.not_authenticated", default="not authenticated"), "dim")
-                else:
-                    status_str = paint(f"({result.error})", "dim")
-                print(row_gx + pad(status_str, quota_w) + plan)
-            elif not result.groups:
-                if result.error:
-                    status_str = paint("─ " + i18n.t("usage.unavailable", default="unavailable"), "dim")
-                else:
-                    status_str = paint(i18n.t("auth.authenticated", default="authenticated"), "green")
-                    if best_grok_name is None:
-                        best_grok_name = profile.name
-                        best_grok_plan = plan
-                print(row_gx + pad(status_str, quota_w) + plan)
-            else:
-                summary = usage.extract_model_summary(result.groups)
-                gx_avail = summary["grok"]["available"]
-                gx_reset = summary["grok"]["reset_time"]
-
-                if gx_avail is not None and gx_avail > best_grok_val:
-                    best_grok_val = gx_avail
-                    best_grok_name = profile.name
-                    best_grok_plan = plan
-                elif best_grok_name is None and gx_avail is not None:
-                    best_grok_name = profile.name
-                    best_grok_plan = plan
-
-                if gx_avail is not None:
-                    gx_bar = usage.format_mini_bar(gx_avail, width=bar_w)
-                    gx_pct = round(gx_avail * 100)
-                    gx_color = usage.usage_color(gx_avail)
-                    gx_disp = pad(paint(f"{gx_bar} {gx_pct:>2}", gx_color), disp_w)
-                else:
-                    gx_disp = pad(paint("-", "dim"), disp_w)
-
-                countdown = usage.format_countdown(gx_reset) if gx_reset else "-"
-                gx_reset_str = pad(paint(f"{countdown}", "dim"), 9)
-
-                print(row_gx + gx_disp + gx_reset_str + plan)
+        start_idx = len(agy_entries) + len(codex_entries) + len(grok_entries) + 1
+        for offset, (profile, result) in enumerate(claude_entries):
+            print(f" {start_idx + offset:<{idx_w}} {profile.name}")
+            for line in _claude_usage_lines(result, bar_w):
+                print(f"     {line}")
 
     recs = []
     if best_gem_name is not None and best_gem_val > 0:
@@ -1011,11 +1010,16 @@ def _cmd_usage_compact(store: Store, _args) -> int:
 
 
 def _cmd_usage_detail(store: Store, args) -> int:
-    name = store.resolve_ref(args.ref)
-    profile = store.get(name)
+    name = store.resolve_ref_readonly(args.ref)
+    profile = store.get_readonly(name)
     result = usage.query_profile_usage(store, name)
     print(f"profile   : {profile.name}")
     print(f"engine    : {profile.engine}")
+    if profile.engine == "claude":
+        print(paint(i18n.t("usage.section_claude_code"), "bold"))
+        for line in _claude_usage_lines(result, 10):
+            print(line)
+        return 0 if result.ok else 1
     if profile.email or result.email:
         print(f"email     : {profile.email or result.email}")
     if profile.engine in ("codex", "grok"):
@@ -1081,6 +1085,12 @@ def cmd_rename(store: Store, args) -> int:
     old = store.resolve_ref(args.old)
     _assert_free(store, old, "renaming the profile")
 
+    if store.get(old).engine == "claude":
+        profile = store.rename(old, args.new)
+        locks.forget(store, old)
+        print(f"renamed {old!r} -> {profile.name!r}")
+        return 0
+
     recovery_data = {}
 
     def prepare_recovery_data() -> dict:
@@ -1120,9 +1130,15 @@ def _finish_delete(store: Store, name: str, no_backup: bool) -> int:
     """Shared tail for both the normal and the corrupt-profile delete paths."""
     _assert_free(store, name, "deleting the profile")
 
+    try:
+        engine = store.get(name).engine
+    except StoreError:
+        engine = None
     purge_errors: List[Exception] = []
 
     def purge_deleted_profile_slot() -> None:
+        if engine == "claude":
+            return
         try:
             with keychain.serialized_access(store):
                 keychain.purge_profile_slot(store, name)
@@ -1209,6 +1225,10 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
         target_profiles = {name: store.get(name) for name in resolved}
         if any(profile.name != name for name, profile in target_profiles.items()):
             raise StoreError("cannot safely share config: target profile owner changed")
+        if src_profile.engine == "claude" or any(
+            profile.engine == "claude" for profile in target_profiles.values()
+        ):
+            raise StoreError(i18n.t("claude.share_unsupported"))
         copied: List[str] = []
         for target_name in resolved:
             target_profile = target_profiles[target_name]
@@ -1262,6 +1282,8 @@ def cmd_import(store: Store, args) -> int:
                 f"a different owner ({profile.name!r})"
             )
         engine = profile.engine
+        if engine == "claude":
+            raise StoreError(i18n.t("claude.import_unsupported"))
         driver = engines.get_engine(engine)
         if args.source is not None:
             real = Path(args.source).expanduser()
@@ -1456,12 +1478,14 @@ def _management_help() -> str:
 
 _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
     (
-        "first run (Antigravity, Codex & Grok)",
+        "first run (Antigravity, Codex, Grok & Claude Code)",
         [
             ("agydra setup", "one-time install of the shim and venv"),
             ("agydra create work -d 'Google workspace'", "create an agy profile (default engine)"),
             ("agydra create cx -e codex -d 'OpenAI account'", "create a codex profile"),
             ("agydra create gk -e grok -d 'xAI account'", "create a grok profile"),
+            ("agydra create cc -e claude", "create a Claude Code profile"),
+            ("agydra login cc", "native Claude Code auth login"),
             ("agydra login work", "Google OAuth flow isolated to 'work'"),
             ("agydra login cx", "Codex authentication isolated to 'cx'"),
             ("agydra login gk", "Grok authentication isolated to 'gk'"),
@@ -1474,6 +1498,7 @@ _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
             ("agydra -p work 'your prompt'", "launch agy with 'work'"),
             ("agydra -p cx 'your prompt'", "launch codex with 'cx' (daemonless by default)"),
             ("agydra -p gk 'your prompt'", "launch grok with 'gk'"),
+            ("agydra -p cc 'your prompt'", "launch Claude Code with 'cc'"),
             ("agydra 'your prompt'", "launch with the default profile"),
             ("agydra -r 'your prompt'", "pick a free authenticated agy profile automatically"),
             ("agydra -e codex -r 'your prompt'", "pick a free authenticated codex profile automatically"),
@@ -1624,7 +1649,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             parser.add_argument(
                 "-n", "--dry-run", action="store_true",
-                help="show the launch plan without running agy",
+                help="show the launch plan without running the engine",
             )
             parser.set_defaults(func=cmd_login)
         elif sub == "status":
@@ -1707,10 +1732,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             parser.set_defaults(func=cmd_doctor)
         elif sub == "usage":
-            parser.add_argument(
+            usage_mode = parser.add_mutually_exclusive_group()
+            usage_mode.add_argument(
                 "ref", nargs="?",
                 help="profile name or number for a detailed view "
                 "(omit for a compact table of every profile)",
+            )
+            usage_mode.add_argument(
+                "--claude-settings", metavar="PROFILE",
+                help=i18n.t("claude.settings_help"),
             )
             parser.set_defaults(func=cmd_usage)
         elif sub == "setup":

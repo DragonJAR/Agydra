@@ -14,8 +14,10 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Mapping, Optional, Tuple
 
 import platforms
 import store
@@ -419,6 +421,170 @@ def save_grok_tokens(data_dir: Path, tokens_data: dict) -> bool:
         return False
 
 
+CLAUDE_STATUS_TIMEOUT = 15.0
+CLAUDE_GLOBAL_CONFIG_FILE = ".claude.json"
+CLAUDE_STATE_AUTHENTICATED = "authenticated"
+CLAUDE_STATE_UNAUTHENTICATED = "unauthenticated"
+CLAUDE_STATE_UNKNOWN = "unknown"
+_SOURCE_CLI = "cli"
+
+
+@dataclass(frozen=True)
+class ClaudeAuthStatus:
+    """Outcome of one ``claude auth status`` invocation.
+
+    ``state`` is ``authenticated`` or ``unauthenticated`` only when the CLI
+    answered coherently (exit code and ``loggedIn`` agree); every other
+    outcome (missing binary, timeout, malformed output, foreign config
+    directory, non-first-party provider) is ``unknown`` with a ``reason``.
+    Credentials are never read: only the CLI's own JSON report is consumed.
+    """
+
+    state: str
+    email: Optional[str] = None
+    auth_method: Optional[str] = None
+    api_provider: Optional[str] = None
+    config_directory: Optional[str] = None
+    reason: str = ""
+
+    @property
+    def authenticated(self) -> bool:
+        return self.state == CLAUDE_STATE_AUTHENTICATED
+
+    @property
+    def auth_state_label(self) -> str:
+        if self.state == CLAUDE_STATE_AUTHENTICATED:
+            return "authenticated"
+        if self.state == CLAUDE_STATE_UNAUTHENTICATED:
+            return "not-authenticated"
+        return CLAUDE_STATE_UNKNOWN
+
+
+def _claude_unknown(reason: str, **fields) -> ClaudeAuthStatus:
+    return ClaudeAuthStatus(state=CLAUDE_STATE_UNKNOWN, reason=reason, **fields)
+
+
+def _same_directory(left: str, right: Path) -> bool:
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+CLAUDE_SUBSCRIPTION_AUTH_METHOD = "claude.ai"
+CLAUDE_FIRST_PARTY_PROVIDER = "firstparty"
+
+
+def inspect_claude_auth(
+    binary: Optional[Path],
+    config_dir: Path,
+    env: Mapping[str, str],
+    timeout: float = CLAUDE_STATUS_TIMEOUT,
+) -> ClaudeAuthStatus:
+    """Run ``claude auth status`` once and classify the answer conservatively.
+
+    Never starts a login, never sends a model request and never touches
+    credential files. ``env`` must already be the isolated environment
+    (``isolation.isolated_env(..., engine="claude")``).
+
+    ``authenticated`` requires exit 0, ``loggedIn`` true, ``authMethod`` exactly
+    ``claude.ai`` (the native subscription login; the CLI also reports
+    ``api_key``, ``api_key_helper``, ``oauth_token``, ``third_party`` and
+    ``none``), ``apiProvider`` ``firstParty`` and no ``apiKeySource``. A missing
+    or unrecognised method/provider is ``unknown``, never ``authenticated``.
+    """
+    if binary is None:
+        return _claude_unknown("claude binary not found")
+    if not Path(config_dir).is_dir():
+        return _claude_unknown(f"claude config directory missing: {config_dir}")
+    try:
+        proc = platforms.run_with_group_kill(
+            [str(binary), "auth", "status"],
+            env=dict(env),
+            timeout=timeout,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return _claude_unknown(f"claude auth status timed out after {timeout:g}s")
+    except (OSError, ValueError) as exc:
+        return _claude_unknown(f"cannot run claude auth status: {exc}")
+    try:
+        report = json.loads(proc.stdout or "")
+    except (ValueError, RecursionError):
+        return _claude_unknown("claude auth status returned malformed JSON")
+    if not isinstance(report, dict) or type(report.get("loggedIn")) is not bool:
+        return _claude_unknown("claude auth status returned an unexpected JSON shape")
+    auth_method = report.get("authMethod")
+    api_provider = report.get("apiProvider")
+    config_directory = report.get("configDirectory")
+    fields = {
+        "auth_method": auth_method if isinstance(auth_method, str) else None,
+        "api_provider": api_provider if isinstance(api_provider, str) else None,
+        "config_directory": config_directory if isinstance(config_directory, str) else None,
+    }
+    if fields["config_directory"] and not _same_directory(fields["config_directory"], config_dir):
+        return _claude_unknown(
+            f"claude reports a different config directory ({fields['config_directory']})",
+            **fields,
+        )
+    logged_in = report["loggedIn"]
+    if proc.returncode == 0 and logged_in:
+        if fields["config_directory"] is None:
+            return _claude_unknown(
+                "claude did not report its config directory (needs claude >= 2.1.268); "
+                "identity cannot be tied to this profile",
+                **fields,
+            )
+        if fields["api_provider"] is None or fields["api_provider"].lower() != CLAUDE_FIRST_PARTY_PROVIDER:
+            return _claude_unknown(
+                f"provider {fields['api_provider']!r} is not the first-party Anthropic API; "
+                "subscription identity is not guaranteed",
+                **fields,
+            )
+        if fields["auth_method"] != CLAUDE_SUBSCRIPTION_AUTH_METHOD:
+            return _claude_unknown(
+                f"auth method {fields['auth_method']!r} is not the native claude.ai "
+                "subscription login; identity is not guaranteed",
+                **fields,
+            )
+        if report.get("apiKeySource"):
+            return _claude_unknown(
+                "an API key source is active; subscription identity is not guaranteed",
+                **fields,
+            )
+        email = report.get("email")
+        return ClaudeAuthStatus(
+            state=CLAUDE_STATE_AUTHENTICATED,
+            email=email.strip() if isinstance(email, str) and "@" in email else None,
+            **fields,
+        )
+    if proc.returncode == 1 and not logged_in:
+        return ClaudeAuthStatus(state=CLAUDE_STATE_UNAUTHENTICATED, **fields)
+    return _claude_unknown(
+        f"claude auth status answered inconsistently (exit {proc.returncode}, "
+        f"loggedIn={logged_in})",
+        **fields,
+    )
+
+
+def claude_auth_status(data_dir: Path, store=None) -> ClaudeAuthStatus:
+    """One status call for a profile's physical claude config directory."""
+    import engines
+    import isolation
+
+    driver = engines.get_engine("claude")
+    try:
+        isolation.validate_claude_config_dir(Path(data_dir))
+    except isolation.IsolationError as exc:
+        return _claude_unknown(str(exc))
+    config = store.load_config() if store is not None else None
+    binary = driver.resolve_binary(getattr(config, "claude_binary", None))
+    env = isolation.isolated_env(Path(data_dir), {}, engine="claude")
+    return driver.inspect_auth(binary, Path(data_dir), env)
+
+
 def detect_email_source(
     data_dir: Path,
     store=None,
@@ -439,6 +605,9 @@ def detect_email_source(
     if engine == "grok":
         email = detect_grok_email(data_dir)
         return email, ("disk" if email else None)
+    if engine == "claude":
+        email = claude_auth_status(data_dir, store).email
+        return email, (_SOURCE_CLI if email else None)
 
     data_dir = Path(data_dir)
     for raw, source in _iter_tokens(data_dir, store, name):
@@ -478,6 +647,8 @@ def auth_state(
         return "authenticated" if inspect_codex_auth(data_dir) is not None else "not-authenticated"
     if engine == "grok":
         return "authenticated" if inspect_grok_auth(data_dir) is not None else "not-authenticated"
+    if engine == "claude":
+        return claude_auth_status(data_dir, store).auth_state_label
 
     data_dir = Path(data_dir)
     for raw, _source in _iter_tokens(data_dir, store, name):

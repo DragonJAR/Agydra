@@ -321,6 +321,52 @@ class TestDoctor(BaseCase):
         )
 
 
+class TestClaudeIsolationCheck(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("cc", engine="claude")
+        isolation.build_overlay("cc", self.store.claude_config_dir("cc"), self.store.root, engine="claude")
+
+    def _check(self):
+        return doctor._check_isolation(
+            self.store,
+            doctor._DoctorContext(scan=self.store.scan(), names=self.store.names()),
+        )
+
+    def test_plain_config_directory_is_ok(self):
+        status, message = self._check()
+        self.assertEqual(status, doctor.OK)
+        self.assertIn("claude", message)
+
+    def test_symlinked_config_directory_fails_via_shared_validator(self):
+        config = self.store.claude_config_dir("cc")
+        target = self.store.root / "elsewhere"
+        target.mkdir()
+        config.rmdir()
+        try:
+            config.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        status, message = self._check()
+        self.assertEqual(status, doctor.FAIL)
+        self.assertIn("cc:", message)
+        self.assertIn("symlink", message)
+
+    def test_alias_of_real_claude_directory_fails(self):
+        real = platforms.claude_data_dir()
+        real.mkdir(parents=True)
+        config = self.store.claude_config_dir("cc")
+        config.rmdir()
+        try:
+            config.symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        status, message = self._check()
+        self.assertEqual(status, doctor.FAIL)
+        self.assertIn("cc:", message)
+
+
 class TestIsolationRecovery(BaseCase):
     """``_check_isolation`` must distinguish the recoverable real-dir case
     (WARN: run doctor --fix) from a real mis-pointed symlink (FAIL). The

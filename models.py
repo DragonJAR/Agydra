@@ -20,7 +20,9 @@ class Profile:
     """A named, isolated identity for agy.
 
     The profile data directory (derived via ``store.profile_data_dir(name)``)
-    holds the equivalent of ``~/.gemini`` for this profile.
+    holds the equivalent of ``~/.gemini`` for this profile. For the ``claude``
+    engine it lives at ``<store>/claude-config/<seq>``, keyed by the immutable
+    ``seq`` so renaming a profile never moves its physical config.
     ``seq`` is a monotonic insertion counter: it defines the stable
     insertion-order sort key in ``_scan`` (so ``list`` and ``resolve_ref``
     number profiles predictably; timestamps alone collide when several
@@ -89,6 +91,7 @@ class Config:
     agy_binary: Optional[str] = None
     codex_binary: Optional[str] = None
     grok_binary: Optional[str] = None
+    claude_binary: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -100,6 +103,8 @@ class Config:
             d["codex_binary"] = self.codex_binary
         if self.grok_binary is not None:
             d["grok_binary"] = self.grok_binary
+        if self.claude_binary is not None:
+            d["claude_binary"] = self.claude_binary
         return d
 
     @classmethod
@@ -130,6 +135,11 @@ class Config:
             raise ValueError(
                 f"grok_binary must be a string, got {type(grok_binary).__name__}"
             )
+        claude_binary = raw.get("claude_binary")
+        if claude_binary is not None and not isinstance(claude_binary, str):
+            raise ValueError(
+                f"claude_binary must be a string, got {type(claude_binary).__name__}"
+            )
         settings = dict(DEFAULT_SETTINGS)
         settings.update(raw_settings or {})
         return cls(
@@ -138,4 +148,5 @@ class Config:
             agy_binary=agy_binary,
             codex_binary=codex_binary,
             grok_binary=grok_binary,
+            claude_binary=claude_binary,
         )

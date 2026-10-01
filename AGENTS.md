@@ -9,11 +9,11 @@ This document serves as the authoritative single source of truth for architectur
 | ID | Invariant | Enforcement Module | Primary Contract |
 |:---|:---|:---|:---|
 | **R1** | **Zero Runtime Dependencies** | `pyproject.toml` | Pure Python Standard Library only (`sys`, `os`, `pathlib`, `json`, `urllib`, etc.). Python >= 3.9. |
-| **R2** | **Engine Isolation & Overlays** | `isolation.py`, `engines.py` | Isolated home overlays for `agy` (`HOME`), `codex` (`CODEX_HOME`), and `grok` (`GROK_HOME` + `GROK_LEADER_SOCKET`). |
+| **R2** | **Engine Isolation & Overlays** | `isolation.py`, `engines.py` | Isolated home overlays for `agy` (`HOME`), `codex` (`CODEX_HOME`), `grok` (`GROK_HOME` + `GROK_LEADER_SOCKET`), and Claude Code (physical `CLAUDE_CONFIG_DIR` keyed by immutable `seq`). |
 | **R3** | **Kernel-Held Advisory Locks** | `locks.py` | Non-blocking OS advisory file locks (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows). No stale PID files. |
-| **R4** | **macOS Keychain Bridge** | `keychain.py` | Serialized private slot swapping around `agy` runs via `swap.lock`. Bypassed as no-op for disk-based `codex` and `grok`. |
+| **R4** | **macOS Keychain Bridge** | `keychain.py` | Serialized private slot swapping around `agy` runs via `swap.lock`. Bypassed for `codex`, `grok`, and `claude`; Claude native Keychain is managed by Claude Code. |
 | **R5** | **Atomic Persistence** | `store.py` | Sibling temporary file write + atomic `os.replace`. Automatic ZIP backup before profile deletion. |
-| **R6** | **Strict Modern Token Schema** | `account.py` | Clean JWT claim parsing (`id_token`, `auth.json`, `token`). Zero legacy migrations. |
+| **R6** | **Strict Modern Token Schema** | `account.py` | Clean JWT claims for agy/Codex/Grok; Claude native `auth status` JSON. Zero legacy migrations. |
 | **R7** | **Idempotent Bootstrap** | `bootstrap.py` | User-space install (`~/.local/bin`), foreign binary guard with marker check, and `-n/--dry-run` inspection. |
 | **R8** | **Centralized i18n & Persistence** | `i18n.py` | Pure stdlib catalog, deterministic fallback cascade (`CLI > ENV > Config > System > English`), atomic persistence. |
 | **R9** | **Zero-Comment Code Contract** | All `*.py` modules | Self-documenting code with expressive naming and docstrings. Strictly zero `#` comments in Python source code. |
@@ -55,10 +55,12 @@ Every modification, addition, or refactor must strictly adhere to four foundatio
 - Packaging uses `setuptools` build backend with a flat `py-modules` layout.
 
 ### R2. Engine Data Redirection & Home Overlay Architecture
-- Agydra decouples CLI execution through engine drivers (`AgyEngine`, `CodexEngine`, and `GrokEngine` in `engines.py`).
+- Agydra decouples CLI execution through engine drivers (`AgyEngine`, `CodexEngine`, `GrokEngine`, and `ClaudeEngine` in `engines.py`).
 - **Antigravity (`agy`)**: Derives store (`~/.gemini`) from user home (`HOME` on POSIX, `USERPROFILE` on Windows). `agydra` builds an isolated home overlay at `<store>/overlays/<profile>` where `<overlay>/.gemini` links to `<store>/profiles/<profile>/data`. Non-gemini home entries are symlinked (or junctioned on Windows).
 - **Codex (`codex`)**: Isolated via `CODEX_HOME` pointing directly to `<overlay>/.codex` (linked to `<store>/profiles/<profile>/data`), avoiding user home pollution.
 - **Grok (`grok`)**: Isolated via `GROK_HOME` pointing directly to `<overlay>/.grok` (linked to `<store>/profiles/<profile>/data`), with `GROK_LEADER_SOCKET` pointing to `<overlay>/.grok/leader.sock`, isolating sessions, socket daemons, and disk credentials.
+- **Claude Code (`claude`)**: `CLAUDE_CONFIG_DIR` points to the physical `<store>/claude-config/<seq>` directory. The immutable positive `Profile.seq` is its identity; rename preserves both sequence and path, and deleted sequence numbers are never reused. Claude preserves the real HOME and receives no Codex daemon flags. Foreign authentication/provider environment is removed by the driver so one profile cannot inherit another provider's credentials.
+- **Claude lifecycle**: Native `claude auth login` and bounded `claude auth status` determine authentication; cache quota never authenticates a profile. The runner invalidates the usage generation under the execution lock before native `auth login`/`auth logout` routed through Agydra; an interactive `/login` inside a running Claude session is undetectable, so not every re-login invalidates the cache. Store deletion verifies a backup containing the physical configuration before removing config/cache state. Backups may contain disk credentials; native macOS Keychain entries are not exported and require re-login. Native macOS Keychain credentials belong to Claude Code: Agydra neither swaps Antigravity slots for Claude nor promises portable OAuth backups. Background supervisor checks fail closed for destructive mutations; Agydra runs foreground sessions and rejects background handoffs. Import/share-config reject Claude until a safe selective configuration contract exists.
 - **Daemonless Codex Execution**: On POSIX/macOS, Codex's background daemons leak file-descriptor locks and trigger `SUN_LEN` socket overflow (104 bytes). `agydra` enforces synchronous, daemonless execution by default (`--no-daemon` and `features.daemon_auto_start = false` in `config.toml`).
 - **Unredirected Real Home (`AGYDRA_REAL_HOME`)**: Injected by `isolation.py` pointing to the user's authentic home directory. Prevents nested subshells or internal CLI invocations from creating nested overlays or losing the root store.
 
@@ -79,7 +81,7 @@ Every modification, addition, or refactor must strictly adhere to four foundatio
   - Synchronized via `swap.lock`.
   - If the profile being executed already owns the shared slot, the operation is a no-op (no superfluous keychain writes).
   - On process exit, updated credentials from the shared slot are saved back into the profile's private slot.
-- For `codex` and `grok` profiles (which store credentials on disk in `auth.json`), the keychain bridge is bypassed as a no-op, avoiding unnecessary system keychain operations.
+- For `codex` and `grok` profiles (disk `auth.json`) and `claude` profiles (native authentication, including native macOS Keychain), the Antigravity bridge is bypassed. Claude credentials are never copied into `agydra.<profile>` slots.
 
 ### R5. Atomic Persistence & Non-Destructive Mutations
 - All state changes (`agydra.json`, profile metadata, store files) use atomic writes:
@@ -95,7 +97,15 @@ Every modification, addition, or refactor must strictly adhere to four foundatio
   - For `agy`: inside the `token` envelope file in `antigravity-cli/`.
   - For `codex`: inside `auth.json` under `tokens.id_token`, workspace `tokens.account_id`, or `OPENAI_API_KEY`.
   - For `grok`: inside `auth.json` under OIDC credentials (`email` and `tier` claim in JWT `key`) or `XAI_API_KEY`.
+- Claude Code credentials are not parsed or migrated: only bounded native `auth status` JSON is trusted, with authenticated/unauthenticated/unknown states and conservative provider/config-directory checks. Noninteractive login availability depends on the native CLI; cloud providers and keyless Console flows are not claimed as verified.
 - Legacy schemas or non-standard structures are never migrated: clean failure modes and predictable state are prioritized.
+
+### Claude Code Informational Usage Snapshots
+- `usage.query_profile_usage` reads opt-in `statusLine` snapshots via `claude_usage`, without HTTP, credential reads, login probes, token refresh or cache writes. Only the opt-in capture writer persists its own whitelisted cache data atomically.
+- Cache ownership uses immutable profile sequence, login generation and session UUID. A pre-login writer cannot repopulate a newer generation, but identity stays unverified and the cache informational because in-session `/login` is not observed. Multiple discordant sessions are ambiguous; absent, expired or invalid windows remain unknown and never imply full availability.
+- `source=claude_status_line`, local `observed_at`, `quality` and `identity_verified=False` are informational metadata. The local observation time is not a server query timestamp and statusLine does not identify an account. Snapshot display never supplies a Claude Code account recommendation or authentication status.
+- Compact and detail output share window formatters. The independent ANTHROPIC CLAUDE CODE section is separate from Antigravity's Claude/GPT quotas. `gather_usage_report` remains one-to-one and sequential across profiles.
+- Capture is opt-in; Agydra never edits user settings automatically or silently overrides managed settings or `--settings`. An existing statusLine needs explicit manual composition; no implicit preservation is promised.
 
 ### R7. Non-Destructive, Idempotent Bootstrap
 - `bootstrap.py` (entry points: `python3 agydra.py` and `agydra setup`):
@@ -125,16 +135,16 @@ Every modification, addition, or refactor must strictly adhere to four foundatio
 
 ## 🔍 Engine Isolation Matrix
 
-| Capability | Google Antigravity (`agy`) | OpenAI Codex (`codex`) | xAI Grok (`grok`) |
-|:---|:---|:---|:---|
-| **Driver Class** | `AgyEngine` | `CodexEngine` | `GrokEngine` |
-| **Data Directory** | `~/.gemini` | `~/.codex` | `~/.grok` |
-| **Isolation Variable** | `HOME` (overlay tree) | `CODEX_HOME` | `GROK_HOME` |
-| **Daemon Handling** | Process-bound | `--no-daemon` enforced | `GROK_LEADER_SOCKET` isolated |
-| **Credential Storage** | macOS Keychain (`antigravity`) / Disk | Disk (`auth.json`) | Disk (`auth.json`) |
-| **Keychain Bridge** | Active on macOS (`swap.lock`) | Bypassed (no-op) | Bypassed (no-op) |
-| **Usage Mechanism** | `agy --print /usage --output-format json` | Direct internal HTTP `/wham/usage` | Direct internal HTTP proxy `/v1/billing` |
-| **Workspace Support** | Handled natively by binary | `ChatGPT-Account-Id` header | Unified billing / On-demand |
+| Capability | Google Antigravity (`agy`) | OpenAI Codex (`codex`) | xAI Grok (`grok`) | Anthropic Claude Code (`claude`) |
+|:---|:---|:---|:---|:---|
+| **Driver Class** | `AgyEngine` | `CodexEngine` | `GrokEngine` | `ClaudeEngine` |
+| **Data Directory** | `~/.gemini` | `~/.codex` | `~/.grok` | Physical `<store>/claude-config/<seq>` |
+| **Isolation Variable** | `HOME` (overlay tree) | `CODEX_HOME` | `GROK_HOME` | `CLAUDE_CONFIG_DIR`; HOME preserved |
+| **Daemon Handling** | Process-bound | `--no-daemon` enforced | `GROK_LEADER_SOCKET` isolated | Foreground; background handoff disabled |
+| **Credential Storage** | macOS Keychain (`antigravity`) / Disk | Disk (`auth.json`) | Disk (`auth.json`) | Native Claude Code; macOS Keychain / platform storage |
+| **Keychain Bridge** | Active on macOS (`swap.lock`) | Bypassed (no-op) | Bypassed (no-op) | Antigravity bridge bypassed; native Keychain untouched |
+| **Usage Mechanism** | `agy --print /usage --output-format json` | Direct internal HTTP `/wham/usage` | Direct internal HTTP proxy `/v1/billing` | Opt-in local statusLine snapshots; no live query |
+| **Workspace Support** | Handled natively by binary | `ChatGPT-Account-Id` header | Unified billing / On-demand | Native CLI; cloud/keyless Console not verified |
 
 ---
 
@@ -161,6 +171,7 @@ agydra/
 ├── vocab.py             # Shared subcommand vocabulary and reserved profile names
 ├── orphans.py           # Store reverse audit and orphaned artifact cleanup
 ├── usage.py             # `agydra usage` quota inspector
+├── claude_usage.py      # Opt-in Claude statusLine capture and read-only snapshot inspection
 ├── bootstrap.py         # Idempotent venv & PATH shim installer
 ├── tests/               # Automated unit and integration test suite
 ├── README.md            # English documentation

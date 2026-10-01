@@ -81,6 +81,7 @@ cheap), but it is not expected to ever fire there.
 from __future__ import annotations
 
 import os
+import uuid
 from pathlib import Path
 from typing import List, Optional
 
@@ -183,6 +184,36 @@ def lock_path(store, name: str) -> Path:
 
 def sequence_lock_path(store) -> Path:
     return lock_dir(store) / _SEQUENCE_LOCK_NAME
+
+
+def normalize_usage_session_id(session_id: object) -> str:
+    if not isinstance(session_id, str):
+        raise ValueError("usage session id must be a UUID string")
+    try:
+        canonical = str(uuid.UUID(session_id))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError("usage session id must be a canonical UUID") from exc
+    if session_id.lower() != canonical:
+        raise ValueError("usage session id must be a canonical UUID")
+    return canonical
+
+
+def usage_cache_lock_path(
+    store: object, seq: int, session_id: Optional[str] = None
+) -> Path:
+    if type(seq) is not int or seq < 1:
+        raise ValueError(f"invalid usage cache sequence {seq!r}")
+    scope = "generation" if session_id is None else normalize_usage_session_id(session_id)
+    return lock_dir(store) / f".usage-cache-{seq}-{scope}{LOCK_SUFFIX}"
+
+
+def try_usage_cache_lock(
+    store: object, seq: int, session_id: Optional[str] = None
+) -> Optional[LockHandle]:
+    """Acquire the profile-generation or one profile-session cache lock."""
+    path = usage_cache_lock_path(store, seq, session_id)
+    description = "usage-cache generation lock" if session_id is None else "usage-cache session lock"
+    return _try_lock_path(path, description, False)
 
 
 def _same_file(fd: int, path: Path) -> bool:

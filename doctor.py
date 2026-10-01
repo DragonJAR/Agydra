@@ -51,9 +51,10 @@ def _check_binary(store: Store, ctx: "_DoctorContext"):
     has_agy_profile = any(getattr(p, "engine", "agy") == "agy" for p in ctx.scan[0]) if has_profiles else True
     has_codex_profile = any(getattr(p, "engine", "agy") == "codex" for p in ctx.scan[0])
     has_grok_profile = any(getattr(p, "engine", "agy") == "grok" for p in ctx.scan[0])
+    has_claude_profile = any(getattr(p, "engine", "agy") == "claude" for p in ctx.scan[0])
     lines = []
     status = OK
-    active_count = sum([has_agy_profile, has_codex_profile, has_grok_profile])
+    active_count = sum([has_agy_profile, has_codex_profile, has_grok_profile, has_claude_profile])
     if active_count > 1:
         lines.append("binaries:")
         prefix = "  - "
@@ -80,6 +81,13 @@ def _check_binary(store: Store, ctx: "_DoctorContext"):
             lines.append(f"{prefix}grok binary not found (install grok or set {platforms.GROK_BIN_ENV})")
         else:
             lines.append(f"{prefix}grok binary: {grok_bin}")
+    if has_claude_profile:
+        claude_bin = platforms.resolve_claude_binary(config.claude_binary)
+        if claude_bin is None:
+            status = FAIL
+            lines.append(f"{prefix}claude binary not found (install claude or set {platforms.CLAUDE_BIN_ENV})")
+        else:
+            lines.append(f"{prefix}claude binary: {claude_bin}")
     return status, "\n".join(lines)
 
 
@@ -109,12 +117,12 @@ def _check_profiles(store: Store, ctx: "_DoctorContext"):
     problems = []
     lines = [f"profiles: {len(profiles)}"]
     for p in profiles:
-        data_dir = store.profile_data_dir(p.name)
+        engine = getattr(p, "engine", "agy") or "agy"
+        data_dir = store.profile_data_dir(p.name, engine=engine)
         if not data_dir.is_dir():
             problems.append(f"{p.name}: data dir missing ({data_dir})")
             lines.append(f"  - {p.name}: DATA DIR MISSING")
             continue
-        engine = getattr(p, "engine", "agy") or "agy"
         state = account.auth_state(
             data_dir, store, p.name, engine=engine,
         )
@@ -177,13 +185,19 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
     pending = []
     profiles_by_name = {p.name: p for p in ctx.scan[0]}
     for name in profiles:
-        data_dir = store.profile_data_dir(name)
-        if not data_dir.is_dir():
-            failures.append(f"{name}: data dir missing")
-            continue
         p = profiles_by_name.get(name)
         engine_name = (getattr(p, "engine", "agy") or "agy") if p else "agy"
         driver = engines.get_engine(engine_name)
+        data_dir = store.profile_data_dir(name, engine=engine_name)
+        if not data_dir.is_dir():
+            failures.append(f"{name}: data dir missing")
+            continue
+        if not driver.uses_overlay:
+            try:
+                isolation.validate_claude_config_dir(data_dir)
+            except isolation.IsolationError as exc:
+                failures.append(f"{name}: {exc}")
+            continue
         link_name = driver.data_dir_name
         overlay = store.overlays_dir / name
         data_link = overlay / link_name
@@ -204,8 +218,15 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
                 failures.append(f"{name}: overlay {link_name} points to REAL store")
             else:
                 failures.append(f"{name}: overlay {link_name} points elsewhere")
+    claude_orphans = store.claude_config_orphans(ctx.scan[0])
     if failures:
         return FAIL, "isolation broken: " + "; ".join(failures)
+    if claude_orphans:
+        return WARN, (
+            "claude-config entries without an owning profile: "
+            + ", ".join(f"claude-config/{n}" for n in claude_orphans)
+            + " (kept untouched: they may hold data of a profile with unreadable metadata)"
+        )
     if recoverable:
         return WARN, (
             "isolation recoverable: real directory instead of link in overlay for "
@@ -213,7 +234,13 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
             + " (data intact — run `agydra doctor --fix` to migrate it "
             "into the profile store and relink)"
         )
-    if pending and len(pending) == len(profiles):
+    overlay_profiles = [
+        n for n in profiles
+        if getattr(profiles_by_name.get(n), "engine", "agy") != "claude"
+    ]
+    if not overlay_profiles:
+        return OK, f"isolation ok for {len(profiles)} claude profile(s) (CLAUDE_CONFIG_DIR, no overlay)"
+    if pending and len(pending) == len(overlay_profiles):
         return WARN, (
             "isolation not yet verifiable (no profile launched): "
             + ", ".join(pending)
@@ -231,7 +258,8 @@ def _check_schema_canary(store: Store, ctx: "_DoctorContext"):
     """
     names = ctx.names
     any_data = any(
-        (store.profile_data_dir(n) / account.AGY_CLI_DIR).exists()
+        (store.profile_data_dir(n) / account.CLAUDE_GLOBAL_CONFIG_FILE).exists()
+        or (store.profile_data_dir(n) / account.AGY_CLI_DIR).exists()
         or (store.profile_data_dir(n) / account.CODEX_AUTH_FILE).exists()
         or (store.profile_data_dir(n) / account.CODEX_CONFIG_FILE).exists()
         or (store.profile_data_dir(n) / account.GROK_AUTH_FILE).exists()
@@ -514,6 +542,8 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
                 f"skipping overlay recovery for {name!r}: "
                 f"cannot establish the profile engine ({exc})"
             )
+            continue
+        if not driver.uses_overlay:
             continue
         overlay = store.overlays_dir / name
         link = overlay / driver.data_dir_name

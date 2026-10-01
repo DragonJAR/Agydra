@@ -13,7 +13,7 @@
   <a href="README.es.md"><img src="https://img.shields.io/badge/Read_in-Español-blue" alt="Read in Español"></a>
 </p>
 
-> **One installation. Three engines. Isolated accounts.** **Agydra** 1.1.0 is a multi-profile manager and workload dispatcher for **Google Antigravity (`agy`)**, **OpenAI Codex (`codex`)**, and **xAI Grok (`grok`)**. Each profile keeps its own store, session, and rate limit. Host credentials stay in `~/.gemini`, `~/.codex`, and `~/.grok`, and the official CLIs run as-is. Python ≥ 3.9, standard library only.
+> **One installation. Four engines. Isolated accounts.** **Agydra** 1.1.0 is a multi-profile manager and workload dispatcher for **Google Antigravity (`agy`)**, **OpenAI Codex (`codex`)**, **xAI Grok (`grok`)**, and **Anthropic Claude Code (`claude`)**. Each profile keeps its own configuration and native authentication; Claude Code snapshots are informational. Claude Code preserves the real HOME and manages native authentication, including the macOS Keychain; Agydra does not extract, exchange or refresh its tokens itself. Python ≥ 3.9, standard library only.
 
 ---
 
@@ -46,6 +46,7 @@ agydra -e grok -r   → least-recently-used idle Grok profile
 | **`agy`** *(optional)* | On `PATH`, or `-b` / `agy_binary`, for `agy` profiles. |
 | **`codex`** *(optional)* | On `PATH`, or `-b` / `AGYDRA_CODEX_BIN`, for `codex` profiles. |
 | **`grok`** *(optional)* | On `PATH`, or `-b` / `AGYDRA_GROK_BIN`, for `grok` profiles. |
+| **`claude`** *(optional)* | On `PATH`, or `-b` / `AGYDRA_CLAUDE_BIN`, for Claude Code profiles. |
 | **bwrap** *(optional)* | Linux only, when `use_linux_sandbox` is on. |
 
 ### Install
@@ -58,7 +59,7 @@ agydra doctor
 
 ### One profile per engine
 
-`agy` is the default. Codex and Grok use the same three steps with `-e`.
+`agy` is the default. Codex, Grok, and Claude Code use the same three steps with `-e`.
 
 ```sh
 agydra create work       -d "Corporate Google workspace"
@@ -68,6 +69,9 @@ agydra create grok-work  -e grok  -d "Corporate xAI account"
 agydra login work
 agydra login codex-work
 agydra login grok-work
+agydra create claude-work -e claude
+agydra login claude-work
+agydra -p claude-work "Review this project"
 
 agydra -p work       "Explain quantum computing in three sentences"
 agydra -p codex-work "Review the latest git diff for security issues"
@@ -117,6 +121,29 @@ Columns shrink on a narrow terminal. `agydra usage vacan` prints reset countdown
 
 ---
 
+### Claude Code profiles and opt-in usage capture
+
+```sh
+agydra create claude-work -e claude
+agydra login claude-work
+agydra status claude-work
+agydra -p claude-work "Review this project"
+agydra usage claude-work
+agydra usage --claude-settings claude-work
+```
+
+Install Claude Code separately. Binary lookup uses `-b`, `AGYDRA_CLAUDE_BIN`, `claude_binary`, then `PATH`. Login runs native `claude auth login`; status/list use bounded native `claude auth status`, and unrecognized responses remain unknown. OAuth credentials, API keys and provider overrides inherited from the parent are removed from the profile environment. Login may require the native interactive browser flow; cloud-provider and keyless Console flows are not verified by this integration.
+
+`agydra status claude-work` prints the physical configuration path and immutable `seq`. `CLAUDE_CONFIG_DIR` points to `<store>/claude-config/<seq>` with the real HOME preserved. Rename preserves that path and native identity. Claude Code manages its own credentials, including the macOS Keychain; Agydra does not use Antigravity's slot bridge or claim OAuth/Keychain portability. Delete backs up physical configuration and removes profile cache state after the backup; backups may include credentials stored on disk, but native Keychain entries are not exported and require native re-login. Claude profiles reject `import` and `share-config` until selective configuration sharing is supported. Configure them explicitly and authenticate natively.
+
+Claude Code usage is an **informational local snapshot**, shown under **ANTHROPIC CLAUDE CODE**, separate from Antigravity's Claude/GPT quotas. It never makes a server quota request, refreshes credentials or probes authentication. `statusLine` does not identify the account; the displayed date is the local observation time, not a server query timestamp. Only observed windows appear: a partial snapshot has no inferred total availability, and an expired reset becomes unknown rather than 100%. Fresh snapshots are marked observed (cached snapshot), older ones stale, conflicting sessions ambiguous, and absent/invalid data unknown. Agydra does not recommend Claude Code accounts based on this cache.
+
+Capture is disabled by default. `agydra usage --claude-settings claude-work` prints a JSON fragment containing a standalone `statusLine` command. It uses the running Agydra interpreter (`sys.executable`), `python -m claude_usage --store <store> --seq <seq> --display`, and POSIX shell quoting on macOS/Linux and a literal, encoded PowerShell command on Windows, including paths with spaces. Windows capture requires PowerShell. That interpreter must have the packaged `claude_usage` module installed; regenerating the fragment after changing the installation keeps its interpreter path current.
+
+Copy or merge the printed `statusLine` object **manually into `settings.json` at the physical profile path shown by status**. Agydra does not write this file or replace any existing settings. The standalone command displays a concise snapshot line and stores only whitelisted rate-limit windows; it does not preserve an existing statusLine automatically. If you already have one, keep it until you deliberately compose the two commands yourself; automatic wrappers are not supplied. `--settings`, managed policies or disabled statusLine execution may prevent capture; Agydra does not override those choices. Launch through Agydra so the writer receives the profile sequence and current login generation. The usage generation is invalidated only for native `auth login`/`auth logout` run through Agydra, and on deletion; payloads from an older generation then cannot repopulate the cache. An interactive `/login` inside a running Claude session cannot be detected, so the snapshot stays informational with unverified account identity.
+
+---
+
 ## 🚀 Core Workflows
 
 **Pin a directory.** `agydra use client-acme` writes `.agydra`. Later commands in that tree use that profile, and the marker wins over `-r`.
@@ -136,6 +163,7 @@ Columns shrink on a narrow terminal. `agydra usage vacan` prints reset countdown
 | `agy` | `HOME` overlay, `~/.gemini` layout | Official Google OAuth | macOS keychain bridge (`agydra.<profile>`). Host `~/.gemini` stays as it was. |
 | `codex` | `CODEX_HOME` → overlay `~/.codex` | `codex login` | `--no-daemon` on every run, and `daemon_auto_start = false`, so the socket path stays under `SUN_LEN` and the lock releases on exit. Credentials live in `auth.json`. |
 | `grok` | `GROK_HOME` and `GROK_LEADER_SOCKET` (`<overlay>/.grok/leader.sock`) | `grok login` | Host `~/.grok` stays as it was. Plan names such as SuperGrok come from `auth.json`. `usage` reads the xAI billing API. No keychain swap. |
+| `claude` | `CLAUDE_CONFIG_DIR` → physical, stable `<store>/claude-config/<seq>`; real HOME | `claude auth login` | Authentication checked with `claude auth status`; no Antigravity Keychain swap. Rename preserves path and identity. Usage reads opt-in snapshots without server quota queries. |
 
 ---
 
@@ -154,7 +182,7 @@ Management commands also accept `--NAME` or `-NAME` (`agydra --list` == `agydra 
 | `default [NAME\|#]` | `d` | Show or set the fallback profile. |
 | `use [NAME\|#]` | `u` | Pin the current directory with a `.agydra` marker. |
 | `status [-n]` | `st` | Resolved profile, engine, binary, email, auth, lock. |
-| `usage [NAME\|#]` | `us` | Live quotas for `agy`, `codex`, and `grok`. |
+| `usage [NAME\|#]` | `us` | Quotas for `agy`, `codex`, and `grok`; informational Claude snapshots. `--claude-settings PROFILE` prints opt-in capture settings. |
 | `share-config SRC TARGET...` | `share` | Copies config files while holding the source and target profile locks through all copies. Leaves credentials in the source. |
 | `doctor [--fix] [-f]` | `doc` | Ten health checks. `--fix` repairs overlay data links and dangling defaults, and purges only orphan artifacts. |
 | `setup [-n]` | `install` | Idempotent venv, console script, and PATH shim. |
@@ -210,23 +238,24 @@ Host home (~/)                         left in place: ~/.gemini  ~/.codex  ~/.gr
     codex  CODEX_HOME → overlay/.codex
     grok   GROK_HOME  → overlay/.grok
            GROK_LEADER_SOCKET → overlay/.grok/leader.sock
+    claude CLAUDE_CONFIG_DIR → <store>/claude-config/<seq> (physical; HOME preserved)
 ```
 
-`.ssh`, `.gitconfig`, and shell config are mirrored into the overlay. Ancestor directories of the store are real directories, so the store itself stays out of reach from inside the overlay. The child receives `AGYDRA_REAL_HOME`.
+For overlay engines, `.ssh`, `.gitconfig`, and shell config are mirrored into the overlay. Ancestor directories of the store are real directories, so the store itself stays out of reach from inside the overlay. The child receives `AGYDRA_REAL_HOME`.
 
-`AgyEngine`, `CodexEngine`, and `GrokEngine` own binary lookup, arguments, paths, and identity parsing. Codex always runs with `--no-daemon`. Grok's leader socket is per profile, so a host `grok` session and a profile session do not share it. The macOS keychain bridge applies to `agy` only.
+`AgyEngine`, `CodexEngine`, `GrokEngine`, and `ClaudeEngine` own binary lookup, arguments, paths, and identity parsing. Codex always runs with `--no-daemon`. Grok's leader socket is per profile, so a host `grok` session and a profile session do not share it. The macOS keychain bridge applies to `agy` only.
 
 Session locks use `<store>/locks/<profile>.lock`; the sentinel file persists, while the OS advisory lock is released when its holder exits. `create`, `rename`, and `delete` acquire the affected profile locks in sorted name order, then the persistent, non-inherited store-wide lock `<store>/locks/.profile-sequence.lock`; profile and sequence locks are acquired non-blockingly and profile locks are released in reverse order. The persistent `<store>/profile-sequence.json` stores `{"last_seq": N}`. If it is missing, the counter is initialized from the highest readable profile sequence while holding the sequence lock. `create` persists its next number before staging, so an interruption or later failure can leave a harmless gap; deleted sequence numbers are not reused.
 
 `create` builds `data/` and `profile.json` in a same-filesystem temporary sibling directory under `<store>/profiles/`, named `.agydra-stage-<name>-<token>`, then publishes the complete profile with one directory rename. A stage left by an interruption is ignored by profile scans and removed by a later create for that exact name under both locks; the reserved sequence remains consumed.
 
-Before moving a profile directory, `rename` atomically writes its intent to `<store>/profile-rename.json`, including a Keychain slot migration recovery action and the `source_present` snapshot. A later public profile read or mutation recovers that journal while holding the old and new profile locks in sorted order, followed by the sequence lock. If only the old directory exists, recovery restores the old default when needed and removes the journal; if only the new directory exists, recovery finishes forward by fixing profile metadata and the default when needed, removing the old overlay, then running the recorded Keychain action before removing the journal. Forward recovery runs that action while holding the sorted profile locks, the sequence lock, and `swap.lock`; if it fails, the journal remains for retry on the next store operation. On the normal rename path, the callback runs with the profile locks held after the sequence lock is released. If both or neither directory exists, the journal or metadata is malformed, or a required lock is busy, recovery fails closed and retains the journal and profile data.
+Before moving a profile directory, `rename` atomically writes its intent to `<store>/profile-rename.json`, including a Keychain slot migration recovery action and the `source_present` snapshot for Antigravity; Claude rename does not add this action. A later public profile read or mutation recovers that journal while holding the old and new profile locks in sorted order, followed by the sequence lock. If only the old directory exists, recovery restores the old default when needed and removes the journal; if only the new directory exists, recovery finishes forward by fixing profile metadata and the default when needed, removing the old overlay, then running the recorded Keychain action before removing the journal. Forward recovery runs that action while holding the sorted profile locks, the sequence lock, and `swap.lock`; if it fails, the journal remains for retry on the next store operation. On the normal rename path, the callback runs with the profile locks held after the sequence lock is released. If both or neither directory exists, the journal or metadata is malformed, or a required lock is busy, recovery fails closed and retains the journal and profile data.
 
-When enabled (the default; `--no-backup` disables it), `delete` writes and verifies its ZIP backup before removing profile data. The CLI keeps the profile lock through its post-delete keychain purge, after releasing the sequence lock; on macOS, that purge uses `swap.lock` to serialize cleanup of the profile's saved slot and system Keychain entry with keychain swaps. A purge failure is reported as a warning after deletion. `import` holds its target profile lock through the copy, and `share-config` holds the source and target profile locks until all copies finish. `doctor --fix` holds the profile lock while migrating and relinking overlay data.
+When enabled (the default; `--no-backup` disables it), `delete` writes and verifies its ZIP backup before removing profile data. For Antigravity, the CLI keeps the profile lock through its post-delete keychain purge, after releasing the sequence lock; on macOS, that purge uses `swap.lock` to serialize cleanup of the profile's saved slot and system Keychain entry with keychain swaps. A purge failure is reported as a warning after deletion. `import` holds its target profile lock through the copy, and `share-config` holds the source and target profile locks until all copies finish. `doctor --fix` holds the profile lock while migrating and relinking overlay data.
 
 | Platform | Mechanism |
 |---|---|
-| **macOS** | Keychain bridge for `agy`. Codex and Grok skip it. |
+| **macOS** | Keychain bridge for `agy`. Codex, Grok and Claude skip it; Claude owns its native Keychain authentication. |
 | **Linux** | Optional `bwrap` (`use_linux_sandbox`) masks DBus and keyring sockets. A missing `bwrap` warns and continues. |
 | **Windows** | NTFS junctions. No Administrator rights and no Developer Mode. |
 
@@ -258,18 +287,19 @@ Global config is `<store>/agydra.json`. Point the store elsewhere with `AGYDRA_H
   },
   "agy_binary": "/usr/local/bin/agy",
   "codex_binary": "/usr/local/bin/codex",
-  "grok_binary": "/usr/local/bin/grok"
+  "grok_binary": "/usr/local/bin/grok",
+  "claude_binary": "/usr/local/bin/claude"
 }
 ```
 
-`codex_binary` and `grok_binary` are optional. Leave a key out and Agydra uses `PATH`.
+`codex_binary`, `grok_binary`, and `claude_binary` are optional. Leave a key out and Agydra uses `PATH`.
 
 | Variable | Purpose |
 |---|---|
 | `AGYDRA_PROFILE` | Fallback profile. `-p` and `.agydra` win. |
 | `AGYDRA_LANG` | `en` or `es` for one process. |
 | `AGYDRA_HOME` | Store and overlays. |
-| `AGYDRA_AGY_BIN` / `AGYDRA_CODEX_BIN` / `AGYDRA_GROK_BIN` | Binary override. |
+| `AGYDRA_AGY_BIN` / `AGYDRA_CODEX_BIN` / `AGYDRA_GROK_BIN` / `AGYDRA_CLAUDE_BIN` | Binary override. |
 | `AGYDRA_NO_KEYCHAIN` | Skip the macOS keychain bridge. |
 | `NO_COLOR` / `FORCE_COLOR` | ANSI styling. |
 
@@ -288,7 +318,7 @@ The suite (650+ tests) uses temporary stores and leaves the host home alone.
 
 ## ⚠️ Limitations
 
-- Agydra manages profiles and sessions. It does not install or update `agy`, `codex`, or `grok`.
+- Agydra manages profiles and sessions. It does not install or update `agy`, `codex`, `grok`, or `claude`.
 - Isolation follows each CLI: `HOME` for `agy`, `CODEX_HOME` for `codex`, `GROK_HOME` plus `GROK_LEADER_SOCKET` for `grok`. Doctor's schema canary reports a layout the current drivers do not recognize.
 - Windows paths run on Windows. On Unix they are covered by the unit tests.
 
