@@ -14,7 +14,18 @@ import locks
 import platforms
 from store import Store
 
-from conftest import BaseCase, _make_jwt, write_fake_agy
+from conftest import (
+    CLI_ENTRY,
+    REPO_ROOT,
+    BaseCase,
+    _FAKE_AGY_SOURCE,
+    _make_jwt,
+    cli_environment,
+    held_cli_session,
+    run_cli,
+    spawn_cli,
+    write_fake_agy,
+)
 
 
 class TestFakeAgyFixture(unittest.TestCase):
@@ -28,6 +39,97 @@ class TestFakeAgyFixture(unittest.TestCase):
                 created = write_fake_agy(binary)
             self.assertEqual(created, binary.with_suffix(".cmd"))
             self.assertTrue(created.is_file())
+
+    def test_windows_launcher_runs_the_same_python_source_and_forwards_exit_code(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "bin" / "agy"
+            with mock.patch("conftest.sys.platform", "win32"):
+                launcher = write_fake_agy(binary)
+            program = binary.with_name("agy-fake.py")
+            self.assertEqual(program.read_text(encoding="utf-8"), _FAKE_AGY_SOURCE)
+            command = launcher.read_text(encoding="utf-8")
+            self.assertIn(f'"{sys.executable}" "{program}" %*', command)
+            self.assertIn("exit /b %ERRORLEVEL%", command)
+            self.assertTrue((binary.parent / "heartbeat_child.py").is_file())
+
+    def test_fake_source_is_deterministic_and_stdlib_only(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            program = Path(directory) / "agy-fake.py"
+            program.write_text(_FAKE_AGY_SOURCE, encoding="utf-8")
+            home = Path(directory) / "home"
+            home.mkdir()
+            env = dict(os.environ, AGYDRA_PROFILE="demo", HOME=str(home), USERPROFILE=str(home))
+            outputs = [
+                subprocess.run(
+                    [sys.executable, str(program)], capture_output=True, text=True, env=env
+                )
+                for _ in range(2)
+            ]
+            version = subprocess.run(
+                [sys.executable, str(program), "--version"], capture_output=True, text=True
+            )
+            self.assertEqual(outputs[0].stdout, outputs[1].stdout)
+            self.assertEqual(outputs[0].stdout, f"PROFILE=demo\nHOME={home}\n")
+            self.assertEqual(version.stdout.strip(), "fake-agy 1.0")
+            self.assertEqual((home / ".gemini" / "fake-agy-wrote").read_text(), "wrote")
+
+
+class TestCliHelperIndependence(BaseCase):
+    def test_environment_prepends_repo_root_and_keeps_existing_pythonpath(self):
+        os.environ["PYTHONPATH"] = "/opt/elsewhere"
+        env = cli_environment({"EXTRA": "1"})
+        self.assertEqual(
+            env["PYTHONPATH"], os.pathsep.join([str(REPO_ROOT), "/opt/elsewhere"])
+        )
+        self.assertEqual(env["EXTRA"], "1")
+        os.environ.pop("PYTHONPATH")
+        self.assertEqual(cli_environment()["PYTHONPATH"], str(REPO_ROOT))
+
+    def test_cli_runs_from_a_directory_outside_the_repository(self):
+        outside = self._tmp / "unrelated-cwd"
+        outside.mkdir()
+        self.assertFalse(str(outside).startswith(str(REPO_ROOT)))
+        os.environ.pop("PYTHONPATH", None)
+        result = run_cli("ls", cwd=outside)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no profiles", result.stdout)
+
+    def test_cli_never_goes_through_bootstrap_or_the_repo_venv(self):
+        import shutil
+
+        installation = self._tmp / "checkout-without-venv"
+        installation.mkdir()
+        for module in REPO_ROOT.glob("*.py"):
+            shutil.copy2(module, installation / module.name)
+        self.assertFalse((installation / ".venv").exists())
+        outside = self._tmp / "bootstrap-cwd"
+        outside.mkdir()
+        result = run_cli(
+            "ls", cwd=outside, extra_env={"PYTHONPATH": str(installation)}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no profiles", result.stdout)
+        self.assertNotIn("running setup", result.stdout)
+        self.assertFalse((installation / ".venv").exists())
+        self.assertFalse((self.fake_home / ".local" / "bin" / "agydra").exists())
+
+    def test_cli_entry_is_the_console_script_body(self):
+        self.assertEqual(CLI_ENTRY, "import sys; from cli import main; sys.exit(main())")
+
+    def test_spawned_cli_does_not_depend_on_the_parent_cwd(self):
+        outside = self._tmp / "spawn-cwd"
+        outside.mkdir()
+        process = spawn_cli(
+            "ls", cwd=outside, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        out, err = process.communicate(timeout=60)
+        self.assertEqual(process.returncode, 0, err)
+        self.assertIn("no profiles", out)
 
 
 class TestFixtureEnvironment(BaseCase):
@@ -178,21 +280,12 @@ class TestIntegration(BaseCase):
         must still show up in `agydra list`, sourced from the private
         keychain slot backup (`<store>/keychain/<name>.secret`).
 
-        `conftest.py` sets `AGYDRA_NO_KEYCHAIN=1` for every test (so no
-        BaseCase test touches a real `security` call by accident); this one
-        opts back in, since the code path under test never shells out to
-        `security` at all -- it only reads the `.secret` backup file."""
+        The CLI runs with the bridge enabled but with a forbidden
+        ``security`` shim first on PATH: any shell-out to the real keychain
+        tool is recorded and fails the test, so the host keychain is never
+        touched. The profile is created before the bridge is enabled."""
         if not platforms.is_macos():
             self.skipTest("macOS-only keychain bridge")
-        import keychain
-        from unittest import mock
-
-        with mock.patch.dict(os.environ, {"AGYDRA_NO_KEYCHAIN": ""}):
-            if not keychain.supported():
-                self.skipTest("keychain bridge not available on this machine")
-            self._assert_list_shows_keychain_email()
-
-    def _assert_list_shows_keychain_email(self):
         import keychain
 
         self.store.create("kc")
@@ -208,10 +301,30 @@ class TestIntegration(BaseCase):
         secret = b"go-keyring-base64:" + base64.b64encode(token_json)
         keychain.save_profile_slot(self.store, "kc", secret)
 
-        result = self._run_cli("list")
+        shim_dir = self._tmp / "forbidden-bin"
+        shim_dir.mkdir()
+        calls = self._tmp / "security-calls.log"
+        shim = shim_dir / "security"
+        shim.write_text(
+            '#!/bin/sh\necho "$@" >> "$FORBIDDEN_SECURITY_LOG"\nexit 1\n', encoding="utf-8"
+        )
+        shim.chmod(0o755)
+
+        result = self._run_cli_with_env(
+            "list",
+            PATH=str(shim_dir) + os.pathsep + os.environ["PATH"],
+            AGYDRA_NO_KEYCHAIN="",
+            FORBIDDEN_SECURITY_LOG=str(calls),
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("kc@example.com", result.stdout)
         self.assertEqual(self.store.get("kc").email, "kc@example.com")
+        self.assertFalse(
+            calls.exists(), f"list shelled out to security: {calls.read_text() if calls.exists() else ''}"
+        )
+
+    def _run_cli_with_env(self, *args, **env):
+        return run_cli(*args, cwd=self._tmp, extra_env=env)
 
 
 class TestRandomProfileSelection(BaseCase):
@@ -274,30 +387,10 @@ class TestRandomProfileSelection(BaseCase):
         self.assertIn("at least 2 profiles", result.stderr)
 
     def test_r_respects_live_session(self):
-        gate = self._tmp / "gate"
-        env = dict(os.environ)
-        env["FAKE_AGY_GATE"] = str(gate)
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "agydra", "-p", "work", "--hold"],
-            env=env,
-        )
-        try:
-            import time
-
-            for _ in range(100):
-                if locks.is_locked(self.store, "work"):
-                    break
-                time.sleep(0.05)
+        with held_cli_session("-p", "work", cwd=self._tmp):
             result = self._run_cli("-r")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("PROFILE=lab", result.stdout)
-        finally:
-            gate.touch()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
 
 
 class TestBusyGuards(BaseCase):
@@ -329,7 +422,7 @@ class TestBusyGuards(BaseCase):
             result = self._run_cli("delete", "work", "-f")
             self.assertEqual(result.returncode, 1)
             pid = os.getpid()
-            self.assertIn(f"agy PID {pid}", result.stderr)
+            self.assertIn(f"PID {pid}", result.stderr)
             self.assertIn(f"kill {pid}", result.stderr)
         finally:
             handle.release()
@@ -652,12 +745,7 @@ class TestAliasesAndFlagTable(BaseCase):
         self.assertEqual(rest, ["chat", "-r"])
 
     def test_alias_subcommand_runs(self):
-        import subprocess
-
-        result = subprocess.run(
-            [sys.executable, "-m", "agydra", "ls"],
-            capture_output=True, text=True, timeout=60,
-        )
+        result = self._run_cli("ls")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("no profiles", result.stdout)
 

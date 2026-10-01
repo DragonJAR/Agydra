@@ -433,11 +433,21 @@ def _assert_free(store: Store, name: str, action: str = "modifying the profile")
     actionable next step instead of a dead end."""
     if locks.is_locked(store, name):
         holders = locks.lease_holders(store, name)
-        pid = locks.lock_holder_pid(store, name)
-        count = len(holders) if holders else 1
-        session = f"a live session (PID {pid})" if pid else "a live session"
-        if holders and count > 1:
-            session = f"{count} live sessions (first PID {pid})" if pid else f"{count} live sessions"
+        if holders is None:
+            try:
+                raw = locks.lock_path(store, name).read_bytes()
+            except OSError:
+                raw = b""
+            holders = locks._parse_holders(raw) or []
+        pid = locks.lock_holder_pid(store, name) if holders else None
+        if not holders:
+            session = "a live session"
+        elif pid is None:
+            session = f"{len(holders)} live sessions"
+        elif len(holders) > 1:
+            session = f"{len(holders)} live sessions (first PID {pid}; kill {pid})"
+        else:
+            session = f"a live session (PID {pid}; kill {pid})"
         raise StoreError(
             f"profile {name!r} has {session}; end it before {action}"
         )
