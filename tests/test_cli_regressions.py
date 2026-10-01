@@ -15,12 +15,13 @@ shim (see cmd_list / cmd_import):
 import contextlib
 import io
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from store import Store, StoreError
+from store import Store, StoreError, read_json_object
 
 import ui
 from ui import strip_ansi
@@ -148,6 +149,103 @@ class TestDeleteSkipsPurgeWhenBackupFails(BaseCase):
         self.assertEqual(keychain.load_profile_slot(self.store, "kc"), b"secret-bytes")
 
 
+class TestDeletePurgesUnderProfileLock(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("kc")
+
+    def test_same_name_cannot_be_recreated_during_keychain_purge(self):
+        import cli
+        import keychain
+        import locks
+        from unittest import mock
+
+        if keychain.fcntl is None:
+            self.skipTest("swap.lock requires POSIX flock")
+
+        keychain.save_profile_slot(self.store, "kc", b"old-credential")
+        original_purge = keychain.purge_profile_slot
+        original_serialized_access = keychain.serialized_access
+        profile_lock_states = []
+        purge_lock_states = []
+        recreation_blocked = []
+        recreated_credentials = []
+
+        @contextlib.contextmanager
+        def inspect_serialized_access(store):
+            handle = locks.try_lock(store, "kc")
+            profile_lock_states.append(handle is None)
+            if handle is not None:
+                handle.release()
+            with original_serialized_access(store):
+                yield
+
+        def recreate_during_purge(store, name):
+            handle = locks.try_lock(store, name)
+            purge_lock_states.append(handle is None)
+            if handle is not None:
+                handle.release()
+            try:
+                store.create(name)
+            except StoreError:
+                recreation_blocked.append(name)
+            else:
+                keychain.save_profile_slot(store, name, b"new-credential")
+                recreated_credentials.append(name)
+            original_purge(store, name)
+
+        class Args:
+            ref = "kc"
+            force = True
+            no_backup = True
+
+        with mock.patch.object(
+            cli.keychain, "serialized_access", side_effect=inspect_serialized_access
+        ), mock.patch.object(
+            cli.keychain, "purge_profile_slot", side_effect=recreate_during_purge
+        ), contextlib.redirect_stdout(io.StringIO()):
+            result = cli.cmd_delete(self.store, Args())
+
+        self.assertEqual(result, 0)
+        self.assertEqual(profile_lock_states, [True])
+        self.assertEqual(purge_lock_states, [True])
+        self.assertEqual(recreation_blocked, ["kc"])
+        self.assertEqual(recreated_credentials, [])
+        self.assertFalse(self.store.exists("kc"))
+
+        self.store.create("kc")
+        keychain.save_profile_slot(self.store, "kc", b"new-credential")
+        self.assertEqual(keychain.load_profile_slot(self.store, "kc"), b"new-credential")
+
+    def test_purge_exception_reports_completed_delete_and_backup(self):
+        import cli
+        import keychain
+        from unittest import mock
+
+        data_file = self.store.profile_data_dir("kc") / "session.json"
+        data_file.write_text("profile data", encoding="utf-8")
+
+        class Args:
+            ref = "kc"
+            force = True
+            no_backup = False
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            cli.keychain, "purge_profile_slot", side_effect=OSError("keychain offline")
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = cli.cmd_delete(self.store, Args())
+
+        self.assertEqual(result, 1)
+        self.assertFalse(self.store.exists("kc"))
+        self.assertIn("backup saved:", stdout.getvalue())
+        self.assertIn("deleted profile: kc", stdout.getvalue())
+        self.assertIn("was deleted, but keychain purge failed", stderr.getvalue())
+        self.assertTrue(list(self.store.backups_dir.glob("kc-*.zip")))
+
+
 class TestImportGuards(BaseCase):
     def setUp(self):
         super().setUp()
@@ -181,6 +279,7 @@ class TestImportGuards(BaseCase):
     def test_import_onto_locked_profile_reports_the_live_session(self):
         import cli
         import locks
+        from unittest import mock
 
         self.store.create("held")
         data = self.store.profile_data_dir("held")
@@ -192,11 +291,14 @@ class TestImportGuards(BaseCase):
                 ref = "held"
                 source = None
 
-            with self.assertRaises(StoreError) as ctx:
-                cli.cmd_import(self.store, Args())
+            with mock.patch.object(cli.shutil, "copytree") as copytree:
+                with self.assertRaises(StoreError) as ctx:
+                    cli.cmd_import(self.store, Args())
         finally:
             handle.release()
         self.assertNotIn("already has data", str(ctx.exception))
+        self.assertEqual((data / "leftover.txt").read_text(encoding="utf-8"), "x")
+        copytree.assert_not_called()
 
     def test_import_calls_keychain_capture_after_copy(self):
         """Wiring guard: `import` must ask the keychain module to consider
@@ -218,6 +320,179 @@ class TestImportGuards(BaseCase):
                 rc = cli.cmd_import(self.store, Args())
         self.assertEqual(rc, 0)
         cap.assert_called_once_with(self.store, "fresh2", data)
+
+    def test_import_holds_profile_lock_through_publication_and_capture(self):
+        import cli
+        import locks
+        from unittest import mock
+
+        self.store.create("locked-import")
+        data = self.store.profile_data_dir("locked-import")
+        original_try_lock = locks.try_lock
+        original_rename = cli.rename_dir_with_retry
+        original_copytree = cli.shutil.copytree
+        lock_checks = []
+        copytree_checks = []
+
+        def assert_lock_is_held():
+            handle = original_try_lock(self.store, "locked-import")
+            lock_checks.append(handle is None)
+            if handle is not None:
+                handle.release()
+
+        def inspect_publication(source, destination):
+            assert_lock_is_held()
+            return original_rename(source, destination)
+
+        def inspect_copy(source, destination, *args, **kwargs):
+            if not copytree_checks:
+                assert_lock_is_held()
+                copytree_checks.append(True)
+            return original_copytree(source, destination, *args, **kwargs)
+
+        def inspect_capture(store, name, data_dir):
+            assert_lock_is_held()
+            self.assertEqual(data_dir, data)
+            self.assertTrue((data_dir / "settings.json").is_file())
+
+        class Args:
+            ref = "locked-import"
+            source = None
+
+        with mock.patch.object(
+            cli, "rename_dir_with_retry", side_effect=inspect_publication
+        ), mock.patch.object(
+            cli.shutil, "copytree", side_effect=inspect_copy
+        ), mock.patch.object(
+            cli.keychain, "capture_shared_slot_for_import", side_effect=inspect_capture
+        ):
+            result = cli.cmd_import(self.store, Args())
+
+        self.assertEqual(result, 0)
+        self.assertEqual(copytree_checks, [True])
+        self.assertEqual(lock_checks, [True, True, True])
+
+    def test_import_waits_for_swap_lock_before_keychain_capture(self):
+        import cli
+        import locks
+        import threading
+        from unittest import mock
+
+        if cli.keychain.fcntl is None:
+            self.skipTest("keychain bridge serialization requires POSIX flock")
+
+        name = "waiting-import"
+        self.store.create(name)
+        source = self._tmp / "import-source"
+        source.mkdir()
+        (source / "settings.json").write_text("{}", encoding="utf-8")
+        data = self.store.profile_data_dir(name)
+        original_serialized = cli.keychain.serialized_access
+        original_try_lock = locks.try_lock
+        waiting_for_swap = threading.Event()
+        captured = threading.Event()
+        profile_locks_at_swap = []
+        profile_locks_at_capture = []
+        results = []
+        failures = []
+        held_swap = cli.keychain._serialize_lock(self.store)
+
+        @contextlib.contextmanager
+        def inspect_serialized_access(store):
+            waiting_for_swap.set()
+            with original_serialized(store):
+                handle = original_try_lock(store, name)
+                profile_locks_at_swap.append(handle is None)
+                if handle is not None:
+                    handle.release()
+                yield
+
+        def inspect_capture(store, profile_name, data_dir):
+            handle = original_try_lock(store, profile_name)
+            profile_locks_at_capture.append(handle is None)
+            if handle is not None:
+                handle.release()
+            self.assertEqual(profile_name, name)
+            self.assertTrue((data_dir / "settings.json").is_file())
+            captured.set()
+
+        class Args:
+            pass
+
+        Args.ref = name
+        Args.source = str(source)
+
+        def import_profile():
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    results.append(cli.cmd_import(self.store, Args()))
+            except BaseException as exc:
+                failures.append(exc)
+
+        worker = threading.Thread(target=import_profile)
+        try:
+            with mock.patch.object(
+                cli.keychain,
+                "serialized_access",
+                side_effect=inspect_serialized_access,
+            ), mock.patch.object(
+                cli.keychain,
+                "capture_shared_slot_for_import",
+                side_effect=inspect_capture,
+            ):
+                worker.start()
+                self.assertTrue(waiting_for_swap.wait(5))
+                self.assertFalse(captured.wait(0.1))
+                profile_handle = original_try_lock(self.store, name)
+                if profile_handle is not None:
+                    profile_handle.release()
+                self.assertIsNone(profile_handle)
+                held_swap.close()
+                worker.join(5)
+        finally:
+            held_swap.close()
+            if worker.is_alive():
+                worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(results, [0])
+        self.assertEqual(profile_locks_at_swap, [True])
+        self.assertEqual(profile_locks_at_capture, [True])
+        self.assertTrue(captured.is_set())
+
+    def test_import_skips_keychain_capture_when_swap_lock_cannot_be_acquired(self):
+        import cli
+        from unittest import mock
+
+        name = "skipped-capture"
+        self.store.create(name)
+        source = self._tmp / "skip-import-source"
+        source.mkdir()
+        (source / "settings.json").write_text("{}", encoding="utf-8")
+
+        class Args:
+            pass
+
+        Args.ref = name
+        Args.source = str(source)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            cli.keychain,
+            "serialized_access",
+            side_effect=OSError("swap lock unavailable"),
+        ) as serialized, mock.patch.object(
+            cli.keychain, "capture_shared_slot_for_import"
+        ) as capture, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = cli.cmd_import(self.store, Args())
+
+        self.assertEqual(result, 0)
+        serialized.assert_called_once_with(self.store)
+        capture.assert_not_called()
+        self.assertIn("keychain import capture skipped", stderr.getvalue())
+        self.assertIn("continuing without it", stderr.getvalue())
 
     def test_import_onto_empty_profile_succeeds(self):
         import cli
@@ -527,6 +802,154 @@ class TestShareConfigDeduplication(BaseCase):
         copied = cli._share_config(self.store, "src", ["target", "target", "target"])
         self.assertEqual(copied, ["target/settings.json"])
 
+    def test_all_profile_locks_are_held_in_sorted_order_during_copies(self):
+        import cli
+        import locks
+        from unittest import mock
+
+        self.store.create("zeta")
+        original_try_lock = locks.try_lock
+        original_copy = cli.atomic_copy
+        acquired_names = []
+        lock_checks = []
+
+        def observe_try_lock(store, name):
+            handle = original_try_lock(store, name)
+            if handle is not None:
+                acquired_names.append(name)
+            return handle
+
+        def inspect_copy(source, destination):
+            available = []
+            for name in ("src", "target", "zeta"):
+                handle = original_try_lock(self.store, name)
+                available.append(handle is not None)
+                if handle is not None:
+                    handle.release()
+            lock_checks.append(available)
+            return original_copy(source, destination)
+
+        with mock.patch.object(locks, "try_lock", side_effect=observe_try_lock), mock.patch.object(
+            cli, "atomic_copy", side_effect=inspect_copy
+        ):
+            copied = cli._share_config(self.store, "src", ["zeta", "target"])
+
+        self.assertEqual(copied, ["zeta/settings.json", "target/settings.json"])
+        self.assertEqual(acquired_names, ["src", "target", "zeta"])
+        self.assertEqual(lock_checks, [[False, False, False], [False, False, False]])
+
+    def test_changed_target_is_revalidated_before_any_copy(self):
+        import cli
+        import locks
+        import shutil
+        from unittest import mock
+
+        self.store.create("zeta")
+        target_file = self.store.profile_data_dir("target") / "settings.json"
+        target_file.write_text("existing", encoding="utf-8")
+        original_try_lock = locks.try_lock
+        removed = []
+
+        def remove_last_target_after_lock(store, name):
+            handle = original_try_lock(store, name)
+            if name == "zeta" and handle is not None:
+                shutil.rmtree(store.profile_dir("zeta"))
+                removed.append(name)
+            return handle
+
+        with mock.patch.object(
+            locks, "try_lock", side_effect=remove_last_target_after_lock
+        ), mock.patch.object(cli, "atomic_copy") as copy_file:
+            with self.assertRaises(StoreError):
+                cli._share_config(self.store, "src", ["target", "zeta"])
+
+        self.assertEqual(removed, ["zeta"])
+        copy_file.assert_not_called()
+        self.assertEqual(target_file.read_text(encoding="utf-8"), "existing")
+
+    def test_busy_source_or_target_leaves_data_untouched(self):
+        import cli
+        import locks
+        from unittest import mock
+
+        target_file = self.store.profile_data_dir("target") / "settings.json"
+        target_file.write_text("existing", encoding="utf-8")
+        for busy_name in ("src", "target"):
+            handle = locks.try_lock(self.store, busy_name)
+            try:
+                with mock.patch.object(cli, "atomic_copy") as copy_file:
+                    with self.assertRaises(StoreError):
+                        cli._share_config(self.store, "src", ["target"])
+            finally:
+                handle.release()
+
+            copy_file.assert_not_called()
+            self.assertEqual(target_file.read_text(encoding="utf-8"), "existing")
+
+    def test_copy_output_order_is_stable_across_process_hash_seeds(self):
+        for name in ("mcp.json", "config.toml"):
+            (self.store.profile_data_dir("src") / name).write_text(
+                "{}", encoding="utf-8"
+            )
+
+        outputs = []
+        old_seed = os.environ.get("PYTHONHASHSEED")
+        try:
+            for seed in ("1", "2"):
+                os.environ["PYTHONHASHSEED"] = seed
+                result = self._run_cli("share-config", "src", "target")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                outputs.append(
+                    [
+                        line for line in result.stdout.splitlines()
+                        if line.startswith("copied:")
+                    ]
+                )
+        finally:
+            if old_seed is None:
+                os.environ.pop("PYTHONHASHSEED", None)
+            else:
+                os.environ["PYTHONHASHSEED"] = old_seed
+
+        expected = [
+            "copied: target/settings.json",
+            "copied: target/mcp.json",
+            "copied: target/config.toml",
+        ]
+        self.assertEqual(outputs, [expected, expected])
+
+
+class TestCliCreateWithDanglingDefault(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        config = self.store.load_config()
+        config.default_profile = "missing"
+        self.store.save_config(config)
+
+    def test_create_succeeds_when_default_profile_is_missing(self):
+        result = self._run_cli("create", "fresh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("created profile: fresh", result.stdout)
+        self.assertTrue(self.store.exists("fresh"))
+
+
+class TestGlobalLanguageOptionDelimiter(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("alpha")
+        os.environ.pop("AGYDRA_LANG", None)
+        config = self.store.load_config()
+        config.settings["lang"] = "en"
+        self.store.save_config(config)
+
+    def test_language_option_after_delimiter_is_forwarded_unchanged(self):
+        result = self._run_cli("-n", "--", "--lang", "es")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--lang es", result.stdout)
+        self.assertEqual(self.store.load_config().settings.get("lang"), "en")
+
 
 class TestDoctorFixDeclinedExitCode(BaseCase):
     """Declining confirmation in cmd_doctor --fix must return exit code 1."""
@@ -547,3 +970,384 @@ class TestDoctorFixDeclinedExitCode(BaseCase):
              mock.patch("cli._confirm", return_value=False):
             code = cli.cmd_doctor(self.store, Args())
             self.assertEqual(code, 1)
+
+
+class TestRenameKeepsProfileLockedThroughKeychainMigration(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("old")
+
+    def test_new_profile_lock_blocks_execution_during_slot_migration(self):
+        import cli
+        import keychain
+        import locks
+        from unittest import mock
+
+        if keychain.fcntl is None:
+            self.skipTest("swap.lock requires POSIX flock")
+
+        old_slot = keychain.slot_backup_path(self.store, "old")
+        old_slot.parent.mkdir(parents=True, exist_ok=True)
+        old_slot.write_bytes(b"credential")
+        original_rename = keychain.rename_profile_slot
+        original_serialize = keychain.serialized_access
+        callback_calls = []
+        profile_locks_at_callback = []
+        locks_at_swap = []
+
+        def inspect_migration(
+            store,
+            old_name,
+            new_name,
+            *,
+            source_present=None,
+            strict=False,
+        ):
+            callback_calls.append((old_name, new_name))
+            acquired = []
+            for name in (old_name, new_name):
+                handle = locks.try_lock(store, name)
+                acquired.append(handle is not None)
+                if handle is not None:
+                    handle.release()
+            profile_locks_at_callback.append(acquired)
+            original_rename(
+                store,
+                old_name,
+                new_name,
+                source_present=source_present,
+                strict=strict,
+            )
+
+        @contextlib.contextmanager
+        def inspect_swap_lock(store):
+            with original_serialize(store):
+                profile_handles = [locks.try_lock(store, name) for name in ("old", "new")]
+                sequence_handle = locks.try_sequence_lock(store)
+                locks_at_swap.append(
+                    [handle is None for handle in profile_handles],
+                )
+                locks_at_swap.append(sequence_handle is not None)
+                for handle in profile_handles:
+                    if handle is not None:
+                        handle.release()
+                if sequence_handle is not None:
+                    sequence_handle.release()
+                yield
+
+        class Args:
+            old = "old"
+            new = "new"
+
+        with mock.patch.object(
+            cli.keychain, "rename_profile_slot", side_effect=inspect_migration
+        ), mock.patch.object(cli.keychain, "supported", return_value=True), mock.patch.object(
+            cli.keychain, "serialized_access", side_effect=inspect_swap_lock
+        ), mock.patch.object(
+            cli.keychain, "_ensure_target_keychain", return_value=self.fake_home
+        ), mock.patch.object(cli.keychain, "delete_slot"):
+            result = cli.cmd_rename(self.store, Args())
+
+        self.assertEqual(result, 0)
+        self.assertEqual(callback_calls, [("old", "new")])
+        self.assertEqual(profile_locks_at_callback, [[False, False]])
+        self.assertEqual(locks_at_swap, [[True, True], True])
+        self.assertFalse(old_slot.exists())
+        self.assertEqual(
+            keychain.load_profile_slot(self.store, "new"), b"credential"
+        )
+
+
+class TestRecoverableKeychainRename(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("old")
+
+    def _crash_during_cli_rename(self, root, point, native_calls):
+        child = """import os, sys
+from pathlib import Path
+import cli
+import keychain
+from store import Store
+
+root = Path(sys.argv[1])
+point = sys.argv[2]
+native_calls = Path(sys.argv[3])
+store = Store(root=root)
+keychain.supported = lambda: True
+keychain._ensure_target_keychain = lambda store: Path('/tmp/fake.keychain')
+def delete_slot(service, target=None):
+    with native_calls.open('a', encoding='utf-8') as output:
+        output.write(service + '\\n')
+keychain.delete_slot = delete_slot
+
+if point == 'before-callback':
+    def crash_before_callback(*args, **kwargs):
+        os._exit(71)
+    keychain.rename_profile_slot = crash_before_callback
+elif point == 'during-migration':
+    original_write = keychain.atomic_write_bytes
+    def crash_after_target_write(path, data):
+        original_write(path, data)
+        if Path(path).name == 'new.secret':
+            os._exit(72)
+    keychain.atomic_write_bytes = crash_after_target_write
+elif point == 'after-callback':
+    def crash_before_journal_remove(self):
+        os._exit(73)
+    Store._remove_rename_journal = crash_before_journal_remove
+
+class Args:
+    old = 'old'
+    new = 'new'
+
+cli.cmd_rename(store, Args())
+os._exit(0)
+"""
+        return subprocess.run(
+            [sys.executable, "-c", child, str(root), point, str(native_calls)],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def _recover_through_cli(self, root, swap_events):
+        import cli
+        import keychain
+        import locks
+        from unittest import mock
+
+        store = Store(root=root)
+        original_try_lock = locks.try_lock
+        original_try_sequence_lock = locks.try_sequence_lock
+        original_serialize_lock = keychain._serialize_lock
+        recovery_events = []
+        native_calls = []
+
+        def observe_profile_lock(store_arg, name):
+            recovery_events.append(("profile", name))
+            return original_try_lock(store_arg, name)
+
+        def observe_sequence_lock(store_arg):
+            recovery_events.append(("sequence", None))
+            return original_try_sequence_lock(store_arg)
+
+        def observe_swap_lock(store_arg):
+            recovery_events.append(("swap", None))
+            return original_serialize_lock(store_arg)
+
+        with mock.patch.object(cli, "Store", return_value=store), mock.patch.object(
+            keychain, "supported", return_value=True
+        ), mock.patch.object(
+            keychain, "_ensure_target_keychain", return_value=self.fake_home
+        ), mock.patch.object(
+            keychain, "delete_slot", side_effect=lambda service, target=None: native_calls.append(service)
+        ), mock.patch.object(
+            keychain, "_serialize_lock", side_effect=observe_swap_lock
+        ), mock.patch.object(
+            locks, "try_lock", side_effect=observe_profile_lock
+        ), mock.patch.object(
+            locks, "try_sequence_lock", side_effect=observe_sequence_lock
+        ), contextlib.redirect_stdout(io.StringIO()):
+            result = cli.main(["list"])
+
+        self.assertEqual(result, 0)
+        expected_lock_order = [
+            ("profile", "new"),
+            ("profile", "old"),
+            ("sequence", None),
+        ]
+        if keychain.fcntl is not None:
+            expected_lock_order.append(("swap", None))
+        self.assertEqual(recovery_events[:len(expected_lock_order)], expected_lock_order)
+        self.assertEqual(native_calls, [keychain.profile_slot("old"), keychain.profile_slot("new")])
+        swap_events.extend(recovery_events)
+        return store
+
+    def test_process_crashes_recover_keychain_rename_at_each_boundary(self):
+        import keychain
+
+        crash_points = (
+            ("before-callback", 71),
+            ("during-migration", 72),
+            ("after-callback", 73),
+        )
+        for point, exit_code in crash_points:
+            with self.subTest(point=point):
+                root = self._tmp / point
+                original = Store(root=root)
+                original.create("old")
+                old_secret = keychain.slot_backup_path(original, "old")
+                target_secret = keychain.slot_backup_path(original, "new")
+                old_secret.parent.mkdir(parents=True, exist_ok=True)
+                old_secret.write_bytes(b"source-credential")
+                target_secret.write_bytes(b"stale-target-credential")
+                native_log = root / "native-calls.log"
+                result = self._crash_during_cli_rename(root, point, native_log)
+
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                self.assertTrue(original.rename_journal_path.is_file())
+                self.assertEqual(
+                    read_json_object(original.profile_meta_path("new"))["name"],
+                    "new",
+                )
+                self.assertEqual(original.load_config().default_profile, "new")
+                journal = original._read_rename_journal()
+                self.assertEqual(journal["recovery_action"]["data"], {"source_present": True})
+                if point == "before-callback":
+                    self.assertEqual(old_secret.read_bytes(), b"source-credential")
+                    self.assertEqual(target_secret.read_bytes(), b"stale-target-credential")
+                    self.assertFalse(native_log.exists())
+                elif point == "during-migration":
+                    self.assertEqual(old_secret.read_bytes(), b"source-credential")
+                    self.assertEqual(target_secret.read_bytes(), b"source-credential")
+                    self.assertFalse(native_log.exists())
+                else:
+                    self.assertFalse(old_secret.exists())
+                    self.assertEqual(target_secret.read_bytes(), b"source-credential")
+                    self.assertEqual(
+                        native_log.read_text(encoding="utf-8").splitlines(),
+                        [keychain.profile_slot("old"), keychain.profile_slot("new")],
+                    )
+
+                observed_locks = []
+                reopened = self._recover_through_cli(root, observed_locks)
+                self.assertEqual(
+                    [(profile.name, profile.seq) for profile in reopened.list()],
+                    [("new", 1)],
+                )
+                self.assertEqual(reopened.default_name(), "new")
+                self.assertFalse(reopened.rename_journal_path.exists())
+                self.assertFalse(old_secret.exists())
+                self.assertEqual(target_secret.read_bytes(), b"source-credential")
+                self.assertNotEqual(target_secret.read_bytes(), b"stale-target-credential")
+
+    def test_recovery_purges_stale_target_when_original_slot_was_absent(self):
+        import keychain
+
+        root = self._tmp / "absent-source"
+        original = Store(root=root)
+        original.create("old")
+        target_secret = keychain.slot_backup_path(original, "new")
+        target_secret.parent.mkdir(parents=True, exist_ok=True)
+        target_secret.write_bytes(b"stale-target-credential")
+        native_log = root / "native-calls.log"
+        result = self._crash_during_cli_rename(root, "before-callback", native_log)
+
+        self.assertEqual(result.returncode, 71, result.stderr)
+        journal = original._read_rename_journal()
+        self.assertEqual(journal["recovery_action"]["data"], {"source_present": False})
+        self.assertEqual(target_secret.read_bytes(), b"stale-target-credential")
+
+        reopened = self._recover_through_cli(root, [])
+        self.assertEqual(
+            read_json_object(reopened.profile_meta_path("new"))["name"], "new"
+        )
+        self.assertEqual(reopened.default_name(), "new")
+        self.assertFalse(reopened.rename_journal_path.exists())
+        self.assertFalse(keychain.slot_backup_path(reopened, "old").exists())
+        self.assertFalse(target_secret.exists())
+
+    def test_required_keychain_failures_keep_the_rename_intent(self):
+        import cli
+        import keychain
+        from unittest import mock
+
+        failures = (
+            ("swap-lock", "durable-write")
+            if keychain.fcntl is not None
+            else ("durable-write",)
+        )
+        for failure in failures:
+            with self.subTest(failure=failure):
+                root = self._tmp / failure
+                store = Store(root=root)
+                store.create("old")
+                old_slot = keychain.slot_backup_path(store, "old")
+                new_slot = keychain.slot_backup_path(store, "new")
+                old_slot.parent.mkdir(parents=True, exist_ok=True)
+                old_slot.write_bytes(b"source-credential")
+                new_slot.write_bytes(b"stale-target-credential")
+
+                class Args:
+                    old = "old"
+                    new = "new"
+
+                if failure == "swap-lock":
+                    keychain_patches = (
+                        mock.patch.object(keychain, "supported", return_value=True),
+                        mock.patch.object(
+                            keychain,
+                            "_serialize_lock",
+                            side_effect=PermissionError("swap lock unavailable"),
+                        ),
+                    )
+                else:
+                    keychain_patches = (
+                        mock.patch.object(keychain, "supported", return_value=False),
+                        mock.patch.object(
+                            keychain,
+                            "atomic_write_bytes",
+                            side_effect=OSError("slot write unavailable"),
+                        ),
+                    )
+
+                with keychain_patches[0], keychain_patches[1]:
+                    with self.assertRaisesRegex(StoreError, "journal retained"):
+                        cli.cmd_rename(store, Args())
+                    self.assertTrue(store.rename_journal_path.is_file())
+                    self.assertTrue(old_slot.is_file())
+                    self.assertEqual(old_slot.read_bytes(), b"source-credential")
+                    self.assertEqual(new_slot.read_bytes(), b"stale-target-credential")
+
+                    with self.assertRaisesRegex(StoreError, "journal retained"):
+                        store.list()
+                    self.assertTrue(store.rename_journal_path.is_file())
+
+                with mock.patch.object(keychain, "supported", return_value=True), \
+                        mock.patch.object(
+                            keychain, "_ensure_target_keychain", return_value=self.fake_home
+                        ), \
+                        mock.patch.object(keychain, "delete_slot"):
+                    self.assertEqual([profile.name for profile in store.list()], ["new"])
+
+                self.assertFalse(store.rename_journal_path.exists())
+                self.assertFalse(old_slot.exists())
+                self.assertEqual(new_slot.read_bytes(), b"source-credential")
+
+
+class TestHelpFormattingRegression(BaseCase):
+    def test_colored_help_keeps_plain_text_spacing(self):
+        import ui
+
+        old_force = os.environ.get("FORCE_COLOR")
+        old_no_color = os.environ.get("NO_COLOR")
+        try:
+            os.environ["FORCE_COLOR"] = "0"
+            os.environ.pop("NO_COLOR", None)
+            plain = self._run_cli("help")
+            os.environ["FORCE_COLOR"] = "1"
+            colored = self._run_cli("help")
+        finally:
+            if old_force is None:
+                os.environ.pop("FORCE_COLOR", None)
+            else:
+                os.environ["FORCE_COLOR"] = old_force
+            if old_no_color is None:
+                os.environ.pop("NO_COLOR", None)
+            else:
+                os.environ["NO_COLOR"] = old_no_color
+
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertEqual(colored.returncode, 0, colored.stderr)
+        self.assertIn("\x1b[", colored.stdout)
+        self.assertEqual(ui.strip_ansi(colored.stdout), plain.stdout)
+
+    def test_doctor_fix_help_does_not_claim_lock_sentinels_are_removed(self):
+        result = self._run_cli("doctor", "--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("(overlays/keychain/backups)", result.stdout)
+        self.assertNotIn("overlays/locks/keychain/backups", result.stdout)

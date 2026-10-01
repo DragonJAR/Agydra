@@ -198,7 +198,6 @@ def canonical_path(path: Path) -> Path:
 
             fd = os.open(str(p), os.O_RDONLY)
             try:
-                # F_GETPATH on macOS queries the kernel for the true canonical path
                 f_getpath = getattr(fcntl, "F_GETPATH", 50)
                 buf = b"\x00" * 1024
                 res = fcntl.fcntl(fd, f_getpath, buf)
@@ -376,14 +375,15 @@ def run_with_group_kill(
     invocation, an OAuth browser helper, macOS's Security Agent for
     `security`, ...) is left running and orphaned. Started in its own
     session/process group (POSIX) or process group (Windows) precisely so
-    a timeout can reach the whole tree via ``_kill_process_group``.
+    a timeout or keyboard interrupt can reach the whole tree via
+    ``_kill_process_group``.
 
-    Re-raises ``subprocess.TimeoutExpired`` on timeout, exactly like
-    ``subprocess.run`` -- callers keep their existing
-    ``except subprocess.TimeoutExpired`` contract (``usage.py``) or wrap
-    this to swallow it into a degraded result of their own
-    (``keychain._run``); this helper does not hide the timeout, only
-    hardens what happens to the child tree when one occurs.
+    Re-raises ``subprocess.TimeoutExpired`` on timeout and
+    ``KeyboardInterrupt`` on interruption after best-effort tree cleanup.
+    Callers keep their existing ``except subprocess.TimeoutExpired``
+    contract (``usage.py``) or wrap this to swallow it into a degraded
+    result of their own (``keychain._run``); this helper does not hide the
+    timeout or interruption, only hardens child cleanup.
 
     ``stdin``/``stdout``/``stderr`` default to the usual pipe/devnull
     behavior but are overridable: ``keychain._run`` passes temp files
@@ -407,11 +407,11 @@ def run_with_group_kill(
     proc = subprocess.Popen(_normalize_windows_argv(argv), **popen_kwargs)
     try:
         out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
         _kill_process_group(proc)
         try:
             proc.communicate(timeout=2.0)
-        except (subprocess.TimeoutExpired, OSError):
+        except (subprocess.TimeoutExpired, OSError, KeyboardInterrupt):
             pass
         raise
     return subprocess.CompletedProcess(list(argv), proc.returncode, out, err)

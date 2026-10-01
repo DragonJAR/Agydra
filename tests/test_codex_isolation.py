@@ -39,6 +39,47 @@ class TestCodexIsolation(BaseCase):
         self.assertEqual(env.get("AGYDRA_PROFILE"), "openai-work")
         self.assertIn("AGYDRA_REAL_HOME", env)
 
+    def test_extra_cannot_override_isolation_environment(self):
+        self.store.create("openai-work", engine="codex")
+        profile_data = self.store.profile_data_dir("openai-work")
+        overlay = isolation.build_overlay(
+            "openai-work", profile_data, self.store.root, engine="codex"
+        )
+
+        env = isolation.isolated_env(
+            overlay,
+            {
+                "HOME": "/host/home",
+                "CODEX_HOME": "/host/.codex",
+                "AGYDRA_REAL_HOME": "/spoofed/real-home",
+                "AGYDRA_PROFILE": "openai-work",
+            },
+            engine="codex",
+        )
+
+        self.assertEqual(env["HOME"], str(overlay))
+        self.assertEqual(env["CODEX_HOME"], str(overlay / ".codex"))
+        self.assertEqual(env["AGYDRA_REAL_HOME"], str(self.fake_home))
+        self.assertEqual(env["AGYDRA_PROFILE"], "openai-work")
+
+    def test_codex_daemon_setting_ignores_comments_and_other_tables(self):
+        self.store.create("openai-work", engine="codex")
+        data_dir = self.store.profile_data_dir("openai-work")
+        config = data_dir / "config.toml"
+        config.write_text(
+            "# daemon_auto_start = true\n"
+            "[other]\n"
+            "daemon_auto_start = true\n"
+            "[features]\n",
+            encoding="utf-8",
+        )
+
+        isolation._disable_codex_daemon_auto_start(data_dir)
+
+        content = config.read_text(encoding="utf-8")
+        self.assertIn("[features]\ndaemon_auto_start = false\n", content)
+        self.assertIn("[other]\ndaemon_auto_start = true\n", content)
+
     def test_host_codex_dir_skipped_from_overlay(self):
         real_home = platforms.real_home()
         fake_host_codex = real_home / ".codex"

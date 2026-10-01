@@ -9,6 +9,8 @@ import json
 import os
 import sys
 import unittest
+import contextlib
+import io
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -213,6 +215,40 @@ class TestUsageCli(BaseCase):
         self.assertIn("plan      : OpenAI API Key", res.stdout)
         self.assertIn("status    : authenticated", res.stdout)
 
+    def test_grok_detail_with_missing_billing_data_stays_authenticated(self):
+        import cli
+        import usage
+        from unittest import mock
+
+        self.store.create("gx", engine="grok")
+        profile = self.store.get("gx")
+        profile.email = "grok@example.com"
+        self.store.save(profile)
+        result = usage.UsageResult(
+            name="gx",
+            ok=False,
+            engine="grok",
+            email=profile.email,
+            plan="SuperGrok",
+            error="no usage data in response",
+        )
+
+        class Args:
+            ref = "gx"
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(cli.usage, "query_profile_usage", return_value=result):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = cli.cmd_usage(self.store, Args())
+
+        self.assertEqual(code, 1)
+        self.assertIn("email     : grok@example.com", stdout.getvalue())
+        self.assertIn("plan      : SuperGrok", stdout.getvalue())
+        self.assertIn("status    : authenticated", stdout.getvalue())
+        self.assertNotIn("status    : not authenticated", stdout.getvalue())
+        self.assertIn("usage unavailable: no usage data in response", stderr.getvalue())
+
     def test_responsive_column_cascade(self):
         self._write_json("alpha", REAL_USAGE_JSON)
         # Give alpha a long email
@@ -251,8 +287,32 @@ class TestUsageCli(BaseCase):
         finally:
             os.environ.pop("COLUMNS", None)
 
+    def test_progress_overwrite_and_clear_cover_long_profile_names(self):
+        import cli
+
+        class TtyBuffer:
+            def __init__(self):
+                self.writes = []
+
+            def isatty(self):
+                return True
+
+            def write(self, value):
+                self.writes.append(value)
+
+            def flush(self):
+                pass
+
+        names = ["x" * 64, "short"]
+        stream = TtyBuffer()
+        progress = cli._usage_progress(stream, names)
+        progress(1, len(names), names[0])
+        progress(2, len(names), names[1])
+        cli._clear_usage_progress(stream, names)
+
+        self.assertEqual(len(stream.writes[0]), len(stream.writes[1]))
+        self.assertEqual(len(stream.writes[1]) - 1, len(stream.writes[2]) - 2)
+
 
 if __name__ == "__main__":
     unittest.main()
-
-

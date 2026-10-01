@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import sys
+import tokenize
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,6 +28,18 @@ class TestDoctor(BaseCase):
     def setUp(self):
         super().setUp()
         self.store = Store()
+
+    def test_cli_and_doctor_runtime_sources_have_no_comments(self):
+        source_dir = Path(__file__).resolve().parents[1]
+        for filename in ("cli.py", "doctor.py"):
+            source = (source_dir / filename).read_text(encoding="utf-8")
+            comments = [
+                token.string
+                for token in tokenize.generate_tokens(io.StringIO(source).readline)
+                if token.type == tokenize.COMMENT and not token.string.startswith("#!")
+            ]
+            with self.subTest(filename=filename):
+                self.assertEqual(comments, [])
 
     def test_codex_schema_canary_accepts_daemonless_config_toml(self):
         """A Codex profile whose only layout file is the config.toml isolation
@@ -338,20 +351,145 @@ class TestIsolationRecovery(BaseCase):
     def test_fix_migrates_real_dir_overlay_into_profile_store(self):
         """``doctor --fix`` recovers the alpha-class breakage: migrates the
         real-dir .gemini into the profile data dir and relinks."""
+        import locks
+
         data_dir = self.store.profile_data_dir("alpha")
         link = self.store.overlays_dir / "alpha" / platforms.AGY_DATA_DIR_NAME
+        original_try_lock = locks.try_lock
+        original_migrate = isolation.migrate_real_dir_to_store
+        original_build_overlay = isolation.build_overlay
+        lock_checks = []
+
+        def inspect_migrate(real_dir, target_dir):
+            handle = original_try_lock(self.store, "alpha")
+            lock_checks.append(handle is None)
+            if handle is not None:
+                handle.release()
+            return original_migrate(real_dir, target_dir)
+
+        def inspect_relink(*args, **kwargs):
+            handle = original_try_lock(self.store, "alpha")
+            lock_checks.append(handle is None)
+            if handle is not None:
+                handle.release()
+            return original_build_overlay(*args, **kwargs)
+
         # pre-conditions: data dir empty of the marker file, overlay has it
         self.assertFalse((data_dir / "antigravity-cli" / "token.json").exists())
         self.assertTrue((link / "antigravity-cli" / "token.json").exists())
 
-        with mock.patch.object(keychain, "supported", return_value=False):
+        with mock.patch.object(keychain, "supported", return_value=False), \
+                mock.patch.object(
+                    isolation, "migrate_real_dir_to_store", side_effect=inspect_migrate
+                ), \
+                mock.patch.object(
+                    isolation, "build_overlay", side_effect=inspect_relink
+                ):
             rc = doctor.run_checks(self.store, fix=True)
 
         self.assertEqual(rc, 0)
+        self.assertEqual(lock_checks, [True, True])
         self.assertTrue((data_dir / "antigravity-cli" / "token.json").exists(),
                         "real-dir contents must move into profile data dir")
         self.assertTrue(isolation._is_link(link),
                         "build_overlay must relink after migrate")
+
+    def test_fix_skips_overlay_recovery_when_profile_lock_is_held(self):
+        import locks
+        from unittest import mock
+
+        data_dir = self.store.profile_data_dir("alpha")
+        link = self.store.overlays_dir / "alpha" / platforms.AGY_DATA_DIR_NAME
+        source_token = link / "antigravity-cli" / "token.json"
+        handle = locks.try_lock(self.store, "alpha")
+        output = io.StringIO()
+        try:
+            with mock.patch.object(keychain, "supported", return_value=False), \
+                    mock.patch.object(isolation, "migrate_real_dir_to_store") as migrate, \
+                    contextlib.redirect_stderr(output):
+                doctor._apply_fixes(self.store, self._ctx())
+        finally:
+            handle.release()
+
+        migrate.assert_not_called()
+        self.assertTrue(source_token.is_file())
+        self.assertFalse((data_dir / "antigravity-cli" / "token.json").exists())
+        self.assertIn("profile lock is held", output.getvalue())
+
+    def test_fix_skips_overlay_recovery_when_profile_owner_changed(self):
+        import locks
+        from unittest import mock
+
+        data_dir = self.store.profile_data_dir("alpha")
+        link = self.store.overlays_dir / "alpha" / platforms.AGY_DATA_DIR_NAME
+        source_token = link / "antigravity-cli" / "token.json"
+        original_try_lock = locks.try_lock
+        changed = []
+
+        def change_profile_owner(store, name):
+            handle = original_try_lock(store, name)
+            if name == "alpha" and handle is not None and not changed:
+                profile = store.get(name)
+                profile.seq += 1
+                store.save(profile)
+                changed.append(name)
+            return handle
+
+        output = io.StringIO()
+        with mock.patch.object(keychain, "supported", return_value=False), \
+                mock.patch.object(locks, "try_lock", side_effect=change_profile_owner), \
+                mock.patch.object(isolation, "migrate_real_dir_to_store") as migrate, \
+                contextlib.redirect_stderr(output):
+            doctor._apply_fixes(self.store, self._ctx())
+
+        migrate.assert_not_called()
+        self.assertEqual(changed, ["alpha"])
+        self.assertTrue(source_token.is_file())
+        self.assertFalse((data_dir / "antigravity-cli" / "token.json").exists())
+        self.assertIn("profile or overlay owner changed", output.getvalue())
+
+    def test_fix_skips_overlay_recovery_when_overlay_directory_is_replaced(self):
+        import locks
+        import shutil
+        from unittest import mock
+
+        overlay = self.store.overlays_dir / "alpha"
+        moved_overlay = self.fake_home / "alpha-before-replacement"
+        replacement_token = self.fake_home / "replacement-token.txt"
+        replacement_token.write_text("foreign overlay", encoding="utf-8")
+        original_try_lock = locks.try_lock
+        replaced = []
+
+        def replace_overlay_after_lock(store, name):
+            handle = original_try_lock(store, name)
+            if name == "alpha" and handle is not None and not replaced:
+                overlay.rename(moved_overlay)
+                overlay.mkdir()
+                replacement_data = overlay / platforms.AGY_DATA_DIR_NAME
+                replacement_data.mkdir()
+                shutil.copy2(replacement_token, replacement_data / "foreign.txt")
+                replaced.append(name)
+            return handle
+
+        output = io.StringIO()
+        with mock.patch.object(keychain, "supported", return_value=False), \
+                mock.patch.object(locks, "try_lock", side_effect=replace_overlay_after_lock), \
+                mock.patch.object(isolation, "migrate_real_dir_to_store") as migrate, \
+                contextlib.redirect_stderr(output):
+            doctor._apply_fixes(self.store, self._ctx())
+
+        migrate.assert_not_called()
+        self.assertEqual(replaced, ["alpha"])
+        self.assertTrue(
+            (moved_overlay / platforms.AGY_DATA_DIR_NAME / "antigravity-cli" / "token.json").is_file()
+        )
+        self.assertEqual(
+            (overlay / platforms.AGY_DATA_DIR_NAME / "foreign.txt").read_text(
+                encoding="utf-8"
+            ),
+            "foreign overlay",
+        )
+        self.assertIn("profile or overlay owner changed", output.getvalue())
 
     def test_fix_clears_dangling_default_profile(self):
         """If the default points at a profile that no longer exists, --fix
@@ -371,6 +509,9 @@ class TestIsolationRecovery(BaseCase):
         resolved keychain path (never the ambient default)."""
         calls = []
         fake_path = Path("/fake/login.keychain-db")
+        import locks
+        original_serialize = keychain.serialized_access
+        profile_locks_at_swap = []
 
         def fake_orphan(_store, known_names, keychain_path=None):
             calls.append(("orphan_slots", keychain_path))
@@ -379,11 +520,23 @@ class TestIsolationRecovery(BaseCase):
         def fake_delete_slot(service, keychain_path=None):
             calls.append(("delete_slot", service, keychain_path))
 
+        @contextlib.contextmanager
+        def inspect_swap_lock(store):
+            handle = locks.try_lock(store, "ghost")
+            profile_locks_at_swap.append(handle is None)
+            if handle is not None:
+                handle.release()
+            with original_serialize(store):
+                yield
+
         with mock.patch.object(keychain, "supported", return_value=True), \
                 mock.patch.object(
                     doctor.keychain, "_ensure_target_keychain", return_value=fake_path
                 ), \
                 mock.patch.object(doctor.keychain, "orphan_slots", fake_orphan), \
+                mock.patch.object(
+                    doctor.keychain, "serialized_access", side_effect=inspect_swap_lock
+                ), \
                 mock.patch.object(doctor.keychain, "delete_slot", fake_delete_slot):
             doctor.run_checks(self.store, fix=True)
 
@@ -391,6 +544,93 @@ class TestIsolationRecovery(BaseCase):
         self.assertIn(("delete_slot", "gemini/agydra/ghost", fake_path), calls)
         self.assertNotIn(("delete_slot", "gemini", fake_path), calls,
                          "shared slot is the real login — must never be touched")
+        self.assertEqual(profile_locks_at_swap, [True])
+
+    def test_fix_skips_keychain_slot_when_unreadable_profile_directory_exists(self):
+        corrupt_dir = self.store.profiles_dir / "broken"
+        corrupt_dir.mkdir(parents=True)
+        (corrupt_dir / "profile.json").write_text("{broken", encoding="utf-8")
+        self.assertNotIn("broken", self.store.names())
+        deleted = []
+        fake_path = Path("/fake/login.keychain-db")
+
+        def fake_delete_slot(service, keychain_path=None):
+            deleted.append(service)
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    doctor.keychain, "_ensure_target_keychain", return_value=fake_path
+                ), \
+                mock.patch.object(
+                    doctor.keychain, "orphan_slots", return_value=["broken"]
+                ), \
+                mock.patch.object(
+                    doctor.keychain, "delete_slot", side_effect=fake_delete_slot
+                ):
+            doctor._apply_fixes(self.store, self._ctx())
+
+        self.assertEqual(deleted, [])
+        self.assertTrue(corrupt_dir.exists())
+
+    def test_fix_rechecks_profile_directory_after_acquiring_its_lock(self):
+        import locks
+        original_try_lock = locks.try_lock
+        corrupt_dir = self.store.profile_dir("ghost")
+        fake_path = Path("/fake/login.keychain-db")
+        deleted = []
+
+        def fake_delete_slot(service, keychain_path=None):
+            deleted.append(service)
+
+        def create_owner_during_lock(store, name):
+            handle = original_try_lock(store, name)
+            if name == "ghost":
+                corrupt_dir.mkdir(parents=True)
+                (corrupt_dir / "profile.json").write_text("{broken", encoding="utf-8")
+            return handle
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    doctor.keychain, "_ensure_target_keychain", return_value=fake_path
+                ), \
+                mock.patch.object(
+                    doctor.keychain, "orphan_slots", return_value=["ghost"]
+                ), \
+                mock.patch.object(
+                    doctor.keychain, "delete_slot", side_effect=fake_delete_slot
+                ), \
+                mock.patch.object(locks, "try_lock", side_effect=create_owner_during_lock):
+            doctor._apply_fixes(self.store, self._ctx())
+
+        self.assertEqual(deleted, [])
+        self.assertTrue(corrupt_dir.exists())
+
+    def test_fix_skips_keychain_slot_when_profile_lock_is_already_held(self):
+        import locks
+
+        fake_path = Path("/fake/login.keychain-db")
+        deleted = []
+
+        def fake_delete_slot(service, keychain_path=None):
+            deleted.append(service)
+
+        handle = locks.try_lock(self.store, "ghost")
+        try:
+            with mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        doctor.keychain, "_ensure_target_keychain", return_value=fake_path
+                    ), \
+                    mock.patch.object(
+                        doctor.keychain, "orphan_slots", return_value=["ghost"]
+                    ), \
+                    mock.patch.object(
+                        doctor.keychain, "delete_slot", side_effect=fake_delete_slot
+                    ):
+                doctor._apply_fixes(self.store, self._ctx())
+        finally:
+            handle.release()
+
+        self.assertEqual(deleted, [])
 
     def test_cmd_doctor_fix_reports_header_once_with_post_fix_exit_code(self):
         """`agydra doctor --fix` must run the check-and-print pass exactly

@@ -41,7 +41,7 @@ def _fail(msg: str, hint: str = "") -> int:
     return 1
 
 
-def _venv_script(repo: str) -> str:
+def _venv_script(repo: Path) -> str:
     import platforms
 
     return str(platforms.console_script(Path(repo) / ".venv"))

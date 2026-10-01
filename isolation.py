@@ -23,6 +23,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import List, NamedTuple, Optional, Tuple
 
@@ -274,15 +275,16 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
     relink (see ``doctor --fix``).
 
     Recovers the "refusing to break isolation" state without data loss:
-    entries are moved into ``data_dir`` (overlay data is the live one), a
-    pre-existing same-named file is overwritten by its overlay version,
-    same-named directories are merged. Refuses when ``real_dir`` is a link
-    (nothing to recover), ``data_dir`` does not exist (no profile store to
-    receive the data), an entry is itself a link (symlink or Windows
-    junction; a real-dir recovery should never legitimately contain one, and
-    moving it verbatim would become a permanent, unchecked escape from
-    isolation), or a type mismatch collides between file and directory at
-    the target.
+    entries are copied into ``data_dir``, same-named directories are merged,
+    and byte-identical destination files are retained so an interrupted copy
+    can be retried. Different-content file collisions are rejected before any
+    copy, and the source is removed only after every copy succeeds.
+    Refuses when ``real_dir`` is a link (nothing to recover), ``data_dir``
+    does not exist (no profile store to receive the data), an entry is itself
+    a link (symlink or Windows junction; a real-dir recovery should never
+    legitimately contain one, and copying it verbatim would become a
+    permanent, unchecked escape from isolation), or a type mismatch collides
+    between file and directory at the target.
     """
     real_dir = Path(real_dir)
     data_dir = Path(data_dir)
@@ -296,6 +298,11 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
             f"cannot migrate {real_dir}: profile data dir {data_dir} does "
             "not exist yet (create the profile first)"
         )
+    if _is_link(data_dir):
+        raise IsolationError(
+            f"cannot migrate {real_dir}: profile data dir {data_dir} "
+            "must not be a symlink or junction"
+        )
 
     try:
         entries = list(real_dir.iterdir())
@@ -304,38 +311,121 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
             f"could not list entries in {real_dir}: {exc}"
         ) from exc
 
-    # Pre-validate all entries before mutating anything so that if any
-    # invariant is violated, nothing in real_dir has been moved or deleted.
-    for entry in entries:
-        if _is_link(entry):
+    def files_are_identical(source: Path, target: Path) -> bool:
+        with source.open("rb") as source_file, target.open("rb") as target_file:
+            while True:
+                source_chunk = source_file.read(65536)
+                target_chunk = target_file.read(65536)
+                if source_chunk != target_chunk:
+                    return False
+                if not source_chunk:
+                    return True
+
+    try:
+        for entry in real_dir.rglob("*"):
+            if _is_link(entry):
+                raise IsolationError(
+                    f"cannot migrate {entry}: real_dir must not contain "
+                    "symlinks or junctions (isolation invariant); remove it "
+                    "manually and re-run `agydra doctor --fix`"
+                )
+            target = data_dir / entry.relative_to(real_dir)
+            if _is_link(target):
+                raise IsolationError(
+                    f"cannot migrate {entry}: profile data target {target} is "
+                    "a symlink or junction (isolation invariant)"
+                )
+            if not target.exists():
+                continue
+            if entry.is_dir() != target.is_dir():
+                target_type = "directory" if target.is_dir() else "file"
+                source_type = "directory" if entry.is_dir() else "file"
+                raise IsolationError(
+                    f"cannot migrate {entry}: a {target_type} already exists "
+                    f"at {target} (type mismatch with source {source_type}); "
+                    "resolve manually and re-run `agydra doctor --fix`"
+                )
+            if (
+                entry.is_file()
+                and target.is_file()
+                and not files_are_identical(entry, target)
+            ):
+                raise IsolationError(
+                    f"cannot migrate {entry}: a file with different contents "
+                    f"already exists at {target} (file-to-file collision); "
+                    "resolve manually and re-run `agydra doctor --fix`"
+                )
+
+        for entry in entries:
+            target = data_dir / entry.name
+            if entry.is_dir() and target.is_dir():
+                for descendant in target.rglob("*"):
+                    if _is_link(descendant):
+                        raise IsolationError(
+                            f"cannot migrate {entry}: profile data target "
+                            f"contains symlink or junction {descendant}"
+                        )
+    except OSError as exc:
+        raise IsolationError(
+            f"could not validate overlay data in {real_dir} ({exc}); "
+            "no migration data was changed"
+        ) from exc
+
+    def copy_file(source: str, destination: str) -> str:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if destination_path.exists():
+            if (
+                source_path.is_file()
+                and destination_path.is_file()
+                and files_are_identical(source_path, destination_path)
+            ):
+                return str(destination_path)
             raise IsolationError(
-                f"cannot migrate {entry}: real_dir must not contain "
-                "symlinks or junctions (isolation invariant); remove it "
-                "manually and re-run `agydra doctor --fix`"
+                f"cannot migrate {source_path}: conflicting data exists at "
+                f"{destination_path}; resolve manually and re-run "
+                "`agydra doctor --fix`"
             )
-        target = data_dir / entry.name
-        if target.exists() and entry.is_dir() != target.is_dir():
-            target_type = "directory" if target.is_dir() else "file"
-            source_type = "directory" if entry.is_dir() else "file"
-            raise IsolationError(
-                f"cannot migrate {entry}: a {target_type} already exists "
-                f"at {target} (type mismatch with source {source_type}); "
-                "resolve manually and re-run `agydra doctor --fix`"
-            )
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=destination_path.parent,
+            prefix=".agydra-copy-",
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        try:
+            shutil.copy2(source_path, temporary_path)
+            os.replace(temporary_path, destination_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return str(destination_path)
 
     try:
         for entry in entries:
             target = data_dir / entry.name
-            if entry.is_dir() and target.exists():
-                shutil.copytree(entry, target, dirs_exist_ok=True)
+            if entry.is_dir():
+                shutil.copytree(
+                    entry,
+                    target,
+                    dirs_exist_ok=True,
+                    copy_function=copy_file,
+                )
             else:
-                shutil.move(str(entry), str(target))
+                copy_file(str(entry), str(target))
+    except OSError as exc:
+        raise IsolationError(
+            f"could not copy overlay data from {real_dir} into the profile "
+            f"store ({exc}); the source remains intact — fix the cause and "
+            "re-run `agydra doctor --fix`"
+        ) from exc
+
+    try:
         store.rmtree(real_dir)
     except OSError as exc:
         raise IsolationError(
-            f"could not migrate overlay data from {real_dir} into the "
-            f"profile store ({exc}); nothing was deleted — fix the cause "
-            "and re-run `agydra doctor --fix`"
+            f"all overlay data was copied into {data_dir}, but source cleanup "
+            f"failed for {real_dir} ({exc}); fix the cause and re-run "
+            "`agydra doctor --fix`"
         ) from exc
 
 
@@ -394,8 +484,6 @@ def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "ag
     return overlay
 
 
-# Usable bytes of sockaddr_un.sun_path. macOS is 104 including the trailing
-# NUL; Linux is 108. 103 is bindable on both. Windows has no such limit.
 _AF_UNIX_PATH_MAX = 103
 
 
@@ -512,21 +600,61 @@ def _disable_codex_daemon_auto_start(data_dir: Path) -> None:
         return
     try:
         content = cfg.read_text(encoding="utf-8")
-        if "daemon_auto_start" in content:
-            new_content = re.sub(
-                r"(daemon_auto_start\s*=\s*)(true|1)",
-                r"\g<1>false",
-                content,
+        newline = "\r\n" if "\r\n" in content else "\n"
+        features = re.search(
+            r"(?m)^([ \t]*\[features\][ \t]*(?:\#[^\r\n]*)?)(\r?\n|$)",
+            content,
+        )
+        if features:
+            section_start = features.end()
+            next_section = re.search(
+                r"(?m)^[ \t]*\[[^\]\r\n]+\][ \t]*(?:\#[^\r\n]*)?(?:\r?\n|$)",
+                content[section_start:],
             )
-        elif re.search(r"^\s*\[features\]", content, re.MULTILINE):
-            new_content = re.sub(
-                r"(^\s*\[features\]\s*\n)",
-                r"\1daemon_auto_start = false\n",
-                content,
-                flags=re.MULTILINE,
+            section_end = (
+                section_start + next_section.start()
+                if next_section
+                else len(content)
             )
+            section = content[section_start:section_end]
+            setting = re.search(
+                r'(?m)^([ \t]*(?:daemon_auto_start|"daemon_auto_start")[ \t]*=[ \t]*)'
+                r"(true|false|1|0)([ \t]*(?:\#[^\r\n]*)?)(\r?)$",
+                section,
+            )
+            if setting:
+                if setting.group(2) in ("true", "1"):
+                    updated = (
+                        setting.group(1)
+                        + "false"
+                        + setting.group(3)
+                        + setting.group(4)
+                    )
+                    section = section[:setting.start()] + updated + section[setting.end():]
+                    new_content = content[:section_start] + section + content[section_end:]
+                else:
+                    new_content = content
+            else:
+                addition = "daemon_auto_start = false" + newline
+                if features.group(2):
+                    new_content = content[:section_start] + addition + content[section_start:]
+                else:
+                    new_content = (
+                        content[:section_start]
+                        + newline
+                        + addition
+                        + content[section_start:]
+                    )
         else:
-            new_content = content.rstrip() + "\n\n[features]\ndaemon_auto_start = false\n"
+            new_content = (
+                content.rstrip()
+                + newline
+                + newline
+                + "[features]"
+                + newline
+                + "daemon_auto_start = false"
+                + newline
+            )
 
         if new_content != content:
             store.atomic_write_text(cfg, new_content)
@@ -545,6 +673,7 @@ def isolated_env(
 
     driver = engines.get_engine(engine)
     env = dict(os.environ)
+    env.update(extra)
     real_home = platforms.real_home()
     env["AGYDRA_REAL_HOME"] = str(real_home)
     env[platforms.home_redirect_var()] = str(overlay)
@@ -566,7 +695,6 @@ def isolated_env(
         if resolved == home_resolved or home_resolved in resolved.parents:
             relative = resolved.relative_to(home_resolved)
             env[xdg_var] = str(Path(overlay, relative))
-    env.update(extra)
     return env
 
 

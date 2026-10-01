@@ -247,7 +247,7 @@ def save_codex_tokens(data_dir: Path, tokens_data: dict) -> bool:
         return False
     raw = store.read_json_object(path, tolerant=True)
     if not isinstance(raw, dict):
-        raw = {}
+        return False
     tokens = raw.get("tokens")
     if not isinstance(tokens, dict):
         tokens = {}
@@ -492,10 +492,9 @@ def auth_state(
 def sync_profile_email(store, name: str) -> Optional[str]:
     """Refresh the cached email in profile metadata; returns the email.
 
-    Re-checks the session lock right before saving: a launch that took the
-    lock between the caller's is_locked() probe and this write would have
-    its fresh last_used (written by runner) clobbered by a full-profile
-    save based on the stale pre-launch snapshot.
+    Acquires the session lock before saving and reloads the profile while
+    holding it, so a launch that wins the race cannot have its fresh
+    ``last_used`` clobbered by a stale full-profile snapshot.
 
     Refuses to overwrite an already-set, DIFFERENT cached email when the
     newly detected one came from the keychain slot backup rather than a
@@ -517,11 +516,23 @@ def sync_profile_email(store, name: str) -> Optional[str]:
     email, source = detect_email_source(store.profile_data_dir(name, engine=engine), store, name, engine=engine)
     if not email:
         return None
-    if locks.is_locked(store, name):
-        return email
     if profile.email and profile.email != email and source == _SOURCE_KEYCHAIN:
         return None
-    if profile.email != email:
-        profile.email = email
-        store.save(profile)
+    if profile.email == email:
+        return email
+    try:
+        handle = locks.try_lock(store, name)
+    except locks.LockError:
+        return email
+    if handle is None:
+        return email
+    try:
+        profile = store.get(name)
+        if profile.email and profile.email != email and source == _SOURCE_KEYCHAIN:
+            return None
+        if profile.email != email:
+            profile.email = email
+            store.save(profile)
+    finally:
+        handle.release()
     return email

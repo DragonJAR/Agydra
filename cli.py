@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import os
 import re
 import shutil
@@ -26,7 +27,12 @@ import vocab
 from bootstrap import BootstrapError
 from isolation import IsolationError
 from store import Store, StoreError, atomic_copy, atomic_write_bytes, rename_dir_with_retry
-from ui import bar as _bar, error as _error, note as _note, pad, paint, paint_each
+from ui import bar as _bar, error as _error, note as _note, pad, paint, paint_each, warn as _warn
+
+Store.register_rename_recovery_handler(
+    keychain.RENAME_RECOVERY_ACTION,
+    keychain.recover_rename_profile_slot,
+)
 
 
 class ColoredHelpFormatter(argparse.HelpFormatter):
@@ -40,8 +46,8 @@ class ColoredHelpFormatter(argparse.HelpFormatter):
     anchors ourselves through the shared ui palette, so the CLI has exactly
     one color source (DRY) and identical styling across surfaces. Only
     anchors are styled — the ``usage:`` label, section headers and option
-    invocations — so the layout stays byte-identical with the plain
-    formatter once escapes are stripped (test invariant).
+    invocations — after argparse has completed its width calculations, so
+    stripping the color escapes preserves the plain layout.
     """
 
     def _set_color(self, color) -> None:
@@ -59,7 +65,26 @@ class ColoredHelpFormatter(argparse.HelpFormatter):
         super().start_section(paint(heading, "cyan", "bold"))
 
     def _format_action_invocation(self, action):
-        return paint(super()._format_action_invocation(action), "bold")
+        invocation = super()._format_action_invocation(action)
+        if hasattr(self, "_action_invocations"):
+            self._action_invocations.append(invocation)
+        return invocation
+
+    def format_help(self) -> str:
+        self._action_invocations = []
+        rendered = super().format_help()
+        for invocation in sorted(set(self._action_invocations), key=len, reverse=True):
+            if not invocation:
+                continue
+            pattern = re.compile(
+                r"(?m)^([ \t]*)" + re.escape(invocation) + r"(?=[ \t]{2,}|\n)"
+            )
+            rendered = pattern.sub(
+                lambda match: match.group(1) + paint(invocation, "bold"),
+                rendered,
+                count=1,
+            )
+        return rendered
 
 _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
     "profile": (
@@ -88,6 +113,7 @@ _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
         "sessions on the same profile may corrupt OAuth tokens",
     ),
 }
+_LAUNCH_LONG_ALIASES: Dict[str, Tuple[str, ...]] = {"random": ("--rotate",)}
 _SHORT_TO_FLAG: Dict[str, Tuple[str, bool]] = {
     short: (key, takes_value)
     for key, (short, _long, takes_value, _metavar, _help) in _LAUNCH_FLAGS.items()
@@ -98,8 +124,9 @@ _SUBCOMMAND_ALIASES = vocab.SUBCOMMAND_ALIASES
 
 _LAUNCHER_SHORT_LETTERS: frozenset = frozenset(short[1:] for short in _SHORT_TO_FLAG)
 _LAUNCHER_LONG_NAMES: frozenset = frozenset(
-    long_[2:]
-    for _key, (_short, long_, _takes_value, _metavar, _help) in _LAUNCH_FLAGS.items()
+    spelling[2:]
+    for key, (_short, long_, _takes_value, _metavar, _help) in _LAUNCH_FLAGS.items()
+    for spelling in (long_, *_LAUNCH_LONG_ALIASES.get(key, ()))
 )
 
 
@@ -219,7 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"agydra {__version__} — Jaime Andrés Restrepo (DragonJAR.org)",
     )
     for _key, (short, long_, takes_value, metavar, help_text) in _LAUNCH_FLAGS.items():
-        aliases = (short, long_, "--rotate") if _key == "random" else (short, long_)
+        aliases = (short, long_, *_LAUNCH_LONG_ALIASES.get(_key, ()))
         if takes_value:
             parser.add_argument(*aliases, metavar=metavar, help=help_text)
         else:
@@ -248,7 +275,11 @@ def _match_flag(token: str) -> Optional[List[Tuple[str, object, int]]]:
                 return [(key, token.split("=", 1)[1], 1)]
             if len(token) > len(short) and token.startswith(short):
                 return [(key, token[len(short):], 1)]
-        elif token == short or token == long_ or (key == "random" and token == "--rotate"):
+        elif (
+            token == short
+            or token == long_
+            or token in _LAUNCH_LONG_ALIASES.get(key, ())
+        ):
             return [(key, True, 1)]
     if token.startswith("-") and not token.startswith("--") and len(token) >= 3:
         matches: List[Tuple[str, object, int]] = []
@@ -409,6 +440,23 @@ def _assert_free(store: Store, name: str, action: str = "modifying the profile")
         )
 
 
+def _acquire_profile_lock(
+    store: Store, name: str, action: str
+) -> locks.LockHandle:
+    try:
+        handle = locks.try_lock(store, name)
+    except locks.LockError as exc:
+        raise StoreError(
+            f"cannot safely proceed with {action} profile {name!r}: {exc}"
+        ) from exc
+    if handle is None:
+        _assert_free(store, name, action)
+        raise StoreError(
+            f"profile {name!r} became busy before {action}; retry when it is idle"
+        )
+    return handle
+
+
 _PROFILE_LABEL = "PROFILE"
 _EMAIL_COL_WIDTH = 34
 """Shared EMAIL column width: `cmd_list`'s profile table and the usage
@@ -457,8 +505,17 @@ def cmd_create(store: Store, args) -> int:
     config = store.load_config()
     if config.settings.get("copy_settings_on_create", True) and engine == "agy":
         default = store.default_name()
-        if default and default != profile.name and store.get(default).engine == "agy":
-            _share_config(store, default, [profile.name])
+        if default and default != profile.name:
+            try:
+                default_profile = store.get(default)
+            except StoreError as exc:
+                _note(
+                    f"settings not copied from unavailable default profile "
+                    f"{default!r} ({exc})"
+                )
+            else:
+                if default_profile.engine == "agy":
+                    _share_config(store, default, [profile.name])
     print(f"created profile: {profile.name}")
     print(f"authenticate it with: agydra login {profile.name}")
     return 0
@@ -526,7 +583,20 @@ def cmd_status(store: Store, args) -> int:
 _USAGE_MIN_COL_WIDTH = 9
 
 
-def _usage_progress(stream) -> "usage.ProgressCallback":
+def _usage_progress_width(names: Sequence[str]) -> int:
+    return max(
+        60,
+        max(
+            (
+                len(f"checking {name}... ({index}/{len(names)})")
+                for index, name in enumerate(names, start=1)
+            ),
+            default=0,
+        ),
+    )
+
+
+def _usage_progress(stream, names: Sequence[str]) -> "usage.ProgressCallback":
     """Print a "checking <name>... (i/N)" indicator while a multi-profile
     usage report is in flight (querying ~7 profiles sequentially, by
     design -- see usage.py -- can take several seconds).
@@ -538,11 +608,12 @@ def _usage_progress(stream) -> "usage.ProgressCallback":
     ``ui.color_enabled`` already use.
     """
     is_tty = hasattr(stream, "isatty") and stream.isatty()
+    width = _usage_progress_width(names)
 
     def _report(index: int, total: int, name: str) -> None:
         message = f"checking {name}... ({index}/{total})"
         if is_tty:
-            stream.write("\r" + message.ljust(60))
+            stream.write("\r" + message.ljust(width))
             stream.flush()
         else:
             print(message, file=stream)
@@ -550,9 +621,9 @@ def _usage_progress(stream) -> "usage.ProgressCallback":
     return _report
 
 
-def _clear_usage_progress(stream) -> None:
+def _clear_usage_progress(stream, names: Sequence[str]) -> None:
     if hasattr(stream, "isatty") and stream.isatty():
-        stream.write("\r" + " " * 60 + "\r")
+        stream.write("\r" + " " * _usage_progress_width(names) + "\r")
         stream.flush()
 
 
@@ -577,9 +648,11 @@ def _cmd_usage_compact(store: Store, _args) -> int:
         return 0
     names = [p.name for p in profiles]
     try:
-        results = usage.gather_usage_report(store, names, on_progress=_usage_progress(sys.stderr))
+        results = usage.gather_usage_report(
+            store, names, on_progress=_usage_progress(sys.stderr, names)
+        )
     finally:
-        _clear_usage_progress(sys.stderr)
+        _clear_usage_progress(sys.stderr, names)
 
     agy_entries = [(p, r) for p, r in zip(profiles, results) if p.engine == "agy"]
     codex_entries = [(p, r) for p, r in zip(profiles, results) if p.engine == "codex"]
@@ -948,9 +1021,17 @@ def _cmd_usage_detail(store: Store, args) -> int:
     if profile.engine in ("codex", "grok"):
         if result.plan:
             print(f"plan      : {result.plan}")
+        unauthenticated_errors = {
+            "not authenticated",
+            "missing access token",
+            "session expired (401)",
+        }
+        authenticated = result.ok or (
+            result.error is not None and result.error not in unauthenticated_errors
+        )
         state_str = (
             i18n.t("auth.authenticated", default="authenticated")
-            if result.ok
+            if authenticated
             else i18n.t("auth.not_authenticated", default="not authenticated")
         )
         print(f"status    : {state_str}")
@@ -988,12 +1069,43 @@ def cmd_default(store: Store, args) -> int:
     return 0
 
 
+def _register_keychain_rename_recovery(store: Store) -> None:
+    store.register_rename_recovery_handler(
+        keychain.RENAME_RECOVERY_ACTION,
+        keychain.recover_rename_profile_slot,
+    )
+
+
 def cmd_rename(store: Store, args) -> int:
+    _register_keychain_rename_recovery(store)
     old = store.resolve_ref(args.old)
     _assert_free(store, old, "renaming the profile")
-    profile = store.rename(old, args.new)
+
+    recovery_data = {}
+
+    def prepare_recovery_data() -> dict:
+        recovery_data.update(
+            keychain.rename_profile_slot_recovery_data(store, old, args.new)
+        )
+        return dict(recovery_data)
+
+    def migrate_keychain_slot(renamed) -> None:
+        keychain.rename_profile_slot(
+            store,
+            old,
+            renamed.name,
+            source_present=recovery_data["source_present"],
+            strict=True,
+        )
+
+    profile = store.rename(
+        old,
+        args.new,
+        after_rename=migrate_keychain_slot,
+        recovery_action=keychain.RENAME_RECOVERY_ACTION,
+        recovery_data_provider=prepare_recovery_data,
+    )
     locks.forget(store, old)
-    keychain.rename_profile_slot(store, old, profile.name)
     print(f"renamed {old!r} -> {profile.name!r}")
     return 0
 
@@ -1007,12 +1119,31 @@ def _confirm(prompt: str, assume_yes: bool) -> bool:
 def _finish_delete(store: Store, name: str, no_backup: bool) -> int:
     """Shared tail for both the normal and the corrupt-profile delete paths."""
     _assert_free(store, name, "deleting the profile")
-    backup = store.delete(name, backup=not no_backup)
+
+    purge_errors: List[Exception] = []
+
+    def purge_deleted_profile_slot() -> None:
+        try:
+            with keychain.serialized_access(store):
+                keychain.purge_profile_slot(store, name)
+        except Exception as exc:
+            purge_errors.append(exc)
+
+    backup = store.delete(
+        name,
+        backup=not no_backup,
+        after_delete=purge_deleted_profile_slot,
+    )
     locks.forget(store, name)
-    keychain.purge_profile_slot(store, name)
     if backup:
         print(f"backup saved: {backup}")
     print(f"deleted profile: {name}")
+    if purge_errors:
+        _warn(
+            f"profile {name!r} was deleted, but keychain purge failed "
+            f"({purge_errors[0]})"
+        )
+        return 1
     return 0
 
 
@@ -1045,29 +1176,49 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
 
     All targets are validated (existence, self-copy, live sessions) BEFORE
     the first byte is copied: a bad third target must not leave the first
-    two half-copied."""
-    allowed = {"settings.json", "mcp.json", "config.toml"}
-    src_profile = store.get(src)
-    src_dir = store.profile_data_dir(src, engine=src_profile.engine)
+    two half-copied. Source and target locks stay held until every copy ends."""
+    allowed = ("settings.json", "mcp.json", "config.toml")
     resolved: List[str] = []
+    references: List[Tuple[str, str]] = []
     seen: set = set()
     for target in targets:
         target_name = store.resolve_ref(target)
-        if target_name == src or target_name in seen:
+        if target_name == src:
             continue
-        _assert_free(store, target_name, "sharing config")
+        references.append((target, target_name))
+        if target_name in seen:
+            continue
         seen.add(target_name)
         resolved.append(target_name)
-    copied: List[str] = []
-    for target_name in resolved:
-        target_profile = store.get(target_name)
-        target_dir = store.profile_data_dir(target_name, engine=target_profile.engine)
-        for name in allowed:
-            file = src_dir / name
-            if file.is_file():
-                atomic_copy(file, target_dir / name)
-                copied.append(f"{target_name}/{name}")
-    return copied
+    with ExitStack() as stack:
+        for name in sorted({src, *resolved}):
+            stack.enter_context(_acquire_profile_lock(store, name, "sharing config"))
+        for reference, expected_name in references:
+            if store.resolve_ref(reference) != expected_name:
+                raise StoreError(
+                    f"profile reference {reference!r} changed while acquiring locks; "
+                    "retry sharing config"
+                )
+        src_profile = store.get(src)
+        if src_profile.name != src:
+            raise StoreError(
+                f"cannot safely share config from {src!r}: profile metadata "
+                f"names a different owner ({src_profile.name!r})"
+            )
+        src_dir = store.profile_data_dir(src, engine=src_profile.engine)
+        target_profiles = {name: store.get(name) for name in resolved}
+        if any(profile.name != name for name, profile in target_profiles.items()):
+            raise StoreError("cannot safely share config: target profile owner changed")
+        copied: List[str] = []
+        for target_name in resolved:
+            target_profile = target_profiles[target_name]
+            target_dir = store.profile_data_dir(target_name, engine=target_profile.engine)
+            for name in allowed:
+                file = src_dir / name
+                if file.is_file():
+                    atomic_copy(file, target_dir / name)
+                    copied.append(f"{target_name}/{name}")
+        return copied
 
 
 def cmd_share_config(store: Store, args) -> int:
@@ -1099,44 +1250,60 @@ def cmd_import(store: Store, args) -> int:
             f"Usage: agydra import <profile-name>   (use -s DIR to override the source)."
         )
     name = store.resolve_ref(ref)
-    _assert_free(store, name, "importing into it")
-    profile = store.get(name)
-    engine = profile.engine
-    driver = engines.get_engine(engine)
-    if args.source is not None:
-        real = Path(args.source).expanduser()
+    with _acquire_profile_lock(store, name, "importing into it"):
+        if store.resolve_ref(ref) != name:
+            raise StoreError(
+                f"profile reference {ref!r} changed while acquiring its lock; retry import"
+            )
+        profile = store.get(name)
+        if profile.name != name:
+            raise StoreError(
+                f"cannot safely import into {name!r}: profile metadata names "
+                f"a different owner ({profile.name!r})"
+            )
+        engine = profile.engine
+        driver = engines.get_engine(engine)
+        if args.source is not None:
+            real = Path(args.source).expanduser()
+            if not real.is_dir():
+                raise StoreError(f"source directory not found: {real}")
+        else:
+            real = platforms.real_home() / driver.data_dir_name
         if not real.is_dir():
-            raise StoreError(f"source directory not found: {real}")
-    else:
-        real = platforms.real_home() / driver.data_dir_name
-    if not real.is_dir():
-        raise StoreError(
-            f"no generic {driver.binary_name} data directory found at {real} — log in once with "
-            f"plain `{driver.binary_name}` to create it, then retry: agydra import " + name
-        )
-    data_dir = store.profile_data_dir(name, engine=engine)
-    if data_dir.exists() and any(data_dir.iterdir()):
-        raise StoreError(
-            f"profile {name!r} already has data ({data_dir}); "
-            "delete it first (agydra delete " + name + ") or pick an empty profile."
-        )
-    if data_dir.exists():
-        data_dir.rmdir()
-    platforms.ensure_dir(data_dir.parent)
-    tmp = Path(tempfile.mkdtemp(prefix=f".import-{name}.", dir=data_dir.parent))
-    try:
-        shutil.copytree(
-            real, tmp, dirs_exist_ok=True,
-            ignore=shutil.ignore_patterns(".DS_Store"),
-        )
-        rename_dir_with_retry(tmp, data_dir)
-    except BaseException:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise
-    if driver.needs_keychain:
-        keychain.capture_shared_slot_for_import(store, name, data_dir)
-    print(f"imported generic data into profile {name!r}: {data_dir}")
-    return 0
+            raise StoreError(
+                f"no generic {driver.binary_name} data directory found at {real} — log in once with "
+                f"plain `{driver.binary_name}` to create it, then retry: agydra import " + name
+            )
+        data_dir = store.profile_data_dir(name, engine=engine)
+        if data_dir.exists() and any(data_dir.iterdir()):
+            raise StoreError(
+                f"profile {name!r} already has data ({data_dir}); "
+                "delete it first (agydra delete " + name + ") or pick an empty profile."
+            )
+        if data_dir.exists():
+            data_dir.rmdir()
+        platforms.ensure_dir(data_dir.parent)
+        tmp = Path(tempfile.mkdtemp(prefix=f".import-{name}.", dir=data_dir.parent))
+        try:
+            shutil.copytree(
+                real, tmp, dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns(".DS_Store"),
+            )
+            rename_dir_with_retry(tmp, data_dir)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        if driver.needs_keychain:
+            try:
+                with keychain.serialized_access(store):
+                    keychain.capture_shared_slot_for_import(store, name, data_dir)
+            except (keychain.KeychainError, OSError, AttributeError) as exc:
+                _warn(
+                    f"keychain import capture skipped ({exc}); "
+                    "continuing without it"
+                )
+        print(f"imported generic data into profile {name!r}: {data_dir}")
+        return 0
 
 
 def cmd_use(store: Store, args) -> int:
@@ -1375,12 +1542,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     banner.show()
     raw = list(sys.argv[1:] if argv is None else argv)
     store = Store()
+    _register_keychain_rename_recovery(store)
 
     lang_val = None
     filtered_raw: List[str] = []
     i = 0
     while i < len(raw):
         token = raw[i]
+        if token == "--":
+            filtered_raw.extend(raw[i:])
+            break
         if token == "--lang":
             if i + 1 < len(raw) and not raw[i + 1].startswith("-"):
                 lang_val = raw[i + 1]
@@ -1525,7 +1696,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "overlay into the profile store and relink, clear a "
                 "dangling default profile, purge orphaned macOS-keychain "
                 "slots, and remove orphaned store artifacts "
-                "(overlays/locks/keychain/backups) left behind by a "
+                "(overlays/keychain/backups) left behind by a "
                 "manually deleted profile; asks for confirmation unless "
                 "-f/--force",
             )

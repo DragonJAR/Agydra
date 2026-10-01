@@ -367,6 +367,20 @@ class TestRunWithGroupKill(unittest.TestCase):
             self.assertEqual(kwargs.get("encoding"), "utf-8")
             self.assertEqual(kwargs.get("errors"), "replace")
 
+    def test_keyboard_interrupt_kills_and_reaps_process_group(self):
+        with mock.patch("subprocess.Popen") as mock_popen, \
+                mock.patch.object(platforms, "_kill_process_group") as mock_kill:
+            proc = mock.MagicMock()
+            proc.communicate.side_effect = [KeyboardInterrupt(), ("", "")]
+            mock_popen.return_value = proc
+
+            with self.assertRaises(KeyboardInterrupt):
+                platforms.run_with_group_kill(["worker"])
+
+            mock_kill.assert_called_once_with(proc)
+            self.assertEqual(proc.communicate.call_count, 2)
+            self.assertEqual(proc.communicate.call_args_list[1].kwargs["timeout"], 2.0)
+
 
 class TestNormalizeWindowsArgv(unittest.TestCase):
     def test_wraps_cmd_and_bat_on_windows(self):

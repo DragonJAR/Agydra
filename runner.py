@@ -129,6 +129,7 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
 
     driver = engines.get_engine(plan.engine)
     store = store or Store()
+    keychain_needs_waited_child = driver.needs_keychain and keychain.supported()
 
     handle: Optional[locks.LockHandle] = None
     if plan.force:
@@ -206,14 +207,9 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
         with guard:
             if platforms.is_windows():
                 rc = platforms.launch_argv(argv, env)
-                # Discard terminal-query replies the agy TUI left unread in
-                # the input queue on exit (e.g. ``ESC[?1;2c``); the next
-                # shell prompt would echo them otherwise. The POSIX execvpe
-                # path cannot drain: agydra is replaced by agy and has no
-                # post-exec hook.
                 platforms.drain_tty_input()
                 return rc
-            if plan.use_sandbox or plan.launch_as_child:
+            if plan.use_sandbox or plan.launch_as_child or keychain_needs_waited_child:
                 rc = platforms.run_wait(argv, env)
                 platforms.drain_tty_input()
                 return rc
@@ -221,13 +217,5 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
                 handle.record_holder_pid()
             return platforms.launch_argv(argv, env)
     finally:
-        # Unconditional release is always safe here: a genuinely successful
-        # execvpe on the plain-exec branch replaces this process image and
-        # never returns control to this line at all. Every path that DOES
-        # reach here -- Windows, sandboxed/waited-child, or a plain exec
-        # that failed (launch_argv deliberately catches FileNotFoundError/
-        # OSError and returns 126/127 instead of raising) -- must release
-        # the lock in-process or it leaks for the rest of this process's
-        # life, holding a stale holder PID.
         if handle is not None:
             handle.release()

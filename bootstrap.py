@@ -23,6 +23,7 @@ Design invariants (see AGENTS.md):
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -103,11 +104,16 @@ def _dir_on_path(d: Path) -> bool:
     return str(d) in os.environ.get("PATH", "").split(os.pathsep)
 
 
+def _shim_entry_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
 def _shim_content(target: Path) -> str:
+    delegate = str(target.parent.parent).replace("\r", " ").replace("\n", " ")
     lines = [
         "#!/bin/sh",
-        f"# {SHIM_MARKER} — delegates to the venv at {target.parent.parent}",
-        f'exec "{target}" "$@"',
+        f"# {SHIM_MARKER} — delegates to the venv at {delegate}",
+        f"exec {shlex.quote(str(target))} \"$@\"",
     ]
     return "\n".join(lines) + "\n"
 
@@ -203,9 +209,10 @@ def install_editable(root: Path, vpy: Path, out: Callable[[str], None]) -> None:
         raise BootstrapError(f"pip succeeded but console script is missing: {script}")
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
+def _atomic_write_text(path: Path, content: str, mode: int) -> None:
     """Write ``content`` to ``path`` atomically: a unique temp file in the
-    same directory, flushed and fsync'd, then ``os.replace``d into place.
+    same directory, given ``mode``, flushed and fsync'd, then ``os.replace``d
+    into place.
 
     Mirrors store.py's mkstemp + fsync + os.replace discipline so the shim
     can never end up truncated by a crash or a permission loss mid-write —
@@ -219,6 +226,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
             fh.flush()
+            os.chmod(tmp_name, mode)
             os.fsync(fh.fileno())
         os.replace(tmp_name, path)
     except BaseException:
@@ -247,19 +255,30 @@ def ensure_path_shim(root: Path, out: Callable[[str], None], force: bool = False
     if not target.exists():
         raise BootstrapError(f"console script missing: {target}")
     shim = shim_path()
+    content = _shim_content(target)
     try:
         platforms.ensure_dir(shim.parent)
-        if shim.exists():
-            body = shim.read_text(encoding="utf-8", errors="replace")
-            if str(target) not in body:
+        if _shim_entry_exists(shim):
+            try:
+                body = shim.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                if not force:
+                    raise BootstrapError(
+                        f"refusing to overwrite foreign file at {shim}; "
+                        "inspect it and remove it manually, then re-run setup (or use --force)"
+                    ) from exc
+                body = ""
+            if body == content and os.access(shim, os.X_OK):
+                out(f"shim installed: {shim} -> {target}")
+                return shim
+            if body != content:
                 if SHIM_MARKER not in body and not force:
                     raise BootstrapError(
                         f"refusing to overwrite foreign file at {shim}; "
                         "inspect it and remove it manually, then re-run setup (or use --force)"
                     )
                 out(f"refreshing stale shim: {shim}")
-        _atomic_write_text(shim, _shim_content(target))
-        shim.chmod(shim.stat().st_mode | 0o755)
+        _atomic_write_text(shim, content, mode=0o755)
     except OSError as exc:
         raise BootstrapError(f"could not write shim at {shim}: {exc}") from exc
     out(f"shim installed: {shim} -> {target}")
@@ -276,7 +295,11 @@ def verify_install(root: Path, out: Callable[[str], None]) -> bool:
     for cand in candidates:
         if not cand.exists():
             continue
-        proc = _run([str(cand), "--version"])
+        try:
+            proc = _run([str(cand), "--version"])
+        except BootstrapError as exc:
+            out(f"candidate failed: {cand} ({exc})")
+            continue
         got = (proc.stdout or "").strip()
         if proc.returncode == 0 and got.startswith("agydra "):
             out(f"verified: {cand} -> {got}")
@@ -307,15 +330,19 @@ def check_state(root: Path) -> dict:
         state["on_path"] = _dir_on_path(script.parent)
         return state
     shim = shim_path()
-    if shim.exists():
-        body = shim.read_text(encoding="utf-8", errors="replace")
-        if str(script) in body:
-            state["shim_ok"] = True
-            state["shim_state"] = "ok"
-        elif SHIM_MARKER in body:
-            state["shim_state"] = "stale"
-        else:
+    if _shim_entry_exists(shim):
+        try:
+            body = shim.read_text(encoding="utf-8", errors="replace")
+        except OSError:
             state["shim_state"] = "foreign"
+        else:
+            if body == _shim_content(script) and os.access(shim, os.X_OK):
+                state["shim_ok"] = True
+                state["shim_state"] = "ok"
+            elif SHIM_MARKER in body:
+                state["shim_state"] = "stale"
+            else:
+                state["shim_state"] = "foreign"
     return state
 
 

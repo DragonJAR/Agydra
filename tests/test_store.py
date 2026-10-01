@@ -1,7 +1,10 @@
 """Store CRUD, validation, atomicity, backup and ref resolution."""
 import errno
 import json
+import os
+import subprocess
 import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -14,6 +17,15 @@ from conftest import BaseCase
 
 
 class TestStore(BaseCase):
+    def _run_child(self, source, *args):
+        return subprocess.run(
+            [sys.executable, "-c", source, *(str(arg) for arg in args)],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
     def test_create_and_get(self):
         store = Store()
         store.create("work", description="Work account")
@@ -21,6 +33,73 @@ class TestStore(BaseCase):
         self.assertEqual(profile.name, "work")
         self.assertEqual(profile.description, "Work account")
         self.assertTrue(store.profile_data_dir("work").is_dir())
+
+    def test_reads_on_missing_store_do_not_create_it(self):
+        reads = (
+            ("scan", lambda store: store.scan(), ([], [])),
+            ("list", lambda store: store.list(), []),
+            ("exists", lambda store: store.exists("ghost"), False),
+            ("default", lambda store: store.default_name(), None),
+        )
+        for name, read, expected in reads:
+            with self.subTest(read=name):
+                store = Store(root=self._tmp / f"empty-{name}")
+                self.assertEqual(read(store), expected)
+                self.assertFalse(store.root.exists())
+
+        store = Store(root=self._tmp / "empty-get")
+        with self.assertRaisesRegex(StoreError, "does not exist"):
+            store.get("ghost")
+        self.assertFalse(store.root.exists())
+
+    def test_missing_store_read_retries_under_lock_after_concurrent_create(self):
+        store = Store(root=self._tmp / "reader-create-race")
+        initial_check = threading.Event()
+        continue_read = threading.Event()
+        original_root_check = store._store_root_exists
+        original_scan = store._scan
+        scan_count = 0
+        reader_errors = []
+        reader_results = []
+
+        def observe_root_check():
+            exists = original_root_check()
+            if not exists and not initial_check.is_set():
+                initial_check.set()
+                if not continue_read.wait(5):
+                    raise RuntimeError("reader was not released after create")
+            return exists
+
+        def count_scan():
+            nonlocal scan_count
+            scan_count += 1
+            return original_scan()
+
+        def read_profiles():
+            try:
+                reader_results.append(store.list())
+            except BaseException as exc:
+                reader_errors.append(exc)
+
+        store._scan = count_scan
+        with unittest.mock.patch.object(
+            store, "_store_root_exists", side_effect=observe_root_check
+        ):
+            reader = threading.Thread(target=read_profiles, daemon=True)
+            reader.start()
+            self.assertTrue(initial_check.wait(5), "reader did not observe missing store")
+            store.create("created")
+            scan_count = 0
+            continue_read.set()
+            reader.join(5)
+
+        self.assertFalse(reader.is_alive(), "reader did not finish after create")
+        self.assertEqual(reader_errors, [])
+        self.assertEqual(
+            [[profile.name for profile in profiles] for profiles in reader_results],
+            [["created"]],
+        )
+        self.assertEqual(scan_count, 2)
 
     def test_first_profile_becomes_default(self):
         store = Store()
@@ -35,7 +114,7 @@ class TestStore(BaseCase):
 
     def test_invalid_names_rejected(self):
         store = Store()
-        for bad in ("../evil", "UPPER", "with space", "-lead", "", "a" * 65, ".dot"):
+        for bad in ("../evil", "UPPER", "with space", "-lead", "", "a" * 65, ".dot", "alpha\n"):
             with self.assertRaises(StoreError, msg=bad):
                 store.create(bad)
 
@@ -48,6 +127,83 @@ class TestStore(BaseCase):
         self.assertLess(seqs["zeta"], seqs["alpha"])
         self.assertLess(seqs["alpha"], seqs["mid"])
 
+    def test_delete_then_create_does_not_reuse_sequence(self):
+        store = Store()
+        first = store.create("first")
+        second = store.create("second")
+
+        store.delete("second", backup=False)
+        third = store.create("third")
+
+        self.assertEqual((first.seq, second.seq, third.seq), (1, 2, 3))
+        self.assertEqual([profile.seq for profile in store.list()], [1, 3])
+
+    def test_legacy_delete_seeds_sequence_before_removing_max_profile(self):
+        store = Store()
+        store.create("first")
+        last = store.create("last")
+        sequence_path = store.sequence_state_path
+        sequence_path.unlink()
+        original_delete = store._delete_locked
+
+        def inspect_sequence_before_delete(name, backup):
+            self.assertEqual(read_json_object(sequence_path), {"last_seq": 2})
+            return original_delete(name, backup)
+
+        with unittest.mock.patch.object(
+            store, "_delete_locked", side_effect=inspect_sequence_before_delete
+        ):
+            store.delete("last", backup=False)
+
+        replacement = store.create("replacement")
+        self.assertEqual(last.seq, 2)
+        self.assertEqual(replacement.seq, 3)
+        self.assertEqual(read_json_object(sequence_path), {"last_seq": 3})
+
+    def test_legacy_create_fails_closed_with_unreadable_profile_metadata(self):
+        store = Store()
+        store.create("readable")
+        store.sequence_state_path.unlink()
+        unreadable_dir = store.profile_dir("unreadable")
+        unreadable_dir.mkdir()
+        (unreadable_dir / "profile.json").write_text("{invalid", encoding="utf-8")
+
+        with self.assertRaisesRegex(StoreError, "cannot initialize profile sequence state"):
+            store.create("new")
+
+        self.assertFalse(store.sequence_state_path.exists())
+        self.assertFalse(store.profile_dir("new").exists())
+        self.assertTrue(store.profile_dir("readable").is_dir())
+
+    def test_legacy_delete_only_ignores_its_own_unreadable_metadata(self):
+        store = Store()
+        self.assertEqual(store.create("readable").seq, 1)
+        store.sequence_state_path.unlink()
+        unreadable_dir = store.profile_dir("unreadable")
+        (unreadable_dir / "data").mkdir(parents=True)
+        (unreadable_dir / "profile.json").write_text("{invalid", encoding="utf-8")
+
+        store.delete("unreadable", backup=False)
+
+        self.assertEqual(read_json_object(store.sequence_state_path), {"last_seq": 1})
+        self.assertEqual(store.create("next").seq, 2)
+
+    def test_legacy_delete_fails_closed_if_another_profile_is_unreadable(self):
+        store = Store()
+        store.create("readable")
+        store.sequence_state_path.unlink()
+        for name in ("first-broken", "second-broken"):
+            profile_dir = store.profile_dir(name)
+            profile_dir.mkdir()
+            (profile_dir / "profile.json").write_text("{invalid", encoding="utf-8")
+
+        with self.assertRaisesRegex(StoreError, "cannot initialize profile sequence state"):
+            store.delete("first-broken", backup=False)
+
+        self.assertFalse(store.sequence_state_path.exists())
+        self.assertTrue(store.profile_dir("first-broken").is_dir())
+        self.assertTrue(store.profile_dir("second-broken").is_dir())
+
     def test_rename_updates_default(self):
         store = Store()
         store.create("old")
@@ -55,6 +211,227 @@ class TestStore(BaseCase):
         self.assertEqual(store.default_name(), "new")
         self.assertTrue(store.exists("new"))
         self.assertFalse(store.exists("old"))
+
+    def test_recoverable_rename_keeps_callback_contract_and_replays_handler(self):
+        import locks
+
+        store = Store()
+        store.create("old")
+        callbacks = []
+        handler_observations = []
+        action_name = "tests.profile-slot-rename"
+
+        def recover_action(store_argument, old_name, new_name, data):
+            profile_handles = [
+                locks.try_lock(store_argument, name)
+                for name in (old_name, new_name)
+            ]
+            sequence_handle = locks.try_sequence_lock(store_argument)
+            handler_observations.append(
+                (old_name, new_name, data, [handle is None for handle in profile_handles], sequence_handle)
+            )
+            for handle in profile_handles:
+                if handle is not None:
+                    handle.release()
+            if sequence_handle is not None:
+                sequence_handle.release()
+
+        store.register_rename_recovery_handler(action_name, recover_action)
+
+        def fail_after_rename(profile):
+            sequence_handle = locks.try_sequence_lock(store)
+            profile_handles = [locks.try_lock(store, name) for name in ("old", "new")]
+            callbacks.append(
+                (
+                    profile.name,
+                    sequence_handle is not None,
+                    [handle is None for handle in profile_handles],
+                    read_json_object(store.rename_journal_path)["recovery_action"],
+                )
+            )
+            for handle in profile_handles:
+                if handle is not None:
+                    handle.release()
+            if sequence_handle is not None:
+                sequence_handle.release()
+            raise RuntimeError("simulated callback interruption")
+
+        with self.assertRaisesRegex(StoreError, "callback interruption"):
+            store.rename(
+                "old",
+                "new",
+                after_rename=fail_after_rename,
+                recovery_action=action_name,
+                recovery_data_provider=lambda: {"source_present": True},
+            )
+
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(
+            callbacks[0],
+            (
+                "new",
+                True,
+                [True, True],
+                {"name": action_name, "data": {"source_present": True}},
+            ),
+        )
+        self.assertTrue(store.rename_journal_path.is_file())
+
+        self.assertEqual([profile.name for profile in store.list()], ["new"])
+        self.assertFalse(store.rename_journal_path.exists())
+        self.assertEqual(len(handler_observations), 1)
+        old_name, new_name, data, profile_locks, sequence_handle = handler_observations[0]
+        self.assertEqual((old_name, new_name, data), ("old", "new", {"source_present": True}))
+        self.assertEqual(profile_locks, [True, True])
+        self.assertIsNone(sequence_handle)
+
+    def test_profile_mutations_refuse_held_session_locks(self):
+        import locks
+
+        store = Store()
+        store.create("locked")
+        handle = locks.try_lock(store, "locked")
+        try:
+            with self.assertRaisesRegex(StoreError, "live session"):
+                store.rename("locked", "renamed")
+            with self.assertRaisesRegex(StoreError, "live session"):
+                store.delete("locked")
+        finally:
+            handle.release()
+
+        self.assertTrue(store.profile_dir("locked").is_dir())
+        self.assertFalse(store.profile_dir("renamed").exists())
+
+    def test_create_and_rename_respect_destination_lock(self):
+        import locks
+
+        store = Store()
+        store.create("old")
+        destination_lock = locks.try_lock(store, "new")
+        try:
+            with self.assertRaisesRegex(StoreError, "live session"):
+                store.rename("old", "new")
+        finally:
+            destination_lock.release()
+        self.assertTrue(store.profile_dir("old").is_dir())
+        self.assertFalse(store.profile_dir("new").exists())
+
+        create_lock = locks.try_lock(store, "reserved")
+        try:
+            with self.assertRaisesRegex(StoreError, "live session"):
+                store.create("reserved")
+        finally:
+            create_lock.release()
+        self.assertFalse(store.profile_dir("reserved").exists())
+
+    def test_concurrent_creates_do_not_share_sequence_numbers(self):
+        import locks
+
+        store = Store()
+        first_in_list = threading.Event()
+        continue_first = threading.Event()
+        first_results = []
+        first_errors = []
+        original_scan = store._scan
+
+        def pause_first_create_scan():
+            profiles = original_scan()
+            if threading.current_thread().name == "first profile creator":
+                first_in_list.set()
+                if not continue_first.wait(5):
+                    raise RuntimeError("timed out waiting to resume first create")
+            return profiles
+
+        def create_first():
+            try:
+                first_results.append(store.create("first"))
+            except BaseException as exc:
+                first_errors.append(exc)
+
+        thread = threading.Thread(target=create_first, name="first profile creator")
+        with unittest.mock.patch.object(
+            store, "_scan", side_effect=pause_first_create_scan
+        ):
+            thread.start()
+            try:
+                self.assertTrue(first_in_list.wait(5))
+                with self.assertRaisesRegex(StoreError, "sequence allocation is busy"):
+                    store.create("second")
+                self.assertFalse(store.profile_dir("second").exists())
+            finally:
+                continue_first.set()
+                thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(first_errors, [])
+        self.assertEqual([profile.seq for profile in first_results], [1])
+        self.assertEqual([profile.seq for profile in store.list()], [1])
+        self.assertFalse(store.profile_dir("second").exists())
+        self.assertTrue(locks.sequence_lock_path(store).exists())
+        sequence_lock = locks.try_sequence_lock(store)
+        self.assertIsNotNone(sequence_lock)
+        sequence_lock.release()
+
+    def test_rename_and_create_interleaving_fails_cleanly_then_retries(self):
+        import locks
+
+        store = Store()
+        original = store.create("alpha")
+        rename_reached_metadata = threading.Event()
+        continue_rename = threading.Event()
+        rename_results = []
+        rename_errors = []
+        original_save = store.save
+
+        def pause_rename_metadata(profile):
+            if profile.name == "renamed":
+                rename_reached_metadata.set()
+                if not continue_rename.wait(5):
+                    raise RuntimeError("timed out waiting to resume rename")
+            return original_save(profile)
+
+        def rename_profile():
+            try:
+                rename_results.append(store.rename("alpha", "renamed"))
+            except BaseException as exc:
+                rename_errors.append(exc)
+
+        thread = threading.Thread(target=rename_profile, name="profile renamer")
+        with unittest.mock.patch.object(
+            store, "save", side_effect=pause_rename_metadata
+        ):
+            thread.start()
+            try:
+                self.assertTrue(rename_reached_metadata.wait(5))
+                with self.assertRaisesRegex(StoreError, "live session"):
+                    store.create("concurrent")
+                self.assertFalse(store.profile_dir("concurrent").exists())
+            finally:
+                continue_rename.set()
+                thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(rename_errors, [])
+        self.assertEqual(rename_results[0].seq, original.seq)
+        self.assertEqual(store.get("renamed").seq, 1)
+
+        retry = store.create("concurrent")
+        self.assertEqual(retry.seq, 2)
+        self.assertEqual([profile.seq for profile in store.list()], [1, 2])
+        self.assertEqual(read_json_object(store.sequence_state_path), {"last_seq": 2})
+
+    def test_profile_path_helpers_reject_path_traversal(self):
+        store = Store()
+        victim = store.root / "victim"
+        victim.mkdir(parents=True)
+        (victim / "important.txt").write_text("keep", encoding="utf-8")
+
+        with self.assertRaises(StoreError):
+            store.delete("../victim")
+        with self.assertRaises(StoreError):
+            store.rename("../victim", "renamed")
+
+        self.assertEqual((victim / "important.txt").read_text(encoding="utf-8"), "keep")
 
     def test_delete_makes_backup_and_reassigns_default(self):
         store = Store()
@@ -71,6 +448,112 @@ class TestStore(BaseCase):
         store.create("solo")
         backup = store.delete("solo", backup=False)
         self.assertIsNone(backup)
+
+    def test_delete_callback_runs_before_profile_lock_release(self):
+        import locks
+
+        store = Store()
+        store.create("callback-profile")
+        callback_lock_results = []
+        sequence_lock_states = []
+        profile_lock_states = []
+        original_delete = store._delete_locked
+        original_sequence_lock = locks.try_sequence_lock
+
+        def inspect_profile_lock_before_sequence(store_argument):
+            handle = locks.try_lock(store_argument, "callback-profile")
+            profile_lock_states.append(handle is None)
+            if handle is not None:
+                handle.release()
+            return original_sequence_lock(store_argument)
+
+        def inspect_sequence_lock(name, backup):
+            handle = locks.try_sequence_lock(store)
+            sequence_lock_states.append(handle is None)
+            if handle is not None:
+                handle.release()
+            return original_delete(name, backup)
+
+        def after_delete():
+            self.assertFalse(store.profile_dir("callback-profile").exists())
+            handle = locks.try_lock(store, "callback-profile")
+            callback_lock_results.append(handle is None)
+            if handle is not None:
+                handle.release()
+            sequence_handle = locks.try_sequence_lock(store)
+            self.assertIsNotNone(sequence_handle)
+            sequence_handle.release()
+
+        with unittest.mock.patch.object(
+            store, "_delete_locked", side_effect=inspect_sequence_lock
+        ), unittest.mock.patch.object(
+            locks, "try_sequence_lock", side_effect=inspect_profile_lock_before_sequence
+        ):
+            store.delete("callback-profile", backup=False, after_delete=after_delete)
+
+        self.assertTrue(profile_lock_states)
+        self.assertTrue(all(profile_lock_states))
+        self.assertEqual(sequence_lock_states, [True])
+        self.assertEqual(callback_lock_results, [True])
+        reacquired = locks.try_lock(store, "callback-profile")
+        self.assertIsNotNone(reacquired)
+        reacquired.release()
+
+    def test_corrupt_sequence_state_blocks_mutations_without_partial_changes(self):
+        store = Store()
+        store.create("first")
+        store.create("second")
+        store.sequence_state_path.write_text("{invalid", encoding="utf-8")
+
+        with self.assertRaisesRegex(StoreError, "sequence state"):
+            store.create("new")
+        with self.assertRaisesRegex(StoreError, "sequence state"):
+            store.rename("first", "renamed")
+        with self.assertRaisesRegex(StoreError, "sequence state"):
+            store.delete("second", backup=False)
+
+        self.assertTrue(store.profile_dir("first").is_dir())
+        self.assertTrue(store.profile_dir("second").is_dir())
+        self.assertFalse(store.profile_dir("new").exists())
+        self.assertFalse(store.profile_dir("renamed").exists())
+
+    def test_sequence_state_write_failure_prevents_partial_mutations(self):
+        store = Store()
+        store.create("existing")
+        store.sequence_state_path.unlink()
+
+        with unittest.mock.patch(
+            "store._atomic_write_json", side_effect=OSError("disk full")
+        ):
+            with self.assertRaisesRegex(StoreError, "cannot persist profile sequence"):
+                store.create("new")
+            with self.assertRaisesRegex(StoreError, "cannot persist profile sequence"):
+                store.delete("existing", backup=False)
+
+        self.assertFalse(store.profile_dir("new").exists())
+        self.assertTrue(store.profile_dir("existing").is_dir())
+
+    def test_failed_profile_metadata_write_preserves_sequence_gap(self):
+        store = Store()
+        self.assertEqual(store.create("first").seq, 1)
+        write_json = store_mod._atomic_write_json
+
+        def fail_profile_metadata(path, data):
+            if (
+                Path(path).name == "profile.json"
+                and store_mod.Store._create_stage_owner(Path(path).parent.name) == "failed"
+            ):
+                raise OSError("disk full")
+            return write_json(path, data)
+
+        with unittest.mock.patch(
+            "store._atomic_write_json", side_effect=fail_profile_metadata
+        ):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                store.create("failed")
+
+        self.assertFalse(store.profile_dir("failed").exists())
+        self.assertEqual(store.create("after").seq, 3)
 
     def test_backup_zip_includes_keychain_secret_when_present(self):
         """A keychain-only profile's only credential is its `.secret`
@@ -295,6 +778,28 @@ class TestStore(BaseCase):
         self.assertTrue(store.profile_meta_path("solo").exists())
         self.assertTrue(store.profile_data_dir("solo").is_dir())
 
+    def test_create_removes_partial_profile_when_metadata_write_fails(self):
+        fresh = self._tmp / "fresh-root"
+        store = Store(root=fresh)
+        write_json = store_mod._atomic_write_json
+
+        def fail_profile_metadata(path, data):
+            if (
+                Path(path).name == "profile.json"
+                and store_mod.Store._create_stage_owner(Path(path).parent.name) == "partial"
+            ):
+                raise OSError("disk full")
+            return write_json(path, data)
+
+        with unittest.mock.patch(
+            "store._atomic_write_json", side_effect=fail_profile_metadata
+        ):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                store.create("partial")
+
+        self.assertFalse(store.profile_dir("partial").exists())
+        self.assertNotIn("partial", store.names())
+
     def test_prune_backups_does_not_eat_other_profile_zips(self):
         """Bug guard: pruning ``work`` must leave ``work-2``'s backups alone.
 
@@ -376,6 +881,399 @@ class TestStore(BaseCase):
         self.assertTrue(
             any("could not mark" in w and "default profile" in w for w in warnings),
             f"Expected warning that profile could not be marked as default, got: {warnings}",
+        )
+
+    def test_create_succeeds_with_warning_when_default_persistence_fails(self):
+        store = Store()
+        warnings = []
+
+        with unittest.mock.patch.object(
+            store, "save_config", side_effect=OSError("disk full")
+        ), unittest.mock.patch("store.warn", side_effect=warnings.append):
+            profile = store.create("alpha")
+
+        self.assertEqual(profile.name, "alpha")
+        self.assertTrue(store.profile_dir("alpha").is_dir())
+        self.assertTrue(store.profile_meta_path("alpha").is_file())
+        self.assertEqual(
+            [path.name for path in store.profiles_dir.iterdir()], ["alpha"]
+        )
+        saved = store.get("alpha")
+        self.assertEqual((saved.name, saved.seq), (profile.name, profile.seq))
+        self.assertIsNone(store.default_name())
+        self.assertTrue(
+            any(
+                "could not mark 'alpha' as default profile" in warning
+                and "disk full" in warning
+                for warning in warnings
+            ),
+            f"Expected warning that default profile was not saved, got: {warnings}",
+        )
+
+    def test_create_crash_at_publication_leaves_complete_profile(self):
+        root = self._tmp / "create-publication"
+        store = Store(root=root)
+        store.create("base")
+        child = """import os, sys
+from pathlib import Path
+import store as store_module
+from store import Store
+root = Path(sys.argv[1])
+original = store_module.rename_dir_with_retry
+def crash_after_publish(source, destination, *args, **kwargs):
+    result = original(source, destination, *args, **kwargs)
+    if Path(destination).name == "published":
+        os._exit(61)
+    return result
+store_module.rename_dir_with_retry = crash_after_publish
+Store(root=root).create("published")
+"""
+
+        result = self._run_child(child, root)
+
+        self.assertEqual(result.returncode, 61, result.stderr)
+        reopened = Store(root=root)
+        profiles = reopened.list()
+        self.assertEqual([(item.name, item.seq) for item in profiles], [("base", 1), ("published", 2)])
+        self.assertEqual(reopened.get("published").name, "published")
+        self.assertEqual(reopened.default_name(), "base")
+        self.assertEqual(
+            sorted(path.name for path in reopened.profiles_dir.iterdir()),
+            ["base", "published"],
+        )
+
+    def test_create_crash_leaves_ignored_stage_that_next_create_cleans(self):
+        root = self._tmp / "create-stage-crash"
+        store = Store(root=root)
+        store.create("base")
+        child = """import os, sys
+from pathlib import Path
+import store as store_module
+from store import Store
+root = Path(sys.argv[1])
+store = Store(root=root)
+original = store_module._atomic_write_json
+def crash_after_stage_metadata(path, data):
+    result = original(path, data)
+    if Path(path).name == "profile.json" and Path(path).parent.name.startswith(".agydra-stage-crashed-"):
+        os._exit(62)
+    return result
+store_module._atomic_write_json = crash_after_stage_metadata
+store.create("crashed")
+"""
+
+        result = self._run_child(child, root)
+
+        self.assertEqual(result.returncode, 62, result.stderr)
+        reopened = Store(root=root)
+        self.assertEqual([item.name for item in reopened.list()], ["base"])
+        self.assertEqual(reopened.unreadable_profiles(), [])
+        stages = list(reopened.profiles_dir.glob(".agydra-stage-crashed-*"))
+        self.assertEqual(len(stages), 1)
+        created = reopened.create("crashed")
+        self.assertEqual(created.seq, 3)
+        self.assertFalse(stages[0].exists())
+        self.assertEqual(reopened.get("crashed").seq, 3)
+        self.assertEqual(reopened.default_name(), "base")
+
+    def test_create_stage_cleanup_does_not_match_profile_name_prefix(self):
+        store = Store()
+        platforms_dir = store.profiles_dir
+        platforms_dir.mkdir(parents=True)
+        unrelated_stage = platforms_dir / ".agydra-stage-foo-bar-123abcde"
+        (unrelated_stage / "data").mkdir(parents=True)
+        (unrelated_stage / "profile.json").write_text("incomplete", encoding="utf-8")
+
+        profile = store.create("foo")
+
+        self.assertEqual((profile.name, profile.seq), ("foo", 1))
+        self.assertTrue(unrelated_stage.is_dir())
+        self.assertEqual(
+            (unrelated_stage / "profile.json").read_text(encoding="utf-8"),
+            "incomplete",
+        )
+
+        following = store.create("foo-bar")
+
+        self.assertEqual((following.name, following.seq), ("foo-bar", 2))
+        self.assertFalse(unrelated_stage.exists())
+
+    def test_create_stage_owner_accepts_uppercase_tempfile_token(self):
+        self.assertEqual(
+            Store._create_stage_owner(".agydra-stage-foo-BarZ_123"),
+            "foo",
+        )
+
+    def test_create_stage_owner_rejects_malformed_token(self):
+        for stage_name in (
+            ".agydra-stage-foo-",
+            ".agydra-stage-foo-Bar!",
+            ".agydra-stage-foo-bar.token",
+            ".agydra-stage-foo-ÅBC",
+        ):
+            with self.subTest(stage_name=stage_name):
+                self.assertIsNone(Store._create_stage_owner(stage_name))
+
+    def test_create_does_not_clean_a_live_writer_stage(self):
+        root = self._tmp / "create-live-stage"
+        store = Store(root=root)
+        store.create("base")
+        child = """import sys
+from pathlib import Path
+import store as store_module
+from store import Store
+root = Path(sys.argv[1])
+store = Store(root=root)
+original = store_module._atomic_write_json
+def pause_after_stage_metadata(path, data):
+    result = original(path, data)
+    if Path(path).name == "profile.json" and Path(path).parent.name.startswith(".agydra-stage-live-"):
+        print(str(Path(path).parent), flush=True)
+        sys.stdin.readline()
+    return result
+store_module._atomic_write_json = pause_after_stage_metadata
+store.create("live")
+"""
+        process = subprocess.Popen(
+            [sys.executable, "-c", child, str(root)],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        ready = threading.Event()
+        output = []
+
+        def read_stage_path():
+            output.append(process.stdout.readline())
+            ready.set()
+
+        reader = threading.Thread(target=read_stage_path, daemon=True)
+        reader.start()
+        try:
+            self.assertTrue(ready.wait(5), "writer did not reach staged metadata")
+            stage_path = Path(output[0].strip())
+            self.assertTrue(stage_path.is_dir())
+            self.assertFalse(store.profile_dir("live").exists())
+            with self.assertRaisesRegex(StoreError, "live session"):
+                store.create("live")
+            self.assertTrue(stage_path.is_dir())
+        finally:
+            if process.poll() is None:
+                process.stdin.write("continue\n")
+                process.stdin.flush()
+            try:
+                returncode = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                returncode = process.wait(timeout=5)
+        self.assertEqual(returncode, 0, output)
+        self.assertTrue(store.profile_meta_path("live").is_file())
+        self.assertEqual(store.get("live").seq, 2)
+
+    def test_rename_crash_boundaries_recover_complete_profiles(self):
+        child = """import os, sys
+from pathlib import Path
+import store as store_module
+from store import Store
+root = Path(sys.argv[1])
+point = sys.argv[2]
+store = Store(root=root)
+if point == "intent":
+    original = store_module._atomic_write_json
+    def crash_after_intent(path, data):
+        result = original(path, data)
+        if Path(path) == store.rename_journal_path:
+            os._exit(63)
+        return result
+    store_module._atomic_write_json = crash_after_intent
+elif point == "move":
+    original = store_module.rename_dir_with_retry
+    def crash_after_move(source, destination, *args, **kwargs):
+        result = original(source, destination, *args, **kwargs)
+        if Path(destination).name == "new":
+            os._exit(64)
+        return result
+    store_module.rename_dir_with_retry = crash_after_move
+elif point == "metadata":
+    original = Store.save
+    def crash_after_metadata(self, profile):
+        result = original(self, profile)
+        os._exit(65)
+    Store.save = crash_after_metadata
+elif point == "config":
+    original = Store.save_config
+    def crash_after_config(self, config):
+        result = original(self, config)
+        os._exit(66)
+    Store.save_config = crash_after_config
+store.rename("old", "new")
+"""
+        crash_points = (("intent", 63, "old"), ("move", 64, "new"), ("metadata", 65, "new"), ("config", 66, "new"))
+
+        for point, exit_code, expected_name in crash_points:
+            with self.subTest(point=point):
+                root = self._tmp / ("rename-crash-" + point)
+                original = Store(root=root)
+                profile = original.create("old")
+                result = self._run_child(child, root, point)
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+
+                reopened = Store(root=root)
+                profiles = reopened.list()
+                self.assertEqual([(item.name, item.seq) for item in profiles], [(expected_name, profile.seq)])
+                self.assertEqual(reopened.unreadable_profiles(), [])
+                self.assertEqual(reopened.get(expected_name).name, expected_name)
+                self.assertEqual(reopened.default_name(), expected_name)
+                self.assertEqual(read_json_object(reopened.sequence_state_path), {"last_seq": 1})
+                self.assertFalse(reopened.rename_journal_path.exists())
+                self.assertEqual(
+                    [path.name for path in reopened.profiles_dir.iterdir()],
+                    [expected_name],
+                )
+
+    def test_rename_overlay_cleanup_failure_keeps_journal_for_recovery(self):
+        store = Store()
+        original = store.create("old")
+        overlay = store.overlays_dir / "old"
+        overlay.mkdir(parents=True)
+        (overlay / "marker").write_text("overlay", encoding="utf-8")
+
+        with unittest.mock.patch(
+            "store.shutil.rmtree", side_effect=PermissionError("overlay busy")
+        ):
+            with self.assertRaisesRegex(StoreError, "overlay"):
+                store.rename("old", "new")
+
+            self.assertTrue(store.rename_journal_path.is_file())
+            self.assertFalse(store.profile_dir("old").exists())
+            self.assertTrue(store.profile_dir("new").is_dir())
+            renamed = store._get_unlocked("new")
+            self.assertEqual((renamed.name, renamed.seq), ("new", original.seq))
+            self.assertEqual(read_json_object(store.config_path)["default_profile"], "new")
+            profiles, unreadable = store._scan()
+            self.assertEqual([(profile.name, profile.seq) for profile in profiles], [("new", 1)])
+            self.assertEqual(unreadable, [])
+            self.assertTrue((overlay / "marker").is_file())
+
+            with self.assertRaisesRegex(StoreError, "overlay"):
+                store.list()
+            self.assertTrue(store.rename_journal_path.is_file())
+            self.assertTrue(store.profile_dir("new").is_dir())
+
+        profiles = store.list()
+        self.assertEqual([(profile.name, profile.seq) for profile in profiles], [("new", 1)])
+        self.assertEqual(store.default_name(), "new")
+        self.assertEqual(store.unreadable_profiles(), [])
+        self.assertFalse(store.rename_journal_path.exists())
+        self.assertFalse(overlay.exists())
+
+    def test_recovery_does_not_remove_a_live_rename_journal(self):
+        root = self._tmp / "rename-live-journal"
+        store = Store(root=root)
+        store.create("old")
+        child = """import sys
+from pathlib import Path
+from store import Store
+root = Path(sys.argv[1])
+original = Store.save
+def pause_after_metadata(self, profile):
+    result = original(self, profile)
+    print("metadata saved", flush=True)
+    sys.stdin.readline()
+    return result
+Store.save = pause_after_metadata
+Store(root=root).rename("old", "new")
+"""
+        process = subprocess.Popen(
+            [sys.executable, "-c", child, str(root)],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        ready = threading.Event()
+        output = []
+
+        def read_metadata_signal():
+            output.append(process.stdout.readline())
+            ready.set()
+
+        reader = threading.Thread(target=read_metadata_signal, daemon=True)
+        reader.start()
+        try:
+            self.assertTrue(ready.wait(5), "renamer did not reach metadata boundary")
+            self.assertTrue(store.rename_journal_path.is_file())
+            with self.assertRaisesRegex(StoreError, "live session"):
+                store.list()
+            self.assertTrue(store.rename_journal_path.is_file())
+            self.assertTrue(store.profile_meta_path("new").is_file())
+        finally:
+            if process.poll() is None:
+                process.stdin.write("continue\n")
+                process.stdin.flush()
+            try:
+                returncode = process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                returncode = process.wait(timeout=5)
+        self.assertEqual(returncode, 0, output)
+        profiles = store.list()
+        self.assertEqual([(item.name, item.seq) for item in profiles], [("new", 1)])
+        self.assertEqual(store.default_name(), "new")
+        self.assertFalse(store.rename_journal_path.exists())
+
+    def test_malformed_rename_journal_fails_closed(self):
+        store = Store()
+        store.create("old")
+        store.rename_journal_path.write_text("{invalid", encoding="utf-8")
+
+        with self.assertRaisesRegex(StoreError, "rename journal"):
+            store.list()
+
+        self.assertTrue(store.profile_dir("old").is_dir())
+        self.assertFalse(store.profile_dir("new").exists())
+        self.assertTrue(store.rename_journal_path.is_file())
+
+    def test_read_recovers_rename_journal_created_after_preflight(self):
+        import locks
+
+        store = Store()
+        store.create("old")
+        original_sequence_lock = locks.try_sequence_lock
+        injected = False
+
+        def crash_like_rename_before_sequence_acquire(store_argument):
+            nonlocal injected
+            if not injected:
+                injected = True
+                store_mod._atomic_write_json(
+                    store.rename_journal_path,
+                    {
+                        "version": 1,
+                        "old": "old",
+                        "new": "new",
+                        "default_was_old": True,
+                    },
+                )
+                store_mod.rename_dir_with_retry(
+                    store.profile_dir("old"), store.profile_dir("new")
+                )
+            return original_sequence_lock(store_argument)
+
+        with unittest.mock.patch.object(
+            locks, "try_sequence_lock", side_effect=crash_like_rename_before_sequence_acquire
+        ):
+            profile = store.get("new")
+
+        self.assertTrue(injected)
+        self.assertEqual((profile.name, profile.seq), ("new", 1))
+        self.assertEqual(store.default_name(), "new")
+        self.assertFalse(store.rename_journal_path.exists())
+        self.assertEqual(
+            [path.name for path in store.profiles_dir.iterdir()], ["new"]
         )
 
     def test_config_rejects_non_object_settings(self):
@@ -475,6 +1373,33 @@ class TestStore(BaseCase):
             with self.assertRaises(OSError) as ctx:
                 store.rename("alpha", "beta")
             self.assertEqual(ctx.exception.errno, errno.EACCES)
+
+    def test_rename_rolls_back_directory_when_metadata_write_fails(self):
+        store = Store()
+        store.create("alpha")
+
+        with unittest.mock.patch.object(store, "save", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                store.rename("alpha", "beta")
+
+        self.assertTrue(store.profile_dir("alpha").is_dir())
+        self.assertEqual(store.get("alpha").name, "alpha")
+        self.assertFalse(store.profile_dir("beta").exists())
+
+    def test_rename_rolls_back_metadata_when_default_write_fails(self):
+        store = Store()
+        store.create("alpha")
+
+        with unittest.mock.patch.object(
+            store, "save_config", side_effect=OSError("disk full")
+        ):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                store.rename("alpha", "beta")
+
+        self.assertTrue(store.profile_dir("alpha").is_dir())
+        self.assertEqual(store.get("alpha").name, "alpha")
+        self.assertFalse(store.profile_dir("beta").exists())
+        self.assertEqual(store.default_name(), "alpha")
 
     def test_backup_owner_requires_zip_extension(self):
         """backup_owner must require .zip extension and profile prefix."""

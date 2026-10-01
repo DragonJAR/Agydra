@@ -73,3 +73,6 @@ py-modules = [
 # static reader resolves py-modules from the project root, so a bare
 # ``attr = "VERSION"`` here would look in a module that does not exist.
 version = { attr = "agydra.VERSION" }
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"

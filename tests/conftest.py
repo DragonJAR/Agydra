@@ -37,6 +37,7 @@ def write_fake_agy(path: Path) -> Path:
     """
     if sys.platform.startswith("win"):
         script = path.with_suffix(".cmd")
+        script.parent.mkdir(parents=True, exist_ok=True)
         script.write_text(
             "@echo off\r\n"
             "if \"%1\"==\"--version\" ( echo fake-agy 1.0 & exit /b 0 )\r\n"
@@ -45,7 +46,6 @@ def write_fake_agy(path: Path) -> Path:
             "echo wrote>%USERPROFILE%\\.gemini\\fake-agy-wrote\r\n",
             encoding="utf-8",
         )
-        path.parent.mkdir(parents=True, exist_ok=True)
         path.with_name("agy.cmd").write_bytes(script.read_bytes())
         return script
 
@@ -132,7 +132,15 @@ class BaseCase(unittest.TestCase):
         self.fake_home = self._tmp / "home"
         self.store_root = self._tmp / "store"
         self.bin_dir = self._tmp / "bin"
-        for d in (self.fake_home, self.store_root, self.bin_dir):
+        self.local_app_data = self._tmp / "localappdata"
+        self.xdg_data_home = self._tmp / "xdg-data"
+        for d in (
+            self.fake_home,
+            self.store_root,
+            self.bin_dir,
+            self.local_app_data,
+            self.xdg_data_home,
+        ):
             d.mkdir(parents=True)
 
         self._old_env = dict(os.environ)
@@ -140,7 +148,8 @@ class BaseCase(unittest.TestCase):
         os.environ["HOME"] = str(self.fake_home)
         os.environ["AGYDRA_REAL_HOME"] = str(self.fake_home)
         os.environ.pop("AGYDRA_PROFILE", None)
-        os.environ.pop("XDG_DATA_HOME", None)
+        os.environ["XDG_DATA_HOME"] = str(self.xdg_data_home)
+        os.environ["LOCALAPPDATA"] = str(self.local_app_data)
         if sys.platform.startswith("win"):
             os.environ["USERPROFILE"] = str(self.fake_home)
 
@@ -183,16 +192,36 @@ def isolated_store_env():
 
     Shared by tests that build a bare Store against a throwaway root; keeps
     the save/restore dance in exactly one place (DRY)."""
-    import tempfile
-
-    old = os.environ.get("AGYDRA_HOME")
+    env_keys = (
+        "AGYDRA_HOME",
+        "AGYDRA_REAL_HOME",
+        "HOME",
+        "LOCALAPPDATA",
+        "XDG_DATA_HOME",
+    )
+    if sys.platform.startswith("win"):
+        env_keys += ("USERPROFILE",)
+    old = {key: os.environ.get(key) for key in env_keys}
     td = tempfile.TemporaryDirectory()
+    root = Path(td.name)
+    home = root / "home"
+    local_app_data = root / "localappdata"
+    xdg_data_home = root / "xdg-data"
+    for directory in (home, local_app_data, xdg_data_home):
+        directory.mkdir()
     try:
         os.environ["AGYDRA_HOME"] = td.name
+        os.environ["AGYDRA_REAL_HOME"] = str(home)
+        os.environ["HOME"] = str(home)
+        os.environ["LOCALAPPDATA"] = str(local_app_data)
+        os.environ["XDG_DATA_HOME"] = str(xdg_data_home)
+        if sys.platform.startswith("win"):
+            os.environ["USERPROFILE"] = str(home)
         yield td.name
     finally:
-        if old is None:
-            os.environ.pop("AGYDRA_HOME", None)
-        else:
-            os.environ["AGYDRA_HOME"] = old
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         td.cleanup()

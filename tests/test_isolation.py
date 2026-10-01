@@ -223,6 +223,55 @@ class TestMigrateRealDir(BaseCase):
         # points where Path.is_symlink() is False. _is_link(entry) checks
         # stat.FILE_ATTRIBUTE_REPARSE_POINT so junctions are caught identically.
 
+    def test_migrate_refuses_nested_symlink_inside_real_dir(self):
+        real_dir = self.fake_home / "real-dir"
+        nested = real_dir / "nested"
+        nested.mkdir(parents=True)
+        outside = self.fake_home / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("outside", encoding="utf-8")
+        (nested / "escape").symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaises(isolation.IsolationError):
+            isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
+
+        self.assertTrue((nested / "escape").is_symlink())
+        self.assertFalse((self.data_dir / "nested").exists())
+
+    def test_migrate_refuses_nested_destination_symlink(self):
+        real_dir = self.fake_home / "real-dir"
+        (real_dir / "clash" / "escape").mkdir(parents=True)
+        (real_dir / "clash" / "escape" / "marker.txt").write_text(
+            "overlay", encoding="utf-8"
+        )
+        outside = self.fake_home / "outside"
+        outside.mkdir()
+        target_dir = self.data_dir / "clash"
+        target_dir.mkdir()
+        (target_dir / "escape").symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaises(isolation.IsolationError):
+            isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
+
+        self.assertFalse((outside / "marker.txt").exists())
+        self.assertTrue((real_dir / "clash" / "escape" / "marker.txt").exists())
+        self.assertTrue((target_dir / "escape").is_symlink())
+
+    def test_migrate_refuses_symlink_as_profile_data_dir(self):
+        real_dir = self.fake_home / "real-dir"
+        real_dir.mkdir()
+        (real_dir / "marker.txt").write_text("overlay", encoding="utf-8")
+        outside = self.fake_home / "outside"
+        outside.mkdir()
+        target = self.fake_home / "profile-data-link"
+        target.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaises(isolation.IsolationError):
+            isolation.migrate_real_dir_to_store(real_dir, target)
+
+        self.assertFalse((outside / "marker.txt").exists())
+        self.assertTrue((real_dir / "marker.txt").exists())
+
     def test_migrate_refuses_directory_vs_file_collision(self):
         """A directory in ``real_dir`` colliding with an existing FILE in
         ``data_dir`` must raise IsolationError (type mismatch) rather than
@@ -240,6 +289,145 @@ class TestMigrateRealDir(BaseCase):
         self.assertIn("type mismatch", str(cm.exception))
         self.assertTrue(target_file.is_file(), "target file must remain intact")
         self.assertEqual(target_file.read_text(encoding="utf-8"), "existing file")
+
+    def test_migrate_refuses_file_to_file_collision_without_partial_move(self):
+        real_dir = self.fake_home / "real-dir"
+        real_dir.mkdir()
+        safe_source = real_dir / "independent.txt"
+        safe_source.write_text("independent source", encoding="utf-8")
+        collision_source = real_dir / "auth.json"
+        collision_source.write_text("overlay credentials", encoding="utf-8")
+
+        collision_target = self.data_dir / "auth.json"
+        collision_target.write_text("profile credentials", encoding="utf-8")
+
+        with self.assertRaises(isolation.IsolationError) as cm:
+            isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
+
+        self.assertIn("file-to-file collision", str(cm.exception))
+        self.assertEqual(collision_source.read_text(encoding="utf-8"), "overlay credentials")
+        self.assertEqual(collision_target.read_text(encoding="utf-8"), "profile credentials")
+        self.assertEqual(safe_source.read_text(encoding="utf-8"), "independent source")
+        self.assertFalse((self.data_dir / safe_source.name).exists())
+
+    def test_migrate_refuses_nested_file_collision_without_partial_move(self):
+        real_dir = self.fake_home / "real-dir"
+        safe_source = real_dir / "a-independent.txt"
+        safe_source.parent.mkdir(parents=True)
+        safe_source.write_text("independent source", encoding="utf-8")
+        collision_source = real_dir / "settings" / "auth.json"
+        collision_source.parent.mkdir()
+        collision_source.write_text("overlay credentials", encoding="utf-8")
+
+        collision_target = self.data_dir / "settings" / "auth.json"
+        collision_target.parent.mkdir()
+        collision_target.write_text("profile credentials", encoding="utf-8")
+
+        with self.assertRaises(isolation.IsolationError) as cm:
+            isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
+
+        self.assertIn("file-to-file collision", str(cm.exception))
+        self.assertEqual(collision_source.read_text(encoding="utf-8"), "overlay credentials")
+        self.assertEqual(collision_target.read_text(encoding="utf-8"), "profile credentials")
+        self.assertEqual(safe_source.read_text(encoding="utf-8"), "independent source")
+        self.assertFalse((self.data_dir / safe_source.name).exists())
+        self.assertTrue(real_dir.exists())
+
+    def test_migrate_merges_matching_directories_without_file_conflicts(self):
+        real_dir = self.fake_home / "real-dir"
+        source_dir = real_dir / "settings"
+        source_dir.mkdir(parents=True)
+        (source_dir / "overlay.toml").write_text("overlay", encoding="utf-8")
+
+        target_dir = self.data_dir / "settings"
+        target_dir.mkdir()
+        (target_dir / "profile.toml").write_text("profile", encoding="utf-8")
+
+        isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
+
+        self.assertEqual((target_dir / "overlay.toml").read_text(encoding="utf-8"), "overlay")
+        self.assertEqual((target_dir / "profile.toml").read_text(encoding="utf-8"), "profile")
+        self.assertFalse(real_dir.exists())
+
+    def test_migrate_copy_failure_is_retry_safe(self):
+        real_dir = self.fake_home / "real-dir"
+        real_dir.mkdir()
+        standalone = real_dir / "a-standalone.txt"
+        standalone.write_text("standalone payload", encoding="utf-8")
+        source_dir = real_dir / "settings"
+        source_dir.mkdir()
+        first_source = source_dir / "a-first.txt"
+        first_source.write_text("first payload", encoding="utf-8")
+        failing_source = source_dir / "b-second.txt"
+        failing_source.write_text("second payload", encoding="utf-8")
+        identical_source = source_dir / "c-identical.txt"
+        identical_source.write_text("identical payload", encoding="utf-8")
+        payloads = {
+            standalone: "standalone payload",
+            first_source: "first payload",
+            failing_source: "second payload",
+            identical_source: "identical payload",
+        }
+
+        target_dir = self.data_dir / "settings"
+        target_dir.mkdir()
+        profile_file = target_dir / "profile.txt"
+        profile_file.write_text("profile payload", encoding="utf-8")
+        profile_mtime = profile_file.stat().st_mtime_ns
+
+        original_iterdir = Path.iterdir
+        original_copytree = isolation.shutil.copytree
+        copied_sources = []
+
+        def ordered_iterdir(path):
+            if path == real_dir:
+                return iter((standalone, source_dir))
+            return original_iterdir(path)
+
+        def fail_after_first_copy(source, destination, *args, **kwargs):
+            original_copy = kwargs.get("copy_function", isolation.shutil.copy2)
+
+            def copy_with_failure(source_path, destination_path):
+                if copied_sources:
+                    raise OSError("injected copy failure")
+                copied_sources.append(Path(source_path))
+                return original_copy(source_path, destination_path)
+
+            kwargs["copy_function"] = copy_with_failure
+            return original_copytree(source, destination, *args, **kwargs)
+
+        with mock.patch.object(Path, "iterdir", ordered_iterdir):
+            with mock.patch.object(
+                isolation.shutil, "copytree", side_effect=fail_after_first_copy
+            ):
+                with self.assertRaises(isolation.IsolationError):
+                    isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
+
+        self.assertEqual(len(copied_sources), 1)
+        partial_source = copied_sources[0]
+        partial_target = target_dir / partial_source.name
+        partial_mtime = partial_target.stat().st_mtime_ns
+        standalone_target = self.data_dir / standalone.name
+        self.assertEqual(
+            partial_target.read_text(encoding="utf-8"), payloads[partial_source]
+        )
+        self.assertEqual(
+            standalone_target.read_text(encoding="utf-8"), "standalone payload"
+        )
+        self.assertTrue(real_dir.exists())
+        for source, expected in payloads.items():
+            self.assertEqual(source.read_text(encoding="utf-8"), expected)
+        self.assertEqual(profile_file.read_text(encoding="utf-8"), "profile payload")
+
+        isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
+
+        self.assertFalse(real_dir.exists())
+        for source, expected in payloads.items():
+            target = self.data_dir / source.relative_to(real_dir)
+            self.assertEqual(target.read_text(encoding="utf-8"), expected)
+        self.assertEqual(partial_target.stat().st_mtime_ns, partial_mtime)
+        self.assertEqual(profile_file.read_text(encoding="utf-8"), "profile payload")
+        self.assertEqual(profile_file.stat().st_mtime_ns, profile_mtime)
 
     def test_migrate_prevalidation_prevents_partial_move(self):
         """Pre-validation ensures that if any entry violates an invariant,

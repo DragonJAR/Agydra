@@ -127,7 +127,7 @@ Las columnas se comprimen en una terminal estrecha. `agydra usage vacan` muestra
 
 **Simulación.** `agydra -np trabajo` imprime rutas, entorno y argv, y no lanza nada.
 
-**Idioma.** `agydra lang es` guarda `en` o `es` en `agydra.json`. `AGYDRA_LANG=es` vale para un solo proceso. `agydra lang` muestra el idioma activo y de dónde sale.
+**Idioma.** `agydra lang es` guarda `en` o `es` en `agydra.json`. `AGYDRA_LANG=es` vale para un solo proceso. `agydra lang` muestra el idioma activo y los códigos disponibles.
 
 ### Qué aísla cada motor
 
@@ -148,15 +148,15 @@ Los comandos de gestión también aceptan `--NOMBRE` o `-NOMBRE` (`agydra --list
 | `list` | `ls`, `l` | Índice, correo, default, auth, ocupado, motor, último uso. |
 | `create NOMBRE [-d DESC] [-e MOTOR]` | `c` | Almacén nuevo. `-e` es `agy` (por defecto), `codex` o `grok`. |
 | `login [NOMBRE\|#] [-f] [-n]` | `in` | Login aislado del motor de ese perfil. `-f` vuelve a autenticar. |
-| `import NOMBRE\|# [-s DIR]` | `imp` | **Copia** `~/.gemini`, `~/.codex` o `~/.grok` al perfil. |
+| `import NOMBRE\|# [-s DIR]` | `imp` | **Copia** `~/.gemini`, `~/.codex` o `~/.grok` al perfil mientras mantiene el lock de ese perfil. |
 | `rename A B` | `mv` | Renombra el perfil y actualiza el default. Rechaza un perfil ocupado. |
 | `delete NOMBRE\|# [-f] [--no-backup]` | `rm` | Escribe un ZIP en `backups/` y luego borra. Rechaza un perfil ocupado. |
 | `default [NOMBRE\|#]` | `d` | Muestra o fija el perfil de respaldo. |
 | `use [NOMBRE\|#]` | `u` | Fija el directorio actual con un marcador `.agydra`. |
 | `status [-n]` | `st` | Perfil resuelto, motor, binario, correo, auth y lock. |
 | `usage [NOMBRE\|#]` | `us` | Cuotas en vivo de `agy`, `codex` y `grok`. |
-| `share-config ORIGEN DESTINO...` | `share` | Copia archivos de configuración. Las credenciales se quedan en el origen. |
-| `doctor [--fix] [-f]` | `doc` | Diez chequeos. `--fix` repara enlaces, locks y slots viejos. |
+| `share-config ORIGEN DESTINO...` | `share` | Copia archivos de configuración mientras mantiene los locks de los perfiles de origen y destino hasta terminar todas las copias. Las credenciales se quedan en el origen. |
+| `doctor [--fix] [-f]` | `doc` | Diez chequeos. `--fix` repara los enlaces de datos del overlay y los defaults colgantes, y purga solo artefactos huérfanos. |
 | `setup [-n]` | `install` | Venv, script de consola y shim en el PATH, de forma idempotente. |
 | `lang [CÓDIGO]` | `language`, `idioma`, `locale` | Idioma de la interfaz: `en` o `es`. |
 | `version` | `-v`, `--version` | Agydra, Python y el sistema. |
@@ -216,7 +216,13 @@ Home del host (~/)                     en su sitio: ~/.gemini  ~/.codex  ~/.grok
 
 `AgyEngine`, `CodexEngine` y `GrokEngine` se encargan de encontrar el binario, los argumentos, las rutas y la identidad. Codex siempre corre con `--no-daemon`. El socket leader de Grok es por perfil, así que una sesión `grok` del host y una de perfil no lo comparten. El puente de llavero de macOS aplica solo a `agy`.
 
-Los locks viven en `<store>/locks/<perfil>.lock` y mueren con el proceso.
+Los locks de sesión usan `<store>/locks/<perfil>.lock`; el archivo marcador persiste, mientras el lock advisory del sistema operativo se libera cuando termina el proceso que lo posee. `create`, `rename` y `delete` adquieren los locks de los perfiles afectados en orden ascendente por nombre y luego el lock persistente, compartido y no heredado `<store>/locks/.profile-sequence.lock`; los locks de perfil y de secuencia se adquieren sin espera, y los locks de perfil se liberan en orden inverso. El archivo persistente `<store>/profile-sequence.json` guarda `{"last_seq": N}`. Si falta, el contador se inicializa con la secuencia más alta de los perfiles con metadatos legibles mientras se mantiene el lock de secuencia. `create` guarda el número siguiente antes de preparar el perfil; una interrupción o un fallo posterior puede dejar un salto inocuo, y no se reutilizan secuencias de perfiles eliminados.
+
+`create` prepara `data/` y `profile.json` en un directorio temporal hermano, del mismo sistema de archivos, dentro de `<store>/profiles/`, con el nombre `.agydra-stage-<nombre>-<token>`, y publica el perfil completo con un único cambio de nombre de directorio. Los listados ignoran una etapa que quedó tras una interrupción; un `create` posterior para ese mismo nombre la elimina mientras mantiene ambos locks. El número de secuencia reservado sigue consumido.
+
+Antes de mover el directorio de un perfil, `rename` escribe atómicamente su intención en `<store>/profile-rename.json`, que incluye una acción de recuperación para migrar el slot de Keychain y la instantánea `source_present`. Una lectura pública o mutación posterior de perfiles recupera ese journal mientras mantiene, en orden ascendente por nombre, los locks de los perfiles anterior y nuevo, seguidos por el lock de secuencia. Si solo existe el directorio anterior, la recuperación restaura el default anterior cuando hace falta y elimina el journal; si solo existe el nuevo, completa el cambio: corrige los metadatos y el default cuando hace falta, elimina el overlay anterior y luego ejecuta la acción de Keychain registrada antes de borrar el journal. La recuperación forward ejecuta esa acción mientras mantiene los locks de perfil ordenados, el lock de secuencia y `swap.lock`; si falla, conserva el journal para reintentar en la siguiente operación del almacén. En el camino normal de rename, el callback se ejecuta con los locks de perfil mantenidos, después de liberar el lock de secuencia. Si existen ambos directorios o ninguno, el journal o los metadatos están dañados, o algún lock requerido está ocupado, la recuperación falla de forma segura y conserva el journal y los datos de perfil.
+
+Cuando está activado (por defecto; `--no-backup` lo desactiva), `delete` crea y verifica el ZIP de respaldo antes de borrar los datos del perfil. La CLI conserva el lock de perfil durante la purga de llavero posterior al borrado, después de liberar el lock de secuencia; en macOS, la purga usa `swap.lock` para serializar la limpieza del slot guardado y de la entrada del Llavero del sistema con los cambios de credenciales. Si falla la purga, se informa una advertencia después del borrado. `import` mantiene el lock del perfil de destino durante la copia y `share-config` mantiene los locks de los perfiles de origen y destino hasta terminar todas las copias. `doctor --fix` mantiene el lock del perfil mientras migra y vuelve a enlazar los datos del overlay.
 
 | Plataforma | Mecanismo |
 |---|---|
@@ -228,7 +234,7 @@ Los locks viven en `<store>/locks/<perfil>.lock` y mueren con el proceso.
 
 ## 🩺 Diagnóstico
 
-`agydra doctor` hace diez chequeos: binarios que de verdad se usan, almacén, perfiles, locks, aislamiento, llavero, canario de esquema, huérfanos, sandbox de Linux y el shim del PATH. `agydra doctor --fix` reenlaza overlays, suelta locks viejos y borra slots huérfanos del llavero.
+`agydra doctor` hace diez chequeos: binarios que de verdad se usan, almacén, perfiles, locks, aislamiento, llavero, canario de esquema, huérfanos, sandbox de Linux y el shim del PATH. `agydra doctor --fix` migra al almacén del perfil un directorio real heredado que ocupa la ruta de datos del overlay de un perfil existente y vuelve a enlazar esa ruta mientras mantiene el lock del perfil; borra el default configurado cuando su nombre no aparece en la lista actual de perfiles con metadatos legibles. Para limpiar huérfanos, el directorio del perfil cuenta como propietario aunque no se puedan leer sus metadatos. Doctor elimina directorios de overlay huérfanos, copias de seguridad de secretos y archivos en cuarentena del llavero, y archivos ZIP de respaldo solo cuando falta el directorio del perfil propietario; intenta adquirir el lock de cada perfil candidato y omite la limpieza si una sesión activa lo mantiene ocupado. Los slots del llavero del sistema también se purgan solo cuando falta el directorio del perfil, tras adquirir primero el lock del perfil y luego `swap.lock`. Los archivos del lock de sesión persisten como marcadores y no se eliminan.
 
 ---
 

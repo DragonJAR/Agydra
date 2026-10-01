@@ -474,7 +474,9 @@ def _locale_lang() -> str:
         return DEFAULT_LANG
 
 
-def resolve_language(store: object = None, flag_lang: Optional[str] = None) -> str:
+def resolve_language(
+    store: Optional[object] = None, flag_lang: Optional[str] = None
+) -> str:
     """Determina el idioma activo y lo establece como estado global.
 
 Cascada (de mayor a menor prioridad):

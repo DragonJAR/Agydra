@@ -1791,5 +1791,161 @@ class TestWriteSlotSelfHealing(unittest.TestCase):
         self.assertEqual(calls[2][0], "add-generic-password")
 
 
+class TestKeychainRenameRecovery(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+
+    def test_recovery_never_purges_a_slot_that_was_migrated(self):
+        old_slot = keychain.slot_backup_path(self.store, "old")
+        new_slot = keychain.slot_backup_path(self.store, "new")
+        old_slot.parent.mkdir(parents=True, exist_ok=True)
+        old_slot.write_bytes(b"source-credential")
+        new_slot.write_bytes(b"stale-target-credential")
+        native_calls = []
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN), \
+                mock.patch.object(
+                    keychain,
+                    "delete_slot",
+                    side_effect=lambda service, target=None: native_calls.append(service),
+                ):
+            keychain.recover_rename_profile_slot(
+                self.store, "old", "new", {"source_present": True}
+            )
+            keychain.recover_rename_profile_slot(
+                self.store, "old", "new", {"source_present": True}
+            )
+
+        self.assertFalse(old_slot.exists())
+        self.assertEqual(new_slot.read_bytes(), b"source-credential")
+        self.assertEqual(
+            native_calls,
+            [
+                keychain.profile_slot("old"),
+                keychain.profile_slot("new"),
+                keychain.profile_slot("old"),
+                keychain.profile_slot("new"),
+            ],
+        )
+
+    def test_recovery_purges_stale_target_when_source_was_absent(self):
+        old_slot = keychain.slot_backup_path(self.store, "old")
+        new_slot = keychain.slot_backup_path(self.store, "new")
+        new_slot.parent.mkdir(parents=True, exist_ok=True)
+        new_slot.write_bytes(b"stale-target-credential")
+        native_calls = []
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN), \
+                mock.patch.object(
+                    keychain,
+                    "delete_slot",
+                    side_effect=lambda service, target=None: native_calls.append(service),
+                ):
+            keychain.recover_rename_profile_slot(
+                self.store, "old", "new", {"source_present": False}
+            )
+            keychain.recover_rename_profile_slot(
+                self.store, "old", "new", {"source_present": False}
+            )
+
+        self.assertFalse(old_slot.exists())
+        self.assertFalse(new_slot.exists())
+        self.assertEqual(
+            native_calls,
+            [
+                keychain.profile_slot("old"),
+                keychain.profile_slot("new"),
+                keychain.profile_slot("old"),
+                keychain.profile_slot("new"),
+            ],
+        )
+
+    def test_strict_recovery_keeps_file_state_when_swap_lock_fails(self):
+        if keychain.fcntl is None:
+            self.skipTest("swap.lock requires POSIX flock")
+
+        old_slot = keychain.slot_backup_path(self.store, "old")
+        new_slot = keychain.slot_backup_path(self.store, "new")
+        old_slot.parent.mkdir(parents=True, exist_ok=True)
+        old_slot.write_bytes(b"source-credential")
+        new_slot.write_bytes(b"stale-target-credential")
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    keychain, "_serialize_lock", side_effect=PermissionError("swap lock unavailable")
+                ):
+            with self.assertRaisesRegex(PermissionError, "swap lock unavailable"):
+                keychain.recover_rename_profile_slot(
+                    self.store, "old", "new", {"source_present": True}
+                )
+
+        self.assertEqual(old_slot.read_bytes(), b"source-credential")
+        self.assertEqual(new_slot.read_bytes(), b"stale-target-credential")
+
+
+class TestRenameProfileSlotSerialization(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+
+    def test_rename_waits_for_swap_lock_before_moving_private_slot(self):
+        import threading
+
+        if keychain.fcntl is None:
+            self.skipTest("keychain bridge serialization requires POSIX flock")
+
+        old_slot = keychain.slot_backup_path(self.store, "old")
+        new_slot = keychain.slot_backup_path(self.store, "new")
+        old_slot.parent.mkdir(parents=True, exist_ok=True)
+        old_slot.write_bytes(b"credential")
+        held_lock = keychain._serialize_lock(self.store)
+        original_serialize = keychain._serialize_lock
+        attempting_lock = threading.Event()
+        finished = threading.Event()
+        failures = []
+
+        def observe_serialize(store):
+            attempting_lock.set()
+            return original_serialize(store)
+
+        def rename_slot():
+            try:
+                keychain.rename_profile_slot(self.store, "old", "new")
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=rename_slot, daemon=True)
+        try:
+            with mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_serialize_lock", side_effect=observe_serialize
+                    ), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ), \
+                    mock.patch.object(keychain, "delete_slot"):
+                worker.start()
+                attempted = attempting_lock.wait(5)
+                self.assertTrue(attempted)
+                self.assertFalse(finished.wait(0.1))
+                self.assertTrue(old_slot.exists())
+                self.assertFalse(new_slot.exists())
+        finally:
+            keychain.fcntl.flock(held_lock.fileno(), keychain.fcntl.LOCK_UN)
+            held_lock.close()
+            if worker.ident is not None:
+                worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        self.assertFalse(old_slot.exists())
+        self.assertEqual(new_slot.read_bytes(), b"credential")
+
+
 if __name__ == "__main__":
     unittest.main()

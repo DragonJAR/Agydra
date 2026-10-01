@@ -113,6 +113,31 @@ class TestCreateAtomicReserve(unittest.TestCase):
             self.assertIn("already exists", str(ctx.exception))
 
 
+class TestIsolatedStoreEnvironment(unittest.TestCase):
+    def test_context_sandboxes_and_restores_host_paths(self):
+        import os
+        import sys
+
+        keys = (
+            "AGYDRA_HOME",
+            "AGYDRA_REAL_HOME",
+            "HOME",
+            "LOCALAPPDATA",
+            "XDG_DATA_HOME",
+        )
+        if sys.platform.startswith("win"):
+            keys += ("USERPROFILE",)
+        original = {key: os.environ.get(key) for key in keys}
+        with isolated_store_env() as root:
+            root_path = Path(root).resolve()
+            for key in keys:
+                with self.subTest(key=key):
+                    self.assertTrue(
+                        Path(os.environ[key]).resolve().is_relative_to(root_path)
+                    )
+        self.assertEqual({key: os.environ.get(key) for key in keys}, original)
+
+
 class TestProfileFromDictCoercion(unittest.TestCase):
     def test_non_string_last_used_is_coerced(self):
         raw = {"name": "alpha", "seq": 1, "last_used": 20260101}
@@ -403,9 +428,8 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
             drain.assert_not_called()
 
     def test_lock_released_after_keychain_guard_exits(self):
-        """The lock must release only AFTER the keychain guard's __exit__
-        finishes (capture/restore), not before it: releasing first lets a
-        concurrent delete/rename race the shared-slot write."""
+        """Store.get releases its sequence lock before the guard; the profile
+        session lock must release only AFTER guard.__exit__ finishes."""
         import os
         import sys
         from unittest import mock
@@ -423,9 +447,7 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
                 order.append("guard-exit")
                 return False
 
-        def recording_release(self):
-            order.append("lock-release")
-            self._released = True
+        original_release = locks.LockHandle.release
 
         with isolated_store_env():
             os.environ["AGYDRA_AGY_BIN"] = sys.executable
@@ -435,6 +457,38 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
                 plan = runner.build_plan(
                     store, [], flag_ref="work", launch_as_child=True
                 )
+
+                sequence_lock_stat = os.stat(
+                    locks.sequence_lock_path(store)
+                )
+                profile_lock_stat = os.stat(
+                    locks.lock_path(store, plan.profile)
+                )
+                sequence_lock_identity = (
+                    sequence_lock_stat.st_dev,
+                    sequence_lock_stat.st_ino,
+                )
+                profile_lock_identity = (
+                    profile_lock_stat.st_dev,
+                    profile_lock_stat.st_ino,
+                )
+
+                def recording_release(handle):
+                    try:
+                        descriptor_stat = os.fstat(handle._fd)
+                        descriptor_identity = (
+                            descriptor_stat.st_dev,
+                            descriptor_stat.st_ino,
+                        )
+                        if descriptor_identity == sequence_lock_identity:
+                            order.append("sequence-release")
+                        elif descriptor_identity == profile_lock_identity:
+                            order.append("profile-release")
+                        else:
+                            order.append("unknown-lock-release")
+                    finally:
+                        original_release(handle)
+
                 with mock.patch.object(
                     platforms, "run_wait", return_value=0
                 ), mock.patch.object(
@@ -444,7 +498,16 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
                 ):
                     rc = runner.run(plan, store=store)
                 self.assertEqual(rc, 0)
-                self.assertEqual(order, ["guard-exit", "lock-release"])
+                self.assertEqual(
+                    order,
+                    ["sequence-release", "guard-exit", "profile-release"],
+                )
+                self.assertLess(
+                    order.index("sequence-release"), order.index("guard-exit")
+                )
+                self.assertGreater(
+                    order.index("profile-release"), order.index("guard-exit")
+                )
             finally:
                 os.environ.pop("AGYDRA_AGY_BIN", None)
 
