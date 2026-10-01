@@ -69,7 +69,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -78,6 +78,7 @@ import keychain
 import platforms
 import resolver
 from account import auth_state
+from models import Profile
 
 DEFAULT_TIMEOUT_S = 20
 
@@ -119,6 +120,10 @@ class UsageResult:
     email: Optional[str] = None
     plan: Optional[str] = None
     is_ineligible: bool = False
+    source: Optional[str] = None
+    observed_at: Optional[datetime] = None
+    quality: Optional[str] = None
+    identity_verified: Optional[bool] = None
 
 
 class UsageResponseError(ValueError):
@@ -143,7 +148,7 @@ class BucketColumn:
     header: str
 
 
-def _parse_reset_time(raw: object) -> Optional[datetime]:
+def _parse_reset_time(raw: object, *, require_utc: bool = False) -> Optional[datetime]:
     """Decode an ISO-8601 UTC ``reset_time`` or unix timestamp.
 
     ``datetime.fromisoformat`` only accepts the trailing ``Z`` shorthand
@@ -156,6 +161,8 @@ def _parse_reset_time(raw: object) -> Optional[datetime]:
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
         try:
             ts = float(raw)
+            if not math.isfinite(ts):
+                return None
             if ts > 1e11:
                 ts /= 1000.0
             return datetime.fromtimestamp(ts, tz=timezone.utc)
@@ -169,7 +176,15 @@ def _parse_reset_time(raw: object) -> Optional[datetime]:
     except ValueError:
         return None
     if parsed.tzinfo is None:
+        if require_utc:
+            return None
         parsed = parsed.replace(tzinfo=timezone.utc)
+    elif require_utc:
+        try:
+            if parsed.utcoffset() != timedelta(0):
+                return None
+        except (OverflowError, ValueError):
+            return None
     return parsed
 
 
@@ -198,14 +213,24 @@ def _parse_window_bucket(
     bucket_id: str,
     name: str,
     window: str,
+    used_key: str = "used_percent",
+    reset_key: str = "reset_at",
+    strict_percentage: bool = False,
+    strict_reset_utc: bool = False,
 ) -> Optional[UsageBucket]:
     if not isinstance(raw_window, dict):
         return None
-    used = raw_window.get("used_percent")
+    used = raw_window.get(used_key)
     if not _is_finite_number(used):
         return None
-    rem = max(0.0, min(1.0, (100.0 - float(used)) / 100.0))
-    reset_dt = _parse_reset_time(raw_window.get("reset_at"))
+    used_percent = float(used)
+    if strict_percentage and not 0.0 <= used_percent <= 100.0:
+        return None
+    rem = max(0.0, min(1.0, (100.0 - used_percent) / 100.0))
+    raw_reset = raw_window.get(reset_key)
+    reset_dt = _parse_reset_time(raw_reset, require_utc=strict_reset_utc)
+    if strict_reset_utc and raw_reset is not None and reset_dt is None:
+        return None
     return UsageBucket(
         id=bucket_id,
         name=name,
@@ -234,6 +259,14 @@ def _parse_groups(raw: object) -> List[UsageGroup]:
     if not isinstance(raw, list):
         return []
     return [g for g in (_parse_group(item) for item in raw) if g is not None]
+
+
+def _get_profile_readonly(store, name: str) -> Profile:
+    return store.get_readonly(name)
+
+
+def _has_pending_profile_rename(store) -> bool:
+    return store.has_pending_rename()
 
 
 def _close_http_error(exc: BaseException) -> None:
@@ -841,9 +874,50 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     docstring), so skipping it shortens real elapsed time, not just log
     noise.
     """
+    try:
+        profile_metadata = _get_profile_readonly(store, name)
+    except Exception:
+        if _has_pending_profile_rename(store):
+            return UsageResult(
+                name=name,
+                ok=False,
+                error="profile rename recovery pending",
+                quality="unknown",
+            )
+        return UsageResult(
+            name=name,
+            ok=False,
+            error="profile metadata unavailable",
+            quality="unknown",
+        )
+
+    if profile_metadata is not None and profile_metadata.engine == "claude":
+        if _has_pending_profile_rename(store):
+            return UsageResult(
+                name=name,
+                ok=True,
+                engine="claude",
+                source="claude_status_line",
+                quality="unknown",
+                identity_verified=False,
+                error="profile rename recovery pending",
+            )
+        import claude_usage
+
+        return claude_usage.query_claude_usage(
+            store,
+            name,
+            profile=profile_metadata,
+        )
+
     profile = store.get(name)
     engine = profile.engine
     data_dir = store.profile_data_dir(name, engine=engine)
+
+    if engine == "claude":
+        import claude_usage
+
+        return claude_usage.query_claude_usage(store, name, profile=profile)
 
     if engine == "codex":
         return query_codex_usage(
@@ -859,6 +933,15 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
             name,
             email=profile.email,
             timeout=timeout,
+        )
+
+    if engine != "agy":
+        return UsageResult(
+            name=name,
+            ok=False,
+            engine=engine,
+            email=profile.email,
+            error=f"unsupported usage engine: {engine}",
         )
 
     state = auth_state(data_dir, store, name, engine=engine)

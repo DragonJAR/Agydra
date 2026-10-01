@@ -13,9 +13,10 @@ built inside ``run`` exclusively.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import isolation
 import keychain
@@ -24,6 +25,22 @@ import platforms
 import resolver
 from store import Store, StoreError
 from ui import warn
+
+
+_PLAN_ENV_DISPLAY = (
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_DISABLE_AGENT_VIEW",
+    "CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF",
+    "AGYDRA_CLAUDE_USAGE_SEQ",
+    "AGYDRA_CLAUDE_USAGE_GENERATION",
+    resolver.PROFILE_ENV,
+)
+
+_NATIVE_IDENTITY_COMMANDS = (("auth", "login"), ("auth", "logout"))
+
+
+def _changes_claude_identity(*argvs: Sequence[str]) -> bool:
+    return any(tuple(argv[:2]) in _NATIVE_IDENTITY_COMMANDS for argv in argvs)
 
 
 @dataclass
@@ -44,18 +61,36 @@ class LaunchPlan:
     windows_redirect_home: bool = False
     cwd: Optional[Path] = None
     raw_args: List[str] = field(default_factory=list)
+    env: Dict[str, str] = field(default_factory=dict, repr=False)
+    ignored_env: List[str] = field(default_factory=list)
 
     def describe(self) -> str:
+        if self.env:
+            location = f"config  : {self.overlay}"
+            env_lines = [
+                f"env     : {name}={self.env[name]}"
+                for name in _PLAN_ENV_DISPLAY
+                if name in self.env
+            ]
+        else:
+            location = f"overlay : {self.overlay}"
+            env_lines = [f"env     : {self.env_home_var}={self.env_home_value}"]
         lines = [
             f"profile : {self.profile} ({self.reason})",
             f"engine  : {self.engine}",
             f"binary  : {self.binary}",
             f"argv    : {self.binary} {' '.join(self.args)}".rstrip(),
-            f"overlay : {self.overlay}",
-            f"env     : {self.env_home_var}={self.env_home_value}",
-            f"sandbox : {'bwrap' if self.use_sandbox else 'off'}",
-            f"force   : {'on' if self.force else 'off'}",
+            location,
+            *env_lines,
         ]
+        if self.ignored_env:
+            lines.append(f"ignored : {', '.join(self.ignored_env)} (inherited, removed for this profile)")
+        lines.extend(
+            [
+                f"sandbox : {'bwrap' if self.use_sandbox else 'off'}",
+                f"force   : {'on' if self.force else 'off'}",
+            ]
+        )
         return "\n".join(lines)
 
 
@@ -90,7 +125,18 @@ def build_plan(
             f"or point agydra to it with --binary <path> or the {driver.env_bin_var} env var"
         )
 
-    overlay = store.overlays_dir / profile.name
+    plan_env: Dict[str, str] = {}
+    if driver.uses_overlay:
+        overlay = store.overlays_dir / profile.name
+    else:
+        overlay = store.profile_data_dir(profile.name, engine=driver.name)
+        import claude_usage
+
+        plan_env = isolation.isolated_env(
+            overlay,
+            {resolver.PROFILE_ENV: profile.name, **claude_usage.capture_environment(store, profile)},
+            engine=driver.name,
+        )
     use_sandbox = bool(config.settings.get("use_linux_sandbox"))
     if use_sandbox and not isolation.use_bwrap():
         use_sandbox = False
@@ -105,7 +151,7 @@ def build_plan(
         binary=binary,
         args=driver.prepare_args(agy_args),
         overlay=overlay,
-        env_home_var=platforms.home_redirect_var(),
+        env_home_var=platforms.home_redirect_var() if driver.uses_overlay else driver.env_home_var,
         env_home_value=overlay,
         use_sandbox=use_sandbox,
         engine=driver.name,
@@ -116,6 +162,8 @@ def build_plan(
         windows_redirect_home=bool(config.settings.get("windows_redirect_home")),
         cwd=cwd,
         raw_args=list(agy_args),
+        env=plan_env,
+        ignored_env=driver.inherited_foreign_auth(os.environ),
     )
 
 
@@ -181,11 +229,31 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
         profile.touch()
         store.save(profile)
 
-        data_dir = store.profile_data_dir(plan.profile)
+        data_dir = store.profile_data_dir(plan.profile, engine=plan.engine)
         overlay = isolation.build_overlay(plan.profile, data_dir, store.root, engine=plan.engine)
+        usage_env: Dict[str, str] = {}
+        if driver.name == "claude":
+            import claude_usage
+
+            if _changes_claude_identity(plan.args, plan.raw_args):
+                try:
+                    claude_usage.invalidate_profile_usage(store, plan.profile)
+                except Exception as exc:
+                    raise StoreError(
+                        f"could not invalidate the Claude usage cache before "
+                        f"{' '.join(plan.args[:2])} for profile {plan.profile!r} ({exc}); "
+                        "launch aborted so a stale session cannot resurrect it"
+                    ) from exc
+            usage_env = claude_usage.capture_environment(store, profile)
+        inherited = driver.inherited_foreign_auth(os.environ)
+        if inherited:
+            warn(
+                f"ignoring inherited {', '.join(inherited)} for {driver.name} profile "
+                f"{plan.profile!r}: identity comes only from the profile's own login"
+            )
         env = isolation.isolated_env(
             overlay,
-            extra={resolver.PROFILE_ENV: plan.profile},
+            extra={resolver.PROFILE_ENV: plan.profile, **usage_env},
             engine=plan.engine,
             config_windows_redirect_home=plan.windows_redirect_home,
         )

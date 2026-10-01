@@ -429,8 +429,72 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
         ) from exc
 
 
+CLAUDE_OWNED_STATE_FILES = (".claude.json", "settings.json", ".credentials.json")
+
+
+def validate_claude_config_dir(config_dir: Path) -> Path:
+    """Central guard: a claude config dir must be its own real directory.
+
+    Rejects a link at the directory or its parent (``claude-config`` root),
+    any alias of the host's ``~/.claude`` (same inode, or nested either way),
+    and links standing in for the files that carry state and credentials
+    (``.claude.json``, ``settings.json``, ``.credentials.json``).
+    """
+    config_dir = Path(config_dir)
+    for candidate in (config_dir, config_dir.parent):
+        if _is_link(candidate):
+            raise IsolationError(
+                f"claude config path {candidate} must not be a symlink or junction; "
+                "refusing to risk aliasing the real ~/.claude"
+            )
+    real_claude = platforms.claude_data_dir()
+    if os.path.lexists(real_claude) and os.path.lexists(config_dir):
+        real_identity = _identity(real_claude)
+        if real_identity is not None and _identity(config_dir) == real_identity:
+            raise IsolationError(
+                f"claude config directory {config_dir} is the real {real_claude}; "
+                "refusing to break isolation"
+            )
+        resolved = platforms.canonical_path(config_dir)
+        real_resolved = platforms.canonical_path(real_claude)
+        if resolved.is_relative_to(real_resolved) or real_resolved.is_relative_to(resolved):
+            raise IsolationError(
+                f"claude config directory {config_dir} overlaps the real {real_claude}"
+            )
+    if os.path.lexists(config_dir) and not config_dir.is_dir():
+        raise IsolationError(f"claude config path {config_dir} is not a directory")
+    for filename in CLAUDE_OWNED_STATE_FILES:
+        entry = config_dir / filename
+        if os.path.lexists(entry) and _is_link(entry):
+            raise IsolationError(
+                f"claude state file {entry} must be a regular file owned by the "
+                "profile, not a symlink or junction"
+            )
+    return config_dir
+
+
+def prepare_claude_config_dir(data_dir: Path) -> Path:
+    """Validate and create a profile's physical Claude config directory.
+
+    Claude profiles get no home overlay: ``CLAUDE_CONFIG_DIR`` alone redirects
+    settings, credentials, global state and the background supervisor, while
+    ``HOME`` stays real so the native binary and its resources keep resolving.
+    """
+    data_dir = validate_claude_config_dir(Path(data_dir))
+    platforms.ensure_dir(data_dir)
+    if not platforms.is_windows():
+        try:
+            os.chmod(data_dir, 0o700)
+        except OSError:
+            pass
+    return validate_claude_config_dir(data_dir)
+
+
 def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "agy") -> Path:
     """(Re)build the overlay for a profile and return its path.
+
+    Engines without an overlay (``claude``) validate the physical config
+    directory and return it: it is the root their environment points at.
 
     - ``<overlay>/<driver.data_dir_name>`` links to ``data_dir`` (the profile store).
     - Every other real-home entry is mirrored: agy's and codex's real data dirs and the
@@ -441,6 +505,8 @@ def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "ag
     import engines
 
     driver = engines.get_engine(engine)
+    if not driver.uses_overlay:
+        return prepare_claude_config_dir(data_dir)
     data_dir = Path(data_dir)
     store_root = Path(store_root)
     real_home = platforms.real_home()
@@ -668,11 +734,28 @@ def isolated_env(
     engine: str = "agy",
     config_windows_redirect_home: bool = False,
 ) -> dict:
-    """Environment for the child process with the home redirected."""
+    """Environment for the child process with the home redirected.
+
+    For engines without an overlay (``claude``) ``overlay`` is the physical
+    config directory: ``HOME``/``USERPROFILE``/XDG stay untouched, inherited
+    per-launch state variables inherited from a parent session are dropped
+    first (only what ``extra`` explicitly injects survives), identity-bearing
+    variables are scrubbed after ``extra`` is merged (so ``extra`` can never
+    re-inject one), foreground-only flags are pinned and ``CLAUDE_CONFIG_DIR``
+    is set last.
+    """
     import engines
 
     driver = engines.get_engine(engine)
     env = dict(os.environ)
+    if not driver.uses_overlay:
+        driver.scrub_inherited_state(env)
+        env.update(extra)
+        driver.scrub_env(env)
+        env["AGYDRA_REAL_HOME"] = str(platforms.real_home())
+        env.update(driver.pinned_env)
+        env[driver.env_home_var] = str(overlay)
+        return env
     env.update(extra)
     real_home = platforms.real_home()
     env["AGYDRA_REAL_HOME"] = str(real_home)

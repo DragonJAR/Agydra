@@ -249,6 +249,45 @@ class TestUsageCli(BaseCase):
         self.assertNotIn("status    : not authenticated", stdout.getvalue())
         self.assertIn("usage unavailable: no usage data in response", stderr.getvalue())
 
+    def test_codex_and_grok_compact_quota_rows_keep_plan_windows_and_errors(self):
+        from datetime import datetime, timedelta, timezone
+        from types import SimpleNamespace
+        from unittest import mock
+        import cli
+        import usage
+
+        self.store.create("cx", engine="codex")
+        self.store.create("gx", engine="grok")
+        reset = datetime.now(timezone.utc) + timedelta(hours=2)
+        results = [usage.UsageResult(name, False, error="not authenticated")
+                   for name in ("alpha", "beta", "gamma", "delta")]
+        results.extend([
+            usage.UsageResult("cx", True, [usage.UsageGroup("Codex", [
+                usage.UsageBucket("weekly", "Weekly", "weekly", 0.65, reset),
+                usage.UsageBucket("5h", "5 Hours", "5h", 0.85, reset),
+            ])], engine="codex", plan="plus"),
+            usage.UsageResult("gx", True, [usage.UsageGroup("Grok", [
+                usage.UsageBucket("weekly", "Weekly", "weekly", 0.45, reset),
+            ])], engine="grok", plan="SuperGrok"),
+        ])
+        with mock.patch.object(usage, "gather_usage_report", return_value=results), contextlib.redirect_stdout(io.StringIO()) as out:
+            cli.cmd_usage(self.store, SimpleNamespace(ref=None))
+        lines = out.getvalue().splitlines()
+        codex = next(line for line in lines if "cx" in line and "plus" in line)
+        grok = next(line for line in lines if "gx" in line and "SuperGrok" in line)
+        self.assertIn("65", codex)
+        self.assertIn("85", codex)
+        self.assertIn("45", grok)
+        self.assertRegex(codex, r"\d+h")
+        self.assertRegex(grok, r"\d+h")
+        self.assertIn("Codex → cx 65%", out.getvalue())
+        self.assertIn("Grok → gx 45%", out.getvalue())
+        results[-1] = usage.UsageResult("gx", False, engine="grok", error="not authenticated")
+        with mock.patch.object(usage, "gather_usage_report", return_value=results), contextlib.redirect_stdout(io.StringIO()) as out:
+            cli.cmd_usage(self.store, SimpleNamespace(ref=None))
+        self.assertNotIn("Grok →", out.getvalue())
+        self.assertIn("not authenticated", next(line for line in out.getvalue().splitlines() if "gx" in line))
+
     def test_responsive_column_cascade(self):
         self._write_json("alpha", REAL_USAGE_JSON)
         # Give alpha a long email

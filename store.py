@@ -12,12 +12,13 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
 import zipfile
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, TypeVar, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
 
 import platforms
 import vocab
@@ -236,8 +237,58 @@ def _rmtree_readonly_ok(function, path, _excinfo):
         pass
 
 
+def _tree_has_entries(root: Path) -> bool:
+    """True when ``root`` is a link or holds any file/link, never following links."""
+    if root.is_symlink():
+        return True
+    if not root.is_dir():
+        return False
+    for _dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        if filenames or any(os.path.islink(os.path.join(_dirpath, d)) for d in dirnames):
+            return True
+    return False
+
+
+def _zip_tree_without_following(zf: "zipfile.ZipFile", root: Path, prefix: str) -> None:
+    """Add ``root`` under ``prefix``: regular files by content, symlinks as links.
+
+    A link is stored as a link (never dereferenced), so nothing outside the
+    tree is read into the archive and nothing outside it is lost when the
+    tree is deleted afterwards. Sockets and other special files carry no data
+    and are skipped.
+    """
+
+    def add_link(path: Path, arcname: str) -> None:
+        info = zipfile.ZipInfo(arcname)
+        info.create_system = 3
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        zf.writestr(info, os.readlink(path))
+
+    if root.is_symlink():
+        add_link(root, prefix)
+        return
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        base = Path(dirpath)
+        relative = base.relative_to(root)
+        for dirname in list(dirnames):
+            child = base / dirname
+            if child.is_symlink():
+                add_link(child, str(Path(prefix) / relative / dirname))
+                dirnames.remove(dirname)
+        for filename in filenames:
+            child = base / filename
+            arcname = str(Path(prefix) / relative / filename)
+            if child.is_symlink():
+                add_link(child, arcname)
+            elif child.is_file():
+                zf.write(child, arcname)
+
+
 def _has_backup_worthy_content(
-    path: Path, store: Optional[Store] = None, name: Optional[str] = None
+    path: Path,
+    store: Optional[Store] = None,
+    name: Optional[str] = None,
+    extra_trees: Sequence[Path] = (),
 ) -> bool:
     """True iff there is anything under ``path`` or in keychain worth zipping.
 
@@ -249,6 +300,9 @@ def _has_backup_worthy_content(
     """
     if path.is_dir() and any(p.is_file() for p in path.rglob("*")):
         return True
+    for tree in extra_trees:
+        if _tree_has_entries(tree):
+            return True
     if store is not None and name is not None:
         import keychain
 
@@ -298,6 +352,8 @@ class Store:
         self.profiles_dir = self.root / "profiles"
         self.overlays_dir = self.root / platforms.OVERLAYS_DIRNAME
         self.backups_dir = self.root / "backups"
+        self.claude_config_root = self.root / platforms.CLAUDE_CONFIG_DIRNAME
+        self.usage_cache_root = self.root / platforms.USAGE_CACHE_DIRNAME
 
     @classmethod
     def register_rename_recovery_handler(
@@ -368,8 +424,63 @@ class Store:
     def profile_meta_path(self, name: str) -> Path:
         return self.profile_dir(name) / "profile.json"
 
-    def profile_data_dir(self, name: str, engine: str = "agy") -> Path:
+    def profile_data_dir(self, name: str, engine: Optional[str] = None) -> Path:
+        """Physical data directory of a profile.
+
+        ``engine=None`` detects the engine from profile metadata (tolerantly,
+        falling back to the ``agy`` layout). Claude profiles resolve to
+        ``claude_config_dir`` so their data never moves when the profile is
+        renamed.
+        """
+        if engine is None:
+            engine = self._engine_of(name)
+        if engine == "claude":
+            return self.claude_config_dir(name)
         return self.profile_dir(name) / "data"
+
+    def _engine_of(self, name: str) -> str:
+        raw = read_json_object(self.profile_meta_path(name), tolerant=True)
+        engine = raw.get("engine") if raw else None
+        return engine if isinstance(engine, str) and engine else "agy"
+
+    def claude_config_dir_for_seq(self, seq: int) -> Path:
+        if type(seq) is not int or seq < 1:
+            raise StoreError(f"invalid claude profile seq {seq!r}")
+        return self.claude_config_root / str(seq)
+
+    def claude_config_dir(self, name: str) -> Path:
+        """``<store>/claude-config/<seq>`` for a claude profile, keyed by its
+        immutable ``seq`` so rename never relocates the config."""
+        raw = read_json_object(self.profile_meta_path(name), tolerant=True)
+        if raw is None:
+            raise StoreError(_unreadable_metadata_message(name))
+        try:
+            profile = Profile.from_dict(raw)
+        except (ValueError, TypeError) as exc:
+            raise StoreError(f"profile {name!r} metadata is corrupt ({exc})") from exc
+        if profile.engine != "claude":
+            raise StoreError(f"profile {name!r} is not a claude profile")
+        return self.claude_config_dir_for_seq(profile.seq)
+
+    def usage_cache_dir(self, seq: int) -> Path:
+        if type(seq) is not int or seq < 1:
+            raise StoreError(f"invalid profile seq {seq!r}")
+        return self.usage_cache_root / str(seq)
+
+    def claude_config_orphans(self, profiles: Sequence[Profile]) -> List[str]:
+        """Entries under ``claude-config/`` that no claude profile owns.
+
+        Never deleted automatically: a crash can leave one behind, but it may
+        also hold the data of a profile whose metadata is unreadable.
+        """
+        if not self.claude_config_root.is_dir():
+            return []
+        owned = {str(p.seq) for p in profiles if p.engine == "claude"}
+        return sorted(
+            entry.name
+            for entry in self.claude_config_root.iterdir()
+            if entry.name not in owned
+        )
 
     @staticmethod
     def validate_name(name: str) -> str:
@@ -426,8 +537,12 @@ class Store:
             raise StoreError(f"profile {name!r} already exists")
         seq = self._reserve_next_sequence()
         stage_dir: Optional[Path] = None
+        config_stage: Optional[Path] = None
+        config_dir: Optional[Path] = None
         try:
             platforms.ensure_dir(self.profiles_dir)
+            if driver.name == "claude":
+                config_dir = self._publish_claude_config(seq)
             stage_dir = Path(
                 tempfile.mkdtemp(
                     dir=str(self.profiles_dir),
@@ -440,17 +555,16 @@ class Store:
 
                 keychain.purge_profile_slot(self, name)
             profile = Profile(name=name, seq=seq, description=description, engine=driver.name)
-            platforms.ensure_dir(data_dir)
+            if driver.name != "claude":
+                platforms.ensure_dir(data_dir)
             _atomic_write_json(stage_dir / "profile.json", profile.to_dict())
             rename_dir_with_retry(stage_dir, profile_dir)
             stage_dir = None
         except FileExistsError:
-            if stage_dir is not None:
-                self._remove_create_stage(stage_dir)
+            self._abort_create(stage_dir, config_dir)
             raise StoreError(f"profile {name!r} already exists") from None
         except BaseException:
-            if stage_dir is not None:
-                self._remove_create_stage(stage_dir)
+            self._abort_create(stage_dir, config_dir)
             raise
         if not config.default_profile:
             if config_writable:
@@ -465,6 +579,50 @@ class Store:
                     f"{self.config_path} is corrupt"
                 )
         return profile
+
+    def _publish_claude_config(self, seq: int) -> Path:
+        """Create ``claude-config/<seq>`` through a stage + atomic rename.
+
+        ``seq`` is store-monotonic and never reused, so an existing target is
+        an orphan or a conflict: refuse instead of adopting unknown data.
+        """
+        target = self.claude_config_dir_for_seq(seq)
+        self._require_plain_claude_roots()
+        platforms.ensure_dir(self.claude_config_root)
+        self._cleanup_claude_config_stages()
+        try:
+            target.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise StoreError(
+                f"claude config directory {target} already exists; refusing to adopt it "
+                "(inspect it, then remove it manually)"
+            )
+        stage = Path(
+            tempfile.mkdtemp(dir=str(self.claude_config_root), prefix=_CREATE_STAGE_PREFIX)
+        )
+        try:
+            rename_dir_with_retry(stage, target)
+        except BaseException:
+            rmtree(stage)
+            raise
+        return target
+
+    def _cleanup_claude_config_stages(self) -> None:
+        if not self.claude_config_root.is_dir():
+            return
+        for entry in sorted(self.claude_config_root.iterdir()):
+            if entry.name.startswith(_CREATE_STAGE_PREFIX) and entry.is_dir() and not entry.is_symlink():
+                rmtree(entry)
+
+    def _abort_create(self, stage_dir: Optional[Path], config_dir: Optional[Path]) -> None:
+        try:
+            if stage_dir is not None:
+                self._remove_create_stage(stage_dir)
+        finally:
+            if config_dir is not None and config_dir.is_dir() and not config_dir.is_symlink():
+                rmtree(config_dir)
 
     def _remove_create_stage(self, stage_dir: Path) -> None:
         if stage_dir.is_symlink() or not stage_dir.is_dir():
@@ -862,6 +1020,63 @@ class Store:
                 f"restore it from backups/ or remove it with: agydra delete {name}"
             ) from exc
 
+    def _probe_rename_journal(self) -> Tuple[bool, Optional[OSError]]:
+        try:
+            self.rename_journal_path.lstat()
+        except FileNotFoundError:
+            return False, None
+        except OSError as exc:
+            return True, exc
+        return True, None
+
+    def has_pending_rename(self) -> bool:
+        """True when a rename journal exists or cannot be inspected (fail
+        closed). Pure ``lstat``: no locks, recovery or writes."""
+        return self._probe_rename_journal()[0]
+
+    def _require_no_pending_rename(self) -> None:
+        pending, error = self._probe_rename_journal()
+        if not pending:
+            return
+        if error is not None:
+            raise StoreError(
+                f"cannot inspect rename journal {self.rename_journal_path} ({error}); "
+                "refusing a read-only read"
+            ) from error
+        raise StoreError(
+            "profile rename recovery is pending; run any agydra command that writes "
+            "(for example: agydra list) to finish it, then retry"
+        )
+
+    def _readonly(self, operation: Callable[[], _Result]) -> _Result:
+        """Run a pure read with no locks, recovery or mutation.
+
+        Fails closed: a pending rename journal before OR after the read means
+        the metadata may describe a half-moved profile, so the answer is
+        discarded.
+        """
+        self._require_no_pending_rename()
+        try:
+            result = operation()
+        except OSError as exc:
+            raise StoreError(f"cannot read the profile store ({exc})") from exc
+        self._require_no_pending_rename()
+        return result
+
+    def get_readonly(self, name: str) -> Profile:
+        self.validate_name(name)
+        return self._readonly(lambda: self._get_unlocked(name))
+
+    def scan_readonly(self) -> tuple:
+        return self._readonly(self._scan)
+
+    def list_readonly(self) -> List[Profile]:
+        return self.scan_readonly()[0]
+
+    def resolve_ref_readonly(self, ref: str) -> str:
+        profiles, unreadable = self.scan_readonly()
+        return self._resolve_ref_in(profiles, unreadable, ref)
+
     def save(self, profile: Profile) -> None:
         _atomic_write_json(self.profile_meta_path(profile.name), profile.to_dict())
 
@@ -1059,6 +1274,10 @@ class Store:
         recovery_data: Optional[dict] = None,
     ) -> Profile:
         profile = self._get_unlocked(old)
+        if profile.engine == "claude":
+            self._guard_claude_supervisor(
+                old, self.claude_config_dir_for_seq(profile.seq), action="renaming"
+            )
         if self.profile_meta_path(new).exists():
             raise StoreError(f"profile {new!r} already exists")
         if self.profile_dir(new).exists():
@@ -1142,9 +1361,18 @@ class Store:
             raise StoreError(
                 f"profile {name!r} does not exist (see: agydra list)"
             )
+        config_dir = self._claude_config_of(name)
+        if config_dir is not None:
+            self._require_plain_claude_roots()
+            self._guard_claude_supervisor(name, config_dir)
         backup_path: Optional[Path] = None
-        if backup and _has_backup_worthy_content(profile_dir, self, name):
-            backup_path = self._write_backup(name)
+        extra_trees = (config_dir,) if config_dir is not None else ()
+        keychain_owner = (self, name) if config_dir is None else (None, None)
+        if backup and _has_backup_worthy_content(profile_dir, *keychain_owner, extra_trees):
+            backup_path = self._write_backup(name, config_dir)
+        if config_dir is not None:
+            self._invalidate_claude_usage_for_delete(name)
+            self._remove_claude_state(name, config_dir)
         rmtree(profile_dir)
         self._remove_overlay(name)
         if profile_dir.exists():
@@ -1162,9 +1390,157 @@ class Store:
                 warn(f"could not update default profile after deleting {name!r} ({exc})")
         return backup_path
 
+    def _claude_config_of(self, name: str) -> Optional[Path]:
+        """Physical config of a claude profile, or ``None`` for other engines.
+
+        Fails closed when the metadata still identifies a claude profile but
+        its ``seq`` is unusable: silently returning ``None`` would let a
+        delete skip the external config and its backup. Metadata that cannot
+        be parsed at all identifies nothing, so the legacy unreadable-profile
+        recovery proceeds and the unattributable ``claude-config/<seq>``
+        entries are only reported (``claude_config_orphans``), never touched.
+        """
+        raw = read_json_object(self.profile_meta_path(name), tolerant=True)
+        if raw is None:
+            if self.claude_config_root.is_dir():
+                warn(
+                    f"metadata of {name!r} is unreadable: any claude-config/<seq> data it "
+                    "owned is kept and reported by `agydra doctor`"
+                )
+            return None
+        if raw.get("engine") != "claude":
+            return None
+        try:
+            return self.claude_config_dir_for_seq(Profile.from_dict(raw).seq)
+        except (ValueError, TypeError, StoreError) as exc:
+            raise StoreError(
+                f"profile {name!r} is a claude profile but its metadata is damaged ({exc}); "
+                "refusing to delete it without knowing which claude-config entry it owns"
+            ) from exc
+
+    CLAUDE_SUPERVISOR_PROBE_TIMEOUT = 5.0
+    CLAUDE_BACKGROUND_EVIDENCE = ("daemon", "jobs", "daemon.log")
+
+    @staticmethod
+    def _claude_roster_workers(roster: Path) -> int:
+        try:
+            data = json.loads(roster.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError) as exc:
+            raise StoreError(f"cannot read claude background roster {roster} ({exc})") from exc
+        if isinstance(data, list):
+            return len(data)
+        if not isinstance(data, dict):
+            raise StoreError(f"claude background roster {roster} has an unexpected shape")
+        return sum(len(v) for v in data.values() if isinstance(v, (list, dict)))
+
+    def _guard_claude_supervisor(self, name: str, config_dir: Path, action: str = "deleting") -> None:
+        """Fail closed while a claude background supervisor may own this profile.
+
+        Contract: no ``daemon``/``jobs``/``daemon.log`` entry under the config
+        dir (the documented state of agent view) means no background session
+        ever ran for it: return without a fork. With such evidence the
+        documented, network-free ``claude daemon status`` decides: exit 0 is
+        running (blocked); exit 1 AND a first output line ``not running`` is
+        down, and then ``daemon/roster.json`` must list no workers (workers
+        can outlive the supervisor with ``--keep-workers``). A missing
+        binary, timeout, other exit code or unreadable roster is unknown and
+        also blocks, before any backup or mutation.
+        """
+        import engines
+        import isolation
+
+        if not any(
+            os.path.lexists(config_dir / entry) for entry in self.CLAUDE_BACKGROUND_EVIDENCE
+        ):
+            return
+        stop_hint = f"CLAUDE_CONFIG_DIR={config_dir} claude daemon stop --any"
+        driver = engines.get_engine("claude")
+        binary = driver.resolve_binary(self.load_config().claude_binary)
+        if binary is None:
+            raise StoreError(
+                f"profile {name!r} has background-session state but the claude binary "
+                f"was not found to verify it is idle; install it or set "
+                f"{platforms.CLAUDE_BIN_ENV}, then retry {action}"
+            )
+        try:
+            env = isolation.isolated_env(config_dir, {}, engine="claude")
+            proc = platforms.run_with_group_kill(
+                [str(binary), "daemon", "status"],
+                env=env,
+                timeout=self.CLAUDE_SUPERVISOR_PROBE_TIMEOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
+            raise StoreError(
+                f"could not verify background sessions of {name!r} ({exc}); refusing {action}"
+            ) from exc
+        if proc.returncode == 0:
+            raise StoreError(
+                f"profile {name!r} has a running claude background supervisor; stop it "
+                f"first with: {stop_hint}"
+            )
+        first_line = (proc.stdout or "").strip().splitlines()[:1]
+        if proc.returncode != 1 or not first_line or first_line[0].strip().lower() != "not running":
+            raise StoreError(
+                f"claude daemon status gave an unrecognised answer (exit {proc.returncode}) "
+                f"for {name!r}; refusing {action}"
+            )
+        roster = config_dir / "daemon" / "roster.json"
+        if os.path.lexists(roster) and self._claude_roster_workers(roster) > 0:
+            raise StoreError(
+                f"profile {name!r} still lists claude background workers; stop them "
+                f"first with: {stop_hint}"
+            )
+
+    def _invalidate_claude_usage_for_delete(self, name: str) -> None:
+        """Tombstone the usage cache generation after the backup and before
+        any removal, so a stale statusLine writer cannot repopulate it later.
+        Any failure aborts the delete with everything still on disk."""
+        import claude_usage
+
+        try:
+            claude_usage.invalidate_profile_usage(self, name, deleted=True)
+        except Exception as exc:
+            raise StoreError(
+                f"could not invalidate the Claude usage cache of {name!r} ({exc}); "
+                "nothing was deleted"
+            ) from exc
+
+    def _require_plain_claude_roots(self) -> None:
+        for root in (self.claude_config_root, self.usage_cache_root):
+            if os.path.lexists(root) and (root.is_symlink() or not root.is_dir()):
+                raise StoreError(
+                    f"{root} must be a real directory, not a link or file; "
+                    "refusing to touch claude profile data through it"
+                )
+
+    def _remove_claude_state(self, name: str, config_dir: Path) -> None:
+        """Remove only this profile's own physical config and usage cache."""
+        seq = int(config_dir.name)
+        targets = (config_dir, self.usage_cache_dir(seq))
+        for target in targets:
+            try:
+                target.lstat()
+            except FileNotFoundError:
+                continue
+            if target.is_symlink():
+                target.unlink()
+            else:
+                rmtree(target)
+            try:
+                target.lstat()
+            except FileNotFoundError:
+                continue
+            raise StoreError(
+                f"profile {name!r} could not be fully removed: {target} survived; "
+                "remove it manually and retry"
+            )
+
     BACKUP_RETENTION = 5
 
-    def _write_backup(self, name: str) -> Path:
+    def _write_backup(self, name: str, claude_config: Optional[Path] = None) -> Path:
         """Zip the profile to a unique tmp, verify, then atomically rename
         (``_atomic_replace`` skeleton plus a testzip() read check).
 
@@ -1185,6 +1561,9 @@ class Store:
                 for file in profile_dir.rglob("*"):
                     if file.is_file():
                         zf.write(file, file.relative_to(profile_dir))
+                if claude_config is not None:
+                    _zip_tree_without_following(zf, claude_config, "_claude-config")
+                    return
                 import keychain
 
                 secret = keychain.slot_backup_path(self, name)
@@ -1252,6 +1631,10 @@ class Store:
     def resolve_ref(self, ref: str) -> str:
         """Resolve a profile reference (name or 1-based number) to a name."""
         profiles, unreadable = self.scan()
+        return self._resolve_ref_in(profiles, unreadable, ref)
+
+    @staticmethod
+    def _resolve_ref_in(profiles: List[Profile], unreadable: List[str], ref: str) -> str:
         names = [p.name for p in profiles]
         if ref in names:
             return ref

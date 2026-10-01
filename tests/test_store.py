@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -1224,6 +1225,64 @@ Store(root=root).rename("old", "new")
         self.assertEqual([(item.name, item.seq) for item in profiles], [("new", 1)])
         self.assertEqual(store.default_name(), "new")
         self.assertFalse(store.rename_journal_path.exists())
+
+    def test_has_pending_rename_is_a_pure_fail_closed_probe(self):
+        from unittest import mock
+
+        store = Store()
+        store.create("old")
+        self.assertFalse(store.has_pending_rename())
+        store.rename_journal_path.write_text("{pending", encoding="utf-8")
+        before = sorted(
+            (str(p), p.read_bytes() if p.is_file() else b"") for p in store.root.rglob("*")
+        )
+        with mock.patch("locks.try_lock") as lock, mock.patch("locks.try_sequence_lock") as seq_lock:
+            self.assertTrue(store.has_pending_rename())
+            for read in (
+                lambda: store.get_readonly("old"),
+                store.scan_readonly,
+                lambda: store.resolve_ref_readonly("old"),
+            ):
+                with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
+                    read()
+        lock.assert_not_called()
+        seq_lock.assert_not_called()
+        after = sorted(
+            (str(p), p.read_bytes() if p.is_file() else b"") for p in store.root.rglob("*")
+        )
+        self.assertEqual(before, after)
+
+    def test_has_pending_rename_fails_closed_when_journal_is_uninspectable(self):
+        from unittest import mock
+
+        store = Store()
+        store.create("old")
+        journal = store.rename_journal_path
+        real_lstat = Path.lstat
+
+        def deny(path, *args, **kwargs):
+            if path == journal:
+                raise PermissionError("denied")
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "lstat", deny):
+            self.assertTrue(store.has_pending_rename())
+            with self.assertRaisesRegex(StoreError, "cannot inspect rename journal"):
+                store.get_readonly("old")
+            import usage
+
+            self.assertTrue(usage._has_pending_profile_rename(store))
+
+    def test_usage_wrapper_delegates_to_the_store_predicate(self):
+        from unittest import mock
+
+        import usage
+
+        store = Store()
+        with mock.patch.object(Store, "has_pending_rename", return_value=True) as probe:
+            self.assertTrue(usage._has_pending_profile_rename(store))
+        probe.assert_called_once_with()
+        self.assertFalse(usage._has_pending_profile_rename(store))
 
     def test_malformed_rename_journal_fails_closed(self):
         store = Store()

@@ -6,7 +6,9 @@ package is platform-agnostic.
 """
 from __future__ import annotations
 
+import base64
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -23,7 +25,14 @@ CODEX_BIN_ENV = "AGYDRA_CODEX_BIN"
 CODEX_DATA_DIR_NAME = ".codex"
 GROK_BIN_ENV = "AGYDRA_GROK_BIN"
 GROK_DATA_DIR_NAME = ".grok"
+CLAUDE_BIN_ENV = "AGYDRA_CLAUDE_BIN"
+CLAUDE_DATA_DIR_NAME = ".claude"
+CLAUDE_CONFIG_ENV = "CLAUDE_CONFIG_DIR"
+CLAUDE_USAGE_SEQ_ENV = "AGYDRA_CLAUDE_USAGE_SEQ"
+CLAUDE_USAGE_GENERATION_ENV = "AGYDRA_CLAUDE_USAGE_GENERATION"
 OVERLAYS_DIRNAME = "overlays"
+CLAUDE_CONFIG_DIRNAME = "claude-config"
+USAGE_CACHE_DIRNAME = "usage-cache"
 
 
 def is_windows() -> bool:
@@ -171,6 +180,80 @@ def resolve_grok_binary(explicit: Optional[str] = None) -> Optional[Path]:
 def grok_data_dir(home: Optional[Path] = None) -> Path:
     """Grok's data directory (``.grok``) under the given home."""
     return (Path(home) if home is not None else real_home()) / GROK_DATA_DIR_NAME
+
+
+def resolve_claude_binary(explicit: Optional[str] = None) -> Optional[Path]:
+    """Locate the real claude binary without fragile heuristics.
+
+    Order: explicit flag → ``AGYDRA_CLAUDE_BIN`` → ``shutil.which("claude")``.
+    Returns ``None`` when not found.
+    """
+    return resolve_binary("claude", CLAUDE_BIN_ENV, explicit)
+
+
+def claude_data_dir(home: Optional[Path] = None) -> Path:
+    """Claude Code's default data directory (``.claude``) under the given home."""
+    return (Path(home) if home is not None else real_home()) / CLAUDE_DATA_DIR_NAME
+
+
+_POWERSHELL_QUOTES = ("'", "\u2018", "\u2019", "\u201a", "\u201b")
+
+
+def powershell_literal(value: str) -> str:
+    """Single-quoted PowerShell literal: no expansion of ``$``, backticks or ``%``.
+
+    PowerShell treats the typographic single quotes U+2018/2019/201A/201B as
+    quote characters too, so every one of them is doubled like ``'``.
+    """
+    if "\x00" in value:
+        raise ValueError("argument contains a NUL character")
+    escaped = "".join(ch * 2 if ch in _POWERSHELL_QUOTES else ch for ch in value)
+    return "'" + escaped + "'"
+
+
+def powershell_script(argv: Sequence[str], forward_stdin: bool = False) -> str:
+    """PowerShell script running ``argv`` literally and propagating its exit code.
+
+    ``forward_stdin`` reads the whole of the host's standard input as UTF-8 and
+    pipes it to the native command as UTF-8 without a BOM: PowerShell's own
+    piping defaults to the ANSI/ASCII ``$OutputEncoding`` and would corrupt
+    non-ASCII JSON.
+    """
+    call = "& " + " ".join(powershell_literal(str(arg)) for arg in argv)
+    if forward_stdin:
+        call = (
+            "[Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false; "
+            "$OutputEncoding = New-Object System.Text.UTF8Encoding $false; "
+            "$agydraStdin = [Console]::In.ReadToEnd(); "
+            "$agydraStdin | " + call
+        )
+    return call + "; exit $LASTEXITCODE"
+
+
+def shell_command(argv: Sequence[str], forward_stdin: bool = False) -> str:
+    """One shell command line that runs ``argv`` literally.
+
+    POSIX: ``shlex.join`` (children inherit stdin, ``forward_stdin`` is moot).
+    Windows: ``subprocess.list2cmdline`` is argv quoting for ``CreateProcess``,
+    not shell quoting (``%VAR%`` and ``&`` stay live in ``cmd.exe``), so the
+    argv goes through a PowerShell script of single-quoted literals passed as
+    ``-EncodedCommand`` (UTF-16LE base64). The outer command line is pure
+    ASCII with no spaces or metacharacters, so it survives cmd.exe,
+    PowerShell and POSIX-style shells unchanged. Pass ``forward_stdin=True``
+    when the command must receive the caller's stdin (a Claude ``statusLine``
+    gets its JSON there). Costs one PowerShell start-up per invocation; not
+    measured on Windows from this repository's macOS test run.
+    """
+    items = [str(arg) for arg in argv]
+    if not items:
+        raise ValueError("argv must not be empty")
+    if not is_windows():
+        if any("\x00" in item for item in items):
+            raise ValueError("argument contains a NUL character")
+        return shlex.join(items)
+    script = powershell_script(items, forward_stdin=forward_stdin)
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return f"powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded}"
 
 
 def ensure_dir(path: Path) -> Path:

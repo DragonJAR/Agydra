@@ -54,7 +54,7 @@ class TestEngineDriverRegistry(BaseCase):
 
     def test_all_engines_returns_registered(self):
         all_eng = engines.all_engines()
-        self.assertEqual({e.name for e in all_eng}, {"agy", "codex", "grok"})
+        self.assertEqual({e.name for e in all_eng}, {"agy", "codex", "grok", "claude"})
 
     def test_resolve_binary_explicit(self):
         driver = engines.get_engine("codex")
