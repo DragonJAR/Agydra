@@ -11,10 +11,11 @@ import os
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence, Union
 
 APP_NAME = "agydra"
 
@@ -47,6 +48,31 @@ def is_linux() -> bool:
     return sys.platform.startswith("linux")
 
 
+def absolute_path(path: Union[Path, str]) -> Path:
+    """Expand a user path and anchor relative values to the current directory."""
+    return Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+
+
+def is_link(path: Union[Path, str], *, strict: bool = False) -> bool:
+    """Inspect symlinks and Windows reparse points without following them.
+
+    Missing entries return False. Strict callers receive other inspection
+    errors so safety checks can fail closed; best-effort probes return False.
+    Dangling links remain detectable because the inspection uses lstat.
+    """
+    try:
+        metadata = Path(path).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        if strict:
+            raise
+        return False
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
 def home_redirect_var() -> str:
     """Environment variable agy reads to resolve its data directory.
 
@@ -60,7 +86,7 @@ def base_dir() -> Path:
     """Root directory for agydra's own data (profiles, overlays, backups)."""
     override = os.environ.get(BASE_DIR_ENV)
     if override:
-        return Path(override).expanduser()
+        return absolute_path(override)
     if is_windows():
         return _windows_base_dir()
     if is_macos():
@@ -329,6 +355,14 @@ def console_script(venv_base: Path, name: str = "agydra") -> Path:
     return venv_base / VENV_BIN_SUBDIR / (name + _EXE_SUFFIX)
 
 
+def _execution_error(argv: Sequence[str], reason: object, status: int) -> int:
+    """Keep launch failures readable even on legacy Windows stderr streams."""
+    from ui import console_print
+
+    console_print(f"agydra: cannot execute {argv[0]}: {reason}", file=sys.stderr)
+    return status
+
+
 def launch_argv(argv: Sequence[str], env: Mapping[str, str]) -> int:
     """Launch agy replacing the current process when possible.
 
@@ -342,11 +376,39 @@ def launch_argv(argv: Sequence[str], env: Mapping[str, str]) -> int:
     try:
         os.execvpe(str(argv[0]), list(argv), dict(env))
     except FileNotFoundError:
-        print(f"agydra: cannot execute {argv[0]}: not found", file=sys.stderr)
-        return 127
+        return _execution_error(argv, "not found", 127)
     except OSError as exc:
-        print(f"agydra: cannot execute {argv[0]}: {exc}", file=sys.stderr)
-        return 126
+        return _execution_error(argv, exc, 126)
+
+
+def _windows_console_api() -> Any:
+    """Declare pointer-sized HANDLE and fixed-width DWORD console signatures."""
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    signatures = (
+        ("GetStdHandle", [ctypes.c_uint32], ctypes.c_void_p),
+        ("GetConsoleMode", [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)], ctypes.c_int),
+        ("SetConsoleMode", [ctypes.c_void_p, ctypes.c_uint32], ctypes.c_int),
+        ("FlushConsoleInputBuffer", [ctypes.c_void_p], ctypes.c_int),
+    )
+    for name, arguments, result in signatures:
+        function = getattr(kernel32, name)
+        function.argtypes = arguments
+        function.restype = result
+    return kernel32
+
+
+def enable_windows_console_vt() -> None:
+    """Enable virtual-terminal processing for standard output and error."""
+    import ctypes
+
+    kernel32 = _windows_console_api()
+    for standard_handle in (-11, -12):
+        handle = kernel32.GetStdHandle(standard_handle)
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
 
 
 def drain_tty_input() -> None:
@@ -373,9 +435,7 @@ def drain_tty_input() -> None:
         if not sys.stdin.isatty():
             return
         if is_windows():
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
+            kernel32 = _windows_console_api()
             handle = kernel32.GetStdHandle(-10)
             kernel32.FlushConsoleInputBuffer(handle)
         else:
@@ -404,10 +464,11 @@ def _kill_process_group(proc: "subprocess.Popen") -> None:
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=2.0,
             )
             if res.returncode == 0:
                 return
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             pass
         try:
             proc.kill()
@@ -501,14 +562,150 @@ def run_with_group_kill(
 
 
 def run_wait(argv: Sequence[str], env: Mapping[str, str]) -> int:
-    """Run argv as a waited child and propagate its exit code (all OSes)."""
+    """Wait for child exit, including its cleanup after a console interrupt.
+
+    Parent and child share the console's signal delivery. An interrupted
+    parent keeps waiting without sending another signal or killing the child;
+    callers retain session locks until the child has exited. Parent-only
+    interrupts also keep waiting, so callers must signal the child explicitly
+    when interrupting outside the shared console. Return 130 if the parent
+    was interrupted, otherwise propagate the child's exit code.
+    """
     try:
-        return subprocess.run(_normalize_windows_argv(argv), env=dict(env), shell=False).returncode
+        proc = subprocess.Popen(_normalize_windows_argv(argv), env=dict(env), shell=False)
     except KeyboardInterrupt:
         return 130
     except FileNotFoundError:
-        print(f"agydra: cannot execute {argv[0]}: not found", file=sys.stderr)
-        return 127
+        return _execution_error(argv, "not found", 127)
     except OSError as exc:
-        print(f"agydra: cannot execute {argv[0]}: {exc}", file=sys.stderr)
-        return 126
+        return _execution_error(argv, exc, 126)
+    interrupted = False
+    while True:
+        try:
+            status = proc.wait()
+            return 130 if interrupted else status
+        except KeyboardInterrupt:
+            interrupted = True
+
+
+_PS_TOKEN_TIMEOUT_S = 2.0
+"""Budget for the one ``ps`` subprocess a macOS start-token lookup spawns.
+
+Only the prune path (a holder whose pid belongs to some other, possibly
+reused, process) pays it; a healthy launch never runs a subprocess here.
+"""
+
+_WINDOWS_STILL_ACTIVE = 259
+"""``GetExitCodeProcess`` value Windows reports for a live process."""
+
+
+def _windows_process_handle(pid: int) -> Any:
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    return ctypes.windll.kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+    )
+
+
+def process_alive(pid: int) -> bool:
+    """True when ``pid`` names a process that is alive right now.
+
+    Never raises for a missing or recycled pid. POSIX uses the signal-0
+    probe (ESRCH means dead, EPERM means alive but owned by someone else);
+    Windows opens the process and reads its exit code, treating the
+    STILL_ACTIVE sentinel as alive. An exit code that legitimately equals
+    STILL_ACTIVE is indistinguishable from liveness here — the caller's
+    ``process_start_token`` check is what catches that rare reuse case.
+    """
+    if pid <= 0:
+        return False
+    if is_windows():
+        import ctypes
+
+        handle = _windows_process_handle(pid)
+        if not handle:
+            return False
+        try:
+            import ctypes.wintypes
+
+            exit_code = ctypes.wintypes.DWORD()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(
+                handle, ctypes.byref(exit_code)
+            ):
+                return True
+            return exit_code.value == _WINDOWS_STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def process_start_token(pid: int) -> Optional[str]:
+    """Opaque identity token for ``pid``, stable for one process lifetime.
+
+    Used to distinguish a reused pid from the original holder: two calls on
+    the same live process return equal strings; a recycled pid yields a
+    different token (or None). Linux reads ``/proc`` (no subprocess), macOS
+    shells out to ``ps -o lstart=`` (rare path, bounded timeout), Windows
+    reads ``GetProcessTimes`` via ctypes. None means "cannot identify" —
+    callers must treat that conservatively (keep the holder) rather than
+    pruning it. Granularity differs per OS (Linux: kernel jiffies; Windows:
+    100ns FILETIME; macOS: minutes — two processes started inside the same
+    minute share a token there, so a same-minute pid reuse on macOS is
+    pruned only when the recycled process itself dies).
+    """
+    if pid <= 0:
+        return None
+    if is_windows():
+        import ctypes
+        import ctypes.wintypes
+
+        handle = _windows_process_handle(pid)
+        if not handle:
+            return None
+        try:
+            creation = ctypes.wintypes.FILETIME()
+            exit_time = ctypes.wintypes.FILETIME()
+            kernel = ctypes.wintypes.FILETIME()
+            user = ctypes.wintypes.FILETIME()
+            if not ctypes.windll.kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            value = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            return str(value)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    if is_linux():
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        except (OSError, UnicodeDecodeError):
+            return None
+        tail = stat_text.rsplit(")", 1)
+        if len(tail) != 2:
+            return None
+        fields = tail[1].split()
+        if len(fields) <= 19:
+            return None
+        return fields[19]
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=_PS_TOKEN_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    token = result.stdout.strip()
+    return token or None
