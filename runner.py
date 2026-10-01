@@ -104,13 +104,21 @@ def build_plan(
     cwd: Optional[Path] = None,
     force: bool = False,
     engine: Optional[str] = None,
+    exclude: Optional[set] = None,
 ) -> LaunchPlan:
-    """Resolve everything needed to launch the tool without mutating anything."""
+    """Resolve everything needed to launch the tool without mutating anything.
+
+    ``exclude`` removes profile names from random-pick consideration after a
+    keychain-busy retry: profiles whose engine slot another live session
+    owns must not be re-picked in the same launch loop.
+    """
     import engines
 
     cwd = Path(cwd) if cwd is not None else None
     if random_pick:
-        resolution = resolver.pick_free_profile(store, cwd=cwd, force=force, engine=engine)
+        resolution = resolver.pick_free_profile(
+            store, cwd=cwd, force=force, engine=engine, exclude=exclude
+        )
     else:
         resolution = resolver.resolve(store, flag_ref=flag_ref, cwd=cwd, engine=engine)
     profile = store.get(resolution.name)
@@ -136,6 +144,7 @@ def build_plan(
             overlay,
             {resolver.PROFILE_ENV: profile.name, **claude_usage.capture_environment(store, profile)},
             engine=driver.name,
+            store_root=store.root,
         )
     use_sandbox = bool(config.settings.get("use_linux_sandbox"))
     if use_sandbox and not isolation.use_bwrap():
@@ -179,111 +188,105 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
     store = store or Store()
     keychain_needs_waited_child = driver.needs_keychain and keychain.supported()
 
-    handle: Optional[locks.LockHandle] = None
-    if plan.force:
-        warn(
-            f"forcing launch on profile {plan.profile!r} without lock: "
-            "concurrent sessions may corrupt OAuth tokens (--force opt-in)"
-        )
-    else:
-        attempts = 0
-        max_attempts: Optional[int] = None
-        while True:
-            handle = locks.try_lock(store, plan.profile)
-            if handle is not None:
-                break
-            if not plan.random_pick or (plan.reason and plan.reason.startswith("project marker")):
-                pid = locks.lock_holder_pid(store, plan.profile)
-                holder = f" ({driver.binary_name} PID {pid})" if pid else ""
-                if plan.reason and plan.reason.startswith("project marker"):
-                    suggestion = (
-                        f"pinned by {plan.reason}; wait for it to finish "
-                        "or bypass with -f/--force, risk: concurrent sessions may corrupt OAuth tokens"
-                    )
-                else:
-                    suggestion = (
-                        "agydra -r picks a free one automatically; "
-                        "or bypass with -f/--force, risk: concurrent sessions may corrupt OAuth tokens"
-                    )
-                raise StoreError(
-                    f"profile {plan.profile!r} is busy: another live session{holder} is "
-                    f"using it ({suggestion})"
-                )
-            if max_attempts is None:
-                max_attempts = len(store.names())
-            attempts += 1
-            if attempts > max_attempts:
-                raise StoreError(
-                    "no free authenticated profile left after concurrent picks"
-                )
-            plan = build_plan(
-                store, plan.raw_args,
-                binary_override=plan.binary_override, random_pick=True,
-                launch_as_child=plan.launch_as_child,
-                cwd=plan.cwd,
-                engine=plan.engine,
-            )
-
-    try:
-        profile = store.get(plan.profile)
-        profile.touch()
-        store.save(profile)
-
-        data_dir = store.profile_data_dir(plan.profile, engine=plan.engine)
-        overlay = isolation.build_overlay(plan.profile, data_dir, store.root, engine=plan.engine)
-        usage_env: Dict[str, str] = {}
-        if driver.name == "claude":
-            import claude_usage
-
-            if _changes_claude_identity(plan.args, plan.raw_args):
-                try:
-                    claude_usage.invalidate_profile_usage(store, plan.profile)
-                except Exception as exc:
-                    raise StoreError(
-                        f"could not invalidate the Claude usage cache before "
-                        f"{' '.join(plan.args[:2])} for profile {plan.profile!r} ({exc}); "
-                        "launch aborted so a stale session cannot resurrect it"
-                    ) from exc
-            usage_env = claude_usage.capture_environment(store, profile)
-        inherited = driver.inherited_foreign_auth(os.environ)
-        if inherited:
+    excluded: set = set()
+    attempts = 0
+    while True:
+        try:
+            joined = locks.acquire_lease(store, plan.profile, patience_s=2.0)
+        except locks.LockError as exc:
+            raise StoreError(
+                f"profile {plan.profile!r} is locked by a store operation "
+                f"({exc}); retry in a moment"
+            ) from exc
+        if joined and driver.name in ("codex", "grok"):
             warn(
-                f"ignoring inherited {', '.join(inherited)} for {driver.name} profile "
-                f"{plan.profile!r}: identity comes only from the profile's own login"
+                f"joining {joined} live session(s) on profile {plan.profile!r}: "
+                "concurrent sessions share the on-disk auth.json and may force "
+                "a re-login (refresh-token rotation)"
             )
-        env = isolation.isolated_env(
-            overlay,
-            extra={resolver.PROFILE_ENV: plan.profile, **usage_env},
-            engine=plan.engine,
-            config_windows_redirect_home=plan.windows_redirect_home,
-        )
+        if joined and plan.launch_as_child:
+            warn(
+                f"re-login while {joined} live session(s) run on profile "
+                f"{plan.profile!r}; those sessions may be logged out"
+            )
+        try:
+            profile = store.get(plan.profile)
+            profile.touch()
+            store.save(profile)
 
-        argv = [str(plan.binary), *plan.args]
-        if plan.use_sandbox:
-            argv = isolation.sandbox_wrap(argv)
-    except BaseException:
-        if handle is not None:
-            handle.release()
-        raise
+            data_dir = store.profile_data_dir(plan.profile, engine=plan.engine)
+            overlay = isolation.build_overlay(plan.profile, data_dir, store.root, engine=plan.engine)
+            usage_env: Dict[str, str] = {}
+            if driver.name == "claude":
+                import claude_usage
 
-    try:
-        guard = (
-            keychain.launch_guard(store, plan.profile, capture=plan.launch_as_child)
-            if driver.needs_keychain
-            else contextlib.nullcontext()
-        )
-        with guard:
-            if platforms.is_windows():
-                rc = platforms.launch_argv(argv, env)
-                platforms.drain_tty_input()
-                return rc
-            if plan.use_sandbox or plan.launch_as_child or keychain_needs_waited_child:
-                rc = platforms.run_wait(argv, env)
-                platforms.drain_tty_input()
-                return rc
-            if handle is not None:
-                handle.record_holder_pid()
-            return platforms.launch_argv(argv, env)
-    finally:
-        if handle is not None:
-            handle.release()
+                if _changes_claude_identity(plan.args, plan.raw_args):
+                    try:
+                        claude_usage.invalidate_profile_usage(store, plan.profile)
+                    except Exception as exc:
+                        raise StoreError(
+                            f"could not invalidate the Claude usage cache before "
+                            f"{' '.join(plan.args[:2])} for profile {plan.profile!r} ({exc}); "
+                            "launch aborted so a stale session cannot resurrect it"
+                        ) from exc
+                usage_env = claude_usage.capture_environment(store, profile)
+            inherited = driver.inherited_foreign_auth(os.environ)
+            if inherited:
+                warn(
+                    f"ignoring inherited {', '.join(inherited)} for {driver.name} profile "
+                    f"{plan.profile!r}: identity comes only from the profile's own login"
+                )
+            env = isolation.isolated_env(
+                overlay,
+                extra={resolver.PROFILE_ENV: plan.profile, **usage_env},
+                engine=plan.engine,
+                config_windows_redirect_home=plan.windows_redirect_home,
+                store_root=store.root,
+            )
+
+            argv = [str(plan.binary), *plan.args]
+            if plan.use_sandbox:
+                argv = isolation.sandbox_wrap(argv)
+
+            guard = (
+                keychain.launch_guard(store, plan.profile, capture=plan.launch_as_child)
+                if driver.needs_keychain
+                else contextlib.nullcontext()
+            )
+            try:
+                with guard:
+                    if platforms.is_windows():
+                        rc = platforms.launch_argv(argv, env)
+                        platforms.drain_tty_input()
+                        return rc
+                    if plan.use_sandbox or plan.launch_as_child or keychain_needs_waited_child:
+                        rc = platforms.run_wait(argv, env)
+                        platforms.drain_tty_input()
+                        return rc
+                    return platforms.launch_argv(argv, env)
+            except keychain.KeychainBusyError as exc:
+                if not plan.random_pick:
+                    raise StoreError(str(exc)) from exc
+                attempts += 1
+                excluded.add(plan.profile)
+                if attempts > len(store.names()):
+                    raise StoreError(
+                        "no joinable authenticated profile left after concurrent picks"
+                    ) from exc
+                plan = build_plan(
+                    store, plan.raw_args,
+                    binary_override=plan.binary_override, random_pick=True,
+                    launch_as_child=plan.launch_as_child,
+                    cwd=plan.cwd,
+                    engine=plan.engine,
+                    exclude=excluded,
+                )
+        finally:
+            try:
+                locks.release_lease(store, plan.profile, patience_s=1.0)
+            except locks.LockError as exc:
+                warn(
+                    f"could not release the session lease for profile "
+                    f"{plan.profile!r} ({exc}); it self-heals on the next "
+                    "launch"
+                )

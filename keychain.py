@@ -11,11 +11,25 @@ Empirical layout of agy 1.2.7 credentials:
   verified: after a login the keychain item mdat advances while the overlay
   file keeps its previous mtime). A fixed slot is a shared resource: every
   profile would fight over it, so agydra gives each profile a private slot
-  ``gemini/agydra/<profile>`` and swaps the shared slot for the duration of
-  each launch:
+  ``gemini/agydra/<profile>`` and swaps the shared slot around each launch:
 
       shared <- profile slot   (launch agy: it sees this profile's token)
       profile slot <- shared   (restore on exit)
+
+  The swap itself is brief: each launch takes ``swap.lock`` only for the
+  slot read/write sections, and a persistent lease state
+  (``keychain/slot-lease.json``, ``{"owner", "had_shared"}``) records which
+  profile owns the shared slot between sections. A session of the SAME
+  profile joins without touching the keychain at all; the LAST live
+  session to exit (per the profile's holder registry in ``locks.py``)
+  persists the refreshed token into the profile's private slot and
+  restores whatever the shared slot held before ownership began. A launch
+  of a DIFFERENT profile while the slot is owned fails fast with
+  ``KeychainBusyError`` — the slot can only ever hold one profile's token
+  while agy refreshes it mid-session. The owner field is a cache validated
+  against the profile's holder registry: an owner whose lease holds no
+  live session is stale and expires on sight, so a crash never wedges
+  the slot.
 
   A profile with no private slot yet (never completed a keychain-backed
   login) gets the shared slot CLEARED instead of left alone: agy reads that
@@ -42,7 +56,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, NamedTuple, Optional
 
 import platforms
 from store import atomic_write_bytes
@@ -72,6 +86,19 @@ QUARANTINE_INFIX = f"{SECRET_SUFFIX}.corrupt-"
 
 class KeychainError(RuntimeError):
     pass
+
+
+class KeychainBusyError(KeychainError):
+    """Another live agydra operation holds the shared keychain swap lock."""
+
+
+class SwapSectionError(KeychainError):
+    """The swap lock itself could not be MANAGED (open/create/lock failure).
+
+    Distinct from ``KeychainBusyError`` (contention) so launch entry can
+    fail closed on lock-management errors while staying fail-open for
+    keychain-operation errors that happen under a successfully held lock.
+    """
 
 
 def supported() -> bool:
@@ -536,38 +563,154 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
 
 
 def _serialize_lock(store):
-    """Cross-process mutex for shared-slot swaps (macOS only)."""
+    """Cross-process non-blocking mutex for shared-slot swaps (macOS only)."""
+    import locks
+
     path = _slots_dir(store) / "swap.lock"
-    platforms.ensure_dir(path.parent)
-    handle = open(path, "a+")
     try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    except OSError:
-        handle.close()
-        raise
+        handle = locks.try_lock_path(
+            path, description="keychain swap lock", inherit_on_exec=False
+        )
+    except OSError as exc:
+        raise KeychainError(f"cannot acquire keychain swap lock ({exc})") from exc
+    if handle is None:
+        raise KeychainBusyError(
+            "another agydra session is using the shared Antigravity keychain "
+            "slot; close it (or use a different engine) and retry"
+        )
     return handle
 
 
 @contextmanager
 def serialized_access(store) -> Iterator[None]:
     """Serialize keychain slot operations with launch-time shared-slot swaps."""
-    if fcntl is None:
+    if not supported():
         yield
         return
     handle = _serialize_lock(store)
     try:
         yield
     finally:
-        try:
-            if handle is not None and fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
         if handle is not None:
-            try:
-                handle.close()
-            except OSError:
-                pass
+            handle.release()
+
+
+class SlotLeaseState(NamedTuple):
+    """Ownership state of the shared keychain slot between swap sections.
+
+    ``owner`` is the profile whose token currently occupies the shared
+    slot; ``had_shared`` is the base64-encoded pre-ownership slot content
+    (or None when the slot started empty) that the LAST live session of
+    ``owner`` must restore on exit. Both fields are derived state: the
+    holder registry in ``locks.py`` remains the single liveness oracle,
+    so a stored owner whose registry entries are all dead expires.
+    """
+
+    owner: Optional[str]
+    had_shared: Optional[str]
+
+
+_SLOT_LEASE_NAME = "slot-lease.json"
+
+
+def _slot_lease_path(store) -> Path:
+    return _slots_dir(store) / _SLOT_LEASE_NAME
+
+
+def _decode_shared(encoded: Optional[str]) -> Optional[bytes]:
+    if not encoded:
+        return None
+    try:
+        return base64.b64decode(encoded, validate=False)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _load_slot_lease(store) -> SlotLeaseState:
+    """Read the slot lease, expiring an owner with no live registry entry.
+
+    The profile's holder registry is the single liveness oracle (DRY):
+    this state file only caches WHICH live profile owns the slot. A None
+    or corrupt file means "no owner" — the next launch simply takes
+    ownership, which is always safe because entry re-swaps the slot from
+    the profile's own private slot under ``swap.lock``.
+    """
+    path = _slot_lease_path(store)
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return SlotLeaseState(owner=None, had_shared=None)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return SlotLeaseState(owner=None, had_shared=None)
+    if not isinstance(data, dict):
+        return SlotLeaseState(owner=None, had_shared=None)
+    owner = data.get("owner")
+    had_shared = data.get("had_shared")
+    if not isinstance(owner, str) or not owner:
+        return SlotLeaseState(owner=None, had_shared=None)
+    import locks as locks_module
+
+    holders = locks_module.lease_holders(store, owner)
+    if holders is None or not holders:
+        return SlotLeaseState(owner=None, had_shared=None)
+    if not isinstance(had_shared, str) or not had_shared:
+        had_shared = None
+    return SlotLeaseState(owner=owner, had_shared=had_shared)
+
+
+def _save_slot_lease(store, owner: Optional[str], had_shared: Optional[bytes]) -> None:
+    """Persist the slot lease atomically. Caller must hold ``swap.lock``:
+    the swap lock is the write mutex, ``atomic_write_bytes`` only keeps
+    the file itself from ever being observed half-written."""
+    payload = json.dumps({
+        "owner": owner,
+        "had_shared": (
+            base64.b64encode(had_shared).decode("ascii")
+            if had_shared is not None
+            else None
+        ),
+    }).encode("utf-8")
+    atomic_write_bytes(_slot_lease_path(store), payload)
+
+
+@contextmanager
+def _launch_section(store) -> Iterator[None]:
+    """Brief ``swap.lock`` section for launch-time slot operations.
+
+    Unlike ``serialized_access`` (instant-busy, used by mutations and
+    read-only queries), a launch waits out micro-contentions — two tabs
+    starting the same profile in the same instant must both succeed, the
+    loser joins as soon as the winner's swap section ends. Still fail-fast
+    after the brief budget: a genuinely long holder (a rename recovery) is
+    the same hard contention the old whole-session lock reported.
+    """
+    import locks as locks_module
+
+    path = _slots_dir(store) / "swap.lock"
+    handle = None
+    for _attempt in range(3):
+        try:
+            handle = locks_module.try_lock_path(
+                path, description="keychain swap lock", inherit_on_exec=False
+            )
+        except OSError as exc:
+            raise SwapSectionError(
+                f"cannot acquire keychain swap lock ({exc})"
+            ) from exc
+        if handle is not None:
+            break
+        time.sleep(0.01)
+    if handle is None:
+        raise KeychainBusyError(
+            "another agydra session is using the shared Antigravity keychain "
+            "slot; close it (or use a different engine) and retry"
+        )
+    try:
+        yield
+    finally:
+        handle.release()
 
 
 def _login_keychain_path() -> Path:
@@ -635,38 +778,51 @@ def _ensure_target_keychain(store) -> Optional[Path]:
 
 def launch_guard(store, profile: str, capture: bool = False,
                  persist_on_exit: bool = True):
-    """Context manager swapping the shared keychain slot to ``profile``.
+    """Guard the shared keychain slot for a session of ``profile``.
 
     Returns a null-context manager on platforms without a keychain bridge.
     Fail-open: any error while swapping logs a warning and yields anyway, so
-    a keychain problem degrades to unswapped behavior instead of aborting.
+    a keychain problem degrades to unswapped behavior instead of aborting
+    (the one exception is ``KeychainBusyError`` for a DIFFERENT profile
+    owning the slot, which must fail the launch — see below).
 
-    ``capture=True`` flips the exit path for the login flow: instead of
-    restoring the pre-launch shared slot (which would DELETE or stale-
-    restore the fresh token agy just wrote), the token is persisted as this
-    profile's private slot and the shared slot keeps pointing at it. Use
-    only around an interactive ``agydra login`` run.
+    Ownership model (see the module docstring): each entry runs inside one
+    brief ``swap.lock`` section (``_launch_section``), then RELEASES the
+    lock for the whole session. Between sections the persistent
+    ``slot-lease.json`` records the owner and the pre-ownership slot
+    content. Three entry outcomes:
+
+    1. no live owner — this session takes ownership: identity-guarded
+       swap of ``profile``'s private slot into the shared slot (or a
+       clear, when the profile has no usable private slot yet), and the
+       lease state is written;
+    2. owner == profile — a JOIN: zero keychain writes and zero state
+       writes. Concurrent same-profile sessions coexist because none of
+       them mutates the slot agy is refreshing;
+    3. owner == another profile — ``KeychainBusyError`` propagates (the
+       runner maps it to a clean error): the fixed slot cannot hold two
+       identities at once.
+
+    Exit mirrors entry: one brief ``swap.lock`` section reads the state;
+    when other live holders remain (the profile's registry in
+    ``locks.py``) nothing happens — the slot belongs to the sessions still
+    running. The LAST holder to exit persists whatever the shared slot
+    holds into ``profile``'s private slot (identity-guarded by
+    ``_persist_if_trusted``, capturing any session's mid-run refresh) and
+    restores the pre-ownership content recorded in the state — the exit
+    reads ``had_shared`` from the STATE file, not from this instance,
+    because the last session to leave may be a joiner that never swapped.
+
+    ``capture=True`` flips the exit for the login flow: instead of
+    restoring, the fresh token is persisted as this profile's private slot
+    and the shared slot keeps pointing at it. Use only around an
+    interactive ``agydra login`` run.
 
     ``persist_on_exit=False`` keeps read-only commands from rewriting the
     profile's ``.secret`` backup; the authentication swap and restore still
     happen, but exit-time credential capture is skipped.
 
-    Why the default exit restores: a normal launch must leave the shared
-    slot exactly as it found it. The login flow, however, sets capture=True
-    so that exit persists the shared slot directly into the profile's
-    private slot via _capture_and_keep() instead of restoring the pre-launch
-    shared slot.
-
-    When ``profile`` has no private slot yet but the shared slot is not
-    empty (see the module docstring), entry clears the shared slot instead
-    of swapping a profile secret into it, so it does not set the internal
-    "swapped" flag either: nothing of this profile's own was injected, so
-    the exit path must not save that cleared value as this profile's
-    private slot — it only restores or deletes the shared slot, per the
-    state entry recorded.
-
-    Every persist onto ``profile``'s private slot (the swapped launch's
-    post-run snapshot, or the login flow's capture) is identity-guarded by
+    Every persist onto ``profile``'s private slot is identity-guarded by
     ``_persist_if_trusted``: whatever the shared slot holds at exit is only
     trusted as this profile's own credential when its email claim matches
     what is already known about the profile, or the profile has no known
@@ -682,19 +838,6 @@ def launch_guard(store, profile: str, capture: bool = False,
     whatever credential source the profile still has (its on-disk token,
     or nothing, in which case the shared slot is cleared like any other
     profile with no usable private slot).
-
-    Non-login (``capture=False``) entry has one more short-circuit: when
-    the shared slot ALREADY decodes to ``profile``'s own known identity
-    (a real session for this exact profile is already running and put it
-    there), entry does nothing at all -- no swap in, no lock-protected
-    write -- and exit correspondingly persists/restores nothing either.
-    Without this, every call would still swap the profile's own `.secret`
-    in and, on exit, restore whatever the shared slot held *before* this
-    call -- which, if the still-running session refreshed its OAuth token
-    while this call's subprocess was executing, is now stale and would
-    clobber that live session's fresh token. A DIFFERENT profile currently
-    occupying the shared slot (the non-busy-profile case) is unaffected and
-    still gets the existing, ``swap.lock``-serialized swap-and-restore.
     """
     if not supported():
         import contextlib
@@ -704,110 +847,167 @@ def launch_guard(store, profile: str, capture: bool = False,
     class _Guard:
         def __init__(self, persist_on_exit: bool) -> None:
             self._persist_on_exit = persist_on_exit
+            self._keychain_path: Optional[Path] = None
+            self._wrote_payload = False
+            self._joined = False
+
+        def _abandon_membership(self) -> None:
+            import locks as locks_module
+
+            try:
+                locks_module.release_lease(store, profile)
+            except OSError:
+                pass
+
+        @property
+        def _swapped(self) -> bool:
+            """Compatibility read for legacy tests: True when this entry
+            performed the ownership swap (wrote the profile payload into the
+            shared slot). Derived, not stored."""
+            return self._wrote_payload
+
+        @property
+        def _already_current(self) -> bool:
+            """Compatibility read for legacy tests: True when entry JOINED a
+            live owner of the same profile (the no-op path of the old
+            model). Derived, not stored."""
+            return self._joined
+
+        @property
+        def _had_shared(self) -> Optional[bytes]:
+            """Compatibility read for legacy tests: the pre-ownership shared
+            slot content this ownership must restore, decoded from the slot
+            lease state. Derived, not stored."""
+            if self._keychain_path is None:
+                return None
+            return _decode_shared(_load_slot_lease(store).had_shared)
 
         def __enter__(self):
-            self._lock = None
-            self._had_shared: Optional[bytes] = None
-            self._swapped = False
-            self._already_current = False
-            self._keychain_path: Optional[Path] = None
+            import locks as locks_module
+
+            locks_module.acquire_lease(store, profile)
             try:
-                self._lock = _serialize_lock(store)
-                self._keychain_path = _ensure_target_keychain(store)
-                if self._keychain_path is None:
-                    return self
-                self._had_shared = read_slot(shared_slot(), self._keychain_path)
-                if not capture and self._had_shared is not None:
-                    shared_identity = _secret_identity(
-                        _as_envelope(self._had_shared)
-                    )
-                    if shared_identity is not None:
-                        known = _known_identity(store, profile, include_secret=False)
-                        if known is not None and shared_identity == known:
-                            self._already_current = True
-                            return self
-                slot = load_profile_slot(store, profile)
-                if slot is not None:
-                    known = _known_identity(store, profile, include_secret=False)
-                    if known is not None:
-                        candidate = _secret_identity(slot)
-                        if candidate != known:
-                            seen = repr(candidate) if candidate else "undecodable"
-                            quarantined = _quarantine_profile_slot(store, profile)
-                            action = (
-                                f"quarantined to {quarantined}"
-                                if quarantined is not None
-                                else "quarantine failed"
-                            )
-                            warn(
-                                f"keychain slot for profile {profile!r} looks "
-                                f"like a different account ({seen} vs "
-                                f"{known!r}); {action}, not swapped in"
-                            )
-                            slot = None
-                if slot is not None:
-                    try:
-                        payload = token_payload_for_slot(slot)
-                    except ValueError as exc:
-                        warn(
-                            f"keychain swap skipped ({exc}); continuing without "
-                            "per-profile credential swap"
+                with _launch_section(store):
+                    self._keychain_path = _ensure_target_keychain(store)
+                    if self._keychain_path is None:
+                        return self
+                    state = _load_slot_lease(store)
+                    if state.owner == profile:
+                        self._joined = True
+                        return self
+                    if state.owner is not None:
+                        raise KeychainBusyError(
+                            "another agydra session is using the shared "
+                            "Antigravity keychain slot (profile "
+                            f"{state.owner!r} owns it; launch that profile "
+                            "to join it, or close its sessions and retry)"
                         )
-                        slot = None
-                    else:
-                        write_slot(
-                            shared_slot(),
-                            payload,
-                            self._keychain_path,
-                        )
-                        self._swapped = True
-                if slot is None and self._had_shared is not None:
-                    delete_slot(shared_slot(), self._keychain_path)
+                    self._begin_ownership()
+            except KeychainBusyError:
+                self._abandon_membership()
+                raise
+            except SwapSectionError:
+                self._abandon_membership()
+                raise
             except (KeychainError, OSError, ValueError) as exc:
+                self._abandon_membership()
                 warn(
                     f"keychain swap skipped ({exc}); continuing without "
                     "per-profile credential swap"
                 )
+            except BaseException:
+                self._abandon_membership()
+                raise
             return self
+
+        def _begin_ownership(self) -> None:
+            had_shared = read_slot(shared_slot(), self._keychain_path)
+            slot = load_profile_slot(store, profile)
+            if slot is not None:
+                known = _known_identity(store, profile, include_secret=False)
+                if known is not None:
+                    candidate = _secret_identity(slot)
+                    if candidate != known:
+                        seen = repr(candidate) if candidate else "undecodable"
+                        quarantined = _quarantine_profile_slot(store, profile)
+                        action = (
+                            f"quarantined to {quarantined}"
+                            if quarantined is not None
+                            else "quarantine failed"
+                        )
+                        warn(
+                            f"keychain slot for profile {profile!r} looks "
+                            f"like a different account ({seen} vs "
+                            f"{known!r}); {action}, not swapped in"
+                        )
+                        slot = None
+            if slot is not None:
+                try:
+                    payload = token_payload_for_slot(slot)
+                except ValueError as exc:
+                    warn(
+                        f"keychain swap skipped ({exc}); continuing without "
+                        "per-profile credential swap"
+                    )
+                    slot = None
+                else:
+                    write_slot(
+                        shared_slot(),
+                        payload,
+                        self._keychain_path,
+                    )
+                    self._wrote_payload = True
+            if slot is None and had_shared is not None:
+                delete_slot(shared_slot(), self._keychain_path)
+            _save_slot_lease(store, profile, had_shared)
 
         def __exit__(self, *exc_info):
             try:
                 if self._keychain_path is None:
                     return False
-                if self._already_current:
-                    return False
-                if capture:
-                    self._capture_and_keep()
-                else:
-                    current: Optional[bytes] = None
-                    if self._swapped and self._persist_on_exit:
-                        current = read_slot(shared_slot(), self._keychain_path)
-                        if current is not None:
-                            _persist_if_trusted(store, profile, current)
+                with _launch_section(store):
+                    state = _load_slot_lease(store)
+                    if state.owner == profile:
+                        import locks as locks_module
 
-                    if self._had_shared is not None:
-                        write_slot(shared_slot(), self._had_shared, self._keychain_path)
-                    elif self._swapped:
-                        has_content = (
-                            (current is not None)
-                            if self._persist_on_exit
-                            else (read_slot(shared_slot(), self._keychain_path) is not None)
-                        )
-                        if has_content:
-                            try:
-                                delete_slot(shared_slot(), self._keychain_path)
-                            except KeychainError:
-                                pass
+                        holders = locks_module.lease_holders(store, profile)
+                        if holders is not None:
+                            others = [h for h in holders if h.pid != os.getpid()]
+                            if not others:
+                                self._finalize_ownership(state)
             except (KeychainError, OSError) as exc:
                 warn(f"keychain restore failed ({exc}); shared slot left as-is")
             finally:
-                if self._lock is not None:
-                    try:
-                        fcntl.flock(self._lock.fileno(), fcntl.LOCK_UN)
-                        self._lock.close()
-                    except OSError:
-                        pass
+                self._abandon_membership()
             return False
+
+        def _finalize_ownership(self, state: SlotLeaseState) -> None:
+            had_shared = _decode_shared(state.had_shared)
+            if capture:
+                self._capture_and_keep()
+                _save_slot_lease(store, None, None)
+                return
+            current: Optional[bytes] = None
+            read_once = self._persist_on_exit or had_shared is not None
+            if read_once:
+                current = read_slot(shared_slot(), self._keychain_path)
+            if self._persist_on_exit and current is not None:
+                _persist_if_trusted(store, profile, current)
+            if had_shared is not None:
+                if current != had_shared:
+                    write_slot(shared_slot(), had_shared, self._keychain_path)
+            else:
+                has_content = (
+                    current
+                    if self._persist_on_exit
+                    else read_slot(shared_slot(), self._keychain_path)
+                )
+                if has_content is not None:
+                    try:
+                        delete_slot(shared_slot(), self._keychain_path)
+                    except KeychainError:
+                        pass
+            _save_slot_lease(store, None, None)
 
         def _capture_and_keep(self):
             data = read_slot(shared_slot(), self._keychain_path)
@@ -1028,15 +1228,14 @@ def capture_shared_slot_for_import(store, name: str, data_dir: Path) -> None:
     The shared slot normally carries plain JSON, while ``.secret`` backups
     and identity decoding use the envelope form. Normalize once so identity
     checks and the saved backup use the same representation.
+
+    A keychain read failure raises ``KeychainError``: the caller owns the
+    explicit failure (the imported disk data stays as published).
     """
     if not supported():
         return
-    try:
-        keychain_path = _ensure_target_keychain(store)
-        current = read_slot(shared_slot(), keychain_path)
-    except (KeychainError, OSError) as exc:
-        warn(f"keychain import capture skipped ({exc}); continuing without it")
-        return
+    keychain_path = _ensure_target_keychain(store)
+    current = read_slot(shared_slot(), keychain_path)
     if current is None:
         return
     current = _as_envelope(current)

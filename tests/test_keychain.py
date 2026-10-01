@@ -1,7 +1,10 @@
 """Lightweight checks for the keychain bridge naming and descriptor shape."""
+from __future__ import annotations
+
 import base64
 import binascii
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -574,6 +577,12 @@ class TestLaunchGuardAlreadyCurrent(unittest.TestCase):
                     mock.patch.object(
                         keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
                     ):
+                import locks as locks_module
+
+                locks_module.acquire_lease(store, "alpha")
+                keychain._save_slot_lease(
+                    store, "alpha", _slot_payload_json("alpha@example.com")
+                )
                 guard = keychain.launch_guard(store, "alpha", capture=False)
                 state = guard.__enter__()
                 self.assertTrue(state._already_current)
@@ -586,8 +595,8 @@ class TestLaunchGuardAlreadyCurrent(unittest.TestCase):
             self.assertEqual(kc.calls, [])
             self.assertEqual(kc.shared, _slot_payload_json("alpha@example.com"))
             self.assertEqual(
-                keychain.load_profile_slot(store, "alpha"),
-                _go_keyring_secret("alpha@example.com"),
+                keychain._secret_identity(keychain.load_profile_slot(store, "alpha")),
+                "alpha@example.com",
             )
 
     def test_different_profile_in_shared_slot_keeps_existing_swap_behavior(self):
@@ -649,16 +658,25 @@ class TestLaunchGuardRecoversHexCorruptedSharedSlot(unittest.TestCase):
                     mock.patch.object(
                         keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
                     ):
+                import locks as locks_module
+
+                locks_module.acquire_lease(store, "alpha")
+                keychain._save_slot_lease(store, "alpha", corrupted_shared)
                 guard = keychain.launch_guard(store, "alpha", capture=False)
                 state = guard.__enter__()
                 self.assertTrue(state._already_current)
                 self.assertFalse(state._swapped)
                 self.assertEqual(kc.calls, [])
                 state.__exit__(None, None, None)
-            # A true no-op: the still-corrupted value is left untouched
-            # rather than rewritten (which would just re-wrap it again).
-            self.assertEqual(kc.calls, [])
+            # The still-corrupted value is left byte-identical in the shared
+            # slot (an idempotent restore may rewrite the same bytes, never
+            # another hex layer), and the normalized payload self-heals into
+            # the profile's private slot through the identity-guarded persist.
             self.assertEqual(kc.shared, corrupted_shared)
+            self.assertEqual(
+                keychain._secret_identity(keychain.load_profile_slot(store, "alpha")),
+                "alpha@example.com",
+            )
 
     def test_different_profile_mismatch_still_detected_through_double_hex_corruption(self):
         """A DIFFERENT profile's identity, hidden under the same double-hex
@@ -1686,20 +1704,21 @@ class TestSerializeLock(unittest.TestCase):
         with isolated_store_env():
             store = Store()
             handles = []
-            orig_open = open
+            orig_open = os.open
 
             def tracking_open(*args, **kwargs):
-                h = orig_open(*args, **kwargs)
-                handles.append(h)
-                return h
+                fd = orig_open(*args, **kwargs)
+                handles.append(fd)
+                return fd
 
             with mock.patch("fcntl.flock", side_effect=OSError("flock lock error")), \
-                    mock.patch("builtins.open", side_effect=tracking_open):
-                with self.assertRaises(OSError):
+                    mock.patch("os.open", side_effect=tracking_open):
+                with self.assertRaises(keychain.KeychainError):
                     keychain._serialize_lock(store)
 
             self.assertEqual(len(handles), 1)
-            self.assertTrue(handles[0].closed, "file handle must be closed after fcntl error")
+            with self.assertRaises(OSError):
+                os.fstat(handles[0])
 
 
 class TestLaunchGuardExitRedundantRead(unittest.TestCase):
@@ -1891,9 +1910,7 @@ class TestRenameProfileSlotSerialization(BaseCase):
         super().setUp()
         self.store = Store()
 
-    def test_rename_waits_for_swap_lock_before_moving_private_slot(self):
-        import threading
-
+    def test_rename_fails_closed_under_swap_lock_contention(self):
         if keychain.fcntl is None:
             self.skipTest("keychain bridge serialization requires POSIX flock")
 
@@ -1902,49 +1919,104 @@ class TestRenameProfileSlotSerialization(BaseCase):
         old_slot.parent.mkdir(parents=True, exist_ok=True)
         old_slot.write_bytes(b"credential")
         held_lock = keychain._serialize_lock(self.store)
-        original_serialize = keychain._serialize_lock
-        attempting_lock = threading.Event()
-        finished = threading.Event()
-        failures = []
 
-        def observe_serialize(store):
-            attempting_lock.set()
-            return original_serialize(store)
-
-        def rename_slot():
-            try:
-                keychain.rename_profile_slot(self.store, "old", "new")
-            except BaseException as exc:
-                failures.append(exc)
-            finally:
-                finished.set()
-
-        worker = threading.Thread(target=rename_slot, daemon=True)
         try:
             with mock.patch.object(keychain, "supported", return_value=True), \
-                    mock.patch.object(
-                        keychain, "_serialize_lock", side_effect=observe_serialize
-                    ), \
                     mock.patch.object(
                         keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
                     ), \
                     mock.patch.object(keychain, "delete_slot"):
-                worker.start()
-                attempted = attempting_lock.wait(5)
-                self.assertTrue(attempted)
-                self.assertFalse(finished.wait(0.1))
+                with self.assertRaises(keychain.KeychainBusyError):
+                    keychain.rename_profile_slot(self.store, "old", "new", strict=True)
                 self.assertTrue(old_slot.exists())
                 self.assertFalse(new_slot.exists())
         finally:
-            keychain.fcntl.flock(held_lock.fileno(), keychain.fcntl.LOCK_UN)
-            held_lock.close()
-            if worker.ident is not None:
-                worker.join(5)
+            held_lock.release()
 
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(failures, [])
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                ), \
+                mock.patch.object(keychain, "delete_slot"):
+            keychain.rename_profile_slot(self.store, "old", "new", strict=True)
+
         self.assertFalse(old_slot.exists())
         self.assertEqual(new_slot.read_bytes(), b"credential")
+
+
+class TestSwapLockFailClosed(BaseCase):
+    def setUp(self):
+        super().setUp()
+        import locks
+
+        self.locks = locks
+        self.store = Store()
+        self.store.create("alpha")
+        keychain.save_profile_slot(
+            self.store, "alpha", _go_keyring_secret("alpha@example.com")
+        )
+        self.foreign = _slot_payload_json("foreign@example.com")
+        self.kc = _MemoryKeychain(self.foreign)
+
+    def _patches(self):
+        return (
+            mock.patch.object(keychain, "supported", return_value=True),
+            mock.patch.object(keychain, "_run", self.kc.run),
+            mock.patch.object(keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN),
+            mock.patch.object(
+                keychain, "read_slot", side_effect=AssertionError("shared slot read without the lock")
+            ),
+        )
+
+    def _enter(self):
+        patches = self._patches()
+        with patches[0], patches[1], patches[2], patches[3]:
+            return keychain.launch_guard(self.store, "alpha").__enter__()
+
+    def test_error_hierarchy_keeps_keychain_errors_out_of_oserror_handlers(self):
+        self.assertFalse(issubclass(keychain.KeychainError, OSError))
+        self.assertTrue(issubclass(keychain.KeychainError, RuntimeError))
+        self.assertTrue(issubclass(keychain.KeychainBusyError, keychain.KeychainError))
+
+    def test_lock_acquisition_error_fails_closed_without_touching_the_slot(self):
+        with mock.patch.object(
+            self.locks, "try_lock_path", side_effect=self.locks.LockError("permission denied")
+        ):
+            with self.assertRaises(keychain.KeychainError) as caught:
+                self._enter()
+        self.assertNotIsInstance(caught.exception, keychain.KeychainBusyError)
+        self.assertIn("permission denied", str(caught.exception))
+        self.assertEqual(self.kc.calls, [])
+        self.assertEqual(self.kc.shared, self.foreign)
+
+    def test_busy_lock_fails_closed_without_touching_the_slot(self):
+        with mock.patch.object(self.locks, "try_lock_path", return_value=None):
+            with self.assertRaises(keychain.KeychainBusyError):
+                self._enter()
+        self.assertEqual(self.kc.calls, [])
+        self.assertEqual(self.kc.shared, self.foreign)
+
+    def test_enter_failure_after_the_lock_releases_it(self):
+        patches = self._patches()
+        with patches[0], patches[1], mock.patch.object(
+            keychain, "_ensure_target_keychain", side_effect=RuntimeError("unexpected")
+        ):
+            guard = keychain.launch_guard(self.store, "alpha")
+            with self.assertRaises(RuntimeError):
+                guard.__enter__()
+        again = keychain._serialize_lock(self.store)
+        again.release()
+
+    def test_import_capture_read_failure_is_explicit(self):
+        def failing_run(args, input_bytes=None, **kwargs):
+            return _rc(1)
+
+        data_dir = self.store.profile_data_dir("alpha")
+        with mock.patch.object(keychain, "supported", return_value=True), mock.patch.object(
+            keychain, "_run", failing_run
+        ), mock.patch.object(keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN):
+            with self.assertRaises(keychain.KeychainError):
+                keychain.capture_shared_slot_for_import(self.store, "alpha", data_dir)
 
 
 if __name__ == "__main__":

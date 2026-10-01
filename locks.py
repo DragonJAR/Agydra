@@ -390,7 +390,23 @@ def lease_holders(store, name: str) -> Optional[List[Holder]]:
     return _prune_holders(parsed)
 
 
-def acquire_lease(store, name: str) -> int:
+_LEASE_POLL_INTERVAL_S = 0.05
+"""Bounded polling interval for ``acquire_lease`` patience.
+
+A launch waiting out a rare, brief store-mutation flock checks back this
+often: cheap enough not to spin, slow enough that a multi-second mutation
+makes only a handful of probes before the patience budget runs out.
+"""
+
+
+def _open_lease_fd(store, name: str) -> int:
+    """Open the lease file for an acquire attempt. Caller owns the fd."""
+    path = lock_path(store, name)
+    platforms.ensure_dir(path.parent)
+    return os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+
+
+def acquire_lease(store, name: str, patience_s: float = 0.0) -> int:
     """Join ``name``'s registry under a brief exclusive flock.
 
     Registers the current process as one holder and returns the number of
@@ -400,40 +416,48 @@ def acquire_lease(store, name: str) -> int:
     The write is in-place on the locked fd — never ``os.replace``, which
     would swap the inode out from under concurrent flock holders.
 
-    Raises LockError when the exclusive lock cannot be taken (a store
-    mutation in progress for longer than the brief-retry budget): the
-    caller surfaces that as a busy failure, the same fail-closed policy
-    as an unreadable lock file.
+    ``patience_s`` bounds how long a store-mutation flock on the same
+    inode is waited out (polling at :data:`_LEASE_POLL_INTERVAL_S` — a
+    bounded recovery for a rare, brief maintenance window, not a spin).
+    Raises LockError when the exclusive lock cannot be taken within the
+    patience budget: the caller surfaces that as a busy failure, the same
+    fail-closed policy as an unreadable lock file.
     """
     path = lock_path(store, name)
-    platforms.ensure_dir(path.parent)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        if platforms.is_windows() and os.fstat(fd).st_size == 0:
-            os.write(fd, b"\0")
-        if not _lock_ex_brief(fd) or not _same_file(fd, path):
-            raise LockError(f"cannot acquire lease lock {path}")
+    deadline = time.monotonic() + patience_s
+    while True:
+        fd = _open_lease_fd(store, name)
         try:
-            parsed = _parse_holders(_read_all(fd))
-            holders = [] if parsed is None else _prune_holders(parsed)
-            entry = Holder(os.getpid(), _own_start_token())
-            merged = [h for h in holders if h.pid != entry.pid]
-            merged.append(entry)
-            _write_holders(fd, merged)
-            return len(holders)
+            if platforms.is_windows() and os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            if _lock_ex_brief(fd) and _same_file(fd, path):
+                try:
+                    parsed = _parse_holders(_read_all(fd))
+                    holders = [] if parsed is None else _prune_holders(parsed)
+                    entry = Holder(os.getpid(), _own_start_token())
+                    merged = [h for h in holders if h.pid != entry.pid]
+                    merged.append(entry)
+                    _write_holders(fd, merged)
+                    return len(holders)
+                finally:
+                    _unlock_fd(fd)
         finally:
-            _unlock_fd(fd)
-    finally:
-        os.close(fd)
+            os.close(fd)
+        if time.monotonic() >= deadline:
+            raise LockError(f"cannot acquire lease lock {path}")
+        time.sleep(_LEASE_POLL_INTERVAL_S)
 
 
-def release_lease(store, name: str) -> None:
+def release_lease(store, name: str, patience_s: float = 0.0) -> None:
     """Remove the current process's entries from ``name``'s registry.
 
     A no-op when the lease file does not exist. Every entry carrying this
     process's pid is dropped (a process can hold at most one entry per
-    profile); other live holders are preserved. Raises LockError only when
-    the exclusive lock cannot be taken, mirroring ``acquire_lease``.
+    profile); other live holders are preserved. ``patience_s`` waits out a
+    rare store-mutation flock the same way ``acquire_lease`` does. A
+    failure to release is recoverable on its own — the registry's liveness
+    pruning frees a stale holder entry on the next read — so the caller
+    is expected to treat an exception here as informational, not fatal.
     """
     path = lock_path(store, name)
     try:
@@ -442,18 +466,24 @@ def release_lease(store, name: str) -> None:
         return
     except OSError as exc:
         raise LockError(f"cannot open lease {path} ({exc})") from exc
-    try:
-        if not _lock_ex_brief(fd):
-            raise LockError(f"cannot acquire lease lock {path}")
+    deadline = time.monotonic() + patience_s
+    while True:
         try:
-            parsed = _parse_holders(_read_all(fd))
-            holders = [] if parsed is None else _prune_holders(parsed)
-            remaining = [h for h in holders if h.pid != os.getpid()]
-            _write_holders(fd, remaining)
+            if _lock_ex_brief(fd):
+                try:
+                    parsed = _parse_holders(_read_all(fd))
+                    holders = [] if parsed is None else _prune_holders(parsed)
+                    remaining = [h for h in holders if h.pid != os.getpid()]
+                    _write_holders(fd, remaining)
+                    return
+                finally:
+                    _unlock_fd(fd)
         finally:
-            _unlock_fd(fd)
-    finally:
-        os.close(fd)
+            os.close(fd)
+        if time.monotonic() >= deadline:
+            raise LockError(f"cannot acquire lease lock {path}")
+        time.sleep(_LEASE_POLL_INTERVAL_S)
+        fd = os.open(path, os.O_RDWR)
 
 
 def normalize_usage_session_id(session_id: object) -> str:
