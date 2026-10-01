@@ -30,6 +30,7 @@ from bootstrap import BootstrapError
 from isolation import IsolationError
 from store import Store, StoreError, atomic_copy, atomic_write_bytes, rename_dir_with_retry
 from ui import bar as _bar, error as _error, note as _note, pad, paint, paint_each, warn as _warn
+from ui import console_print as print
 
 Store.register_rename_recovery_handler(
     keychain.RENAME_RECOVERY_ACTION,
@@ -99,7 +100,7 @@ _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
     ),
     "engine": (
         "-e", "--engine", True, "ENGINE",
-        "target CLI engine: agy (default), codex, grok, or claude; filters candidate profiles for -r",
+        f"target CLI engine: {', '.join(engines.SUPPORTED_ENGINES)} (default: agy); filters candidate profiles for -r",
     ),
     "dry-run": (
         "-n", "--dry-run", False, None,
@@ -111,8 +112,8 @@ _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
     ),
     "force": (
         "-f", "--force", False, None,
-        "force-launch without taking the session lock; concurrent "
-        "sessions on the same profile may corrupt OAuth tokens",
+        "compatibility alias: joining a busy profile is now the default "
+        "behavior, so this flag no longer changes launch semantics",
     ),
 }
 _LAUNCH_LONG_ALIASES: Dict[str, Tuple[str, ...]] = {"random": ("--rotate",)}
@@ -431,14 +432,14 @@ def _assert_free(store: Store, name: str, action: str = "modifying the profile")
     only — see ``locks.lock_holder_pid``), name it so the user has an
     actionable next step instead of a dead end."""
     if locks.is_locked(store, name):
+        holders = locks.lease_holders(store, name)
         pid = locks.lock_holder_pid(store, name)
-        if pid:
-            raise StoreError(
-                f"profile {name!r} has a live session (agy PID {pid}); end it "
-                f"(or: kill {pid}) before {action}"
-            )
+        count = len(holders) if holders else 1
+        session = f"a live session (PID {pid})" if pid else "a live session"
+        if holders and count > 1:
+            session = f"{count} live sessions (first PID {pid})" if pid else f"{count} live sessions"
         raise StoreError(
-            f"profile {name!r} has a live session; end it before {action}"
+            f"profile {name!r} has {session}; end it before {action}"
         )
 
 
@@ -499,6 +500,7 @@ def cmd_list(store: Store, _args) -> int:
         state_shown = paint(state, state_color) if state_color else state
         busy_shown = paint("yes", "yellow", "bold") if busy else "-"
         last = paint(profile.last_used or "-", "dim")
+        email = ui.console_text(email)
         print(
             f"{idx:<3}{profile.name:<{width + 2}}{email:<{_EMAIL_COL_WIDTH}}"
             f"{pad(state_shown, 20)}{pad(is_default, 9)}{pad(busy_shown, 6)}{pad(engine, 9)}{last}"
@@ -590,7 +592,12 @@ def cmd_status(store: Store, args) -> int:
     print(f"binary    : {plan.binary}")
     print(f"email     : {email}")
     print(f"auth      : {state}")
-    print(f"busy      : {'yes' if locks.is_locked(store, plan.profile) else 'no'}")
+    holders = locks.lease_holders(store, plan.profile)
+    sessions = (
+        "busy (unverified)" if holders is None
+        else (str(len(holders)) if holders else "none")
+    )
+    print(f"sessions  : {sessions}")
     print(f"store     : {data_dir}")
     if native:
         print(f"seq       : {profile.seq}")
@@ -1270,7 +1277,7 @@ def cmd_import(store: Store, args) -> int:
             f"Usage: agydra import <profile-name>   (use -s DIR to override the source)."
         )
     name = store.resolve_ref(ref)
-    with _acquire_profile_lock(store, name, "importing into it"):
+    with _acquire_profile_lock(store, name, "importing into it"), ExitStack() as guards:
         if store.resolve_ref(ref) != name:
             raise StoreError(
                 f"profile reference {ref!r} changed while acquiring its lock; retry import"
@@ -1302,6 +1309,8 @@ def cmd_import(store: Store, args) -> int:
                 f"profile {name!r} already has data ({data_dir}); "
                 "delete it first (agydra delete " + name + ") or pick an empty profile."
             )
+        if driver.needs_keychain:
+            guards.enter_context(keychain.serialized_access(store))
         if data_dir.exists():
             data_dir.rmdir()
         platforms.ensure_dir(data_dir.parent)
@@ -1317,9 +1326,10 @@ def cmd_import(store: Store, args) -> int:
             raise
         if driver.needs_keychain:
             try:
-                with keychain.serialized_access(store):
-                    keychain.capture_shared_slot_for_import(store, name, data_dir)
-            except (keychain.KeychainError, OSError, AttributeError) as exc:
+                keychain.capture_shared_slot_for_import(store, name, data_dir)
+            except keychain.KeychainError:
+                raise
+            except (OSError, AttributeError) as exc:
                 _warn(
                     f"keychain import capture skipped ({exc}); "
                     "continuing without it"
@@ -1424,9 +1434,9 @@ def cmd_language(store: Store, args) -> int:
 
 _SUBCOMMAND_HELP: Dict[str, str] = {
     "list": "show all profiles (number, email, auth, engine, busy)",
-    "create": "create an isolated profile store (-e agy|codex|grok)",
-    "login": "run engine authentication flow isolated to a profile (agy, codex, or grok)",
-    "import": "copy generic data dir into a profile (~/.gemini, ~/.codex, or ~/.grok auto-detected)",
+    "create": f"create an isolated profile store (-e {'|'.join(engines.SUPPORTED_ENGINES)})",
+    "login": f"run engine authentication flow isolated to a profile ({', '.join(engines.SUPPORTED_ENGINES)})",
+    "import": "copy generic data dir into an existing profile (target engine auto-detected; Claude Code import unsupported)",
     "status": "show resolved profile, engine, binary, and credentials (zero side effects)",
     "default": "get or set the fallback default profile",
     "use": "pin a profile to the current directory (.agydra marker)",
@@ -1525,7 +1535,7 @@ _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
 
 def _report_error(exc: BaseException) -> int:
     """Single error-mapping table shared by both dispatch paths."""
-    if isinstance(exc, (StoreError, IsolationError, BootstrapError, ValueError)):
+    if isinstance(exc, (StoreError, IsolationError, BootstrapError, keychain.KeychainError, ValueError)):
         _error(str(exc))
         return 1
     if isinstance(exc, EOFError):
@@ -1623,7 +1633,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if sub is not None:
         rest = raw[1:]
         parser = argparse.ArgumentParser(
-            prog=f"agydra {sub}", formatter_class=ColoredHelpFormatter
+            prog=f"agydra {sub}", formatter_class=ColoredHelpFormatter,
+            description=_SUBCOMMAND_HELP[sub] if sub in ("create", "login", "import") else None,
         )
         if sub == "list":
             parser.set_defaults(func=cmd_list)
@@ -1701,7 +1712,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.add_argument(
                 "-s", "--source",
                 metavar="DIR",
-                help="generic agy data dir to copy from (default: auto-detected ~/.gemini)",
+                help="generic data dir to copy from (default: target engine's data dir; Claude Code import unsupported)",
             )
             parser.set_defaults(func=cmd_import)
         elif sub == "share-config":
@@ -1764,7 +1775,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return args.func(store, args)
         except (
             StoreError, IsolationError, BootstrapError, EOFError, OSError,
-            KeyboardInterrupt, ValueError,
+            KeyboardInterrupt, keychain.KeychainError, ValueError,
         ) as exc:
             return _report_error(exc)
 
@@ -1794,7 +1805,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             engine=engine_str,
         )
         return runner.run(plan, store=store, dry_run=bool(values["dry-run"]))
-    except (StoreError, IsolationError, OSError, KeyboardInterrupt, ValueError) as exc:
+    except (StoreError, IsolationError, keychain.KeychainError, OSError, KeyboardInterrupt, ValueError) as exc:
         return _report_error(exc)
 
 
