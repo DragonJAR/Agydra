@@ -21,10 +21,25 @@ The lock lives exactly as long as the session it protects:
   either (msvcrt's byte-range locking makes concurrent reads of the same
   region unreliable enough to skip rather than guess).
 
+Beyond the flock, the SAME file now carries a holders registry: a JSON
+list of ``{"pid", "start"}`` entries describing every live session that
+joined the profile. ``lease_holders`` is the single parser for that
+content (legacy PID-only files parse as one token-less holder), sessions
+join via ``acquire_lease`` and leave via ``release_lease`` under a brief
+exclusive flock, and liveness comes from ``platforms.process_alive`` plus
+``platforms.process_start_token`` so a crashed session's entry is pruned
+on the next read instead of lingering. ``is_locked`` reports busy when
+EITHER the flock is held (store mutations, legacy sessions) OR the
+registry contains a live holder — the flock remains a valid busy signal,
+the registry adds refcounted multi-session joins. Registry writes always
+happen in place on the locked fd (never ``os.replace``: swapping the
+inode would break the flock mutual exclusion documented below).
+
 A lock file that exists but is unlocked simply means "no session": file
 existence alone NEVER marks a profile as in use — only the kernel-held
-lock does. Probes (``is_locked``) never create files, so read-only
-commands keep having zero filesystem side effects.
+lock or a live registered holder does. Probes (``is_locked``,
+``lease_holders``) never create files, so read-only commands keep having
+zero filesystem side effects.
 
 Fail-closed guarantee and its hard limit (read this before touching
 anything below):
@@ -80,10 +95,12 @@ cheap), but it is not expected to ever fire there.
 """
 from __future__ import annotations
 
+import json
 import os
+import time
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 import platforms
 
@@ -141,13 +158,20 @@ class LockHandle:
     process image, the fd survives inside agy, and the kernel releases the
     lock when agy exits. Store-maintenance locks are released by their caller
     and are not inherited by child processes.
+
+    A handle that recorded its PID (legacy plain-exec path) truncates that
+    PID on ``release`` so the file's content cannot masquerade as a live
+    registered holder once the flock is gone; the exec path itself never
+    releases, which is exactly why its PID content stays meaningful for
+    as long as the exec'd process lives.
     """
 
-    __slots__ = ("_fd", "_released")
+    __slots__ = ("_fd", "_released", "_recorded_pid")
 
     def __init__(self, fd: int) -> None:
         self._fd = fd
         self._released = False
+        self._recorded_pid = False
 
     def __enter__(self) -> "LockHandle":
         return self
@@ -159,6 +183,11 @@ class LockHandle:
         if self._released:
             return
         self._released = True
+        if self._recorded_pid:
+            try:
+                os.ftruncate(self._fd, 0)
+            except OSError:
+                pass
         _unlock_fd(self._fd)
         os.close(self._fd)
 
@@ -172,6 +201,7 @@ class LockHandle:
         PID and ``lock_holder_pid`` correctly reports ``None`` for it.
         """
         _write_holder_pid(self._fd)
+        self._recorded_pid = True
 
 
 def lock_dir(store) -> Path:
@@ -184,6 +214,246 @@ def lock_path(store, name: str) -> Path:
 
 def sequence_lock_path(store) -> Path:
     return lock_dir(store) / _SEQUENCE_LOCK_NAME
+
+
+class Holder(NamedTuple):
+    """One live session registered on a profile's lease.
+
+    ``start`` is the opaque ``platforms.process_start_token`` of ``pid``
+    when it could be read, else None (legacy entries, or unreadable
+    identity). A None start never prunes the holder on identity grounds —
+    only a dead pid does.
+    """
+
+    pid: int
+    start: Optional[str]
+
+
+_OWN_START_TOKEN: Optional[str] = None
+_OWN_START_TOKEN_RESOLVED = False
+
+
+def _own_start_token() -> Optional[str]:
+    """The running process's identity token, resolved once per lifetime."""
+    global _OWN_START_TOKEN, _OWN_START_TOKEN_RESOLVED
+    if not _OWN_START_TOKEN_RESOLVED:
+        _OWN_START_TOKEN = platforms.process_start_token(os.getpid())
+        _OWN_START_TOKEN_RESOLVED = True
+    return _OWN_START_TOKEN
+
+
+def _parse_holders(raw: bytes) -> Optional[List[Holder]]:
+    """THE single parser of lease-file content (DRY: nothing else parses).
+
+    Three accepted shapes: empty → no holders; legacy PID-only (digits) →
+    one token-less holder; JSON ``{"holders": [{"pid", "start"}]}``. Any
+    other content returns None = "undecodable": readers treat that as a
+    conservative busy signal, the exclusive writer of ``acquire_lease``
+    and ``release_lease`` (which holds the flock while parsing) treats it
+    as crash residue it may reset.
+    """
+    stripped = raw.strip()
+    if not stripped:
+        return []
+    if stripped.isdigit():
+        return [Holder(int(stripped), None)]
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("holders"), list):
+        return None
+    holders: List[Holder] = []
+    for entry in data["holders"]:
+        if not isinstance(entry, dict):
+            return None
+        pid = entry.get("pid")
+        start = entry.get("start")
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            return None
+        if start is not None and not isinstance(start, str):
+            return None
+        holders.append(Holder(pid, start))
+    return holders
+
+
+def _prune_holders(holders: List[Holder]) -> List[Holder]:
+    """Drop entries whose process died or whose pid was recycled.
+
+    A holder is dead when ``process_alive`` says so. When the pid is alive
+    but its current start token differs from the recorded one, the pid was
+    recycled to a different process and the entry drops too. An unreadable
+    token keeps the holder: 'cannot identify' must never release a lease
+    on a guess.
+    """
+    kept: List[Holder] = []
+    for holder in holders:
+        if not platforms.process_alive(holder.pid):
+            continue
+        if holder.start is None:
+            kept.append(holder)
+            continue
+        current = (
+            _own_start_token()
+            if holder.pid == os.getpid()
+            else platforms.process_start_token(holder.pid)
+        )
+        if current is not None and current != holder.start:
+            continue
+        kept.append(holder)
+    return kept
+
+
+def _read_all(fd: int) -> bytes:
+    chunks: List[bytes] = []
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _write_holders(fd: int, holders: List[Holder]) -> None:
+    payload = json.dumps(
+        {"holders": [{"pid": h.pid, "start": h.start} for h in holders]}
+    ).encode("utf-8")
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, payload)
+
+
+def _lock_ex_brief(fd: int) -> bool:
+    """Brief exclusive acquire with bounded retry for micro-contentions.
+
+    The retry covers the (sub-millisecond, by contract) window where a
+    store mutation or a sibling registry update holds the flock. It is a
+    bounded recovery, not a polling loop: three attempts, 10ms apart, then
+    fail closed.
+    """
+    for attempt in range(_MAX_LOCK_ATTEMPTS):
+        if _try_lock_fd(fd):
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _lock_read_brief(fd: int) -> bool:
+    """Non-blocking brief lock for a consistent registry read.
+
+    POSIX uses a shared flock so readers coexist with each other while
+    excluding the exclusive writers; Windows has no shared msvcrt lock, so
+    the reader takes the same brief exclusive probe the existing flock
+    probe uses. Either way, failure means "a writer is mid-update" and the
+    caller reports a conservative busy.
+    """
+    if platforms.is_windows():
+        return _try_lock_fd(fd)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def lease_holders(store, name: str) -> Optional[List[Holder]]:
+    """Single read path of the registry: live holders of ``name``.
+
+    Read-only and side-effect free (never creates the lock file, never
+    rewrites pruned content — the write-back belongs to acquire/release
+    under their exclusive flock). Returns None when a consistent read is
+    impossible right now (a writer holds the file, or the content is
+    undecodable): callers must treat None as busy-with-unknown-holders,
+    never as free.
+    """
+    path = lock_path(store, name)
+    flags = os.O_RDWR if platforms.is_windows() else os.O_RDONLY
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    try:
+        if not _lock_read_brief(fd) or not _same_file(fd, path):
+            _unlock_fd(fd)
+            return None
+        try:
+            parsed = _parse_holders(_read_all(fd))
+        finally:
+            _unlock_fd(fd)
+    finally:
+        os.close(fd)
+    if parsed is None:
+        return None
+    return _prune_holders(parsed)
+
+
+def acquire_lease(store, name: str) -> int:
+    """Join ``name``'s registry under a brief exclusive flock.
+
+    Registers the current process as one holder and returns the number of
+    LIVE holders already registered before this join (0 = this session is
+    the first, i.e. the profile's owner). Prunes dead entries while it
+    holds the file, so a crashed session's slot frees on the next join.
+    The write is in-place on the locked fd — never ``os.replace``, which
+    would swap the inode out from under concurrent flock holders.
+
+    Raises LockError when the exclusive lock cannot be taken (a store
+    mutation in progress for longer than the brief-retry budget): the
+    caller surfaces that as a busy failure, the same fail-closed policy
+    as an unreadable lock file.
+    """
+    path = lock_path(store, name)
+    platforms.ensure_dir(path.parent)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if platforms.is_windows() and os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+        if not _lock_ex_brief(fd) or not _same_file(fd, path):
+            raise LockError(f"cannot acquire lease lock {path}")
+        try:
+            parsed = _parse_holders(_read_all(fd))
+            holders = [] if parsed is None else _prune_holders(parsed)
+            entry = Holder(os.getpid(), _own_start_token())
+            merged = [h for h in holders if h.pid != entry.pid]
+            merged.append(entry)
+            _write_holders(fd, merged)
+            return len(holders)
+        finally:
+            _unlock_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def release_lease(store, name: str) -> None:
+    """Remove the current process's entries from ``name``'s registry.
+
+    A no-op when the lease file does not exist. Every entry carrying this
+    process's pid is dropped (a process can hold at most one entry per
+    profile); other live holders are preserved. Raises LockError only when
+    the exclusive lock cannot be taken, mirroring ``acquire_lease``.
+    """
+    path = lock_path(store, name)
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise LockError(f"cannot open lease {path} ({exc})") from exc
+    try:
+        if not _lock_ex_brief(fd):
+            raise LockError(f"cannot acquire lease lock {path}")
+        try:
+            parsed = _parse_holders(_read_all(fd))
+            holders = [] if parsed is None else _prune_holders(parsed)
+            remaining = [h for h in holders if h.pid != os.getpid()]
+            _write_holders(fd, remaining)
+        finally:
+            _unlock_fd(fd)
+    finally:
+        os.close(fd)
 
 
 def normalize_usage_session_id(session_id: object) -> str:
@@ -283,6 +553,17 @@ def _try_lock_path(
     return None
 
 
+def try_lock_path(
+    path: Path, description: str = "lock", inherit_on_exec: bool = False
+) -> Optional[LockHandle]:
+    """Try to take one non-blocking kernel-held advisory lock on a given path.
+
+    Returns a LockHandle if acquired, or None if the lock is held by another
+    process or if the path could not be verified against TOCTOU races.
+    """
+    return _try_lock_path(path, description, inherit_on_exec)
+
+
 def try_lock(store, name: str) -> Optional[LockHandle]:
     """Try to take the session lock for ``name``.
 
@@ -330,30 +611,32 @@ def _write_holder_pid(fd: int) -> None:
 
 
 def lock_holder_pid(store, name: str) -> Optional[int]:
-    """Best-effort PID of the session currently holding this profile's
-    lock, for a more actionable busy-profile message. POSIX only:
-    ``try_lock`` only writes the PID on POSIX (see ``_write_holder_pid``),
-    and Windows' msvcrt byte-range locking makes concurrent reads of the
-    same region unreliable enough to skip rather than guess. Returns
-    ``None`` on any error, missing file, or content that fails to parse
-    cleanly — callers must fall back to the generic busy message."""
-    if platforms.is_windows():
-        return None
+    """Best-effort PID of a session currently using this profile.
+
+    Reads the first live registered holder (see ``lease_holders``). When
+    the profile is only flock-busy with no readable registry entry — a
+    store mutation, or a session recorded through the legacy plain-exec
+    PID write — returns that legacy PID when the content parses, else
+    None. Returns None whenever the profile is not in use at all;
+    callers must fall back to the generic busy message."""
     if not is_locked(store, name):
         return None
+    holders = lease_holders(store, name)
+    if holders:
+        return holders[0].pid
     path = lock_path(store, name)
     try:
         raw = path.read_bytes()
     except OSError:
         return None
-    text = raw.decode("ascii", errors="ignore").strip()
-    if not text.isdigit():
-        return None
-    return int(text)
+    parsed = _parse_holders(raw)
+    if parsed:
+        return parsed[0].pid
+    return None
 
 
-def is_locked(store, name: str) -> bool:
-    """True iff a live session holds this profile's lock. Never creates files.
+def _flock_probe_locked(store, name: str) -> bool:
+    """True iff a live flock holder exists on the lock INODE itself.
 
     An unreadable existing lock file, or a path replaced during this very
     probe (see ``_same_file`` and the module docstring), reports as locked:
@@ -378,6 +661,22 @@ def is_locked(store, name: str) -> bool:
         return locked or not same_file_after_probe
     finally:
         os.close(fd)
+
+
+def is_locked(store, name: str) -> bool:
+    """True iff a live session or mutation is using this profile.
+
+    Two independent busy signals, either suffices: the kernel-held flock
+    (store mutations, legacy whole-session holders — see
+    ``_flock_probe_locked``) or the holders registry carrying at least one
+    live registered session (``lease_holders``). Never creates files. An
+    undecodable registry or a registry mid-update reports as busy, for the
+    same fail-closed reason as an unreadable lock file.
+    """
+    if _flock_probe_locked(store, name):
+        return True
+    holders = lease_holders(store, name)
+    return holders is None or bool(holders)
 
 
 def in_use_names(store, names: Optional[List[str]] = None) -> List[str]:
