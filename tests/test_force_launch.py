@@ -19,11 +19,12 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import locks
+import platforms
 import resolver
 import runner
 from store import Store, StoreError
 
-from conftest import BaseCase
+from conftest import BaseCase, held_cli_session
 
 
 def _authenticate(store, name: str) -> None:
@@ -32,6 +33,20 @@ def _authenticate(store, name: str) -> None:
     token_dir.mkdir(parents=True, exist_ok=True)
     (token_dir / "antigravity-oauth-token").write_text(
         '{"token": {"access_token": "mock-token"}}', encoding="utf-8"
+    )
+
+
+def _install_foreign_holder(store, name: str, pid: int = 424242) -> None:
+    """Write one foreign registry holder entry and keep it 'alive' via the
+    caller's ``process_alive`` mock. Models a live session of the same
+    profile from another process without needing a second real process."""
+    import json
+
+    path = locks.lock_path(store, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"holders": [{"pid": pid, "start": None}]}),
+        encoding="utf-8",
     )
 
 
@@ -45,21 +60,17 @@ class TestResolverForce(BaseCase):
         _authenticate(self.store, "beta")
 
     def test_force_returns_busy_authenticated_profile(self):
-        """With ``force=True`` the busy filter is lifted: an authenticated
-        profile whose lock is held by another session is still pickable,
-        even when every OTHER free-aware candidate is also busy."""
+        """``force`` is a compat alias of the join model: when every
+        authenticated profile is busy, -r JOINS one instead of erroring,
+        with the "joining busy profile" reason."""
         handle_a = locks.try_lock(self.store, "alpha")
         self.assertIsNotNone(handle_a)
         handle_b = locks.try_lock(self.store, "beta")
         self.assertIsNotNone(handle_b)
         try:
-            with self.assertRaises(StoreError):
-                resolver.pick_free_profile(self.store)
             forced = resolver.pick_free_profile(self.store, force=True)
             self.assertIn(forced.name, ("alpha", "beta"))
-            self.assertEqual(
-                forced.reason, "least-recently-used profile (-r, forced)"
-            )
+            self.assertIn("joining busy profile", forced.reason)
         finally:
             handle_b.release()
             handle_a.release()
@@ -134,38 +145,113 @@ class TestRunnerForce(BaseCase):
         rc = runner.run(plan, store=self.store, dry_run=True)
         self.assertEqual(rc, 0)
 
-    def test_run_skips_lock_when_force_and_other_session_present(self):
-        handle = locks.try_lock(self.store, "work")
-        self.assertIsNotNone(handle)
+    def _spawn_recorder(self, observed):
+        def fake_launch(argv, env):
+            observed.append(
+                {
+                    "argv": list(argv),
+                    "held_during_spawn": locks.is_locked(self.store, "work"),
+                    "profile": env.get("AGYDRA_PROFILE"),
+                }
+            )
+            return 0
+
+        return fake_launch
+
+    def test_forced_run_spawns_without_taking_or_stealing_the_held_lock(self):
+        _install_foreign_holder(self.store, "work")
+        observed = []
         try:
-            self.assertTrue(locks.is_locked(self.store, "work"))
             plan = runner.build_plan(
                 self.store, ["chat"], flag_ref="work", force=True,
             )
-            rc = runner.run(plan, store=self.store, dry_run=True)
+            with mock.patch.object(
+                locks, "try_lock", side_effect=AssertionError("runner must not take the mutation lock")
+            ), mock.patch.object(
+                platforms, "process_alive", return_value=True
+            ), mock.patch.object(
+                platforms, "launch_argv", side_effect=self._spawn_recorder(observed)
+            ):
+                rc = runner.run(plan, store=self.store)
             self.assertEqual(rc, 0)
-            self.assertTrue(
-                locks.is_locked(self.store, "work"),
-                "force must NOT steal or release the original lock",
-            )
+            self.assertEqual(len(observed), 1)
+            self.assertEqual(observed[0]["argv"][-1], "chat")
+            self.assertEqual(observed[0]["profile"], "work")
+            self.assertTrue(observed[0]["held_during_spawn"])
+            with mock.patch.object(platforms, "process_alive", return_value=True):
+                self.assertTrue(locks.is_locked(self.store, "work"))
+                holders = locks.lease_holders(self.store, "work")
+                self.assertEqual([h.pid for h in holders], [424242])
         finally:
-            handle.release()
+            pass
+        with mock.patch.object(platforms, "process_alive", return_value=False):
+            self.assertFalse(locks.is_locked(self.store, "work"))
 
-    def test_release_after_guard_skipped_when_handle_is_none(self):
-        """``runner.run``'s unconditional post-guard release must skip
-        when the handle is ``None``; with force the handle is always
-        ``None`` — DRY check that we do not regress to a
-        ``None.release()`` AttributeError."""
-        handle = locks.try_lock(self.store, "work")
+    def test_forced_waited_child_never_releases_a_lock_it_did_not_take(self):
+        _install_foreign_holder(self.store, "work")
+        released = []
+        spawned = []
+        original_release = locks.release_lease
+
+        def recording_release(store, name, **kwargs):
+            released.append(name)
+            original_release(store, name)
+
         try:
             plan = runner.build_plan(
                 self.store, ["chat"], flag_ref="work",
                 force=True, launch_as_child=True,
             )
-            rc = runner.run(plan, store=self.store, dry_run=True)
-            self.assertEqual(rc, 0)
+            with mock.patch.object(
+                locks, "release_lease", recording_release
+            ), mock.patch.object(
+                platforms, "process_alive", return_value=True
+            ), mock.patch.object(
+                platforms, "run_wait", side_effect=lambda argv, env: spawned.append(argv) or 0
+            ):
+                rc = runner.run(plan, store=self.store)
+            self.assertEqual((rc, len(spawned)), (0, 1))
+            self.assertEqual(released, ["work"])
+            with mock.patch.object(platforms, "process_alive", return_value=True):
+                self.assertTrue(locks.is_locked(self.store, "work"))
+                holders = locks.lease_holders(self.store, "work")
+                self.assertEqual([h.pid for h in holders], [424242])
         finally:
-            handle.release()
+            original_release(self.store, "work")
+        with mock.patch.object(platforms, "process_alive", return_value=False):
+            self.assertFalse(locks.is_locked(self.store, "work"))
+
+    def test_unforced_run_joins_a_busy_profile_and_spawns(self):
+        _install_foreign_holder(self.store, "work")
+        observed = []
+        try:
+            plan = runner.build_plan(self.store, ["chat"], flag_ref="work")
+            with mock.patch.object(
+                platforms, "process_alive", return_value=True
+            ), mock.patch.object(
+                platforms, "launch_argv", side_effect=self._spawn_recorder(observed)
+            ):
+                self.assertEqual(runner.run(plan, store=self.store), 0)
+            self.assertEqual(len(observed), 1)
+            self.assertTrue(observed[0]["held_during_spawn"])
+            with mock.patch.object(platforms, "process_alive", return_value=True):
+                self.assertTrue(locks.is_locked(self.store, "work"))
+                holders = locks.lease_holders(self.store, "work")
+                self.assertEqual([h.pid for h in holders], [424242])
+        finally:
+            pass
+        with mock.patch.object(platforms, "process_alive", return_value=False):
+            self.assertFalse(locks.is_locked(self.store, "work"))
+
+    def test_unforced_run_holds_the_lock_while_spawning(self):
+        observed = []
+        plan = runner.build_plan(self.store, ["chat"], flag_ref="work")
+        with mock.patch.object(
+            platforms, "launch_argv", side_effect=self._spawn_recorder(observed)
+        ):
+            self.assertEqual(runner.run(plan, store=self.store), 0)
+        self.assertEqual([item["held_during_spawn"] for item in observed], [True])
+        self.assertFalse(locks.is_locked(self.store, "work"))
 
     def test_agy_keychain_launch_waits_for_guard_restoration(self):
         plan = runner.build_plan(self.store, ["chat"], flag_ref="work")
@@ -195,41 +281,15 @@ class TestForceEndToEnd(BaseCase):
         _authenticate(self.store, "concur")
 
     def test_force_launches_against_already_locked_profile(self):
-        gate = self._tmp / "hold_gate"
-        if gate.exists():
-            gate.unlink()
-
-        repo_root = str(Path(__file__).resolve().parents[1])
-        env_first = dict(os.environ)
-        env_first["FAKE_AGY_GATE"] = str(gate)
-        env_first["PYTHONPATH"] = repo_root
-        first = subprocess.Popen(
-            [sys.executable, "-m", "agydra", "-p", "concur", "--hold"],
-            env=env_first,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            cwd=str(self._tmp),
-        )
-        try:
-            deadline = time.monotonic() + 10
-            while not locks.is_locked(self.store, "concur"):
-                if time.monotonic() > deadline:
-                    self.fail("first agydra never acquired the lock")
-                time.sleep(0.05)
-
+        with held_cli_session("-p", "concur", cwd=self._tmp):
+            self.assertTrue(locks.is_locked(self.store, "concur"))
             res = self._run_cli("-p", "concur", "-f", "echo_again")
             self.assertEqual(res.returncode, 0, res.stderr)
-            self.assertIn("forcing launch", res.stderr)
             self.assertTrue(
                 locks.is_locked(self.store, "concur"),
-                "first session's lock must still be held",
+                "first session's registry entry must still be held",
             )
-        finally:
-            gate.touch()
-            try:
-                first.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                first.kill()
-                first.communicate(timeout=5)
+        self.assertFalse(locks.is_locked(self.store, "concur"))
 
 
 if __name__ == "__main__":

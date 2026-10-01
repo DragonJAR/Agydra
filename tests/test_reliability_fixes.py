@@ -9,8 +9,11 @@ Each test pins one defect found during the cross-platform audit:
 - Profile.from_dict passed last_used/email through unvalidated, letting
   hand-edited metadata explode later inside resolver's min() key
 """
+import os
+import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from conftest import isolated_store_env
 
@@ -145,12 +148,12 @@ class TestProfileFromDictCoercion(unittest.TestCase):
         self.assertEqual(profile.last_used, "20260101")
 
     def test_non_string_email_is_coerced(self):
-        raw = {"name": "alpha", "email": 12345}
+        raw = {"name": "alpha", "seq": 1, "email": 12345}
         profile = models.Profile.from_dict(raw)
         self.assertEqual(profile.email, "12345")
 
     def test_null_fields_stay_none(self):
-        raw = {"name": "alpha"}
+        raw = {"name": "alpha", "seq": 1}
         profile = models.Profile.from_dict(raw)
         self.assertIsNone(profile.last_used)
         self.assertIsNone(profile.email)
@@ -428,8 +431,10 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
             drain.assert_not_called()
 
     def test_lock_released_after_keychain_guard_exits(self):
-        """Store.get releases its sequence lock before the guard; the profile
-        session lock must release only AFTER guard.__exit__ finishes."""
+        """The profile lease release must happen only AFTER guard.__exit__
+        finishes. Earlier than that and a joiner launching the same profile
+        would see an empty registry mid-flight, take ownership of the
+        shared slot, and clobber a still-running session."""
         import os
         import sys
         from unittest import mock
@@ -437,17 +442,21 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
         import locks
         import platforms
 
-        order = []
+        events: list = []
 
         class _RecordingGuard:
             def __enter__(self):
                 return self
 
             def __exit__(self, *exc_info):
-                order.append("guard-exit")
+                events.append("guard-exit")
                 return False
 
-        original_release = locks.LockHandle.release
+        original_release_lease = locks.release_lease
+
+        def recording_release_lease(store, name, **kwargs):
+            events.append(f"release_lease:{name}")
+            original_release_lease(store, name)
 
         with isolated_store_env():
             os.environ["AGYDRA_AGY_BIN"] = sys.executable
@@ -457,73 +466,29 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
                 plan = runner.build_plan(
                     store, [], flag_ref="work", launch_as_child=True
                 )
-
-                sequence_lock_stat = os.stat(
-                    locks.sequence_lock_path(store)
-                )
-                profile_lock_stat = os.stat(
-                    locks.lock_path(store, plan.profile)
-                )
-                sequence_lock_identity = (
-                    sequence_lock_stat.st_dev,
-                    sequence_lock_stat.st_ino,
-                )
-                profile_lock_identity = (
-                    profile_lock_stat.st_dev,
-                    profile_lock_stat.st_ino,
-                )
-
-                def recording_release(handle):
-                    try:
-                        descriptor_stat = os.fstat(handle._fd)
-                        descriptor_identity = (
-                            descriptor_stat.st_dev,
-                            descriptor_stat.st_ino,
-                        )
-                        if descriptor_identity == sequence_lock_identity:
-                            order.append("sequence-release")
-                        elif descriptor_identity == profile_lock_identity:
-                            order.append("profile-release")
-                        else:
-                            order.append("unknown-lock-release")
-                    finally:
-                        original_release(handle)
-
                 with mock.patch.object(
                     platforms, "run_wait", return_value=0
                 ), mock.patch.object(
                     keychain, "launch_guard", return_value=_RecordingGuard()
                 ), mock.patch.object(
-                    locks.LockHandle, "release", recording_release
+                    locks, "release_lease", recording_release_lease
                 ):
                     rc = runner.run(plan, store=store)
                 self.assertEqual(rc, 0)
-                self.assertEqual(
-                    order,
-                    ["sequence-release", "guard-exit", "profile-release"],
-                )
-                self.assertLess(
-                    order.index("sequence-release"), order.index("guard-exit")
-                )
-                self.assertGreater(
-                    order.index("profile-release"), order.index("guard-exit")
-                )
+                self.assertEqual(events, ["guard-exit", "release_lease:work"])
             finally:
                 os.environ.pop("AGYDRA_AGY_BIN", None)
 
 
 class TestLockHolderPidExecPathOnly(unittest.TestCase):
-    """The lock file's PID hint must name the process that will ACTUALLY be
-    running once the launch completes, or not exist at all. Before this
-    fix, ``try_lock`` unconditionally recorded the agydra wrapper's own PID
-    -- correct only on the plain ``execvpe`` path, where the PID survives
-    the exec. On ``launch_as_child``/sandboxed launches the real ``agy``
-    runs as a NEW child process with a different PID, so naming the
-    wrapper's PID in the busy-profile message let a user `kill` the
-    waiting wrapper (dropping the flock, "freeing" the profile) while the
-    real spawned ``agy`` process kept running completely unprotected."""
+    """The lease registry names a process that is REALLY running for the
+    session. On the plain ``execvpe`` path the pid survives the exec, so
+    the entry names the engine itself; on ``launch_as_child``/sandboxed
+    launches the recorded pid is the live agydra parent that waits on the
+    child — accurate as a session marker and released by the runner's
+    ``finally`` once the child exits."""
 
-    def test_launch_as_child_path_never_records_a_pid(self):
+    def test_launch_as_child_path_records_the_live_parent_pid(self):
         import os
         import sys
         from unittest import mock
@@ -551,7 +516,7 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
                 rc = runner.run(plan, store=store)
             self.assertEqual(rc, 0)
         self.assertIn("pid_while_held", captured)
-        self.assertIsNone(captured["pid_while_held"])
+        self.assertEqual(captured["pid_while_held"], os.getpid())
         self.assertIsNone(locks.lock_holder_pid(store, "work"))
 
     def test_plain_exec_path_still_records_a_real_pid(self):
@@ -567,7 +532,9 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
             captured["pid_while_held"] = locks.lock_holder_pid(store, "work")
             return 0
 
-        with isolated_store_env():
+        with isolated_store_env(), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
+        ):
             store = Store()
             store.create("work")
             plan = runner.build_plan(store, [], flag_ref="work")
@@ -651,7 +618,9 @@ class TestRunnerReleasesLockOnExecFailure(unittest.TestCase):
         import locks
         import platforms
 
-        with isolated_store_env():
+        with isolated_store_env(), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
+        ):
             store = Store()
             store.create("work")
             plan = runner.build_plan(store, [], flag_ref="work")
@@ -665,101 +634,88 @@ class TestRunnerReleasesLockOnExecFailure(unittest.TestCase):
             self.assertFalse(locks.is_locked(store, "work"))
 
 
-class TestRunnerBusyProfileMessage(unittest.TestCase):
-    """The busy-profile error message must include the holder's PID when
-    available, fall back cleanly when None, and mention the -f opt-in."""
+class TestRunnerJoinSemantics(unittest.TestCase):
+    """The runner JOINS a profile with live holders instead of refusing it:
+    concurrent sessions of the same profile are the supported mode (the
+    keychain slot lease makes same-profile agy sessions safe; codex/grok
+    joins carry a refresh-rotation warning). The old busy-refusal message
+    and its -f/--force escape hatch are gone — cross-profile keychain
+    contention remains the one hard error, covered by the macOS slot-lease
+    tests."""
 
-    def test_busy_message_includes_holder_pid_when_present(self):
+    def _session_plan(self, launch_as_child: bool = False):
+        import os
+        import sys
+
+        store = Store()
+        store.create("work")
+        plan = runner.build_plan(
+            store, [], flag_ref="work", launch_as_child=launch_as_child
+        )
+        return store, plan
+
+    def test_second_session_joins_and_both_release(self):
+        import locks
+        import platforms
+        from unittest import mock
+
+        with isolated_store_env(), mock.patch.dict(
+            self if False else {}, {}
+        ), mock.patch.object(platforms, "run_wait", return_value=0) as waits:
+            import os
+            import sys
+
+            os.environ["AGYDRA_AGY_BIN"] = sys.executable
+            try:
+                store, plan = self._session_plan(launch_as_child=True)
+                first = runner.run(plan, store=store)
+                second = runner.run(plan, store=store)
+                self.assertEqual((first, second), (0, 0))
+                self.assertEqual(waits.call_count, 2)
+                self.assertFalse(locks.is_locked(store, "work"))
+            finally:
+                import os
+
+                os.environ.pop("AGYDRA_AGY_BIN", None)
+
+    def test_codex_join_warns_about_refresh_rotation(self):
         import os
         import sys
         from unittest import mock
 
-        import locks
-        from store import StoreError
+        import engines
+        import platforms
 
-        with isolated_store_env(), mock.patch.dict(
-            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
-        ):
-            store = Store()
-            store.create("work")
-            plan = runner.build_plan(store, [], flag_ref="work")
-            with mock.patch.object(locks, "try_lock", return_value=None), \
-                    mock.patch.object(locks, "lock_holder_pid", return_value=12345):
-                with self.assertRaises(StoreError) as ctx:
-                    runner.run(plan, store=store)
-            msg = str(ctx.exception)
-            self.assertIn("agy PID 12345", msg)
-            self.assertIn("-f/--force", msg)
+        warnings: list = []
 
-    def test_busy_message_falls_back_cleanly_when_pid_is_none(self):
-        import os
-        import sys
-        from unittest import mock
+        with isolated_store_env():
+            os.environ["AGYDRA_AGY_BIN"] = sys.executable
+            os.environ["AGYDRA_CODEX_BIN"] = sys.executable
+            try:
+                store = Store()
+                store.create("cx", engine="codex")
+                plan = runner.build_plan(
+                    store, ["--no-daemon"], flag_ref="cx", launch_as_child=True
+                )
+                import locks
 
-        import locks
-        from store import StoreError
-
-        with isolated_store_env(), mock.patch.dict(
-            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
-        ):
-            store = Store()
-            store.create("work")
-            plan = runner.build_plan(store, [], flag_ref="work")
-            with mock.patch.object(locks, "try_lock", return_value=None), \
-                    mock.patch.object(locks, "lock_holder_pid", return_value=None):
-                with self.assertRaises(StoreError) as ctx:
-                    runner.run(plan, store=store)
-            msg = str(ctx.exception)
-            self.assertNotIn("agy PID", msg)
-            self.assertIn("another live session", msg)
-            self.assertIn("-f/--force", msg)
-
-    def test_busy_message_pinned_by_marker_does_not_suggest_random_pick(self):
-        import os
-        import sys
-        from unittest import mock
-
-        import locks
-        from store import StoreError
-
-        with isolated_store_env(), mock.patch.dict(
-            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
-        ):
-            store = Store()
-            store.create("work")
-            plan = runner.build_plan(store, [], flag_ref="work")
-            plan.reason = "project marker .agydra (/some/path/.agydra)"
-            with mock.patch.object(locks, "try_lock", return_value=None), \
-                    mock.patch.object(locks, "lock_holder_pid", return_value=54321):
-                with self.assertRaises(StoreError) as ctx:
-                    runner.run(plan, store=store)
-            msg = str(ctx.exception)
-            self.assertIn("pinned by project marker", msg)
-            self.assertNotIn("agydra -r", msg)
-            self.assertIn("-f/--force", msg)
-            self.assertIn("agy PID 54321", msg)
-
-    def test_busy_message_without_marker_suggests_random_pick(self):
-        import os
-        import sys
-        from unittest import mock
-
-        import locks
-        from store import StoreError
-
-        with isolated_store_env(), mock.patch.dict(
-            os.environ, {"AGYDRA_AGY_BIN": sys.executable}
-        ):
-            store = Store()
-            store.create("work")
-            plan = runner.build_plan(store, [], flag_ref="work")
-            with mock.patch.object(locks, "try_lock", return_value=None), \
-                    mock.patch.object(locks, "lock_holder_pid", return_value=None):
-                with self.assertRaises(StoreError) as ctx:
-                    runner.run(plan, store=store)
-            msg = str(ctx.exception)
-            self.assertIn("agydra -r picks a free one automatically", msg)
-            self.assertIn("-f/--force", msg)
+                locks.acquire_lease(store, "cx")
+                try:
+                    with mock.patch.object(
+                        platforms, "run_wait", return_value=0
+                    ), mock.patch.object(
+                        runner, "warn", side_effect=warnings.append
+                    ):
+                        rc = runner.run(plan, store=store)
+                    self.assertEqual(rc, 0)
+                finally:
+                    locks.release_lease(store, "cx")
+                self.assertTrue(
+                    any("refresh-token rotation" in str(w) for w in warnings)
+                )
+            finally:
+                os.environ.pop("AGYDRA_AGY_BIN", None)
+                os.environ.pop("AGYDRA_CODEX_BIN", None)
 
 
 class TestRunnerPickRetryPreservesCwd(unittest.TestCase):
@@ -768,10 +724,12 @@ class TestRunnerPickRetryPreservesCwd(unittest.TestCase):
     context is not lost."""
 
     def test_retry_forwards_plan_cwd(self):
+        import contextlib
         import os
         import sys
         from unittest import mock
 
+        import keychain
         import locks
 
         with isolated_store_env(), mock.patch.dict(
@@ -780,7 +738,8 @@ class TestRunnerPickRetryPreservesCwd(unittest.TestCase):
             store = Store()
             store.create("alpha")
             store.create("beta")
-            for name in ("alpha", "beta"):
+            store.create("gamma")
+            for name in ("alpha", "beta", "gamma"):
                 token_dir = store.profile_data_dir(name) / "antigravity-cli"
                 token_dir.mkdir(parents=True, exist_ok=True)
                 (token_dir / "antigravity-oauth-token").write_text(
@@ -798,30 +757,38 @@ class TestRunnerPickRetryPreservesCwd(unittest.TestCase):
                 build_plan_cwds.append(kwargs.get("cwd"))
                 return orig_build_plan(*args, **kwargs)
 
-            orig_try_lock = locks.try_lock
-            call_count = 0
-            real_handle = None
+            busy_guard_calls = {"n": 0}
 
-            def fake_try_lock(st, name):
-                nonlocal call_count, real_handle
-                call_count += 1
-                if call_count == 1:
-                    return None
-                real_handle = orig_try_lock(st, name)
-                return real_handle
+            class _BusyThenOkGuard:
+                def __init__(self) -> None:
+                    busy_guard_calls["n"] += 1
+                    if busy_guard_calls["n"] == 1:
+                        self._busy = keychain.KeychainBusyError(
+                            "another agydra session is using the shared "
+                            "Antigravity keychain slot"
+                        )
+                    else:
+                        self._busy = None
+
+                def __enter__(self):
+                    if self._busy is not None:
+                        raise self._busy
+                    return self
+
+                def __exit__(self, *exc_info):
+                    return False
 
             try:
-                with mock.patch.object(locks, "try_lock", side_effect=fake_try_lock), \
-                        mock.patch.object(runner, "build_plan", side_effect=tracked_build_plan), \
+                with mock.patch.object(runner, "build_plan", side_effect=tracked_build_plan), \
+                        mock.patch.object(keychain, "launch_guard", side_effect=lambda *a, **k: _BusyThenOkGuard()), \
                         mock.patch.object(runner.platforms, "launch_argv", return_value=0):
                     rc = runner.run(plan, store=store)
                 self.assertEqual(rc, 0)
                 self.assertIn(custom_cwd, build_plan_cwds)
             finally:
-                if real_handle is not None:
-                    real_handle.release()
+                for name in ("alpha", "beta", "gamma"):
+                    locks.release_lease(store, name)
 
 
 if __name__ == "__main__":
     unittest.main()
-

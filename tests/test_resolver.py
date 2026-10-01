@@ -1,7 +1,9 @@
 """Resolver cascade: flag → env → marker → default → first → none."""
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -131,20 +133,18 @@ class TestPickFreeProfileAuthAndBusyOrder(BaseCase):
         self.assertIn("agydra login", str(ctx.exception))
 
     def test_no_free_when_only_authenticated_profile_is_busy(self):
-        """When an authenticated profile exists but is busy (and the only free
-        candidate is unauthenticated), error must report that the authenticated
-        profile has a live session, NOT that no authenticated profile exists."""
+        """When an authenticated profile is busy (and the only free candidate
+        is unauthenticated), -r JOINS the busy authenticated profile:
+        concurrent same-profile sessions are the supported mode."""
         import locks
 
         self._authenticate("alpha")
         handle = locks.try_lock(self.store, "alpha")
         self.assertIsNotNone(handle)
         try:
-            with self.assertRaises(StoreError) as ctx:
-                resolver.pick_free_profile(self.store)
-            msg = str(ctx.exception)
-            self.assertIn("no free authenticated profile", msg)
-            self.assertIn("-f/--force", msg)
+            res = resolver.pick_free_profile(self.store)
+            self.assertEqual(res.name, "alpha")
+            self.assertIn("joining busy profile", res.reason)
         finally:
             handle.release()
 
@@ -156,8 +156,10 @@ class TestPickFreeProfileAuthAndBusyOrder(BaseCase):
         self.assertEqual(res.name, "alpha")
 
     def test_force_picks_busy_authenticated_over_unauthenticated_free(self):
-        """With force=True, alpha (authenticated but busy) is picked over
-        beta (unauthenticated free)."""
+        """``force`` keeps its CLI compatibility alias: pick_free_profile
+        joins the busy authenticated profile and reports a "joining"
+        reason. The old "forced" reason is gone — the join semantics
+        subsume the old busy-skip behavior."""
         import locks
 
         self._authenticate("alpha")
@@ -166,7 +168,7 @@ class TestPickFreeProfileAuthAndBusyOrder(BaseCase):
         try:
             res = resolver.pick_free_profile(self.store, force=True)
             self.assertEqual(res.name, "alpha")
-            self.assertIn("forced", res.reason)
+            self.assertIn("joining busy profile", res.reason)
         finally:
             handle.release()
 
@@ -191,6 +193,106 @@ class TestPickFreeProfileAuthAndBusyOrder(BaseCase):
         with self.assertRaises(StoreError) as ctx:
             resolver.pick_free_profile(single_store, cwd=self._tmp)
         self.assertIn("at least 2 profiles", str(ctx.exception))
+
+
+class TestPickFreeProfileLazyProbing(BaseCase):
+    """Auth probes stop at the first eligible profile in (last_used, seq) order."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        for name in ("alpha", "beta", "gamma"):
+            self.store.create(name)
+
+    def _probed_names(self, states, **kwargs):
+        probed = []
+
+        def fake_auth_state(_data_dir, _store, name, engine="agy"):
+            probed.append(name)
+            return states.get(name, "not-authenticated")
+
+        with mock.patch.object(resolver.account, "auth_state", side_effect=fake_auth_state):
+            try:
+                res = resolver.pick_free_profile(self.store, **kwargs)
+            except StoreError as exc:
+                return None, probed, exc
+        return res, probed, None
+
+    def test_first_authenticated_free_profile_costs_one_probe(self):
+        res, probed, _ = self._probed_names({n: "authenticated" for n in ("alpha", "beta", "gamma")})
+        self.assertEqual(res.name, "alpha")
+        self.assertEqual(probed, ["alpha"])
+
+    def test_least_recently_used_wins_over_creation_order(self):
+        beta = self.store.get("beta")
+        beta.last_used = "2026-01-01T00:00:00Z"
+        self.store.save(beta)
+        gamma = self.store.get("gamma")
+        gamma.last_used = "2025-01-01T00:00:00Z"
+        self.store.save(gamma)
+        res, probed, _ = self._probed_names({n: "authenticated" for n in ("alpha", "beta", "gamma")})
+        self.assertEqual(res.name, "alpha")
+        res, probed, _ = self._probed_names({"beta": "authenticated", "gamma": "authenticated"})
+        self.assertEqual(res.name, "gamma")
+        self.assertEqual(probed, ["alpha", "gamma"])
+
+    def test_busy_profile_is_skipped_unless_forced(self):
+        import locks
+
+        handle = locks.try_lock(self.store, "alpha")
+        try:
+            states = {n: "authenticated" for n in ("alpha", "beta", "gamma")}
+            res, probed, _ = self._probed_names(states)
+            self.assertEqual((res.name, probed), ("beta", ["alpha", "beta"]))
+        finally:
+            handle.release()
+
+    def test_error_selection_matches_busy_versus_unauthenticated(self):
+        import locks
+
+        _res, _probed, exc = self._probed_names({})
+        self.assertIn("no authenticated profile available", str(exc))
+        handles = [locks.try_lock(self.store, n) for n in ("alpha", "beta", "gamma")]
+        try:
+            res, probed, _ = self._probed_names({"beta": "authenticated"})
+            self.assertEqual((res.name, probed), ("beta", ["alpha", "beta", "gamma"]))
+            self.assertIn("joining busy profile", res.reason)
+        finally:
+            for handle in handles:
+                handle.release()
+
+
+@unittest.skipIf(sys.platform.startswith("win"), "POSIX fake claude executable")
+class TestPickFreeProfileClaudeProbeCount(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.log = self._tmp / "claude-probes.log"
+        fake = self._tmp / "bin" / "claude"
+        fake.parent.mkdir(exist_ok=True)
+        fake.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            f"open({str(self.log)!r}, 'a').write(os.environ.get('CLAUDE_CONFIG_DIR', '') + '\\n')\n"
+            "print(json.dumps({'loggedIn': True, 'authMethod': 'claude.ai', "
+            "'apiProvider': 'firstParty', 'email': 'cc@example.test', "
+            "'configDirectory': os.environ.get('CLAUDE_CONFIG_DIR')}))\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        os.environ["AGYDRA_CLAUDE_BIN"] = str(fake)
+        for name in ("c1", "c2", "c3", "c4"):
+            self.store.create(name, engine="claude")
+
+    def test_claude_rotation_runs_one_status_probe_when_first_is_eligible(self):
+        res = resolver.pick_free_profile(self.store, engine="claude", force=True)
+        self.assertEqual(res.name, "c1")
+        self.assertEqual(len(self.log.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_claude_rotation_without_engine_and_without_agy_profiles_probes_once(self):
+        res = resolver.pick_free_profile(self.store)
+        self.assertEqual(res.name, "c1")
+        self.assertEqual(len(self.log.read_text(encoding="utf-8").splitlines()), 1)
 
 
 if __name__ == "__main__":

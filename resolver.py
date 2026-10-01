@@ -163,23 +163,29 @@ def pick_free_profile(
     cwd: Optional[Path] = None,
     force: bool = False,
     engine: Optional[str] = None,
+    exclude: Optional[set] = None,
 ) -> Resolution:
     """Pick the free-est authenticated profile for ``-r``/``--random``.
 
-    Deterministic and side-effect-free (the caller takes the lock later, in
-    ``runner.run``, which owns all filesystem mutation):
+    Deterministic and side-effect-free (the caller takes the lease later,
+    in ``runner.run``, which owns all filesystem mutation):
 
     1. a store marker pinning this directory wins (``-r`` asks agydra to
        CHOOSE, so an explicit project pin must win over the choice);
     2. the 2-profile floor (a choice needs at least two candidates);
     3. skip unauthenticated profiles;
-    4. skip profiles with a live session (advisory lock held);
-    5. prefer the least-recently-used, break ties by seq (creation order).
+    4. first pass: prefer a profile with NO live session (free);
+    5. second pass: when every authenticated profile of the engine is in
+       use, JOIN the least-recently-used busy one — concurrent sessions
+       of the same profile are the supported mode now (the keychain slot
+       lease on macOS makes same-profile agy joins safe; codex/grok
+       share the on-disk auth.json with a re-login risk the runner
+       warns about);
+    6. break ties by seq (creation order).
 
-    With ``force=True`` (launcher ``-f`` mode), the busy filter is skipped
-    so an authenticated profile can be re-used even while another
-    session holds its lock. The auth filter and the marker precedence
-    are preserved — a marker or "no tokens yet" profile still refuses.
+    ``force=True`` (launcher ``-f`` mode) is accepted for CLI
+    compatibility; the two passes subsume the busy filter it used to
+    skip, and the auth filter and marker precedence are preserved.
     """
     marker = _marker_resolution(store, Path(cwd) if cwd is not None else Path.cwd())
     if marker is not None:
@@ -196,6 +202,8 @@ def pick_free_profile(
         agy_profiles = [p for p in profiles if getattr(p, "engine", "agy") == "agy"]
         if agy_profiles:
             profiles = agy_profiles
+    if exclude:
+        profiles = [p for p in profiles if p.name not in exclude]
 
     names = [p.name for p in profiles]
     if not names:
@@ -215,30 +223,25 @@ def pick_free_profile(
             )
         raise StoreError(_TOO_FEW)
 
-    authenticated = [
-        p for p in profiles
-        if account.auth_state(
-            store.profile_data_dir(p.name, engine=getattr(p, "engine", "agy")),
+    authenticated: list = []
+    for profile in sorted(profiles, key=lambda p: (p.last_used or "", p.seq)):
+        profile_engine = getattr(profile, "engine", "agy")
+        state = account.auth_state(
+            store.profile_data_dir(profile.name, engine=profile_engine),
             store,
-            p.name,
-            engine=getattr(p, "engine", "agy"),
+            profile.name,
+            engine=profile_engine,
         )
-        == "authenticated"
-    ]
-    if not authenticated:
-        raise StoreError(_NOT_AUTHENTICATED)
-
-    candidates = authenticated if force else [
-        p for p in authenticated if not locks.is_locked(store, p.name)
-    ]
-    if not candidates:
-        raise StoreError(_NO_FREE)
-    best = min(
-        candidates, key=lambda p: (p.last_used or "", p.seq)
-    )
-    reason = (
-        "least-recently-used profile (-r, forced)"
-        if force
-        else "least-recently-used free profile (-r)"
-    )
-    return Resolution(best.name, reason)
+        if state != "authenticated":
+            continue
+        if not locks.is_locked(store, profile.name):
+            return Resolution(
+                profile.name, "least-recently-used free profile (-r)"
+            )
+        authenticated.append(profile)
+    if authenticated:
+        return Resolution(
+            authenticated[0].name,
+            "joining busy profile (-r; free profiles exhausted)",
+        )
+    raise StoreError(_NOT_AUTHENTICATED)

@@ -126,10 +126,10 @@ class TestCliParameterMatrix(BaseCase):
             (["-f", "-p", "alpha", "-n"], "profile : alpha"),
             (["-fpalpha", "-n"], "profile : alpha"),
             (["-fp", "alpha", "-n"], "profile : alpha"),
-            (["-r", "-f", "-n"], "(-r, forced)"),
-            (["-fr", "-n"], "(-r, forced)"),
-            (["-rf", "-n"], "(-r, forced)"),
-            (["-nrf"], "(-r, forced)"),
+            (["-r", "-f", "-n"], "(-r)"),
+            (["-fr", "-n"], "(-r)"),
+            (["-rf", "-n"], "(-r)"),
+            (["-nrf"], "(-r)"),
         ]
         for args, needle in cases:
             with self.subTest(args=args):

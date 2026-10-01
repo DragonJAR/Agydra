@@ -244,7 +244,7 @@ class TestEnvironment(ClaudeBase):
             cfg, {}, engine="claude", config_windows_redirect_home=True
         )
         self.assertEqual(env["HOME"], os.environ["HOME"])
-        self.assertNotIn("XDG_CONFIG_HOME", env)
+        self.assertEqual(env.get("XDG_CONFIG_HOME"), os.environ.get("XDG_CONFIG_HOME"))
 
     def test_other_engines_keep_inherited_variables(self):
         data = self._tmp / "data"
@@ -885,14 +885,17 @@ class TestRunner(ClaudeBase):
         self.assertFalse((self.fake_home / ".claude").exists())
         self.assertFalse((self.fake_home / ".claude.json").exists())
 
-    def test_busy_profile_refuses_second_session(self):
+    def test_busy_profile_joins_instead_of_refusing(self):
+        """Concurrent sessions of the same profile JOIN (no refusal). A live
+        registry holder from another session does not block a launch — the
+        new session joins, runs, and releases its own entry."""
         self.make_profile("work")
-        handle = locks.try_lock(self.store, "work")
+        locks.acquire_lease(self.store, "work")
         try:
-            with self.assertRaises(StoreError):
-                runner.run(self.plan_for("work"), store=self.store)
+            rc = runner.run(self.plan_for("work"), store=self.store)
+            self.assertEqual(rc, 0)
         finally:
-            handle.release()
+            locks.release_lease(self.store, "work")
 
     def test_dry_run_touches_nothing(self):
         self.make_profile("work")
@@ -1179,7 +1182,10 @@ class TestRunnerUsageIntegration(ClaudeBase):
         real_capture = claude_usage.capture_environment
 
         def invalidate(store, name, **kw):
-            events.append(("invalidate", locks.try_lock(store, name) is None))
+            handle = locks.try_lock(store, name)
+            events.append(("invalidate", handle is not None))
+            if handle is not None:
+                handle.release()
             return 7
 
         def capture(store, profile):
