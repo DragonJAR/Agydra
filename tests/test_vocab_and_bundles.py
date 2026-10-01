@@ -363,6 +363,13 @@ class TestLauncherLongFlagCollisionGuard(unittest.TestCase):
                 hypothetical_canonical, {"doc"}
             )
 
+    def test_guard_covers_the_random_long_alias(self):
+        self.assertEqual(_match_flag("--rotate"), [("random", True, 1)])
+        with self.assertRaises(RuntimeError):
+            _check_no_launcher_long_flag_collision(
+                {"rotate": "random"}, _LAUNCHER_LONG_NAMES
+            )
+
 
 class TestResolveSubcommandSingleDash(unittest.TestCase):
     """Direct unit coverage of the single-dash resolution rule, independent

@@ -208,6 +208,113 @@ class TestSyncProfileEmailKeychainPoisoning(unittest.TestCase):
             refreshed = store.get("brandnew")
             self.assertEqual(refreshed.email, "new@example.com")
 
+    def test_email_sync_does_not_overwrite_last_used_after_lock_race(self):
+        import locks
+
+        with isolated_store_env():
+            store = Store()
+            store.create("racing")
+            profile = store.get("racing")
+            profile.last_used = "before-launch"
+            store.save(profile)
+            data_dir = store.profile_data_dir("racing")
+            cli_dir = data_dir / account.AGY_CLI_DIR
+            cli_dir.mkdir(parents=True, exist_ok=True)
+            token_file = cli_dir / account.TOKEN_FILE
+            token_file.write_text(
+                json.dumps({"id_token": _make_jwt({"email": "race@example.com"})}),
+                encoding="utf-8",
+            )
+
+            def session_updates_last_used():
+                current = store.get("racing")
+                current.last_used = "during-launch"
+                store.save(current)
+
+            def free_probe_then_launch(store_arg, name):
+                session_updates_last_used()
+                return False
+
+            def failed_lock_after_launch(store_arg, name):
+                session_updates_last_used()
+                return None
+
+            with mock.patch.object(locks, "is_locked", side_effect=free_probe_then_launch), \
+                    mock.patch.object(locks, "try_lock", side_effect=failed_lock_after_launch):
+                email = account.sync_profile_email(store, "racing")
+
+            self.assertEqual(email, "race@example.com")
+            self.assertEqual(store.get("racing").last_used, "during-launch")
+
+    def test_email_sync_preserves_last_used_after_successful_lock(self):
+        import locks
+
+        with isolated_store_env():
+            store = Store()
+            store.create("locked-race")
+            profile = store.get("locked-race")
+            profile.last_used = "before-launch"
+            store.save(profile)
+            data_dir = store.profile_data_dir("locked-race")
+            cli_dir = data_dir / account.AGY_CLI_DIR
+            cli_dir.mkdir(parents=True, exist_ok=True)
+            token_file = cli_dir / account.TOKEN_FILE
+            token_file.write_text(
+                json.dumps({"id_token": _make_jwt({"email": "locked@example.com"})}),
+                encoding="utf-8",
+            )
+            lock_handle = mock.Mock()
+
+            def acquire_after_session_update(store_arg, name):
+                current = store.get("locked-race")
+                current.last_used = "during-launch"
+                store.save(current)
+                return lock_handle
+
+            with mock.patch.object(locks, "try_lock", side_effect=acquire_after_session_update):
+                email = account.sync_profile_email(store, "locked-race")
+
+            persisted = store.get("locked-race")
+            self.assertEqual(email, "locked@example.com")
+            self.assertEqual(persisted.email, "locked@example.com")
+            self.assertEqual(persisted.last_used, "during-launch")
+            lock_handle.release.assert_called_once_with()
+
+    def test_email_sync_returns_detected_email_when_lock_cannot_be_managed(self):
+        import locks
+
+        with isolated_store_env():
+            store = Store()
+            store.create("unavailable")
+            profile = store.get("unavailable")
+            profile.email = "cached@example.com"
+            profile.last_used = "previous-session"
+            profile.description = "preserved"
+            store.save(profile)
+            before = store.get("unavailable").to_dict()
+            data_dir = store.profile_data_dir("unavailable")
+            cli_dir = data_dir / account.AGY_CLI_DIR
+            cli_dir.mkdir(parents=True, exist_ok=True)
+            token_file = cli_dir / account.TOKEN_FILE
+            token_file.write_text(
+                json.dumps({"id_token": _make_jwt({"email": "detected@example.com"})}),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                    locks, "try_lock", side_effect=locks.LockError("cannot manage lock")
+            ):
+                email = account.sync_profile_email(store, "unavailable")
+
+            self.assertEqual(email, "detected@example.com")
+            self.assertEqual(store.get("unavailable").to_dict(), before)
+
+            with mock.patch.object(
+                    locks, "try_lock", side_effect=RuntimeError("unexpected failure")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "unexpected failure"):
+                    account.sync_profile_email(store, "unavailable")
+
 
 class TestAuthStateKeychain(unittest.TestCase):
     def _write_secret(self, store, name, access_token="a", refresh_token="r"):

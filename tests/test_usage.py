@@ -273,7 +273,6 @@ class TestGatherUsageReportSurvivesPerProfileFailures(_UsageBase):
         self.assertEqual(res.engine, "codex")
         self.assertEqual(res.error, "not authenticated")
 
-        # Now authenticate with a fake auth.json
         data_dir = self.store.profile_data_dir("cx", engine="codex")
         auth_file = data_dir / "auth.json"
         auth_file.write_text(
@@ -327,10 +326,6 @@ class TestQueryProfileUsageTimeoutKillsProcessGroup(_UsageBase):
 
         import time as _time
 
-        # The grandchild is spawned by the fake agy itself right as it
-        # starts, well before its (much longer) sleep -- so by the time
-        # this call's own timeout fires and kills the group, the heartbeat
-        # log already exists with at least one line.
         result = usage.query_profile_usage(self.store, "alpha", timeout=2.0)
         self.assertFalse(result.ok)
         self.assertIn("timed out", result.error)
@@ -394,8 +389,6 @@ class TestQueryProfileUsageAlreadyBusyKeychainNoop(_UsageBase):
             result = usage.query_profile_usage(self.store, "alpha", timeout=10)
 
         self.assertTrue(result.ok, result.error)
-        # Same value before and after: genuinely a pure read for the
-        # already-busy-with-this-profile case, no write/delete call made.
         self.assertEqual(kc.calls, [])
         self.assertEqual(kc.shared, shared_before)
 
@@ -644,9 +637,46 @@ class TestCodexUsage(BaseCase):
         self.assertEqual(res.groups, [])
         self.assertIn("offline", res.error)
 
+    @mock.patch("usage.fetch_codex_usage_payload")
+    def test_query_codex_usage_non_auth_http_error_keeps_authenticated_state(self, mock_fetch):
+        mock_fetch.side_effect = urllib.error.HTTPError(
+            "https://chatgpt.com/usage", 503, "Service Unavailable", {}, None
+        )
+        auth_data = {
+            "tokens": {
+                "access_token": "acc_tok",
+                "id_token": _make_jwt({"email": "unavailable@example.com"}),
+            }
+        }
+        data_dir = self._tmp / "codex_data_http_unavailable"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
+
+        res = usage.query_codex_usage(data_dir, "cx_http_unavailable")
+
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(res.error, "usage unavailable (HTTP 503)")
+        self.assertEqual(res.email, "unavailable@example.com")
+        self.assertEqual(res.groups, [])
+
+    @mock.patch("usage.refresh_codex_tokens")
+    def test_query_codex_usage_without_access_token_is_read_only(self, mock_refresh):
+        auth_data = {"tokens": {"refresh_token": "ref_tok"}}
+        data_dir = self._tmp / "codex_data_refresh_only"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        auth_path = data_dir / "auth.json"
+        auth_path.write_text(json.dumps(auth_data), encoding="utf-8")
+
+        res = usage.query_codex_usage(data_dir, "cx_refresh_only")
+
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error, "missing access token")
+        mock_refresh.assert_not_called()
+        self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8")), auth_data)
+
     @mock.patch("usage.refresh_codex_tokens")
     @mock.patch("usage.fetch_codex_usage_payload")
-    def test_query_codex_usage_token_refresh_on_401(self, mock_fetch, mock_refresh):
+    def test_query_codex_usage_401_is_read_only(self, mock_fetch, mock_refresh):
         import urllib.error
 
         expired = urllib.error.HTTPError("http://...", 401, "Unauthorized", {}, None)
@@ -656,21 +686,8 @@ class TestCodexUsage(BaseCase):
             closed.append(True)
             urllib.error.HTTPError.close(expired)
 
-        expired.close = _close  # type: ignore[method-assign]
-        mock_fetch.side_effect = [
-            expired,
-            {
-                "email": "refreshed@example.com",
-                "plan_type": "team",
-                "rate_limit": {
-                    "primary_window": {"used_percent": 5, "reset_at": 1790000000},
-                },
-            },
-        ]
-        mock_refresh.return_value = {
-            "access_token": "new_acc",
-            "refresh_token": "new_ref",
-        }
+        expired.close = _close
+        mock_fetch.side_effect = [expired]
         auth_data = {
             "tokens": {
                 "access_token": "old_acc",
@@ -682,13 +699,13 @@ class TestCodexUsage(BaseCase):
         (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
 
         res = usage.query_codex_usage(data_dir, "cx_ref")
-        self.assertTrue(res.ok)
-        self.assertEqual(res.plan, "ChatGPT Team")
-        self.assertEqual(mock_fetch.call_count, 2)
-        saved_auth = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
-        self.assertEqual(saved_auth["tokens"]["access_token"], "new_acc")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error, "session expired (401)")
+        self.assertEqual(mock_fetch.call_count, 1)
+        mock_refresh.assert_not_called()
         self.assertEqual(closed, [True])
-        self.assertEqual(saved_auth["tokens"]["refresh_token"], "new_ref")
+        saved_auth = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved_auth, auth_data)
 
 
 class TestUsageRobustnessAndEdgeCases(unittest.TestCase):
@@ -708,7 +725,6 @@ class TestUsageRobustnessAndEdgeCases(unittest.TestCase):
         self.assertIsNone(usage._parse_bucket({"id": "b1", "remaining_fraction": True}))
         self.assertIsNone(usage._parse_bucket({"id": "b1", "remaining_fraction": float("nan")}))
         self.assertIsNone(usage._parse_bucket({"id": "b1", "remaining_fraction": float("inf")}))
-        # Negative remaining_fraction is clamped to 0.0
         b_neg = usage._parse_bucket({"id": "b1", "remaining_fraction": -0.5})
         self.assertIsNotNone(b_neg)
         self.assertEqual(b_neg.remaining_fraction, 0.0)
@@ -727,15 +743,48 @@ class TestUsageRobustnessAndEdgeCases(unittest.TestCase):
             }
         }
         groups, plan, email = usage.parse_codex_usage_payload(payload)
-        # NaN used_percent is rejected so primary_window is skipped, secondary_window clamps to 0.0
         self.assertEqual(len(groups), 1)
         self.assertEqual(len(groups[0].buckets), 1)
         self.assertEqual(groups[0].buckets[0].id, "codex-weekly")
         self.assertEqual(groups[0].buckets[0].remaining_fraction, 0.0)
         self.assertIsNone(groups[0].buckets[0].reset_time)
 
+    def test_external_numeric_overflow_is_rejected_without_raising(self):
+        oversized = 10 ** 10000
+
+        self.assertIsNone(
+            usage._parse_bucket({"id": "large", "remaining_fraction": oversized})
+        )
+        self.assertIsNone(
+            usage._parse_window_bucket(
+                {"used_percent": oversized},
+                bucket_id="large",
+                name="Large",
+                window="weekly",
+            )
+        )
+        groups, _plan, _email = usage.parse_codex_usage_payload({
+            "rate_limit": {
+                "primary_window": {"used_percent": oversized},
+                "secondary_window": {"used_percent": 10},
+            }
+        })
+        self.assertEqual([bucket.id for bucket in groups[0].buckets], ["codex-weekly"])
+        grok_groups, reset_time = usage.parse_grok_billing_payload({
+            "config": {"creditUsagePercent": oversized}
+        })
+        self.assertEqual(grok_groups, [])
+        self.assertIsNone(reset_time)
+
+    def test_codex_credit_balance_rejects_non_finite_strings(self):
+        _groups, plan, _email = usage.parse_codex_usage_payload({
+            "plan_type": "plus",
+            "credits": {"balance": "NaN"},
+        })
+
+        self.assertEqual(plan, "ChatGPT Plus")
+
     def test_extract_model_summary_unrecognized_groups(self):
-        # Two custom groups with non-standard names
         groups = [
             usage.UsageGroup(
                 name="Custom Engine A",
@@ -762,12 +811,160 @@ class TestUsageRobustnessAndEdgeCases(unittest.TestCase):
     def test_format_countdown_naive_datetime(self):
         from datetime import datetime
         naive = datetime(2026, 12, 31, 23, 59)
-        # Does not raise TypeError
         cd = usage.format_countdown(naive)
         self.assertIsInstance(cd, str)
 
 
 class TestCodexAndGrokEnhancedUsage(BaseCase):
+    def test_query_grok_usage_transport_and_non_auth_http_errors_keep_authenticated_state(self):
+        data_dir = self._tmp / "grok_unavailable"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        auth_data = {
+            "https://auth.x.ai::client": {
+                "email": "grok@example.com",
+                "key": "grok-token",
+                "refresh_token": "refresh-token",
+            }
+        }
+        (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
+        unavailable = urllib.error.HTTPError(
+            "https://cli-chat-proxy.grok.com/v1/billing", 503,
+            "Service Unavailable", {}, None,
+        )
+
+        with mock.patch(
+            "usage.fetch_grok_billing_payload",
+            side_effect=[urllib.error.URLError("connection refused"), unavailable],
+        ), mock.patch("usage.fetch_grok_settings_payload") as mock_settings, mock.patch(
+            "usage.refresh_grok_tokens"
+        ) as mock_refresh:
+            transport_result = usage.query_grok_usage(data_dir, "grok_unavailable")
+            http_result = usage.query_grok_usage(data_dir, "grok_unavailable")
+
+        for result, error in (
+            (transport_result, "offline"),
+            (http_result, "usage unavailable (HTTP 503)"),
+        ):
+            self.assertTrue(result.ok, result.error)
+            self.assertEqual(result.email, "grok@example.com")
+            self.assertEqual(result.groups, [])
+            self.assertIn(error, result.error)
+        mock_settings.assert_not_called()
+        mock_refresh.assert_not_called()
+        self.assertEqual(
+            json.loads((data_dir / "auth.json").read_text(encoding="utf-8")), auth_data
+        )
+
+    @mock.patch("usage.fetch_codex_usage_payload", return_value={})
+    def test_query_codex_usage_empty_payload_is_explicit(self, _mock_fetch):
+        data_dir = self._tmp / "codex_empty_response"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "auth.json").write_text(
+            json.dumps({"tokens": {"access_token": "token"}}),
+            encoding="utf-8",
+        )
+
+        res = usage.query_codex_usage(data_dir, "cx_empty_response")
+
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error, "no usage data in response")
+
+    @mock.patch("usage.fetch_grok_settings_payload", return_value=None)
+    @mock.patch("usage.fetch_grok_billing_payload", return_value={"config": {}})
+    def test_query_grok_usage_empty_payload_is_explicit(self, _mock_billing, _mock_settings):
+        data_dir = self._tmp / "grok_empty_response"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "auth.json").write_text(
+            json.dumps({"issuer::client": {"key": "token"}}),
+            encoding="utf-8",
+        )
+
+        res = usage.query_grok_usage(data_dir, "grok_empty_response")
+
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error, "no usage data in response")
+
+    def test_query_grok_usage_success_with_existing_access_token_is_read_only(self):
+        data_dir = self._tmp / "grok_success_response"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        auth_data = {
+            "https://auth.x.ai::client": {
+                "email": "grok@example.com",
+                "key": "grok-token",
+                "refresh_token": "refresh-token",
+            }
+        }
+        auth_path = data_dir / "auth.json"
+        auth_bytes = json.dumps(auth_data).encode("utf-8")
+        auth_path.write_bytes(auth_bytes)
+        billing_payload = {
+            "config": {
+                "creditUsagePercent": 25.0,
+                "billingPeriodEnd": "2026-10-15T00:00:00Z",
+                "productUsage": [{"product": "Grok 3", "usagePercent": 10.0}],
+            }
+        }
+
+        with mock.patch(
+            "usage.fetch_grok_billing_payload", return_value=billing_payload
+        ) as mock_billing, mock.patch(
+            "usage.fetch_grok_settings_payload",
+            return_value={"subscription_tier_display": "SuperGrok"},
+        ) as mock_settings, mock.patch("usage.refresh_grok_tokens") as mock_refresh:
+            result = usage.query_grok_usage(data_dir, "grok_success_response")
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.email, "grok@example.com")
+        self.assertEqual(result.plan, "SuperGrok")
+        self.assertEqual(len(result.groups), 1)
+        self.assertEqual(result.groups[0].name, "xAI Grok")
+        buckets = {bucket.id: bucket for bucket in result.groups[0].buckets}
+        self.assertEqual(set(buckets), {"grok-weekly", "grok-grok-3"})
+        self.assertAlmostEqual(buckets["grok-weekly"].remaining_fraction, 0.75)
+        self.assertAlmostEqual(buckets["grok-grok-3"].remaining_fraction, 0.9)
+        mock_billing.assert_called_once_with(
+            "grok-token", timeout=usage.DEFAULT_TIMEOUT_S
+        )
+        mock_settings.assert_called_once_with("grok-token", timeout=4.0)
+        mock_refresh.assert_not_called()
+        self.assertEqual(auth_path.read_bytes(), auth_bytes)
+
+    def test_query_codex_usage_rejects_malformed_external_json(self):
+        data_dir = self._tmp / "codex_bad_response"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "auth.json").write_text(
+            json.dumps({"tokens": {"access_token": "secret-token"}}),
+            encoding="utf-8",
+        )
+
+        response = mock.MagicMock()
+        response.read.return_value = b"{invalid"
+        response.__enter__.return_value = response
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            res = usage.query_codex_usage(data_dir, "cx_bad_response")
+
+        self.assertFalse(res.ok)
+        self.assertIn("invalid usage response", res.error)
+        self.assertNotIn("secret-token", res.error)
+
+    def test_query_grok_usage_rejects_non_object_external_json(self):
+        data_dir = self._tmp / "grok_bad_response"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "auth.json").write_text(
+            json.dumps({"issuer::client": {"key": "grok-token"}}),
+            encoding="utf-8",
+        )
+
+        response = mock.MagicMock()
+        response.read.return_value = b"[]"
+        response.__enter__.return_value = response
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            res = usage.query_grok_usage(data_dir, "grok_bad_response")
+
+        self.assertFalse(res.ok)
+        self.assertIn("non-object JSON response", res.error)
+        self.assertNotIn("grok-token", res.error)
+
     def test_account_id_detection_and_header(self):
         import account
 
@@ -937,7 +1134,7 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
     @mock.patch("usage.refresh_grok_tokens")
     @mock.patch("usage.fetch_grok_billing_payload")
     @mock.patch("usage.fetch_grok_settings_payload")
-    def test_query_grok_usage_proactive_refresh(self, mock_settings, mock_billing, mock_refresh):
+    def test_query_grok_usage_without_access_token_is_read_only(self, mock_settings, mock_billing, mock_refresh):
         data_dir = self._tmp / "grok_proactive"
         data_dir.mkdir(parents=True, exist_ok=True)
         auth_data = {
@@ -948,46 +1145,19 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
         }
         (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
 
-        mock_refresh.return_value = {
-            "key": "proactive_jwt",
-            "refresh_token": "updated_ref",
-        }
-        mock_billing.return_value = {
-            "config": {
-                "creditUsagePercent": 20.0,
-                "billingPeriodEnd": "2026-10-31T00:00:00Z",
-            }
-        }
-        mock_settings.return_value = {
-            "subscription_tier_display": "SuperGrok Pro",
-        }
-
         res = usage.query_grok_usage(data_dir, "grok_pro")
-        self.assertTrue(res.ok)
-        self.assertEqual(res.plan, "SuperGrok Pro")
-        self.assertEqual(mock_refresh.call_count, 1)
-        self.assertEqual(mock_billing.call_args[0][0], "proactive_jwt")
-        self.assertEqual(mock_settings.call_args[0][0], "proactive_jwt")
-
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error, "missing access token")
+        mock_refresh.assert_not_called()
+        mock_billing.assert_not_called()
+        mock_settings.assert_not_called()
         saved = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
-        entry = saved["https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"]
-        self.assertEqual(entry["key"], "proactive_jwt")
-        self.assertEqual(entry["refresh_token"], "updated_ref")
-
-        mock_refresh.return_value = None
-        (data_dir / "auth.json").write_text(json.dumps({
-            "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
-                "refresh_token": "bad_ref",
-            }
-        }), encoding="utf-8")
-        fail_res = usage.query_grok_usage(data_dir, "grok_fail")
-        self.assertFalse(fail_res.ok)
-        self.assertEqual(fail_res.error, "token refresh failed")
+        self.assertEqual(saved, auth_data)
 
     @mock.patch("usage.refresh_grok_tokens")
     @mock.patch("usage.fetch_grok_billing_payload")
     @mock.patch("usage.fetch_grok_settings_payload")
-    def test_query_grok_usage_reactive_401_refresh(self, mock_settings, mock_billing, mock_refresh):
+    def test_query_grok_usage_401_is_read_only(self, mock_settings, mock_billing, mock_refresh):
         data_dir = self._tmp / "grok_reactive"
         data_dir.mkdir(parents=True, exist_ok=True)
         auth_data = {
@@ -1008,40 +1178,18 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
 
         expired.close = _close_mock
 
-        mock_billing.side_effect = [
-            expired,
-            {
-                "config": {
-                    "creditUsagePercent": 10.0,
-                    "billingPeriodEnd": "2026-10-31T00:00:00Z",
-                }
-            },
-        ]
-        mock_refresh.return_value = {"access_token": "renewed_token"}
-        mock_settings.return_value = {"subscription_tier_display": "SuperGrok"}
+        mock_billing.side_effect = [expired]
 
         res = usage.query_grok_usage(data_dir, "grok_rx")
-        self.assertTrue(res.ok)
-        self.assertEqual(res.plan, "SuperGrok")
-        self.assertEqual(mock_billing.call_count, 2)
-        self.assertEqual(mock_billing.call_args[0][0], "renewed_token")
-        self.assertEqual(mock_settings.call_args[0][0], "renewed_token")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error, "session expired (401)")
+        self.assertEqual(mock_billing.call_count, 1)
+        mock_refresh.assert_not_called()
+        mock_settings.assert_not_called()
         self.assertTrue(closed)
-
-        mock_billing.side_effect = [expired]
-        mock_refresh.return_value = None
-        fail_res = usage.query_grok_usage(data_dir, "grok_rx_fail")
-        self.assertFalse(fail_res.ok)
-        self.assertEqual(fail_res.error, "session expired (401)")
-
-        mock_billing.side_effect = [expired, RuntimeError("socket disconnect")]
-        mock_refresh.return_value = {"access_token": "renewed_token_2"}
-        inner_fail_res = usage.query_grok_usage(data_dir, "grok_rx_inner_fail")
-        self.assertTrue(inner_fail_res.ok)
-        self.assertIn("usage unavailable (socket disconnect)", inner_fail_res.error)
+        saved = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved, auth_data)
 
 
 if __name__ == "__main__":
     unittest.main()
-
-

@@ -36,11 +36,13 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 import platforms
 from store import atomic_write_bytes
@@ -54,6 +56,7 @@ except ImportError:
 SHARED_SERVICE = "gemini"
 SHARED_ACCOUNT = "antigravity"
 _SLOT_SERVICE_PREFIX = "gemini/agydra/"
+RENAME_RECOVERY_ACTION = "keychain.profile-slot-rename"
 
 NOT_FOUND_CODES = {44, 45, 51, 128}
 
@@ -239,6 +242,12 @@ def read_slot(service: str, keychain_path: Optional[Path] = None) -> Optional[by
 
 
 def write_slot(service: str, data: bytes, keychain_path: Optional[Path] = None) -> None:
+    """Write a keychain item, retrying a macOS duplicate-item update once.
+
+    `security add-generic-password -U` can return errSecDuplicateItem (45)
+    when ``SecKeychainItemModifyContent`` cannot update an existing item in
+    place; deleting the colliding item before retrying lets the write recover.
+    """
     args = [
         "add-generic-password",
         "-U",
@@ -250,9 +259,6 @@ def write_slot(service: str, data: bytes, keychain_path: Optional[Path] = None) 
         args.append(str(keychain_path))
     result = _run(args)
     if result.returncode == 45:
-        # macOS security quirk: `add-generic-password -U` can fail with errSecDuplicateItem (rc=45)
-        # when SecKeychainItemModifyContent fails to update an existing item in-place.
-        # Self-healing: delete the colliding entry and retry insertion cleanly.
         try:
             delete_slot(service, keychain_path)
             retry = _run(args)
@@ -516,9 +522,6 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
         save_profile_slot(store, name, serialized)
         return
     if candidate is None and decode_go_keyring_secret(serialized) is not None:
-        # Case 2: refreshed token without id_token -- same account almost
-        # certainly, but unverifiable. Honest note (not warn), backup
-        # untouched. The decode re-runs only in the failure branch.
         note(
             f"keychain slot for profile {name!r} holds a refreshed token "
             "without an identity claim; keeping its saved credential"
@@ -543,6 +546,28 @@ def _serialize_lock(store):
         handle.close()
         raise
     return handle
+
+
+@contextmanager
+def serialized_access(store) -> Iterator[None]:
+    """Serialize keychain slot operations with launch-time shared-slot swaps."""
+    if fcntl is None:
+        yield
+        return
+    handle = _serialize_lock(store)
+    try:
+        yield
+    finally:
+        try:
+            if handle is not None and fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
 
 
 def _login_keychain_path() -> Path:
@@ -622,6 +647,10 @@ def launch_guard(store, profile: str, capture: bool = False,
     profile's private slot and the shared slot keeps pointing at it. Use
     only around an interactive ``agydra login`` run.
 
+    ``persist_on_exit=False`` keeps read-only commands from rewriting the
+    profile's ``.secret`` backup; the authentication swap and restore still
+    happen, but exit-time credential capture is skipped.
+
     Why the default exit restores: a normal launch must leave the shared
     slot exactly as it found it. The login flow, however, sets capture=True
     so that exit persists the shared slot directly into the profile's
@@ -674,11 +703,6 @@ def launch_guard(store, profile: str, capture: bool = False,
 
     class _Guard:
         def __init__(self, persist_on_exit: bool) -> None:
-            # Read-only mode (``agydra --usage`` and friends): the exit path
-            # must not attempt to rewrite the profile's ``.secret``. The
-            # swap+restore still happen (auth); only the credential-cap
-            # capture is skipped. Default True preserves every launch/login's
-            # behaviour; passing False is the orthogonal, explicit opt-out.
             self._persist_on_exit = persist_on_exit
 
         def __enter__(self):
@@ -694,26 +718,12 @@ def launch_guard(store, profile: str, capture: bool = False,
                     return self
                 self._had_shared = read_slot(shared_slot(), self._keychain_path)
                 if not capture and self._had_shared is not None:
-                    # The shared slot carries the plain-JSON payload when
-                    # agydra wrote it (see ``token_payload_for_slot``) and
-                    # the envelope when agy's own keyring layer did; only
-                    # the latter is what ``_secret_identity`` decodes, so
-                    # normalize in memory through the one helper that knows
-                    # both shapes.
                     shared_identity = _secret_identity(
                         _as_envelope(self._had_shared)
                     )
                     if shared_identity is not None:
                         known = _known_identity(store, profile, include_secret=False)
                         if known is not None and shared_identity == known:
-                            # The shared slot already holds THIS profile's
-                            # own live credential (a real session for it is
-                            # already running). Swapping anything in/out
-                            # here would risk clobbering a token that
-                            # session refreshes while our subprocess runs --
-                            # see the module docstring's launch_guard notes.
-                            # Treat this as a true no-op: nothing is read,
-                            # written, or restored for this invocation.
                             self._already_current = True
                             return self
                 slot = load_profile_slot(store, profile)
@@ -736,10 +746,6 @@ def launch_guard(store, profile: str, capture: bool = False,
                             )
                             slot = None
                 if slot is not None:
-                    # Slot is bytes from the ``.secret`` file backup (envelope
-                    # or whatever the file holds). Unwrap so the live shared
-                    # slot carries plain JSON -- agy parses it; see the
-                    # ``token_payload_for_slot`` docstring.
                     try:
                         payload = token_payload_for_slot(slot)
                     except ValueError as exc:
@@ -758,10 +764,6 @@ def launch_guard(store, profile: str, capture: bool = False,
                 if slot is None and self._had_shared is not None:
                     delete_slot(shared_slot(), self._keychain_path)
             except (KeychainError, OSError, ValueError) as exc:
-                # ValueError covers the strict unwrap rejecting a
-                # non-envelope ``.secret`` (e.g. plain JSON from a pre-fix
-                # build) — the fail-open contract applies to ANY swap
-                # failure, not just security-tool ones.
                 warn(
                     f"keychain swap skipped ({exc}); continuing without "
                     "per-profile credential swap"
@@ -773,8 +775,6 @@ def launch_guard(store, profile: str, capture: bool = False,
                 if self._keychain_path is None:
                     return False
                 if self._already_current:
-                    # Entry made no change (see __enter__): exit persists
-                    # and restores nothing either, so this is a pure read.
                     return False
                 if capture:
                     self._capture_and_keep()
@@ -817,7 +817,14 @@ def launch_guard(store, profile: str, capture: bool = False,
     return _Guard(persist_on_exit)
 
 
-def rename_profile_slot(store, old_name: str, new_name: str) -> None:
+def rename_profile_slot(
+    store,
+    old_name: str,
+    new_name: str,
+    *,
+    source_present: Optional[bool] = None,
+    strict: bool = False,
+) -> None:
     """Rename a profile's keychain slot file (rename keeps the token).
 
     A source with no `.secret` is not a no-op: the new name could be
@@ -826,27 +833,114 @@ def rename_profile_slot(store, old_name: str, new_name: str) -> None:
     profile would silently inherit someone else's credential (same
     invariant as ``Store.create``'s own purge on a fresh name).
 
-    Fail-open like ``purge_profile_slot``: the profile rename itself already
-    committed by the time this runs, so an OSError here must warn and
-    continue, not report the whole rename as failed.
+    The default remains fail-open for callers that cannot persist a retry
+    intent. A recoverable Store rename opts into strict errors so its intent
+    stays available until every required operation succeeds.
+
+    The caller holds both profile locks, matching the launch order of profile
+    lock followed by ``swap.lock``. The shared keychain lock also protects
+    this file move and the native keychain cleanup from concurrent launches.
     """
+    keychain_supported = supported()
     try:
-        old = slot_backup_path(store, old_name)
-        if not old.exists():
-            purge_profile_slot(store, new_name)
-            return
-        new = slot_backup_path(store, new_name)
-        platforms.ensure_dir(new.parent)
-        old.replace(new)
+        if keychain_supported:
+            with serialized_access(store):
+                _rename_profile_slot_unlocked(
+                    store,
+                    old_name,
+                    new_name,
+                    keychain_supported,
+                    source_present,
+                )
+        else:
+            _rename_profile_slot_unlocked(
+                store,
+                old_name,
+                new_name,
+                keychain_supported,
+                source_present,
+            )
+    except (KeychainError, OSError, AttributeError) as exc:
+        if strict:
+            raise
+        warn(
+            f"could not serialize keychain slot rename for "
+            f"{old_name!r} ({exc}); credential migration skipped"
+        )
+
+
+def rename_profile_slot_recovery_data(store, old_name: str, new_name: str) -> dict:
+    if old_name == new_name:
+        raise KeychainError("cannot recover a keychain slot rename to the same name")
+    old = slot_backup_path(store, old_name)
+    source_present = _regular_slot_present(old, old_name)
+    return {"source_present": source_present}
+
+
+def _regular_slot_present(path: Path, name: str) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
     except OSError as exc:
-        warn(f"could not rename keychain slot for {old_name!r} ({exc})")
-    if supported():
-        try:
-            target = _ensure_target_keychain(store)
-            delete_slot(profile_slot(old_name), target)
-            delete_slot(profile_slot(new_name), target)
-        except (KeychainError, OSError):
-            pass
+        raise KeychainError(f"cannot inspect keychain slot for {name!r} ({exc})") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise KeychainError(f"keychain slot for {name!r} is not a regular file")
+    return True
+
+
+def recover_rename_profile_slot(store, old_name: str, new_name: str, data: dict) -> None:
+    if not isinstance(data, dict) or set(data) != {"source_present"}:
+        raise KeychainError("keychain slot rename recovery data is invalid")
+    source_present = data["source_present"]
+    if type(source_present) is not bool:
+        raise KeychainError("keychain slot rename recovery state is invalid")
+    rename_profile_slot(
+        store,
+        old_name,
+        new_name,
+        source_present=source_present,
+        strict=True,
+    )
+
+
+def _rename_profile_slot_unlocked(
+    store,
+    old_name: str,
+    new_name: str,
+    keychain_supported: bool,
+    source_present: Optional[bool],
+) -> None:
+    old = slot_backup_path(store, old_name)
+    new = slot_backup_path(store, new_name)
+    if source_present is None:
+        source_present = rename_profile_slot_recovery_data(
+            store, old_name, new_name
+        )["source_present"]
+    actual_source_present = _regular_slot_present(old, old_name)
+    if source_present:
+        if actual_source_present:
+            data = old.read_bytes()
+            platforms.ensure_dir(new.parent)
+            atomic_write_bytes(new, data)
+            old.unlink()
+        elif not _regular_slot_present(new, new_name):
+            raise KeychainError(
+                f"migrated keychain slot for {new_name!r} is missing"
+            )
+    else:
+        if actual_source_present:
+            raise KeychainError(
+                f"keychain slot state for {old_name!r} changed during rename"
+            )
+        _regular_slot_present(new, new_name)
+        new.unlink(missing_ok=True)
+    if keychain_supported:
+        target = _ensure_target_keychain(store)
+        if target is None:
+            raise KeychainError("could not resolve the keychain for slot migration")
+        delete_slot(profile_slot(old_name), target)
+        delete_slot(profile_slot(new_name), target)
 
 
 def purge_profile_slot(store, name: str) -> None:
@@ -930,6 +1024,10 @@ def capture_shared_slot_for_import(store, name: str, data_dir: Path) -> None:
     all"; an ambient keychain value with zero corroborating on-disk
     evidence is never captured, since ``import`` gives no other identity
     signal to check it against.
+
+    The shared slot normally carries plain JSON, while ``.secret`` backups
+    and identity decoding use the envelope form. Normalize once so identity
+    checks and the saved backup use the same representation.
     """
     if not supported():
         return
@@ -941,9 +1039,6 @@ def capture_shared_slot_for_import(store, name: str, data_dir: Path) -> None:
         return
     if current is None:
         return
-    # ``.secret`` backups and every identity decode in this module use the
-    # envelope form, while the shared slot normally carries plain JSON;
-    # normalize once so the comparisons below and the saved backup agree.
     current = _as_envelope(current)
 
     import account
@@ -983,7 +1078,9 @@ def describe(store, names: Optional[List[str]] = None) -> Dict[str, object]:
     """Doctor/report view: which slots exist, no secrets.
 
     ``names`` lets a caller that already scanned the store (doctor) skip the
-    re-glob; defaults to scanning when omitted."""
+    re-glob; defaults to scanning when omitted. ``shared_format`` identifies
+    non-JSON shared-slot values such as the legacy go-keyring envelope that
+    can cause agy to request another login on each launch."""
     if not supported():
         return {"supported": False}
     if names is None:
@@ -998,10 +1095,6 @@ def describe(store, names: Optional[List[str]] = None) -> Dict[str, object]:
         keychain_path = _ensure_target_keychain(store) if store is not None else None
         payload = read_slot(shared_slot(), keychain_path)
         shared = payload is not None
-        # agy reads the shared slot as JSON; a non-JSON payload (e.g. the
-        # go-keyring envelope written by a pre-fix agydra build) is the
-        # exact condition behind the "re-login on every launch" failure
-        # mode. Surfaced here so doctor can name it in one run.
         shared_format = None
         if payload is not None:
             try:

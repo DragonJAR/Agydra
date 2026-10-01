@@ -14,6 +14,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -165,6 +166,20 @@ class TestRunnerForce(BaseCase):
             self.assertEqual(rc, 0)
         finally:
             handle.release()
+
+    def test_agy_keychain_launch_waits_for_guard_restoration(self):
+        plan = runner.build_plan(self.store, ["chat"], flag_ref="work")
+
+        with mock.patch("keychain.supported", return_value=True), \
+                mock.patch("keychain.launch_guard") as guard_factory, \
+                mock.patch("platforms.run_wait", return_value=0) as run_wait, \
+                mock.patch("platforms.launch_argv", return_value=0) as launch_argv:
+            result = runner.run(plan, store=self.store)
+
+        self.assertEqual(result, 0)
+        guard_factory.assert_called_once_with(self.store, "work", capture=False)
+        run_wait.assert_called_once()
+        launch_argv.assert_not_called()
 
 
 class TestForceEndToEnd(BaseCase):

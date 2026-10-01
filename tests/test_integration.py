@@ -14,7 +14,29 @@ import locks
 import platforms
 from store import Store
 
-from conftest import BaseCase, _make_jwt
+from conftest import BaseCase, _make_jwt, write_fake_agy
+
+
+class TestFakeAgyFixture(unittest.TestCase):
+    def test_windows_fake_binary_creates_missing_parent(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "missing" / "agy"
+            with mock.patch("conftest.sys.platform", "win32"):
+                created = write_fake_agy(binary)
+            self.assertEqual(created, binary.with_suffix(".cmd"))
+            self.assertTrue(created.is_file())
+
+
+class TestFixtureEnvironment(BaseCase):
+    def test_host_data_paths_are_sandboxed(self):
+        root = self._tmp.resolve()
+        for name in ("HOME", "LOCALAPPDATA", "XDG_DATA_HOME"):
+            with self.subTest(name=name):
+                data_path = Path(os.environ[name]).resolve()
+                self.assertTrue(data_path.is_relative_to(root))
 
 
 class TestIntegration(BaseCase):
@@ -533,12 +555,20 @@ class TestAliasesAndFlagTable(BaseCase):
 
         old = os.environ.get("FORCE_COLOR")
         old_no = os.environ.get("NO_COLOR")
-        os.environ["FORCE_COLOR"] = "1"
-        os.environ.pop("NO_COLOR", None)
-        try:
+
+        def capture_help():
             buf = io.StringIO()
             with redirect_stdout(buf):
                 main(["help"])
+            return buf.getvalue()
+
+        try:
+            os.environ["FORCE_COLOR"] = "0"
+            os.environ["NO_COLOR"] = ""
+            plain = capture_help()
+            os.environ["FORCE_COLOR"] = "1"
+            os.environ.pop("NO_COLOR", None)
+            out = capture_help()
         finally:
             if old is None:
                 os.environ.pop("FORCE_COLOR", None)
@@ -548,10 +578,9 @@ class TestAliasesAndFlagTable(BaseCase):
                 os.environ.pop("NO_COLOR", None)
             else:
                 os.environ["NO_COLOR"] = old_no
-        out = buf.getvalue()
         self.assertIn("\x1b[", out)
         from ui import strip_ansi
-        self.assertEqual(strip_ansi(out), strip_ansi(out))
+        self.assertEqual(strip_ansi(out).split(), plain.split())
         self.assertIn("management:", strip_ansi(out))
 
     def test_no_color_wins_over_force_color(self):

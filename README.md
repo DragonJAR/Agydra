@@ -127,7 +127,7 @@ Columns shrink on a narrow terminal. `agydra usage vacan` prints reset countdown
 
 **Dry-run.** `agydra -np work` prints paths, environment, and argv and does not launch.
 
-**Language.** `agydra lang es` stores `en` or `es` in `agydra.json`. `AGYDRA_LANG=es` covers one process. `agydra lang` prints the active language and where it came from.
+**Language.** `agydra lang es` stores `en` or `es` in `agydra.json`. `AGYDRA_LANG=es` covers one process. `agydra lang` prints the active language and supported codes.
 
 ### What each engine isolates
 
@@ -148,15 +148,15 @@ Management commands also accept `--NAME` or `-NAME` (`agydra --list` == `agydra 
 | `list` | `ls`, `l` | Index, email, default, auth, busy, engine, last use. |
 | `create NAME [-d DESC] [-e ENGINE]` | `c` | New store. `-e` is `agy` (default), `codex`, or `grok`. |
 | `login [NAME\|#] [-f] [-n]` | `in` | Isolated login for that profile's engine. `-f` re-authenticates. |
-| `import NAME\|# [-s DIR]` | `imp` | **Copies** `~/.gemini`, `~/.codex`, or `~/.grok` into the profile. |
+| `import NAME\|# [-s DIR]` | `imp` | **Copies** `~/.gemini`, `~/.codex`, or `~/.grok` into the profile while holding its profile lock. |
 | `rename A B` | `mv` | Renames the profile and updates the default. Refuses a busy profile. |
 | `delete NAME\|# [-f] [--no-backup]` | `rm` | Writes a ZIP under `backups/`, then deletes. Refuses a busy profile. |
 | `default [NAME\|#]` | `d` | Show or set the fallback profile. |
 | `use [NAME\|#]` | `u` | Pin the current directory with a `.agydra` marker. |
 | `status [-n]` | `st` | Resolved profile, engine, binary, email, auth, lock. |
 | `usage [NAME\|#]` | `us` | Live quotas for `agy`, `codex`, and `grok`. |
-| `share-config SRC TARGET...` | `share` | Copies config files. Leaves credentials in the source. |
-| `doctor [--fix] [-f]` | `doc` | Ten health checks. `--fix` repairs links, locks, and stale slots. |
+| `share-config SRC TARGET...` | `share` | Copies config files while holding the source and target profile locks through all copies. Leaves credentials in the source. |
+| `doctor [--fix] [-f]` | `doc` | Ten health checks. `--fix` repairs overlay data links and dangling defaults, and purges only orphan artifacts. |
 | `setup [-n]` | `install` | Idempotent venv, console script, and PATH shim. |
 | `lang [CODE]` | `language`, `idioma`, `locale` | Display language: `en` or `es`. |
 | `version` | `-v`, `--version` | Agydra, Python, and OS. |
@@ -216,7 +216,13 @@ Host home (~/)                         left in place: ~/.gemini  ~/.codex  ~/.gr
 
 `AgyEngine`, `CodexEngine`, and `GrokEngine` own binary lookup, arguments, paths, and identity parsing. Codex always runs with `--no-daemon`. Grok's leader socket is per profile, so a host `grok` session and a profile session do not share it. The macOS keychain bridge applies to `agy` only.
 
-Locks live on `<store>/locks/<profile>.lock` and die with the process.
+Session locks use `<store>/locks/<profile>.lock`; the sentinel file persists, while the OS advisory lock is released when its holder exits. `create`, `rename`, and `delete` acquire the affected profile locks in sorted name order, then the persistent, non-inherited store-wide lock `<store>/locks/.profile-sequence.lock`; profile and sequence locks are acquired non-blockingly and profile locks are released in reverse order. The persistent `<store>/profile-sequence.json` stores `{"last_seq": N}`. If it is missing, the counter is initialized from the highest readable profile sequence while holding the sequence lock. `create` persists its next number before staging, so an interruption or later failure can leave a harmless gap; deleted sequence numbers are not reused.
+
+`create` builds `data/` and `profile.json` in a same-filesystem temporary sibling directory under `<store>/profiles/`, named `.agydra-stage-<name>-<token>`, then publishes the complete profile with one directory rename. A stage left by an interruption is ignored by profile scans and removed by a later create for that exact name under both locks; the reserved sequence remains consumed.
+
+Before moving a profile directory, `rename` atomically writes its intent to `<store>/profile-rename.json`, including a Keychain slot migration recovery action and the `source_present` snapshot. A later public profile read or mutation recovers that journal while holding the old and new profile locks in sorted order, followed by the sequence lock. If only the old directory exists, recovery restores the old default when needed and removes the journal; if only the new directory exists, recovery finishes forward by fixing profile metadata and the default when needed, removing the old overlay, then running the recorded Keychain action before removing the journal. Forward recovery runs that action while holding the sorted profile locks, the sequence lock, and `swap.lock`; if it fails, the journal remains for retry on the next store operation. On the normal rename path, the callback runs with the profile locks held after the sequence lock is released. If both or neither directory exists, the journal or metadata is malformed, or a required lock is busy, recovery fails closed and retains the journal and profile data.
+
+When enabled (the default; `--no-backup` disables it), `delete` writes and verifies its ZIP backup before removing profile data. The CLI keeps the profile lock through its post-delete keychain purge, after releasing the sequence lock; on macOS, that purge uses `swap.lock` to serialize cleanup of the profile's saved slot and system Keychain entry with keychain swaps. A purge failure is reported as a warning after deletion. `import` holds its target profile lock through the copy, and `share-config` holds the source and target profile locks until all copies finish. `doctor --fix` holds the profile lock while migrating and relinking overlay data.
 
 | Platform | Mechanism |
 |---|---|
@@ -228,7 +234,7 @@ Locks live on `<store>/locks/<profile>.lock` and die with the process.
 
 ## 🩺 Diagnostics
 
-`agydra doctor` runs ten checks: binaries actually in use, store, profiles, locks, isolation, keychain, schema canary, orphans, Linux sandbox, and the PATH shim. `agydra doctor --fix` relinks overlays, drops stale locks, and removes orphan keychain slots.
+`agydra doctor` runs ten checks: binaries actually in use, store, profiles, locks, isolation, keychain, schema canary, orphans, Linux sandbox, and the PATH shim. `agydra doctor --fix` migrates a real directory occupying an existing profile's overlay data path into that profile's store and relinks the path while holding that profile's lock; it clears the configured default when its name is absent from the current readable profile list. For orphan cleanup, a profile owns its artifacts whenever its profile directory exists, even if its metadata cannot be read. Doctor removes orphan overlay directories, keychain secret backups and quarantine files, and backup ZIPs only when the owning profile directory is absent; it tries each candidate's profile lock and skips cleanup when an active session holds that lock. System keychain slots are also purged only when the profile directory is absent, with the profile lock acquired before `swap.lock`. Session lock files remain persistent sentinels and are not removed.
 
 ---
 

@@ -1,4 +1,4 @@
-"""Aggregate quota usage across profiles via agy's built-in ``/usage`` query.
+"""Aggregate quota usage across profiles through each engine's usage source.
 
 Mechanism (validated live against a real agy 1.2.7 binary): running
 ``agy --print "/usage" --output-format json`` is a stateless, read-only
@@ -7,8 +7,8 @@ clean structured JSON on stdout under ``command.data.groups`` -- a list of
 model groups, each holding one or more usage buckets (``weekly``/``5h``
 windows) with a ``remaining_fraction`` (0..1) and a UTC ``reset_time``.
 
-Never hardcode group/bucket NAMES ("Gemini"/"Claude") as string literals
-anywhere in this module: everything is read dynamically from
+For agy's response, never hardcode group/bucket NAMES ("Gemini"/"Claude")
+as string literals: everything is read dynamically from
 ``group["name"]``/``bucket["window"]``/``bucket["id"]`` so a future agy
 release that adds or renames a model group still renders correctly.
 
@@ -19,6 +19,11 @@ is why ``query_profile_usage`` deliberately does NOT take the session
 lock (``locks.try_lock``). ``usage`` must keep working while a profile is
 busy; this is the one documented exception alongside ``-f/--force`` (see
 AGENTS.md's lock-exceptions bullet).
+
+Codex and Grok usage requests only use access tokens already present in
+their profile data. This read-only command never exchanges refresh tokens or
+rewrites ``auth.json``; missing and expired access tokens return explicit
+errors so an inspection cannot rotate credentials behind a running session.
 
 Keychain-safety note: on macOS, when the profile being queried already
 owns the shared keychain slot (a real session for it is already running
@@ -41,13 +46,18 @@ below is the ONLY place that iterates multiple profiles; it MUST call
 ``query_profile_usage`` one profile at a time, never via a thread pool,
 ``asyncio``, or ``concurrent.futures``. Do not "optimize" this loop.
 
-Every failure mode this module can hit -- not authenticated, no agy
-binary, an isolation error building the overlay, a keychain swap issue
-outside the fail-open contract, a subprocess timeout, a non-zero exit, a
-non-JSON stdout body, a ``status`` other than ``"SUCCESS"``, or a
-response missing ``command.data`` -- degrades to
-``UsageResult(ok=False, error=...)``. ``query_profile_usage`` never
-raises, so one broken or ineligible profile can never abort a
+The meaning of ``UsageResult.ok`` is engine-specific. The agy subprocess
+path reports failures as ``ok=False``. For Codex and Grok, missing
+credentials, HTTP 401, invalid responses, and absent usage data from the
+required quota endpoint return ``ok=False``. With locally recognized
+credentials, a transport failure or an HTTP error other than 401 from that
+endpoint returns ``ok=True`` with no groups and an explicit ``error``: the
+account is recognized, but quota data is unavailable. A successful quota
+response returns ``ok=True`` with groups; API-key authentication can also
+return ``ok=True`` without groups or an error. Grok's settings endpoint is
+an optional best-effort lookup for the displayed plan; its failure is
+ignored and does not invalidate the billing status. ``query_profile_usage``
+never raises, so one broken or ineligible profile can never abort a
 multi-profile report.
 """
 from __future__ import annotations
@@ -111,6 +121,19 @@ class UsageResult:
     is_ineligible: bool = False
 
 
+class UsageResponseError(ValueError):
+    """An external usage endpoint returned data that could not be parsed."""
+
+
+def _is_finite_number(value: object) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 @dataclass
 class BucketColumn:
     """One column of the compact multi-profile table: a bucket ``id`` plus
@@ -157,7 +180,7 @@ def _parse_bucket(raw: object) -> Optional[UsageBucket]:
     if not isinstance(bucket_id, str) or not bucket_id:
         return None
     fraction = raw.get("remaining_fraction")
-    if not isinstance(fraction, (int, float)) or isinstance(fraction, bool) or not math.isfinite(fraction):
+    if not _is_finite_number(fraction):
         return None
     clamped = max(0.0, min(1.0, float(fraction)))
     return UsageBucket(
@@ -179,7 +202,7 @@ def _parse_window_bucket(
     if not isinstance(raw_window, dict):
         return None
     used = raw_window.get("used_percent")
-    if not isinstance(used, (int, float)) or isinstance(used, bool) or not math.isfinite(used):
+    if not _is_finite_number(used):
         return None
     rem = max(0.0, min(1.0, (100.0 - float(used)) / 100.0))
     reset_dt = _parse_reset_time(raw_window.get("reset_at"))
@@ -224,6 +247,16 @@ def _close_http_error(exc: BaseException) -> None:
             pass
 
 
+def _read_json_object_response(response, source: str) -> dict:
+    try:
+        payload = json.loads(response.read().decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise UsageResponseError(f"{source} returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise UsageResponseError(f"{source} returned a non-object JSON response")
+    return payload
+
+
 def _post_token_refresh(
     url: str,
     body: bytes,
@@ -244,7 +277,7 @@ def _post_token_refresh(
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            data = _read_json_object_response(resp, "token refresh endpoint")
             if isinstance(data, dict) and (data.get("access_token") or data.get("key")):
                 return data
     except Exception as exc:
@@ -312,8 +345,7 @@ def fetch_codex_usage_payload(
         headers=headers,
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-        return data if isinstance(data, dict) else None
+        return _read_json_object_response(resp, "OpenAI usage endpoint")
 
 
 def parse_codex_usage_payload(
@@ -339,12 +371,13 @@ def parse_codex_usage_payload(
     credits_info = payload.get("credits")
     if isinstance(credits_info, dict) and detected_plan:
         balance = credits_info.get("balance")
-        if isinstance(balance, (int, float)) and not isinstance(balance, bool) and math.isfinite(balance):
+        if _is_finite_number(balance):
             detected_plan = f"{detected_plan} (${float(balance):.2f})"
         elif isinstance(balance, str) and balance.strip():
             try:
                 bal_f = float(balance.strip())
-                detected_plan = f"{detected_plan} (${bal_f:.2f})"
+                if math.isfinite(bal_f):
+                    detected_plan = f"{detected_plan} (${bal_f:.2f})"
             except ValueError:
                 pass
 
@@ -406,16 +439,16 @@ def parse_codex_usage_payload(
     )
     if isinstance(spend_limit, dict):
         rem_pct = spend_limit.get("remaining_percent")
-        if not isinstance(rem_pct, (int, float)) or isinstance(rem_pct, bool) or not math.isfinite(rem_pct):
+        if not _is_finite_number(rem_pct):
             used = spend_limit.get("used")
             limit = spend_limit.get("limit")
             if (
-                isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used)
-                and isinstance(limit, (int, float)) and not isinstance(limit, bool) and math.isfinite(limit)
+                _is_finite_number(used)
+                and _is_finite_number(limit)
                 and limit > 0
             ):
                 rem_pct = max(0.0, min(100.0, (1.0 - (float(used) / float(limit))) * 100.0))
-        if isinstance(rem_pct, (int, float)) and not isinstance(rem_pct, bool) and math.isfinite(rem_pct):
+        if _is_finite_number(rem_pct):
             rem_fraction = max(0.0, min(1.0, float(rem_pct) / 100.0))
             reset_raw = spend_limit.get("reset_at") or spend_limit.get("resets_at")
             reset_dt = _parse_reset_time(reset_raw)
@@ -470,29 +503,7 @@ def query_codex_usage(
         )
 
     access_token = auth_info.get("access_token")
-    refresh_token = auth_info.get("refresh_token")
     account_id = auth_info.get("account_id")
-
-    def _do_refresh() -> Optional[str]:
-        if not refresh_token:
-            return None
-        new_tokens = refresh_codex_tokens(refresh_token, timeout=timeout)
-        if new_tokens and new_tokens.get("access_token"):
-            account.save_codex_tokens(data_dir, new_tokens)
-            return new_tokens.get("access_token")
-        return None
-
-    if not access_token and refresh_token:
-        access_token = _do_refresh()
-        if not access_token:
-            return UsageResult(
-                name=name,
-                ok=False,
-                engine="codex",
-                email=detected_email,
-                plan=detected_plan,
-                error="token refresh failed",
-            )
 
     if not access_token:
         return UsageResult(
@@ -510,39 +521,14 @@ def query_codex_usage(
     except urllib.error.HTTPError as exc:
         _close_http_error(exc)
         if exc.code == 401:
-            if refresh_token:
-                new_access_token = _do_refresh()
-                if new_access_token:
-                    try:
-                        payload = fetch_codex_usage_payload(new_access_token, account_id=account_id, timeout=timeout)
-                    except Exception as inner_exc:
-                        _close_http_error(inner_exc)
-                        return UsageResult(
-                            name=name,
-                            ok=True,
-                            engine="codex",
-                            email=detected_email,
-                            plan=detected_plan or "ChatGPT Plus",
-                            error=f"usage unavailable ({inner_exc})",
-                        )
-                else:
-                    return UsageResult(
-                        name=name,
-                        ok=False,
-                        engine="codex",
-                        email=detected_email,
-                        plan=detected_plan,
-                        error="session expired (401)",
-                    )
-            else:
-                return UsageResult(
-                    name=name,
-                    ok=False,
-                    engine="codex",
-                    email=detected_email,
-                    plan=detected_plan,
-                    error="session expired (401)",
-                )
+            return UsageResult(
+                name=name,
+                ok=False,
+                engine="codex",
+                email=detected_email,
+                plan=detected_plan,
+                error="session expired (401)",
+            )
         else:
             return UsageResult(
                 name=name,
@@ -552,6 +538,15 @@ def query_codex_usage(
                 plan=detected_plan or "ChatGPT Plus",
                 error=f"usage unavailable (HTTP {exc.code})",
             )
+    except UsageResponseError as exc:
+        return UsageResult(
+            name=name,
+            ok=False,
+            engine="codex",
+            email=detected_email,
+            plan=detected_plan,
+            error=f"invalid usage response ({exc})",
+        )
     except Exception as exc:
         _close_http_error(exc)
         return UsageResult(
@@ -566,15 +561,26 @@ def query_codex_usage(
     if not payload:
         return UsageResult(
             name=name,
-            ok=True,
+            ok=False,
             engine="codex",
             email=detected_email,
             plan=detected_plan or "ChatGPT Plus",
+            error="no usage data in response",
         )
 
     groups, api_plan, api_email = parse_codex_usage_payload(payload)
     final_plan = api_plan or detected_plan or "ChatGPT Plus"
     final_email = api_email or detected_email
+
+    if not groups:
+        return UsageResult(
+            name=name,
+            ok=False,
+            engine="codex",
+            email=final_email,
+            plan=final_plan,
+            error="no usage data in response",
+        )
 
     return UsageResult(
         name=name,
@@ -598,8 +604,7 @@ def fetch_grok_billing_payload(token: str, *, timeout: float = 10.0) -> Optional
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-        return data if isinstance(data, dict) else None
+        return _read_json_object_response(resp, "xAI billing endpoint")
 
 
 def fetch_grok_settings_payload(token: str, *, timeout: float = 4.0) -> Optional[dict]:
@@ -615,8 +620,7 @@ def fetch_grok_settings_payload(token: str, *, timeout: float = 4.0) -> Optional
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data if isinstance(data, dict) else None
+            return _read_json_object_response(resp, "xAI settings endpoint")
     except Exception as exc:
         _close_http_error(exc)
         return None
@@ -634,7 +638,7 @@ def parse_grok_billing_payload(
         return [], None
 
     used_pct = cfg.get("creditUsagePercent")
-    if not isinstance(used_pct, (int, float)) or isinstance(used_pct, bool) or not math.isfinite(used_pct):
+    if not _is_finite_number(used_pct):
         ondemand_used = (
             cfg.get("onDemandUsed", {}).get("val")
             if isinstance(cfg.get("onDemandUsed"), dict)
@@ -646,12 +650,8 @@ def parse_grok_billing_payload(
             else None
         )
         if (
-            isinstance(ondemand_used, (int, float))
-            and not isinstance(ondemand_used, bool)
-            and math.isfinite(ondemand_used)
-            and isinstance(ondemand_cap, (int, float))
-            and not isinstance(ondemand_cap, bool)
-            and math.isfinite(ondemand_cap)
+            _is_finite_number(ondemand_used)
+            and _is_finite_number(ondemand_cap)
             and ondemand_cap > 0
         ):
             used_pct = (float(ondemand_used) / float(ondemand_cap)) * 100.0
@@ -691,7 +691,7 @@ def parse_grok_billing_payload(
                 continue
             clean_prod = prod_name.strip()
             pct = item.get("usagePercent")
-            if isinstance(pct, (int, float)) and not isinstance(pct, bool) and math.isfinite(pct):
+            if _is_finite_number(pct):
                 prod_rem = max(0.0, min(1.0, (100.0 - float(pct)) / 100.0))
                 slug = clean_prod.lower().replace(" ", "-")
                 buckets.append(
@@ -742,36 +742,6 @@ def query_grok_usage(
         )
 
     token = auth_info.get("token") or auth_info.get("key")
-    refresh_token = auth_info.get("refresh_token")
-    oidc_client_id = auth_info.get("oidc_client_id")
-    oidc_issuer = auth_info.get("oidc_issuer")
-
-    def _do_refresh() -> Optional[str]:
-        if not refresh_token:
-            return None
-        new_tokens = refresh_grok_tokens(
-            refresh_token,
-            client_id=oidc_client_id,
-            issuer=oidc_issuer,
-            timeout=timeout,
-        )
-        if new_tokens and (new_tokens.get("access_token") or new_tokens.get("key")):
-            account.save_grok_tokens(data_dir, new_tokens)
-            return new_tokens.get("access_token") or new_tokens.get("key")
-        return None
-
-    if not token and refresh_token:
-        token = _do_refresh()
-        if not token:
-            return UsageResult(
-                name=name,
-                ok=False,
-                engine="grok",
-                email=detected_email,
-                plan=detected_plan,
-                error="token refresh failed",
-            )
-
     if not token:
         return UsageResult(
             name=name,
@@ -788,40 +758,14 @@ def query_grok_usage(
     except urllib.error.HTTPError as exc:
         _close_http_error(exc)
         if exc.code == 401:
-            if refresh_token:
-                new_token = _do_refresh()
-                if new_token:
-                    token = new_token
-                    try:
-                        billing_payload = fetch_grok_billing_payload(token, timeout=timeout)
-                    except Exception as inner_exc:
-                        _close_http_error(inner_exc)
-                        return UsageResult(
-                            name=name,
-                            ok=True,
-                            engine="grok",
-                            email=detected_email,
-                            plan=detected_plan or "Grok (xAI)",
-                            error=f"usage unavailable ({inner_exc})",
-                        )
-                else:
-                    return UsageResult(
-                        name=name,
-                        ok=False,
-                        engine="grok",
-                        email=detected_email,
-                        plan=detected_plan,
-                        error="session expired (401)",
-                    )
-            else:
-                return UsageResult(
-                    name=name,
-                    ok=False,
-                    engine="grok",
-                    email=detected_email,
-                    plan=detected_plan,
-                    error="session expired (401)",
-                )
+            return UsageResult(
+                name=name,
+                ok=False,
+                engine="grok",
+                email=detected_email,
+                plan=detected_plan,
+                error="session expired (401)",
+            )
         else:
             return UsageResult(
                 name=name,
@@ -831,6 +775,15 @@ def query_grok_usage(
                 plan=detected_plan or "Grok (xAI)",
                 error=f"usage unavailable (HTTP {exc.code})",
             )
+    except UsageResponseError as exc:
+        return UsageResult(
+            name=name,
+            ok=False,
+            engine="grok",
+            email=detected_email,
+            plan=detected_plan,
+            error=f"invalid usage response ({exc})",
+        )
     except Exception as exc:
         _close_http_error(exc)
         return UsageResult(
@@ -852,13 +805,23 @@ def query_grok_usage(
     if not billing_payload:
         return UsageResult(
             name=name,
-            ok=True,
+            ok=False,
             engine="grok",
             email=detected_email,
             plan=final_plan or "Grok (xAI)",
+            error="no usage data in response",
         )
 
     groups, _reset_dt = parse_grok_billing_payload(billing_payload)
+    if not groups:
+        return UsageResult(
+            name=name,
+            ok=False,
+            engine="grok",
+            email=detected_email,
+            plan=final_plan or "Grok (xAI)",
+            error="no usage data in response",
+        )
     return UsageResult(
         name=name,
         ok=True,
@@ -1035,11 +998,7 @@ def format_mini_bar(remaining_fraction: float, width: int = 10) -> str:
     """Format a compact fixed-width gauge using filled and empty blocks: e.g. '███░░░░░░░'."""
     if width <= 0:
         return ""
-    if (
-        not isinstance(remaining_fraction, (int, float))
-        or isinstance(remaining_fraction, bool)
-        or not math.isfinite(remaining_fraction)
-    ):
+    if not _is_finite_number(remaining_fraction):
         return "░" * width
     clamped = max(0.0, min(1.0, float(remaining_fraction)))
     filled = round(clamped * width)

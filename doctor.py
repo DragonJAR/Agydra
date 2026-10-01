@@ -263,7 +263,9 @@ def _check_keychain(store: Store, ctx: "_DoctorContext"):
     (``keychain.orphan_slots``, called once here -- not re-globbed), the
     same proactive-WARN pattern ``_check_orphans`` already uses for
     file-based orphans: otherwise these were only discoverable via
-    ``doctor --fix``'s preview.
+    ``doctor --fix``'s preview. The shared slot is the user's live agy
+    identity; malformed payload reporting is detection only, and the next
+    agy launch repairs it from the profile's own backup.
     """
     report = keychain.describe(store, names=ctx.names)
     skip_marker = keychain._slots_dir(store) / getattr(keychain, "_SKIP_MARKER_NAME", ".setup-skipped")
@@ -315,12 +317,6 @@ def _check_keychain(store: Store, ctx: "_DoctorContext"):
             "orphaned keychain slots: " + ", ".join(orphans)
             + " (run `agydra doctor --fix` to purge)"
         )
-    # agy reads the shared slot as JSON; any other payload shape is the
-    # "re-login on every launch" failure mode (pre-fix agydra builds wrote
-    # the file-backup envelope into the live slot). Detection only: doctor
-    # must never rewrite the shared slot — the user's real agy login lives
-    # there. It self-heals on the next launch (the swap unwraps the
-    # profile's own backup), so the advice is to launch once, not to delete.
     shared_format = report.get("shared_format")
     if shared and shared_format not in (None, "json"):
         lines.append(
@@ -335,13 +331,15 @@ def _check_keychain(store: Store, ctx: "_DoctorContext"):
 
 
 def _check_orphans(store: Store, ctx: "_DoctorContext"):
-    """Reverse-scan ``overlays/``, ``locks/``, ``keychain/`` and
-    ``backups/`` for artifacts whose owning profile is no longer in
+    """Reverse-scan ``overlays/``, ``keychain/`` and ``backups/`` for
+    artifacts whose owning profile is no longer in
     ``profiles/`` -- confirmed possible when a profile directory is
     deleted by hand instead of through ``agydra delete``/``rename``, which
-    otherwise keep every side-store in sync. Always WARN (never FAIL):
-    these are cleanup opportunities, not correctness failures. Run
-    `agydra doctor --fix` to remove what this lists.
+    otherwise keep every side-store in sync. Session lock sentinels are
+    persistent and excluded from orphan cleanup; the locks check reports
+    live sessions, while ``doctor --fix`` never removes lock files. Always
+    WARN (never FAIL): these are cleanup opportunities, not correctness
+    failures. Run ``agydra doctor --fix`` to remove what this lists.
     """
     import orphans
 
@@ -444,6 +442,14 @@ def _fix_orphans(store: Store, names: Sequence[str]) -> None:
         print(paint("[fix]", "cyan", "bold") + f" removed: {line}")
 
 
+def _directory_identity(path: Path) -> Tuple[int, int]:
+    stat_result = path.stat()
+    inode = getattr(stat_result, "st_ino", 0)
+    if not inode:
+        raise OSError(f"could not establish a stable directory identity for {path}")
+    return stat_result.st_dev, inode
+
+
 def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
     """What ``doctor --fix`` would change, in human-readable form. Single
     source of truth so the confirmation gate and the live-apply step can
@@ -482,19 +488,126 @@ def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
 
 
 def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
-    """One self-heal pass for everything ``doctor --fix`` covers."""
+    """One self-heal pass for everything ``doctor --fix`` covers.
+
+    Profile names are refreshed immediately before dangling-default and
+    orphan cleanup because the confirmation prompt can leave time for the
+    store to change after ``ctx`` was built.
+    """
     import engines
+    import locks
 
     profiles_by_name = {p.name: p for p in ctx.scan[0]}
     for name in ctx.names:
-        if not store.exists(name):
+        snapshot = profiles_by_name.get(name)
+        if snapshot is None or snapshot.name != name:
+            warn(
+                f"skipping overlay recovery for {name!r}: "
+                "cannot establish the profile owner"
+            )
             continue
-        p = profiles_by_name.get(name)
-        engine_name = (getattr(p, "engine", "agy") or "agy") if p else "agy"
-        driver = engines.get_engine(engine_name)
-        data_dir = store.profile_data_dir(name)
-        link = store.overlays_dir / name / driver.data_dir_name
-        if link.exists() and not isolation._is_link(link):
+        engine_name = getattr(snapshot, "engine", "agy") or "agy"
+        try:
+            driver = engines.get_engine(engine_name)
+        except ValueError as exc:
+            warn(
+                f"skipping overlay recovery for {name!r}: "
+                f"cannot establish the profile engine ({exc})"
+            )
+            continue
+        overlay = store.overlays_dir / name
+        link = overlay / driver.data_dir_name
+        profile_dir = store.profile_dir(name)
+        metadata_path = store.profile_meta_path(name)
+        try:
+            if (
+                isolation._is_link(profile_dir)
+                or not profile_dir.is_dir()
+                or isolation._is_link(metadata_path)
+                or not metadata_path.is_file()
+                or isolation._is_link(store.overlays_dir)
+                or not store.overlays_dir.is_dir()
+                or isolation._is_link(overlay)
+                or not overlay.is_dir()
+                or not link.is_dir()
+                or isolation._is_link(link)
+            ):
+                warn(
+                    f"skipping overlay recovery for {name!r}: "
+                    "cannot safely establish the profile or overlay owner"
+                )
+                continue
+            profile_identity = _directory_identity(profile_dir)
+            overlay_identity = _directory_identity(overlay)
+            link_identity = _directory_identity(link)
+        except OSError as exc:
+            warn(
+                f"skipping overlay recovery for {name!r}: "
+                f"cannot safely establish the profile or overlay owner ({exc})"
+            )
+            continue
+        try:
+            handle = locks.try_lock(store, name)
+        except OSError as exc:
+            warn(f"could not lock profile {name!r} for overlay recovery ({exc})")
+            continue
+        if handle is None:
+            warn(
+                f"skipping overlay recovery for {name!r}: "
+                "profile lock is held by an active session"
+            )
+            continue
+        try:
+            try:
+                current = store.get(name)
+                if (
+                    current.name != name
+                    or current.seq != snapshot.seq
+                    or current.created != snapshot.created
+                    or current.engine != engine_name
+                ):
+                    warn(
+                        f"skipping overlay recovery for {name!r}: "
+                        "profile or overlay owner changed since the check"
+                    )
+                    continue
+                if (
+                    isolation._is_link(profile_dir)
+                    or not profile_dir.is_dir()
+                    or isolation._is_link(metadata_path)
+                    or not metadata_path.is_file()
+                    or isolation._is_link(store.overlays_dir)
+                    or not store.overlays_dir.is_dir()
+                    or isolation._is_link(overlay)
+                    or not overlay.is_dir()
+                    or not link.is_dir()
+                    or isolation._is_link(link)
+                    or _directory_identity(profile_dir) != profile_identity
+                    or _directory_identity(overlay) != overlay_identity
+                    or _directory_identity(link) != link_identity
+                ):
+                    warn(
+                        f"skipping overlay recovery for {name!r}: "
+                        "profile or overlay owner changed while acquiring its lock"
+                    )
+                    continue
+                current_driver = engines.get_engine(current.engine)
+                link = overlay / current_driver.data_dir_name
+                if not link.exists() or isolation._is_link(link):
+                    continue
+                if not link.is_dir():
+                    warn(
+                        f"skipping overlay recovery for {name!r}: "
+                        "overlay data owner is not a real directory"
+                    )
+                    continue
+                data_dir = store.profile_data_dir(name, engine=current.engine)
+            except (StoreError, OSError, ValueError) as exc:
+                warn(
+                    f"skipping overlay recovery for {name!r}: "
+                    f"cannot safely establish the profile or overlay owner ({exc})"
+                )
+                continue
             try:
                 isolation.migrate_real_dir_to_store(link, data_dir)
             except (isolation.IsolationError, OSError) as exc:
@@ -509,11 +622,8 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
                 paint("[fix]", "cyan", "bold")
                 + f" migrated overlay data for {name!r} and relinked {driver.data_dir_name}"
             )
-    # Fresh names at purge time, never the pre-confirmation ``ctx.names``
-    # snapshot: the confirmation prompt in ``cmd_doctor`` can pause for an
-    # arbitrary time, during which a profile could be created -- using fresh
-    # names protects against falsely clearing a newly created default or
-    # treating its artifacts as orphans.
+        finally:
+            handle.release()
     current_names = store.names()
     default = store.default_name()
     if default and default not in current_names:
@@ -530,14 +640,46 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
     keychain_path = keychain._ensure_target_keychain(store) if keychain.supported() else None
     for orphan in keychain.orphan_slots(store, current_names, keychain_path=keychain_path):
         try:
-            keychain.delete_slot(keychain.profile_slot(orphan), keychain_path)
-        except (keychain.KeychainError, OSError) as exc:
-            warn(f"could not purge orphan keychain slot {orphan!r} ({exc})")
+            profile_dir = store.profile_dir(orphan)
+        except StoreError as exc:
+            warn(f"could not safely purge orphan keychain slot {orphan!r} ({exc})")
             continue
-        print(
-            paint("[fix]", "cyan", "bold")
-            + f" purged orphan keychain slot for {orphan!r}"
-        )
+        if profile_dir.exists() or profile_dir.is_symlink():
+            warn(
+                f"skipping orphan keychain slot for {orphan!r}: "
+                "profile directory still exists"
+            )
+            continue
+        try:
+            handle = locks.try_lock(store, orphan)
+        except OSError as exc:
+            warn(f"could not lock orphan profile {orphan!r} before purge ({exc})")
+            continue
+        if handle is None:
+            warn(
+                f"skipping orphan keychain slot for {orphan!r}: "
+                "profile lock is held"
+            )
+            continue
+        try:
+            if profile_dir.exists() or profile_dir.is_symlink():
+                warn(
+                    f"skipping orphan keychain slot for {orphan!r}: "
+                    "profile directory appeared during purge"
+                )
+                continue
+            try:
+                with keychain.serialized_access(store):
+                    keychain.delete_slot(keychain.profile_slot(orphan), keychain_path)
+            except (keychain.KeychainError, OSError, AttributeError) as exc:
+                warn(f"could not purge orphan keychain slot {orphan!r} ({exc})")
+                continue
+            print(
+                paint("[fix]", "cyan", "bold")
+                + f" purged orphan keychain slot for {orphan!r}"
+            )
+        finally:
+            handle.release()
     _fix_orphans(store, current_names)
 
 

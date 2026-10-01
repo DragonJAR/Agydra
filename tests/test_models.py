@@ -69,6 +69,10 @@ class TestModels(unittest.TestCase):
         with self.assertRaises(ValueError):
             Profile.from_dict({})
 
+    def test_profile_from_dict_rejects_non_finite_sequence_cleanly(self):
+        with self.assertRaisesRegex(ValueError, "seq"):
+            Profile.from_dict({"name": "invalid-sequence", "seq": float("inf")})
+
     def test_profile_touch(self):
         p = Profile(name="touch-test")
         self.assertIsNone(p.last_used)

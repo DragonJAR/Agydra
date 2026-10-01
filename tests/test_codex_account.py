@@ -103,6 +103,18 @@ class TestCodexAccount(BaseCase):
         self.assertEqual(updated["tokens"]["id_token"], "id-123")
         self.assertIn("last_refresh", updated)
 
+    def test_save_codex_tokens_preserves_corrupt_auth_file(self):
+        data_dir = self._tmp / "corrupt_save_tokens_dir"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        auth_file = data_dir / "auth.json"
+        original = "{invalid json"
+        auth_file.write_text(original, encoding="utf-8")
+
+        result = account.save_codex_tokens(data_dir, {"access_token": "new-tok"})
+
+        self.assertFalse(result)
+        self.assertEqual(auth_file.read_text(encoding="utf-8"), original)
+
 
 if __name__ == "__main__":
     unittest.main()

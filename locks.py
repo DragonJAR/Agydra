@@ -88,6 +88,7 @@ import platforms
 
 LOCK_DIR_NAME = "locks"
 LOCK_SUFFIX = ".lock"
+_SEQUENCE_LOCK_NAME = ".profile-sequence.lock"
 
 if platforms.is_windows():
     import msvcrt
@@ -132,12 +133,13 @@ class LockError(OSError):
 
 
 class LockHandle:
-    """An acquired profile lock.
+    """An acquired advisory lock.
 
     ``release`` is idempotent. On POSIX the handle is intentionally NOT
-    released on the success path: ``execvpe`` replaces the process image,
-    the fd survives inside agy, and the kernel releases the lock when agy
-    exits — which is the whole point of the mechanism.
+    released on the profile-session success path: ``execvpe`` replaces the
+    process image, the fd survives inside agy, and the kernel releases the
+    lock when agy exits. Store-maintenance locks are released by their caller
+    and are not inherited by child processes.
     """
 
     __slots__ = ("_fd", "_released")
@@ -179,6 +181,10 @@ def lock_path(store, name: str) -> Path:
     return lock_dir(store) / (name + LOCK_SUFFIX)
 
 
+def sequence_lock_path(store) -> Path:
+    return lock_dir(store) / _SEQUENCE_LOCK_NAME
+
+
 def _same_file(fd: int, path: Path) -> bool:
     """True iff the open ``fd`` and a fresh, symlink-unaware stat of
     ``path`` name the same inode.
@@ -199,13 +205,51 @@ def _same_file(fd: int, path: Path) -> bool:
     """
     try:
         st_path = os.stat(path, follow_symlinks=False)
+        st_fd = os.fstat(fd)
     except OSError:
         return False
-    st_fd = os.fstat(fd)
     return (st_fd.st_dev, st_fd.st_ino) == (st_path.st_dev, st_path.st_ino)
 
 
 _MAX_LOCK_ATTEMPTS = 3
+
+
+def _try_lock_path(
+    path: Path, description: str, inherit_on_exec: bool
+) -> Optional[LockHandle]:
+    """Try to take one non-blocking kernel-held advisory lock."""
+    for _attempt in range(_MAX_LOCK_ATTEMPTS):
+        try:
+            platforms.ensure_dir(path.parent)
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as exc:
+            raise LockError(f"cannot create {description} {path} ({exc})") from exc
+        try:
+            if platforms.is_windows():
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+            if not _try_lock_fd(fd):
+                os.close(fd)
+                return None
+            if not _same_file(fd, path):
+                _unlock_fd(fd)
+                os.close(fd)
+                continue
+            if not platforms.is_windows():
+                os.set_inheritable(fd, inherit_on_exec)
+                if inherit_on_exec:
+                    try:
+                        os.ftruncate(fd, 0)
+                    except OSError:
+                        pass
+        except OSError as exc:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise LockError(f"cannot acquire {description} {path} ({exc})") from exc
+        return LockHandle(fd)
+    return None
 
 
 def try_lock(store, name: str) -> Optional[LockHandle]:
@@ -219,38 +263,18 @@ def try_lock(store, name: str) -> Optional[LockHandle]:
     this module (fail-closed). Raises LockError only when the lock cannot
     be managed at all.
     """
-    path = lock_path(store, name)
-    for _attempt in range(_MAX_LOCK_ATTEMPTS):
-        try:
-            platforms.ensure_dir(path.parent)
-            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-        except OSError as exc:
-            raise LockError(f"cannot create session lock {path} ({exc})") from exc
-        try:
-            if platforms.is_windows():
-                if os.fstat(fd).st_size == 0:
-                    os.write(fd, b"\0")
-            if not _try_lock_fd(fd):
-                os.close(fd)
-                return None
-            if not _same_file(fd, path):
-                _unlock_fd(fd)
-                os.close(fd)
-                continue
-            if not platforms.is_windows():
-                os.set_inheritable(fd, True)
-                try:
-                    os.ftruncate(fd, 0)
-                except OSError:
-                    pass
-        except OSError as exc:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            raise LockError(f"cannot acquire session lock {path} ({exc})") from exc
-        return LockHandle(fd)
-    return None
+    return _try_lock_path(lock_path(store, name), "session lock", True)
+
+
+def try_sequence_lock(store) -> Optional[LockHandle]:
+    """Try to serialize profile insertion-sequence allocation.
+
+    This persistent store-wide lock is not inherited by child processes and
+    never carries a session PID.
+    """
+    return _try_lock_path(
+        sequence_lock_path(store), "profile sequence lock", False
+    )
 
 
 def _write_holder_pid(fd: int) -> None:
@@ -317,11 +341,12 @@ def is_locked(store, name: str) -> bool:
         if not _same_file(fd, path):
             return True
         locked = not _try_lock_fd(fd)
+        same_file_after_probe = _same_file(fd, path)
         if not locked:
             _unlock_fd(fd)
+        return locked or not same_file_after_probe
     finally:
         os.close(fd)
-    return locked
 
 
 def in_use_names(store, names: Optional[List[str]] = None) -> List[str]:
@@ -335,8 +360,9 @@ def in_use_names(store, names: Optional[List[str]] = None) -> List[str]:
 
 
 def forget(store, name: str) -> None:
-    """Drop the (unlocked) lock file after delete/rename. Best-effort."""
-    try:
-        lock_path(store, name).unlink()
-    except OSError:
-        pass
+    """Keep the lock inode stable after delete/rename.
+
+    Removing a lock path after a separate busy check can orphan a live
+    holder's inode and let a new process lock a replacement file instead.
+    Unlocked files are harmless, so callers retain them for future use.
+    """

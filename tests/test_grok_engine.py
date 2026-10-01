@@ -284,10 +284,11 @@ class TestGrokEngine(unittest.TestCase):
         with unittest.mock.patch("usage.fetch_grok_billing_payload", return_value=None), \
              unittest.mock.patch("usage.fetch_grok_settings_payload", return_value=None):
             res_auth = usage.query_profile_usage(self.store, "grok-query")
-            self.assertTrue(res_auth.ok)
+            self.assertFalse(res_auth.ok)
             self.assertEqual(res_auth.engine, "grok")
             self.assertEqual(res_auth.email, "dev@x.ai")
             self.assertEqual(res_auth.plan, "Grok Pro")
+            self.assertEqual(res_auth.error, "no usage data in response")
 
     def test_cli_create_and_status(self):
         # Create profile via CLI

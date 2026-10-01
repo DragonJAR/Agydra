@@ -1,6 +1,5 @@
 """locks: kernel-held session locks (flock/msvcrt) — acquire, probe, release."""
 import os
-import stat
 import sys
 import unittest
 from pathlib import Path
@@ -51,6 +50,7 @@ class TestLocks(BaseCase):
         handle.release()
 
     def test_probe_never_creates_lock_file(self):
+        locks.lock_path(self.store, "work").unlink()
         self.assertFalse(locks.is_locked(self.store, "work"))
         self.assertFalse(locks.lock_path(self.store, "work").exists())
 
@@ -61,23 +61,36 @@ class TestLocks(BaseCase):
         self.assertTrue(locks.lock_path(self.store, "work").exists())
         self.assertFalse(locks.is_locked(self.store, "work"))
 
-    def test_forget_removes_file(self):
-        locks.try_lock(self.store, "work").release()
+    def test_forget_keeps_unlocked_lock_file_for_stable_inode(self):
+        handle = locks.try_lock(self.store, "work")
+        path = locks.lock_path(self.store, "work")
+        handle.release()
+        inode = path.stat().st_ino
         locks.forget(self.store, "work")
-        self.assertFalse(locks.lock_path(self.store, "work").exists())
+        self.assertTrue(path.exists())
+        self.assertEqual(path.stat().st_ino, inode)
+        self.assertFalse(locks.is_locked(self.store, "work"))
         locks.forget(self.store, "work")
 
-    def test_try_lock_error_on_unwritable_dir(self):
+    def test_forget_does_not_unlink_a_held_lock_inode(self):
+        handle = locks.try_lock(self.store, "work")
+        path = locks.lock_path(self.store, "work")
+        try:
+            locks.forget(self.store, "work")
+            self.assertTrue(path.exists())
+            self.assertTrue(locks.is_locked(self.store, "work"))
+        finally:
+            handle.release()
+
+    def test_try_lock_permission_error_becomes_lock_error(self):
         if sys.platform.startswith("win"):
             self.skipTest("POSIX permission semantics")
         locks.lock_dir(self.store).mkdir(parents=True, exist_ok=True)
-        lock_root = locks.lock_dir(self.store)
-        lock_root.chmod(stat.S_IRUSR | stat.S_IXUSR)
-        try:
+        with mock.patch.object(
+            locks.os, "open", side_effect=PermissionError("permission denied")
+        ):
             with self.assertRaises(locks.LockError):
                 locks.try_lock(self.store, "work")
-        finally:
-            lock_root.chmod(stat.S_IRWXU)
 
     def test_in_use_names(self):
         self.store.create("lab")
@@ -93,6 +106,21 @@ class TestLocks(BaseCase):
             self.store.root / "locks" / "work.lock",
         )
 
+    def test_sequence_lock_is_kernel_held_persistent_and_not_inherited(self):
+        handle = locks.try_sequence_lock(self.store)
+        self.assertIsNotNone(handle)
+        if not sys.platform.startswith("win"):
+            self.assertFalse(os.get_inheritable(handle._fd))
+        path = locks.sequence_lock_path(self.store)
+        self.assertTrue(path.exists())
+        self.assertIsNone(locks.try_sequence_lock(self.store))
+
+        handle.release()
+
+        self.assertTrue(path.exists())
+        second = locks.try_sequence_lock(self.store)
+        self.assertIsNotNone(second)
+        second.release()
 
 class TestLockHolderPid(BaseCase):
     """The busy-profile error must be able to name the holder's PID: the
@@ -274,6 +302,31 @@ class TestLockInodeConsistency(BaseCase):
         policy: 'cannot verify a clean state' -> assume busy."""
         locks.try_lock(self.store, "work").release()
         with mock.patch.object(locks, "_same_file", return_value=False):
+            self.assertTrue(locks.is_locked(self.store, "work"))
+
+    def test_is_locked_rechecks_path_after_acquiring_probe_lock(self):
+        if sys.platform.startswith("win"):
+            self.skipTest("POSIX inode semantics")
+        path = locks.lock_path(self.store, "work")
+        real_try_lock_fd = locks._try_lock_fd
+
+        def replace_during_probe(fd):
+            acquired = real_try_lock_fd(fd)
+            path.unlink()
+            path.touch()
+            return acquired
+
+        with mock.patch.object(locks, "_try_lock_fd", side_effect=replace_during_probe):
+            self.assertTrue(locks.is_locked(self.store, "work"))
+
+        replacement = locks.try_lock(self.store, "work")
+        self.assertIsNotNone(replacement)
+        replacement.release()
+
+    def test_is_locked_fails_closed_when_descriptor_stat_fails(self):
+        locks.lock_dir(self.store).mkdir(parents=True, exist_ok=True)
+        locks.lock_path(self.store, "work").touch()
+        with mock.patch.object(locks.os, "fstat", side_effect=OSError("stat failed")):
             self.assertTrue(locks.is_locked(self.store, "work"))
 
     def test_deleted_and_recreated_lock_file_is_undetectable_by_design(self):

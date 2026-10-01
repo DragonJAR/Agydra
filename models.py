@@ -54,9 +54,13 @@ class Profile:
         last_used = raw.get("last_used")
         email = raw.get("email")
         engine = raw.get("engine")
+        try:
+            seq = int(raw.get("seq") or 0)
+        except OverflowError as exc:
+            raise ValueError(f"profile seq must be finite, got {raw.get('seq')!r}") from exc
         return cls(
             name=name,
-            seq=int(raw.get("seq") or 0),
+            seq=seq,
             created=str(raw.get("created") or _utcnow_iso()),
             last_used=str(last_used) if last_used is not None else None,
             description=str(raw.get("description") or ""),
