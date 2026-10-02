@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from types import MappingProxyType
+from typing import Any, ClassVar, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import account
 import platforms
-
+import ui
 SUPPORTED_ENGINES = ("agy", "codex", "grok", "claude")
 DEFAULT_ENGINE = "agy"
 
@@ -72,6 +73,8 @@ class EngineDriver:
     foreign_auth_env: Tuple[str, ...] = ()
     pinned_env: Tuple[Tuple[str, str], ...] = ()
     inherited_state_env: Tuple[str, ...] = ()
+    import_ignore: Tuple[str, ...] = (".DS_Store", "*.sock", "*.socket", "ipc", "tmp")
+    UNIVERSAL_FLAG_TRANSLATIONS: ClassVar[Mapping[str, Tuple[str, ...]]] = MappingProxyType({})
 
     def scrub_inherited_state(self, env: MutableMapping[str, str]) -> None:
         """Drop per-launch state variables inherited from a parent session.
@@ -121,7 +124,55 @@ class EngineDriver:
         return account.detect_email(data_dir, store=store, name=profile_name, engine=self.name)
 
     def prepare_args(self, args: Sequence[str]) -> List[str]:
-        return list(args)
+        return self.translate_universal_flags(args)
+
+    def translate_universal_flags(self, args: Sequence[str]) -> List[str]:
+        """Map cross-engine permission flags onto this engine's native form.
+
+        Agydra users pass ``--dangerously-skip-permissions`` (Claude's
+        spelling) to ANY engine; each driver declares the equivalent in
+        ``UNIVERSAL_FLAG_TRANSLATIONS`` so the intent survives without the
+        user memorizing four dialects. An empty tuple means the engine has
+        no safe equivalent: the flag is dropped with a warning rather than
+        crashing the launch on an unknown argument.
+        """
+        result: List[str] = []
+        for token in args:
+            replacement = self.UNIVERSAL_FLAG_TRANSLATIONS.get(token)
+            if replacement is None:
+                result.append(token)
+                continue
+            if replacement:
+                ui.warn(
+                    f"{self.binary_name}: translating {token} to "
+                    + " ".join(replacement)
+                )
+                result.extend(replacement)
+            else:
+                ui.warn(
+                    f"{self.binary_name}: no native equivalent for {token}; "
+                    "skipped it (configure permissions through the engine's "
+                    "own flags)"
+                )
+        return result
+
+    def export_credential_ignore(self) -> Tuple[str, ...]:
+        """Paths (relative to the engine's data dir) that MUST NOT be copied
+        into a portable profile archive.
+
+        The list is the single source of truth for what each engine considers
+        a non-portable credential. The default empty tuple means "everything
+        in ``data/`` is portable". Each driver that needs its own exclusion
+        set overrides this method and gets the same export pipeline for free.
+
+        Returning a relative path means the engine owns the convention
+        (``antigravity-cli/antigravity-oauth-token``, ``auth.json``, ...)
+        without leaking the absolute data dir layout. The export command
+        joins the data dir at zip time; the import side never needs to
+        reconstruct it because credentials are excluded at origin, not added
+        back at destination.
+        """
+        return ()
 
 
 class AgyEngine(EngineDriver):
@@ -139,9 +190,27 @@ class AgyEngine(EngineDriver):
             login_args=(),
         )
 
+    def export_credential_ignore(self) -> Tuple[str, ...]:
+        """R4: Antigravity OAuth tokens and macOS keychain backups are bound
+        to the device and the login identity; carrying them across machines
+        would be a false promise. The ``.secret.corrupt-*`` entry matches
+        every quarantined variant the bridge produces when a foreign
+        credential is refused at launch."""
+        return (
+            "antigravity-cli/antigravity-oauth-token",
+            "antigravity-cli/.secret",
+            "antigravity-cli/.secret.corrupt-*",
+        )
+
 
 class CodexEngine(EngineDriver):
     """Driver for OpenAI Codex CLI (codex)."""
+
+    UNIVERSAL_FLAG_TRANSLATIONS: ClassVar[Mapping[str, Tuple[str, ...]]] = MappingProxyType({
+        "--dangerously-skip-permissions": (
+            "--dangerously-bypass-approvals-and-sandbox",
+        ),
+    })
 
     def __init__(self) -> None:
         super().__init__(
@@ -153,17 +222,31 @@ class CodexEngine(EngineDriver):
             needs_keychain=False,
             config_binary_attr="codex_binary",
             login_args=("login",),
+            import_ignore=(
+                ".DS_Store", "*.sock", "*.socket", "ipc", "tmp", "app-server-daemon",
+            ),
         )
 
     def prepare_args(self, args: Sequence[str]) -> List[str]:
-        res = list(args)
+        res = self.translate_universal_flags(args)
         if "--no-daemon" not in res:
             res.insert(0, "--no-daemon")
         return res
 
+    def export_credential_ignore(self) -> Tuple[str, ...]:
+        """R4: Codex bypasses the Antigravity bridge; ``auth.json`` carries
+        either an OAuth refresh token or an ``OPENAI_API_KEY``, both tied
+        to the destination account. We do not promise portable credentials;
+        the user re-runs ``agydra login`` on the destination machine."""
+        return ("auth.json",)
+
 
 class GrokEngine(EngineDriver):
     """Driver for xAI Grok CLI (grok)."""
+
+    UNIVERSAL_FLAG_TRANSLATIONS: ClassVar[Mapping[str, Tuple[str, ...]]] = MappingProxyType({
+        "--dangerously-skip-permissions": (),
+    })
 
     def __init__(self) -> None:
         super().__init__(
@@ -176,6 +259,12 @@ class GrokEngine(EngineDriver):
             config_binary_attr="grok_binary",
             login_args=("login",),
         )
+
+    def export_credential_ignore(self) -> Tuple[str, ...]:
+        """R4: Grok bypasses the Antigravity bridge; ``auth.json`` holds the
+        xAI OIDC refresh token and the JWT API key. The destination
+        machine must authenticate again with ``agydra login``."""
+        return ("auth.json",)
 
 
 class ClaudeEngine(EngineDriver):
@@ -195,6 +284,20 @@ class ClaudeEngine(EngineDriver):
             foreign_auth_env=CLAUDE_FOREIGN_AUTH_ENV,
             pinned_env=CLAUDE_FOREGROUND_ENV,
             inherited_state_env=CLAUDE_INHERITED_STATE_ENV,
+        )
+
+    def export_credential_ignore(self) -> Tuple[str, ...]:
+        """R4: ``Import/share-config reject Claude until a safe selective
+        configuration contract exists`` — and export falls under the same
+        prohibition because it ships the same physical data the importer
+        would reject. We surface the policy at the call site (the export
+        command) so the user gets one consistent reason across both
+        directions, not a half-built archive plus a later rejection."""
+        raise EngineExportError(
+            "claude profiles cannot be exported: AGENTS.md R4 forbids "
+            "portable Claude Code backups until a safe selective "
+            "configuration contract exists; recreate the profile on the "
+            "destination machine and run `agydra login claude`"
         )
 
     def inspect_auth(
@@ -233,3 +336,15 @@ def get_engine(name: Optional[str] = None) -> EngineDriver:
 def all_engines() -> List[EngineDriver]:
     """List all registered EngineDriver instances."""
     return list(_REGISTRY.values())
+
+
+class EngineExportError(Exception):
+    """Raised when an engine refuses to be exported.
+
+    Lives in ``engines.py`` (not in ``store.py``) to keep the engine module
+    self-contained: callers do not need the store dependency to decide
+    which engines are exportable, and tests can assert the policy without
+    spinning up a real profile. The export CLI command catches this
+    exception by class and surfaces its message verbatim; everything else
+    in the chain treats it as an ordinary user error.
+    """

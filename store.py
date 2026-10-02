@@ -22,7 +22,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Uni
 
 import platforms
 import vocab
-from models import Config, Profile, _utcnow_iso
+from models import Config, Profile, _utcnow_iso, normalize_engine
 from ui import warn
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z")
@@ -197,6 +197,10 @@ def read_json_object(path: Path, *, tolerant: bool = False):
         if tolerant:
             return None
         raise
+    except RecursionError as exc:
+        if tolerant:
+            return None
+        raise ValueError(f"{path.name}: JSON nesting exceeds the supported depth") from exc
     if not isinstance(data, dict):
         if tolerant:
             return None
@@ -225,16 +229,115 @@ def atomic_copy(source: Path, dest: Path) -> None:
     _atomic_replace(dest, payload)
 
 
-def _rmtree_readonly_ok(function, path, _excinfo):
-    """rmtree handler: chmod + retry readonly files (Windows AV/git often
-    marks them read-only), then give up — deletion must stay best-effort."""
-    import stat as _stat
+def _chmod_path_without_following(
+    path: Path, mode: int, device: int, inode: int
+) -> None:
+    current = os.lstat(path)
+    if (
+        current.st_dev != device
+        or current.st_ino != inode
+        or platforms.is_link(path, strict=True)
+    ):
+        raise OSError(errno.EBUSY, "path identity changed during cleanup", str(path))
+    if os.chmod in os.supports_follow_symlinks:
+        os.chmod(path, mode, follow_symlinks=False)
+    else:
+        os.chmod(path, mode)
+    updated = os.lstat(path)
+    if (
+        updated.st_dev != device
+        or updated.st_ino != inode
+        or platforms.is_link(path, strict=True)
+    ):
+        raise OSError(errno.EBUSY, "path identity changed during cleanup", str(path))
 
+
+def _restore_rmtree_modes(
+    changed_paths: List[Tuple[Path, int, int, int]],
+) -> List[Tuple[Path, OSError]]:
+    modes = {}
+    for path, device, inode, mode in changed_paths:
+        modes.setdefault((path, device, inode), mode)
+    ordered = sorted(
+        modes.items(), key=lambda item: len(item[0][0].parts), reverse=True
+    )
+    failures = []
+    for (path, device, inode), mode in ordered:
+        try:
+            current = os.lstat(path)
+            linked = platforms.is_link(path, strict=True)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            failures.append((path, exc))
+            continue
+        if current.st_dev != device or current.st_ino != inode or linked:
+            failures.append(
+                (
+                    path,
+                    OSError(errno.EBUSY, "path identity changed during cleanup", str(path)),
+                )
+            )
+            continue
+        if stat.S_IMODE(current.st_mode) == mode:
+            continue
+        try:
+            _chmod_path_without_following(path, mode, device, inode)
+        except OSError as exc:
+            failures.append((path, exc))
+    return failures
+
+
+def _raise_rmtree_failure(
+    path: Path,
+    cleanup_error: Optional[BaseException],
+    restore_errors: List[Tuple[Path, OSError]],
+) -> None:
+    if cleanup_error is not None and restore_errors:
+        details = "; ".join(f"{target}: {error}" for target, error in restore_errors)
+        raise OSError(
+            f"could not remove {path} ({cleanup_error}); could not restore "
+            f"original permissions ({details})"
+        ) from cleanup_error
+    if cleanup_error is not None:
+        raise cleanup_error
+    if restore_errors:
+        details = "; ".join(f"{target}: {error}" for target, error in restore_errors)
+        raise OSError(
+            f"could not restore original permissions after removing {path} ({details})"
+        ) from restore_errors[0][1]
+
+
+def _rmtree_readonly_ok(
+    function, path, _excinfo, changed_paths: Optional[List[Tuple[Path, int, int, int]]] = None
+):
+    """Retry read-only removals and defer surviving-mode restoration to rmtree."""
+    path = Path(path)
+    owns_changes = changed_paths is None
+    changes = [] if changed_paths is None else changed_paths
+    cleanup_error = None
     try:
-        os.chmod(path, _stat.S_IWRITE)
+        try:
+            original = os.lstat(path)
+        except FileNotFoundError:
+            return
+        mode = stat.S_IMODE(original.st_mode)
+        writable_mode = mode | stat.S_IWRITE
+        if stat.S_ISDIR(original.st_mode):
+            writable_mode |= stat.S_IXUSR
+        if not stat.S_ISLNK(original.st_mode) and writable_mode != mode:
+            changes.append((path, original.st_dev, original.st_ino, mode))
+            _chmod_path_without_following(
+                path, writable_mode, original.st_dev, original.st_ino
+            )
         function(path)
-    except OSError:
+    except FileNotFoundError:
         pass
+    except BaseException as exc:
+        cleanup_error = exc
+    restore_errors = _restore_rmtree_modes(changes) if owns_changes else []
+    if cleanup_error is not None or restore_errors:
+        _raise_rmtree_failure(path, cleanup_error, restore_errors)
 
 
 def _tree_has_entries(root: Path) -> bool:
@@ -247,6 +350,47 @@ def _tree_has_entries(root: Path) -> bool:
         if filenames or any(os.path.islink(os.path.join(_dirpath, d)) for d in dirnames):
             return True
     return False
+
+
+_ZIP_MIN_YEAR = 1980
+_ZIP_FLOOR_DATE = (1980, 1, 1, 0, 0, 0)
+
+
+def _zip_file_datetime(path: Path) -> Tuple[int, int, int, int, int, int]:
+    """``date_time`` for ``path``, clamped to the ZIP/DOS floor.
+
+    The ZIP format cannot encode a timestamp before 1980-01-01, and engine
+    caches legitimately carry placeholder mtimes (Codex extracts its
+    plugin cache with mtime=1, i.e. one second after the Unix epoch).
+    ``ZipFile.write`` raises on those, which would make such a profile
+    UNDELETABLE: the verified backup is written before the purge, so the
+    whole delete fails closed on a purely cosmetic field. The stored
+    timestamp is not data, so clamping it keeps the content intact.
+    """
+    try:
+        stamp = time.localtime(path.stat().st_mtime)
+    except (OSError, ValueError):
+        return _ZIP_FLOOR_DATE
+    if stamp.tm_year < _ZIP_MIN_YEAR:
+        return _ZIP_FLOOR_DATE
+    return stamp[:6]
+
+
+def _zip_add_file(zf: "zipfile.ZipFile", path: Path, arcname: str) -> None:
+    """Add ``path`` as a regular-file entry, keeping its mode and mtime.
+
+    Content is streamed, never read whole into memory, so a large engine
+    cache cannot inflate the delete's peak usage.
+    """
+    info = zipfile.ZipInfo(str(arcname), date_time=_zip_file_datetime(path))
+    info.compress_type = zf.compression
+    info.create_system = 3
+    try:
+        info.external_attr = (stat.S_IMODE(path.stat().st_mode) & 0xFFFF) << 16
+    except OSError:
+        info.external_attr = 0
+    with path.open("rb") as source, zf.open(info, "w") as target:
+        shutil.copyfileobj(source, target)
 
 
 def _zip_tree_without_following(zf: "zipfile.ZipFile", root: Path, prefix: str) -> None:
@@ -281,7 +425,7 @@ def _zip_tree_without_following(zf: "zipfile.ZipFile", root: Path, prefix: str) 
             if child.is_symlink():
                 add_link(child, arcname)
             elif child.is_file():
-                zf.write(child, arcname)
+                _zip_add_file(zf, child, arcname)
 
 
 def _has_backup_worthy_content(
@@ -322,24 +466,35 @@ def _unreadable_metadata_message(name: str) -> str:
 
 
 def rmtree(path: Path) -> None:
-    """rmtree that tolerates transient Windows AV locks and readonly files.
+    """Remove a tree and restore modes of any chmod'd entries that survive.
 
-    A failed removal must NEVER be silent: a directory that survives a
-    `delete()` call would lie about state and block the next `create()`
-    with a spurious "already exists". Fail-loud via the shared `warn()`
-    helper so the user knows their profile dir survived the operation.
+    Cleanup and permission-restoration failures propagate so callers cannot
+    mistake a warned, partial removal for a successful cleanup.
 
     Public (used across modules, e.g. bootstrap.py's broken-venv cleanup) —
     not a store-private helper.
     """
     path = Path(path)
+    changed_paths: List[Tuple[Path, int, int, int]] = []
+    cleanup_error = None
+
+    def retry_readonly(function, target, error) -> None:
+        _rmtree_readonly_ok(function, target, error, changed_paths)
+
     try:
-        if sys.version_info >= (3, 12):
-            shutil.rmtree(path, onexc=_rmtree_readonly_ok)
-        else:
-            shutil.rmtree(path, onerror=_rmtree_readonly_ok)
-    except OSError as exc:
-        warn(f"could not fully remove {path} ({exc})")
+        try:
+            if sys.version_info >= (3, 12):
+                shutil.rmtree(path, onexc=retry_readonly)
+            else:
+                shutil.rmtree(path, onerror=retry_readonly)
+        except FileNotFoundError:
+            pass
+        except BaseException as exc:
+            cleanup_error = exc
+    finally:
+        restore_errors = _restore_rmtree_modes(changed_paths)
+    if cleanup_error is not None or restore_errors:
+        _raise_rmtree_failure(path, cleanup_error, restore_errors)
 
 
 class Store:
@@ -348,7 +503,8 @@ class Store:
     ] = {}
 
     def __init__(self, root: Optional[Union[Path, str]] = None) -> None:
-        self.root = Path(root) if root is not None else platforms.base_dir()
+        configured_root = Path(root) if root is not None else platforms.base_dir()
+        self.root = platforms.absolute_path(configured_root)
         self.profiles_dir = self.root / "profiles"
         self.overlays_dir = self.root / platforms.OVERLAYS_DIRNAME
         self.backups_dir = self.root / "backups"
@@ -397,8 +553,38 @@ class Store:
                 f"refusing to overwrite corrupt {self.config_path}; "
                 "fix or delete it first (it may hold profiles' settings)"
             )
+        self._write_config(config)
+
+    def _write_config(self, config: Config) -> None:
         platforms.ensure_dir(self.root)
         _atomic_write_json(self.config_path, config.to_dict())
+
+    def update_config(self, mutator: Callable[[Config], None]) -> Config:
+        """Load fresh config, mutate it in place, and atomically save under the
+        nonblocking sequence lock. A mutator failure writes nothing and always
+        releases the lock; a busy lock fails immediately with ``StoreError``."""
+        if not callable(mutator):
+            raise StoreError("configuration mutator must be callable")
+
+        def operation() -> Config:
+            try:
+                config = Config.from_dict(read_json_object(self.config_path))
+            except FileNotFoundError:
+                config = Config()
+            except (OSError, ValueError, TypeError, AttributeError) as exc:
+                raise StoreError(
+                    f"refusing to update corrupt {self.config_path}; "
+                    "fix or delete it first (it may hold profiles' settings)"
+                ) from exc
+            mutator(config)
+            if not isinstance(config, Config):
+                raise StoreError("configuration mutator must leave a Config instance")
+            self._write_config(config)
+            return config
+
+        return self._with_recoverable_sequence_lock(
+            "updating configuration", operation
+        )
 
     def _config_parses(self) -> bool:
         """True iff load_config would accept this file as healthy.
@@ -424,6 +610,61 @@ class Store:
     def profile_meta_path(self, name: str) -> Path:
         return self.profile_dir(name) / "profile.json"
 
+    def _require_real_filesystem_path(
+        self, path: Path, label: str, profile_name: Optional[str] = None
+    ) -> None:
+        try:
+            linked = platforms.is_link(path, strict=True)
+        except OSError as exc:
+            subject = f"profile {profile_name!r} {label}" if profile_name else label
+            raise StoreError(
+                f"cannot safely inspect {subject} {path} ({exc}); refusing access"
+            ) from exc
+        if linked:
+            subject = f"profile {profile_name!r} {label}" if profile_name else label
+            raise StoreError(
+                f"{subject} {path} is a symlink or junction; refusing to access "
+                "data outside the profile store"
+            )
+
+    def _require_profiles_root_is_real(self) -> None:
+        self._require_real_filesystem_path(self.profiles_dir, "profiles root")
+
+    def _require_profile_entry_paths_are_real(self, name: str) -> Path:
+        profile_dir = self.profile_dir(name)
+        for label, path in (
+            ("directory", profile_dir),
+            ("metadata", profile_dir / "profile.json"),
+            ("data", profile_dir / "data"),
+        ):
+            self._require_real_filesystem_path(path, label, name)
+        return profile_dir
+
+    def _require_profile_paths_are_real(self, name: str) -> Path:
+        self._require_profiles_root_is_real()
+        return self._require_profile_entry_paths_are_real(name)
+
+    def _read_profile_metadata(
+        self, path: Path, expected_name: Optional[str] = None
+    ) -> Profile:
+        raw = read_json_object(path)
+        self._validate_profile_metadata_name(raw, expected_name)
+        return Profile.from_dict(raw)
+
+    def _validate_profile_metadata_name(
+        self, raw: dict, expected_name: Optional[str] = None
+    ) -> str:
+        name = raw.get("name")
+        if not isinstance(name, str):
+            raise ValueError("metadata profile name must be a string")
+        try:
+            self.validate_name(name)
+        except StoreError as exc:
+            raise ValueError(f"metadata contains an invalid profile name {name!r}") from exc
+        if expected_name is not None and name != expected_name:
+            raise ValueError("metadata name does not match its directory")
+        return name
+
     def profile_data_dir(self, name: str, engine: Optional[str] = None) -> Path:
         """Physical data directory of a profile.
 
@@ -432,6 +673,7 @@ class Store:
         ``claude_config_dir`` so their data never moves when the profile is
         renamed.
         """
+        self._require_profile_paths_are_real(name)
         if engine is None:
             engine = self._engine_of(name)
         if engine == "claude":
@@ -439,9 +681,14 @@ class Store:
         return self.profile_dir(name) / "data"
 
     def _engine_of(self, name: str) -> str:
-        raw = read_json_object(self.profile_meta_path(name), tolerant=True)
-        engine = raw.get("engine") if raw else None
-        return engine if isinstance(engine, str) and engine else "agy"
+        self._require_profile_paths_are_real(name)
+        profiles, _unreadable = self._scan()
+        for profile in profiles:
+            if profile.name == name:
+                return profile.engine
+        if name in _unreadable or self.profile_dir(name).is_dir():
+            raise StoreError(_unreadable_metadata_message(name))
+        return "agy"
 
     def claude_config_dir_for_seq(self, seq: int) -> Path:
         if type(seq) is not int or seq < 1:
@@ -451,13 +698,7 @@ class Store:
     def claude_config_dir(self, name: str) -> Path:
         """``<store>/claude-config/<seq>`` for a claude profile, keyed by its
         immutable ``seq`` so rename never relocates the config."""
-        raw = read_json_object(self.profile_meta_path(name), tolerant=True)
-        if raw is None:
-            raise StoreError(_unreadable_metadata_message(name))
-        try:
-            profile = Profile.from_dict(raw)
-        except (ValueError, TypeError) as exc:
-            raise StoreError(f"profile {name!r} metadata is corrupt ({exc})") from exc
+        profile = self._get_unlocked(name)
         if profile.engine != "claude":
             raise StoreError(f"profile {name!r} is not a claude profile")
         return self.claude_config_dir_for_seq(profile.seq)
@@ -506,9 +747,14 @@ class Store:
         self._recover_pending_rename()
         return self._with_recoverable_sequence_lock(
             "checking a profile",
-            lambda: self.profile_meta_path(name).exists(),
+            lambda: self._exists_unlocked(name),
             allow_missing_store=True,
         )
+
+    def _exists_unlocked(self, name: str) -> bool:
+        self._require_profile_paths_are_real(name)
+        self._scan()
+        return self.profile_meta_path(name).exists()
 
     def create(self, name: str, description: str = "", engine: str = "agy") -> Profile:
         self.validate_name(name)
@@ -525,13 +771,13 @@ class Store:
     def _create_locked(self, name: str, description: str, engine: str) -> Profile:
         import engines
 
+        profile_dir = self._require_profile_paths_are_real(name)
         try:
             driver = engines.get_engine(engine)
         except ValueError as exc:
             raise StoreError(str(exc)) from exc
         config = self.load_config()
         config_writable = self._config_writable()
-        profile_dir = self.profile_dir(name)
         self._cleanup_create_stages(name)
         if profile_dir.exists():
             raise StoreError(f"profile {name!r} already exists")
@@ -654,17 +900,27 @@ class Store:
             return None
         return owner
 
+    READ_LOCK_PATIENCE_S = 2.0
+
     def _with_sequence_lock(
-        self, action: str, operation: Callable[[], _Result]
+        self,
+        action: str,
+        operation: Callable[[], _Result],
+        patience_s: float = 0.0,
     ) -> _Result:
         import locks
 
-        try:
-            handle = locks.try_sequence_lock(self)
-        except locks.LockError as exc:
-            raise StoreError(
-                f"cannot safely proceed with {action} profile sequence: {exc}"
-            ) from exc
+        deadline = time.monotonic() + patience_s
+        while True:
+            try:
+                handle = locks.try_sequence_lock(self)
+            except locks.LockError as exc:
+                raise StoreError(
+                    f"cannot safely proceed with {action} profile sequence: {exc}"
+                ) from exc
+            if handle is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(locks.POLL_INTERVAL_S)
         if handle is None:
             if action == "creating":
                 message = "profile sequence allocation is busy; sequence lock is busy"
@@ -687,6 +943,9 @@ class Store:
     ) -> _Result:
         """Serialize a read when a store exists, with an empty-store fast path.
 
+        Reads wait up to :data:`READ_LOCK_PATIENCE_S` for a brief maintenance
+        lock instead of failing a concurrent launch.
+
         For callers that may read an absent store, run speculatively between
         two non-creating root checks. The second absent check is the read's
         linearization point; if a concurrent create publishes the root first,
@@ -703,7 +962,9 @@ class Store:
                     return result
         for _ in range(3):
             try:
-                return self._with_sequence_lock(action, operation)
+                return self._with_sequence_lock(
+                    action, operation, patience_s=self.READ_LOCK_PATIENCE_S
+                )
             except _RenameRecoveryRequired:
                 self._recover_pending_rename()
         raise StoreError("rename state changed repeatedly; retry the operation")
@@ -853,12 +1114,18 @@ class Store:
             ) from exc
 
     def _read_profile_for_rename(self, directory: Path) -> Profile:
+        profile_dir = self._require_profile_paths_are_real(directory.name)
         try:
-            return Profile.from_dict(read_json_object(directory / "profile.json"))
+            profile = self._read_profile_metadata(profile_dir / "profile.json")
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise StoreError(
                 f"cannot recover rename: metadata in {directory} is unreadable ({exc})"
             ) from exc
+        profiles, _unreadable = self._scan()
+        self._require_profile_sequence_available(
+            profile, profiles, excluded_names=(directory.name, profile.name)
+        )
+        return profile
 
     def _sync_rename_default(self, journal: dict, forward: bool) -> None:
         if not journal["default_was_old"]:
@@ -887,8 +1154,8 @@ class Store:
         new = journal["new"]
         old_dir = self.profile_dir(old)
         new_dir = self.profile_dir(new)
-        if old_dir.is_symlink() or new_dir.is_symlink():
-            raise StoreError("cannot recover rename through a profile symlink")
+        self._require_profile_paths_are_real(old)
+        self._require_profile_paths_are_real(new)
         old_exists = old_dir.exists()
         new_exists = new_dir.exists()
         if old_exists == new_exists:
@@ -920,6 +1187,8 @@ class Store:
     def _rollback_rename_locked(self, journal: dict) -> None:
         old_dir = self.profile_dir(journal["old"])
         new_dir = self.profile_dir(journal["new"])
+        self._require_profile_paths_are_real(journal["old"])
+        self._require_profile_paths_are_real(journal["new"])
         old_exists = old_dir.exists()
         new_exists = new_dir.exists()
         if old_exists and not new_exists:
@@ -1006,19 +1275,16 @@ class Store:
         )
 
     def _get_unlocked(self, name: str) -> Profile:
-        if not self.profile_meta_path(name).exists():
-            if self.profile_dir(name).is_dir():
-                raise StoreError(_unreadable_metadata_message(name))
-            raise StoreError(
-                f"profile {name!r} does not exist (create it with: agydra create {name})"
-            )
-        try:
-            return Profile.from_dict(read_json_object(self.profile_meta_path(name)))
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise StoreError(
-                f"profile {name!r} metadata is corrupt ({exc}); "
-                f"restore it from backups/ or remove it with: agydra delete {name}"
-            ) from exc
+        profile_dir = self._require_profile_paths_are_real(name)
+        profiles, unreadable = self._scan()
+        for profile in profiles:
+            if profile.name == name:
+                return profile
+        if name in unreadable or profile_dir.is_dir():
+            raise StoreError(_unreadable_metadata_message(name))
+        raise StoreError(
+            f"profile {name!r} does not exist (create it with: agydra create {name})"
+        )
 
     def _probe_rename_journal(self) -> Tuple[bool, Optional[OSError]]:
         try:
@@ -1078,30 +1344,105 @@ class Store:
         return self._resolve_ref_in(profiles, unreadable, ref)
 
     def save(self, profile: Profile) -> None:
-        _atomic_write_json(self.profile_meta_path(profile.name), profile.to_dict())
+        self._write_profile_metadata(profile)
+
+    def _write_profile_metadata(self, profile: Profile) -> None:
+        profile_dir = self._require_profile_paths_are_real(profile.name)
+        metadata_path = profile_dir / "profile.json"
+        self._require_valid_profile_sequence(profile)
+        if not self._identity_unchanged_on_disk(metadata_path, profile):
+            profiles, _unreadable = self._scan()
+            self._require_profile_sequence_available(profile, profiles)
+        _atomic_write_json(metadata_path, profile.to_dict())
+
+    def _identity_unchanged_on_disk(self, metadata_path: Path, profile: Profile) -> bool:
+        """True when the stored metadata is valid and has this profile's exact
+        name, sequence and engine, so a routine update (``last_used``, email)
+        cannot introduce a new sequence conflict and skips the whole-store scan.
+        Anything else (new, renamed, renumbered, re-engined or unreadable
+        metadata) takes the full validation path."""
+        try:
+            current = self._read_profile_metadata(metadata_path, expected_name=profile.name)
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        return current.seq == profile.seq and current.engine == profile.engine
+
+    @staticmethod
+    def _duplicate_profile_sequence_error(sequence: int, names: Sequence[str]) -> StoreError:
+        ordered_names = sorted(set(names))
+        return StoreError(
+            f"duplicate positive profile sequence {sequence} is shared by "
+            f"{', '.join(repr(name) for name in ordered_names)}; refusing to use "
+            "sequence-keyed Claude configuration until the duplicate metadata is "
+            "resolved explicitly (profiles were not renumbered)"
+        )
+
+    @staticmethod
+    def _require_valid_profile_sequence(profile: Profile) -> None:
+        if (
+            type(profile.seq) is not int
+            or profile.seq < 0
+            or (normalize_engine(profile.engine) == "claude" and profile.seq < 1)
+        ):
+            raise StoreError(
+                f"invalid profile sequence {profile.seq!r} for engine {profile.engine!r}"
+            )
+
+    def _require_profile_sequence_available(
+        self,
+        profile: Profile,
+        profiles: Sequence[Profile],
+        excluded_names: Sequence[str] = (),
+    ) -> None:
+        self._require_valid_profile_sequence(profile)
+        if profile.seq == 0:
+            return
+        excluded = set(excluded_names)
+        conflicting_names = [
+            peer.name
+            for peer in profiles
+            if peer.name not in excluded
+            and peer.name != profile.name
+            and peer.seq == profile.seq
+        ]
+        if conflicting_names:
+            raise self._duplicate_profile_sequence_error(
+                profile.seq, [profile.name, *conflicting_names]
+            )
 
     def _scan(self) -> tuple:
         """One pass over metadata: (parsed profiles sorted by seq, unreadable names)."""
         profiles: List[Profile] = []
         unreadable: List[str] = []
+        sequence_owners: Dict[int, List[str]] = {}
+        self._require_profiles_root_is_real()
         if self.profiles_dir.is_dir():
             for pdir in sorted(self.profiles_dir.iterdir()):
                 if pdir.name.startswith(_CREATE_STAGE_PREFIX):
                     continue
-                if not pdir.is_dir():
-                    continue
-                meta = pdir / "profile.json"
-                if not meta.is_file():
+                try:
+                    profile_dir = self._require_profile_entry_paths_are_real(pdir.name)
+                except StoreError:
                     unreadable.append(pdir.name)
+                    continue
+                if not profile_dir.is_dir():
+                    continue
+                meta = profile_dir / "profile.json"
+                if not meta.is_file():
+                    unreadable.append(profile_dir.name)
                     continue
                 try:
-                    profile = Profile.from_dict(read_json_object(meta))
-                    self.validate_name(profile.name)
-                    if profile.name != pdir.name:
-                        raise ValueError("metadata name does not match its directory")
+                    profile = self._read_profile_metadata(
+                        meta, expected_name=profile_dir.name
+                    )
                     profiles.append(profile)
+                    if type(profile.seq) is int and profile.seq > 0:
+                        sequence_owners.setdefault(profile.seq, []).append(profile.name)
                 except (OSError, ValueError, KeyError, TypeError, StoreError):
-                    unreadable.append(pdir.name)
+                    unreadable.append(profile_dir.name)
+        for sequence, names in sorted(sequence_owners.items()):
+            if len(names) > 1:
+                raise self._duplicate_profile_sequence_error(sequence, names)
         profiles.sort(key=lambda p: (p.seq, p.name))
         return profiles, unreadable
 
@@ -1134,26 +1475,32 @@ class Store:
         except FileNotFoundError:
             return
         except OSError as exc:
+            raise StoreError(
+                f"cannot inspect overlay {overlay} before cleanup ({exc})"
+            ) from exc
+        try:
+            rmtree(overlay)
+        except OSError as exc:
             if require_removed:
-                raise StoreError(
-                    f"cannot inspect overlay {overlay} before rename recovery ({exc})"
-                ) from exc
-            return
-        rmtree(overlay)
+                message = "could not fully remove overlay during rename recovery"
+            else:
+                message = "could not fully remove overlay during profile deletion"
+            raise StoreError(f"{message}: {overlay} ({exc})") from exc
         try:
             overlay.lstat()
         except FileNotFoundError:
             return
         except OSError as exc:
-            if require_removed:
-                raise StoreError(
-                    f"cannot verify removal of overlay {overlay} ({exc})"
-                ) from exc
-            return
+            raise StoreError(
+                f"cannot verify removal of overlay {overlay} ({exc})"
+            ) from exc
         if require_removed:
             raise StoreError(
                 f"could not fully remove overlay {overlay}; rename recovery will retry"
             )
+        raise StoreError(
+            f"could not fully remove overlay {overlay}; profile deletion is incomplete"
+        )
 
     def _with_profile_locks(
         self, names: Sequence[str], action: str, operation: Callable[[], _Result]
@@ -1166,7 +1513,7 @@ class Store:
             try:
                 for name in sorted(set(names)):
                     try:
-                        handle = locks.try_lock(self, name)
+                        handle = locks.try_mutation_lock(self, name)
                     except locks.LockError as exc:
                         raise StoreError(
                             f"cannot safely proceed with {action} profile {name!r}: {exc}"
@@ -1221,6 +1568,8 @@ class Store:
         self._recover_pending_rename()
 
         def operation() -> Profile:
+            self._require_profile_paths_are_real(old)
+            self._require_profile_paths_are_real(new)
             recovery_data = None
             if recovery_action is not None:
                 try:
@@ -1340,13 +1689,44 @@ class Store:
         self._recover_pending_rename()
 
         def operation() -> Optional[Path]:
-            def delete_with_sequence_lock() -> Optional[Path]:
+            def prepare_delete() -> Tuple[Path, Optional[Path]]:
+                self._require_profile_paths_are_real(name)
                 self._ensure_sequence_counter(deleting_name=name)
-                return self._delete_locked(name, backup)
+                profile_dir = self.profile_dir(name)
+                if not profile_dir.exists():
+                    raise StoreError(
+                        f"profile {name!r} does not exist (see: agydra list)"
+                    )
+                config_dir = self._claude_config_of(name)
+                if config_dir is not None:
+                    self._require_plain_claude_roots()
+                return profile_dir, config_dir
 
-            backup_path = self._with_sequence_lock(
-                "deleting", delete_with_sequence_lock
+            profile_dir, config_dir = self._with_sequence_lock(
+                "deleting", prepare_delete
             )
+            backup_path = self._prepare_delete_backup(
+                name, backup, profile_dir, config_dir
+            )
+
+            def commit_delete() -> Optional[Path]:
+                self._ensure_sequence_counter(deleting_name=name)
+                self._require_profile_paths_are_real(name)
+                current_config_dir = self._claude_config_of(name)
+                if current_config_dir != config_dir:
+                    raise StoreError(
+                        f"profile {name!r} identity changed while preparing deletion; "
+                        "nothing was removed"
+                    )
+                if config_dir is not None:
+                    self._require_plain_claude_roots()
+                return self._delete_locked(
+                    name, config_dir, backup_path
+                )
+
+            self._with_sequence_lock("deleting", commit_delete)
+            if backup_path is not None:
+                self._prune_backups(name, keep=self.BACKUP_RETENTION)
             if after_delete is not None:
                 after_delete()
             return backup_path
@@ -1355,21 +1735,39 @@ class Store:
             (name,), "deleting", operation
         )
 
-    def _delete_locked(self, name: str, backup: bool) -> Optional[Path]:
-        profile_dir = self.profile_dir(name)
+    def _prepare_delete_backup(
+        self,
+        name: str,
+        backup: bool,
+        profile_dir: Path,
+        config_dir: Optional[Path],
+    ) -> Optional[Path]:
+        if config_dir is not None:
+            self._guard_claude_supervisor(name, config_dir)
+        if not backup:
+            return None
+        extra_trees = (config_dir,) if config_dir is not None else ()
+        keychain_owner = (self, name) if config_dir is None else (None, None)
+        if not _has_backup_worthy_content(
+            profile_dir, *keychain_owner, extra_trees
+        ):
+            return None
+        backup_path = self._write_backup(name, config_dir, prune=False)
+        if config_dir is not None:
+            self._guard_claude_supervisor(name, config_dir)
+        return backup_path
+
+    def _delete_locked(
+        self,
+        name: str,
+        config_dir: Optional[Path],
+        backup_path: Optional[Path],
+    ) -> Optional[Path]:
+        profile_dir = self._require_profile_paths_are_real(name)
         if not profile_dir.exists():
             raise StoreError(
                 f"profile {name!r} does not exist (see: agydra list)"
             )
-        config_dir = self._claude_config_of(name)
-        if config_dir is not None:
-            self._require_plain_claude_roots()
-            self._guard_claude_supervisor(name, config_dir)
-        backup_path: Optional[Path] = None
-        extra_trees = (config_dir,) if config_dir is not None else ()
-        keychain_owner = (self, name) if config_dir is None else (None, None)
-        if backup and _has_backup_worthy_content(profile_dir, *keychain_owner, extra_trees):
-            backup_path = self._write_backup(name, config_dir)
         if config_dir is not None:
             self._invalidate_claude_usage_for_delete(name)
             self._remove_claude_state(name, config_dir)
@@ -1400,6 +1798,7 @@ class Store:
         recovery proceeds and the unattributable ``claude-config/<seq>``
         entries are only reported (``claude_config_orphans``), never touched.
         """
+        self._scan()
         raw = read_json_object(self.profile_meta_path(name), tolerant=True)
         if raw is None:
             if self.claude_config_root.is_dir():
@@ -1408,7 +1807,7 @@ class Store:
                     "owned is kept and reported by `agydra doctor`"
                 )
             return None
-        if raw.get("engine") != "claude":
+        if normalize_engine(raw.get("engine")) != "claude":
             return None
         try:
             return self.claude_config_dir_for_seq(Profile.from_dict(raw).seq)
@@ -1463,7 +1862,9 @@ class Store:
                 f"{platforms.CLAUDE_BIN_ENV}, then retry {action}"
             )
         try:
-            env = isolation.isolated_env(config_dir, {}, engine="claude")
+            env = isolation.isolated_env(
+                config_dir, {}, engine="claude", store_root=self.root
+            )
             proc = platforms.run_with_group_kill(
                 [str(binary), "daemon", "status"],
                 env=env,
@@ -1540,35 +1941,88 @@ class Store:
 
     BACKUP_RETENTION = 5
 
-    def _write_backup(self, name: str, claude_config: Optional[Path] = None) -> Path:
+    def _write_backup(
+        self,
+        name: str,
+        claude_config: Optional[Path] = None,
+        *,
+        prune: bool = True,
+        dest: Optional[Path] = None,
+        manifest: Optional[Dict[str, object]] = None,
+        exclude_root_relpaths: Sequence[str] = (),
+    ) -> Path:
         """Zip the profile to a unique tmp, verify, then atomically rename
         (``_atomic_replace`` skeleton plus a testzip() read check).
 
         A truncated zip must never sit at the final name: a later restore
         would fail mid-way with data loss.
+
+        ``dest`` lets the export command write a portable archive at a
+        user-chosen path without touching the ``backups/`` rotation. The
+        manifest, when provided, is the export contract (engine, format
+        version, exclusions actually applied); it is written last, inside
+        the same ``_atomic_replace`` so the file and the manifest can never
+        disagree. ``exclude_root_relpaths`` lists paths relative to the
+        profile directory (e.g. ``"data/auth.json"``, ``"_keychain/foo.secret"``)
+        that must be skipped: the export command assembles the per-engine
+        and R4-wide rules and hands them in, so the store stays engine-
+        agnostic.
         """
-        platforms.ensure_dir(self.backups_dir)
-        stamp = _backup_stamp()
-        backup_path = self.backups_dir / f"{name}-{stamp}.zip"
-        counter = 2
-        while backup_path.exists():
-            backup_path = self.backups_dir / f"{name}-{stamp}.{counter}.zip"
-            counter += 1
+        platforms.ensure_dir(dest.parent if dest is not None else self.backups_dir)
+        if dest is not None:
+            if dest.suffix != ".zip":
+                raise StoreError(
+                    f"export destination must end in .zip: {dest!r}"
+                )
+            backup_path = dest
+            if backup_path.exists():
+                counter = 2
+                while True:
+                    candidate = backup_path.with_name(
+                        f"{backup_path.stem}-{counter}{backup_path.suffix}"
+                    )
+                    if not candidate.exists():
+                        backup_path = candidate
+                        break
+                    counter += 1
+        else:
+            stamp = _backup_stamp()
+            backup_path = self.backups_dir / f"{name}-{stamp}.zip"
+            counter = 2
+            while backup_path.exists():
+                backup_path = self.backups_dir / f"{name}-{stamp}.{counter}.zip"
+                counter += 1
         profile_dir = self.profile_dir(name)
+        excluded_set = {Path(p).as_posix() for p in exclude_root_relpaths}
 
         def payload(fh, tmp: Path) -> None:
             with zipfile.ZipFile(fh, "w", zipfile.ZIP_DEFLATED) as zf:
                 for file in profile_dir.rglob("*"):
-                    if file.is_file():
-                        zf.write(file, file.relative_to(profile_dir))
-                if claude_config is not None:
+                    if not file.is_file():
+                        continue
+                    rel = file.relative_to(profile_dir).as_posix()
+                    if rel in excluded_set:
+                        continue
+                    _zip_add_file(zf, file, rel)
+                if claude_config is not None and "_claude-config" not in excluded_set:
                     _zip_tree_without_following(zf, claude_config, "_claude-config")
-                    return
-                import keychain
+                elif claude_config is None and "_keychain" not in excluded_set:
+                    import keychain
 
-                secret = keychain.slot_backup_path(self, name)
-                if secret.is_file():
-                    zf.write(secret, f"_keychain/{name}{keychain.SECRET_SUFFIX}")
+                    secret = keychain.slot_backup_path(self, name)
+                    if secret.is_file():
+                        _zip_add_file(
+                            zf, secret, f"_keychain/{name}{keychain.SECRET_SUFFIX}"
+                        )
+                if manifest is not None:
+                    info = zipfile.ZipInfo("_manifest.json")
+                    info.compress_type = zf.compression
+                    info.create_system = 3
+                    info.date_time = (1980, 1, 1, 0, 0, 0)
+                    zf.writestr(
+                        info,
+                        json.dumps(manifest, indent=2).encode("utf-8") + b"\n",
+                    )
 
         def verify(tmp: Path) -> None:
             with zipfile.ZipFile(tmp) as zf:
@@ -1577,7 +2031,8 @@ class Store:
                     raise StoreError(f"backup verification failed on {bad!r}")
 
         _atomic_replace(backup_path, payload, verify)
-        self._prune_backups(name, keep=self.BACKUP_RETENTION)
+        if prune and dest is None:
+            self._prune_backups(name, keep=self.BACKUP_RETENTION)
         return backup_path
 
     def _prune_backups(self, name: str, keep: int) -> None:
@@ -1639,8 +2094,11 @@ class Store:
         if ref in names:
             return ref
         token = ref.lstrip("#")
-        if token.isdigit():
-            idx = int(token) - 1
+        if token.isascii() and token.isdecimal():
+            try:
+                idx = int(token) - 1
+            except ValueError:
+                idx = len(names)
             if 0 <= idx < len(names):
                 return names[idx]
             raise StoreError(
