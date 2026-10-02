@@ -26,12 +26,12 @@ A Google One AI Premium / Google AI Pro family group can hold up to six accounts
 ```
 agy                 → generic session, real ~/.gemini
 agydra -p fam-dev   → same agy binary, HOME points at an isolated overlay
-agydra -e grok -r   → least-recently-used idle Grok profile
+agydra -e grok -r   → next unused Grok profile, ranked by saved quota
 ```
 
 - Each profile authenticates through the official CLI. Tokens stay inside that profile.
 - Kernel advisory locks (`fcntl.flock` / `msvcrt.locking`) release when the process exits, including after `SIGKILL`.
-- `agydra -r` sends the next command to the least-recently-used idle profile of that engine.
+- `agydra -r` uses each eligible profile once per engine cycle, choosing the unused profile with the most remaining quota in a recent `agydra usage` snapshot. Unknown quota ranks after known quota; refresh it with `agydra usage`.
 - `agydra usage` shows live quotas for Antigravity, Codex, and Grok in one view.
 
 ---
@@ -56,6 +56,8 @@ python3 agydra.py          # venv, console script, shim in ~/.local/bin
 pip install .              # or: pipx install .
 agydra doctor
 ```
+
+`python3 agydra.py` bootstraps a source checkout and re-executes the installed command; after a `pip`/`pipx` install (`python -m agydra` enters the CLI directly), `agydra setup` detects the pip-owned installation, reports it and writes nothing — update or remove it with pip/pipx.
 
 ### One profile per engine
 
@@ -93,7 +95,7 @@ agydra -e grok -r "Run a security review"
 agydra usage
 ```
 
-`agydra list` shows email, engine, and auth state. `-r` needs two profiles of that engine; it skips a busy one and picks the least-recently-used idle profile. Add `-f` to launch anyway when every candidate is busy.
+`agydra list` shows email, engine, and auth state. `-r` keeps a persistent cycle per engine and selects every eligible profile before repeating; when all have been selected, the next launch starts a new cycle. Within the unused profiles it prefers the highest remaining quota in a snapshot no older than 15 minutes; missing, stale, expired, or invalid readings rank last. Run `agydra usage` to refresh quota data. `.agydra` pins normal profile resolution, while explicit `-r` ignores that pin. Concurrent sessions are unlimited by default; set `settings.max_sessions_per_profile` in `agydra.json` to cap them. `-f` bypasses that cap without changing rotation order.
 
 ```text
 agydra usage                                     4 profiles · Sun Sep 27 · 23:18
@@ -136,19 +138,19 @@ Install Claude Code separately. Binary lookup uses `-b`, `AGYDRA_CLAUDE_BIN`, `c
 
 `agydra status claude-work` prints the physical configuration path and immutable `seq`. `CLAUDE_CONFIG_DIR` points to `<store>/claude-config/<seq>` with the real HOME preserved. Rename preserves that path and native identity. Claude Code manages its own credentials, including the macOS Keychain; Agydra does not use Antigravity's slot bridge or claim OAuth/Keychain portability. Delete backs up physical configuration and removes profile cache state after the backup; backups may include credentials stored on disk, but native Keychain entries are not exported and require native re-login. Claude profiles reject `import` and `share-config` until selective configuration sharing is supported. Configure them explicitly and authenticate natively.
 
-Claude Code usage is an **informational local snapshot**, shown under **ANTHROPIC CLAUDE CODE**, separate from Antigravity's Claude/GPT quotas. It never makes a server quota request, refreshes credentials or probes authentication. `statusLine` does not identify the account; the displayed date is the local observation time, not a server query timestamp. Only observed windows appear: a partial snapshot has no inferred total availability, and an expired reset becomes unknown rather than 100%. Fresh snapshots are marked observed (cached snapshot), older ones stale, conflicting sessions ambiguous, and absent/invalid data unknown. Agydra does not recommend Claude Code accounts based on this cache.
+Claude Code usage is shown under **ANTHROPIC CLAUDE CODE**, separate from Antigravity's Claude/GPT quotas, from two sources in this order. (1) **Live**: `agydra usage` runs the profile's own `claude -p "/usage" --no-session-persistence --safe-mode` (isolated `CLAUDE_CONFIG_DIR`, `TZ=UTC`, about 2 s) and reads the session and weekly percentages and reset times it prints; the result is cached for 5 minutes and marked `live (server-confirmed)`. The profile's own `claude` handles its login and token renewal, so Agydra never reads, refreshes or writes credentials, never touches the Keychain, and works the same on macOS, Linux and Windows; `--safe-mode` also keeps the profile's hooks, plugins and MCP servers from running. A missing binary, a timeout, no subscription usage in the output (not logged in or an API-key login) or an unreadable reset simply fall back to (2). (2) **statusLine snapshot**: an informational local snapshot where `statusLine` does not identify the account; its displayed date is the local observation time, not a server query timestamp. Only observed windows appear: a partial snapshot has no inferred total availability, and an expired reset becomes unknown rather than 100%. Fresh snapshots are marked observed (cached snapshot), older ones stale, conflicting sessions ambiguous, and absent/invalid data unknown. In the compact `usage` table Claude Code uses the same columns as the other engines (`ACCOUNT`, `AVAILABLE`, `WK · 5H`, `↻`) plus a `STATE` column (`live`, `snapshot`, `stale`, `ambiguous`, `unknown`); the source and caveats stay in `agydra usage <profile>`. Only server-confirmed `live` readings feed the `USE NOW` line, never statusLine snapshots.
 
 Capture is disabled by default. `agydra usage --claude-settings claude-work` prints a JSON fragment containing a standalone `statusLine` command. It uses the running Agydra interpreter (`sys.executable`), `python -m claude_usage --store <store> --seq <seq> --display`, and POSIX shell quoting on macOS/Linux and a literal, encoded PowerShell command on Windows, including paths with spaces. Windows capture requires PowerShell. That interpreter must have the packaged `claude_usage` module installed; regenerating the fragment after changing the installation keeps its interpreter path current.
 
-Copy or merge the printed `statusLine` object **manually into `settings.json` at the physical profile path shown by status**. Agydra does not write this file or replace any existing settings. The standalone command displays a concise snapshot line and stores only whitelisted rate-limit windows; it does not preserve an existing statusLine automatically. If you already have one, keep it until you deliberately compose the two commands yourself; automatic wrappers are not supplied. `--settings`, managed policies or disabled statusLine execution may prevent capture; Agydra does not override those choices. Launch through Agydra so the writer receives the profile sequence and current login generation. The usage generation is invalidated only for native `auth login`/`auth logout` run through Agydra, and on deletion; payloads from an older generation then cannot repopulate the cache. An interactive `/login` inside a running Claude session cannot be detected, so the snapshot stays informational with unverified account identity.
+Copy or merge the printed `statusLine` object **manually into `settings.json` at the physical profile path shown by status**. By default Agydra does not write this file; `--claude-settings PROFILE --apply` writes it for you: it creates `settings.json` when absent, or atomically merges Agydra's `statusLine` into an existing one that has no `statusLine`, preserving every other key. It does nothing if Agydra's `statusLine` is already present, and it refuses, leaving the file untouched, when a different `statusLine` or invalid JSON is present. The standalone command displays a concise snapshot line and stores only whitelisted rate-limit windows; it does not preserve an existing statusLine automatically. If you already have one, keep it until you deliberately compose the two commands yourself; automatic wrappers are not supplied. `--settings`, managed policies or disabled statusLine execution may prevent capture; Agydra does not override those choices. Launch through Agydra so the writer receives the profile sequence and current login generation. The usage generation is invalidated only for native `auth login`/`auth logout` run through Agydra, and on deletion; payloads from an older generation then cannot repopulate the cache. An interactive `/login` inside a running Claude session cannot be detected, so the snapshot stays informational with unverified account identity.
 
 ---
 
 ## 🚀 Core Workflows
 
-**Pin a directory.** `agydra use client-acme` writes `.agydra`. Later commands in that tree use that profile, and the marker wins over `-r`.
+**Pin a directory.** `agydra use client-acme` writes `.agydra`. Normal profile resolution in that tree uses the pinned profile; explicit `-r` ignores the marker and rotates through the engine's cycle.
 
-**Rotate.** `agydra -r` stays on `agy`. `agydra -e codex -r` and `agydra -e grok -r` rotate inside that engine.
+**Rotate.** `agydra -r` stays on `agy`. `agydra -e codex -r`, `agydra -e grok -r`, and `agydra -e claude -r` rotate inside that engine, exhausting unused profiles before starting another cycle and ranking them by recent saved quota.
 
 **Share config, keep credentials.** `agydra share-config work personal staging` copies `settings.json`, `mcp.json`, and `config.toml`. `auth.json` stays in the source profile.
 
@@ -163,7 +165,7 @@ Copy or merge the printed `statusLine` object **manually into `settings.json` at
 | `agy` | `HOME` overlay, `~/.gemini` layout | Official Google OAuth | macOS keychain bridge (`agydra.<profile>`). Host `~/.gemini` stays as it was. |
 | `codex` | `CODEX_HOME` → overlay `~/.codex` | `codex login` | `--no-daemon` on every run, and `daemon_auto_start = false`, so the socket path stays under `SUN_LEN` and the lock releases on exit. Credentials live in `auth.json`. |
 | `grok` | `GROK_HOME` and `GROK_LEADER_SOCKET` (`<overlay>/.grok/leader.sock`) | `grok login` | Host `~/.grok` stays as it was. Plan names such as SuperGrok come from `auth.json`. `usage` reads the xAI billing API. No keychain swap. |
-| `claude` | `CLAUDE_CONFIG_DIR` → physical, stable `<store>/claude-config/<seq>`; real HOME | `claude auth login` | Authentication checked with `claude auth status`; no Antigravity Keychain swap. Rename preserves path and identity. Usage reads opt-in snapshots without server quota queries. |
+| `claude` | `CLAUDE_CONFIG_DIR` → physical, stable `<store>/claude-config/<seq>`; real HOME | `claude auth login` | Authentication checked with `claude auth status`; no Antigravity Keychain swap. Rename preserves path and identity. Usage runs the profile's own `claude -p "/usage"` (cached 5 min), else opt-in statusLine snapshots. |
 
 ---
 
@@ -174,42 +176,43 @@ Management commands also accept `--NAME` or `-NAME` (`agydra --list` == `agydra 
 | Command | Aliases | Description |
 |---|---|---|
 | `list` | `ls`, `l` | Index, email, default, auth, busy, engine, last use. |
-| `create NAME [-d DESC] [-e ENGINE]` | `c` | New store. `-e` is `agy` (default), `codex`, or `grok`. |
+| `create NAME [-d DESC] [-e ENGINE]` | `c` | New store. `-e` is `agy` (default), `codex`, `grok`, or `claude`. |
 | `login [NAME\|#] [-f] [-n]` | `in` | Isolated login for that profile's engine. `-f` re-authenticates. |
-| `import NAME\|# [-s DIR]` | `imp` | **Copies** `~/.gemini`, `~/.codex`, or `~/.grok` into the profile while holding its profile lock. |
+| `import NAME\|# [-s DIR]` | `imp` | **Copies** `~/.gemini`, `~/.codex`, or `~/.grok` into the profile while holding its profile lock. Claude profiles are rejected. |
+| `export NAME\|# [-o PATH]` | `exp` | **Writes** a portable ZIP of the profile (excludes OAuth/API key/Keychain secrets by R4 policy; Claude is rejected). Default destination: `~/agydra-export-<name>-<ts>.zip`. |
 | `rename A B` | `mv` | Renames the profile and updates the default. Refuses a busy profile. |
 | `delete NAME\|# [-f] [--no-backup]` | `rm` | Writes a ZIP under `backups/`, then deletes. Refuses a busy profile. |
 | `default [NAME\|#]` | `d` | Show or set the fallback profile. |
-| `use [NAME\|#]` | `u` | Pin the current directory with a `.agydra` marker. |
-| `status [-n]` | `st` | Resolved profile, engine, binary, email, auth, lock. |
-| `usage [NAME\|#]` | `us` | Quotas for `agy`, `codex`, and `grok`; informational Claude snapshots. `--claude-settings PROFILE` prints opt-in capture settings. |
+| `use NAME\|#` | `u` | Pin the current directory with a `.agydra` marker. |
+| `status [NAME\|#] [-p NAME\|#] [-e ENGINE] [-n]` | `st` | Resolved profile, engine, binary (`not found` when the engine CLI is not installed), email, auth, live sessions. `-n` prints the launch plan and does need the binary. |
+| `usage [NAME\|#]` | `us` | Quotas for `agy`, `codex`, and `grok`; informational Claude snapshots. `--claude-settings PROFILE` prints opt-in capture settings; `--apply` (only with `--claude-settings`) writes the `statusLine` into the profile's `settings.json` (creating it, or atomically merging it while preserving other keys); no-op if already present; refuses and leaves the file untouched if a different `statusLine` or invalid JSON exists. |
 | `share-config SRC TARGET...` | `share` | Copies config files while holding the source and target profile locks through all copies. Leaves credentials in the source. |
-| `doctor [--fix] [-f]` | `doc` | Ten health checks. `--fix` repairs overlay data links and dangling defaults, and purges only orphan artifacts. |
-| `setup [-n]` | `install` | Idempotent venv, console script, and PATH shim. |
-| `lang [CODE]` | `language`, `idioma`, `locale` | Display language: `en` or `es`. |
-| `version` | `-v`, `--version` | Agydra, Python, and OS. |
-| `help [COMMAND]` | `-h`, `--help` | Help for Agydra or one subcommand. |
+| `doctor [--fix [-f]]` | `doc` | Ten health checks. `--fix` repairs overlay data links and dangling defaults, and purges only orphan artifacts; `-f` skips the `--fix` confirmation and is rejected without `--fix`. |
+| `setup [-n] [-f]` | `install` | Idempotent venv, console script, and PATH shim. `-n` previews; `-f` overwrites a foreign shim. |
+| `language [CODE]` | `lang`, `idioma`, `locale` | Display language: `en` or `es`. |
+| `version` | `--version` | Prints the Agydra version and author. |
+| `help` | `h`, `-h`, `--help` | Top-level help. `agydra COMMAND --help` shows one subcommand. |
 
 Launcher flags go **before** engine arguments.
 
 | Flag | Long form | Description |
 |:---:|---|---|
 | `-p NAME\|#` | `--profile` | Profile by name or index. |
-| `-r` | `--random` | Least-recently-used idle authenticated profile. `-e` limits the pool. |
-| `-e ENGINE` | `--engine` | `agy` (default), `codex`, or `grok`. |
+| `-r` | `--random` (`--rotate`) | Uses each eligible profile once per engine cycle, preferring the highest remaining recent saved quota; unknown quota ranks last. Ignores `.agydra`. `-e` limits the pool. |
+| `-e ENGINE` | `--engine` | `agy` (default), `codex`, `grok`, or `claude`. |
 | `--lang CODE` | — | Set and persist `en` or `es`. |
 | `-n` | `--dry-run` | Print the plan. Do not launch. |
 | `-b PATH` | `--binary` | Override the engine binary for this run. |
-| `-f` | `--force` | Skip the session lock. |
+| `-f` | `--force` | Ignore the optional `max_sessions_per_profile` cap. Joining a busy profile is already the default. |
 
 Short flags bundle (`-nr` == `-n -r`). `-p` together with `-r` exits `2`.
 
 | Combination | Purpose |
 |---|---|
 | `agydra -p grok-work "prompt"` | Launch Grok on that profile. |
-| `agydra -e grok -r "prompt"` | Rotate across idle Grok profiles. |
-| `agydra -e codex -r "prompt"` | Rotate across idle Codex profiles. |
-| `agydra -rf "prompt"` | Rotate, and launch anyway when every profile is busy. |
+| `agydra -e grok -r "prompt"` | Rotate across eligible Grok profiles by saved quota. |
+| `agydra -e codex -r "prompt"` | Rotate across eligible Codex profiles by saved quota. |
+| `agydra -rf "prompt"` | Rotate by saved quota, bypassing the optional `max_sessions_per_profile` cap. |
 | `agydra -np work` | Show the launch plan for `work`. |
 | `agydra -b /path/grok -p grok-work` | Try a specific binary with that profile's credentials. |
 
@@ -220,7 +223,7 @@ Without `-p`, the first match wins:
    └── 2. AGYDRA_PROFILE
        └── 3. .agydra marker (nearest ancestor; overrides -r)
            └── 4. default_profile in agydra.json
-               └── 5. First profile in alphabetical order
+               └── 5. First profile by number (creation order; `agy` profiles first)
 ```
 
 **Exit codes:** `0` success · `1` error · `2` `-p` with `-r` · `126` binary not executable · `127` binary not found · `130` Ctrl-C.
@@ -251,7 +254,9 @@ Session locks use `<store>/locks/<profile>.lock`; the sentinel file persists, wh
 
 Before moving a profile directory, `rename` atomically writes its intent to `<store>/profile-rename.json`, including a Keychain slot migration recovery action and the `source_present` snapshot for Antigravity; Claude rename does not add this action. A later public profile read or mutation recovers that journal while holding the old and new profile locks in sorted order, followed by the sequence lock. If only the old directory exists, recovery restores the old default when needed and removes the journal; if only the new directory exists, recovery finishes forward by fixing profile metadata and the default when needed, removing the old overlay, then running the recorded Keychain action before removing the journal. Forward recovery runs that action while holding the sorted profile locks, the sequence lock, and `swap.lock`; if it fails, the journal remains for retry on the next store operation. On the normal rename path, the callback runs with the profile locks held after the sequence lock is released. If both or neither directory exists, the journal or metadata is malformed, or a required lock is busy, recovery fails closed and retains the journal and profile data.
 
-When enabled (the default; `--no-backup` disables it), `delete` writes and verifies its ZIP backup before removing profile data. For Antigravity, the CLI keeps the profile lock through its post-delete keychain purge, after releasing the sequence lock; on macOS, that purge uses `swap.lock` to serialize cleanup of the profile's saved slot and system Keychain entry with keychain swaps. A purge failure is reported as a warning after deletion. `import` holds its target profile lock through the copy, and `share-config` holds the source and target profile locks until all copies finish. `doctor --fix` holds the profile lock while migrating and relinking overlay data.
+When enabled (the default; `--no-backup` disables it), `delete` writes and verifies its ZIP backup before removing profile data: the backup is written and verified while holding the profile lock, then the commit phase re-acquires the sequence lock, re-checks the profile's identity and paths, and only then purges. At most the last 5 backup ZIPs per profile are kept. For Antigravity, the CLI keeps the profile lock through its post-delete keychain purge, after releasing the sequence lock; on macOS, that purge uses `swap.lock` to serialize cleanup of the profile's saved slot and system Keychain entry with keychain swaps. A purge failure is reported as a warning after deletion. `import` holds its target profile lock through the copy (plus `swap.lock` on macOS for Antigravity so the imported credential cannot race a live swap), and `share-config` holds the source and target profile locks until all copies finish. `doctor --fix` holds the profile lock while migrating and relinking overlay data.
+
+Store paths are hardened: a symlink or junction at the profiles root, a profile directory, `profile.json`, `data/`, the overlays root or the Claude config path fails closed instead of redirecting a write outside the store, and two profiles claiming the same sequence number are refused rather than aliasing one Claude configuration. On macOS, when another live Agydra operation holds the shared keychain swap lock, a launch reports a clean busy error instead of blocking or interleaving credential swaps.
 
 | Platform | Mechanism |
 |---|---|
@@ -263,7 +268,7 @@ When enabled (the default; `--no-backup` disables it), `delete` writes and verif
 
 ## 🩺 Diagnostics
 
-`agydra doctor` runs ten checks: binaries actually in use, store, profiles, locks, isolation, keychain, schema canary, orphans, Linux sandbox, and the PATH shim. `agydra doctor --fix` migrates a real directory occupying an existing profile's overlay data path into that profile's store and relinks the path while holding that profile's lock; it clears the configured default when its name is absent from the current readable profile list. For orphan cleanup, a profile owns its artifacts whenever its profile directory exists, even if its metadata cannot be read. Doctor removes orphan overlay directories, keychain secret backups and quarantine files, and backup ZIPs only when the owning profile directory is absent; it tries each candidate's profile lock and skips cleanup when an active session holds that lock. System keychain slots are also purged only when the profile directory is absent, with the profile lock acquired before `swap.lock`. Session lock files remain persistent sentinels and are not removed.
+`agydra doctor` runs ten checks: binaries actually in use, store, profiles, locks, isolation, keychain, schema canary, orphans, Linux sandbox, and the PATH shim. `agydra doctor --fix` migrates a real directory occupying an existing profile's overlay data path into that profile's store and relinks the path while holding that profile's lock; it clears the configured default when its name is absent from the current readable profile list. For orphan cleanup, a profile owns its artifacts whenever its profile directory exists, even if its metadata cannot be read. Doctor removes orphan overlay directories and keychain secret backups and quarantine files only when the owning profile directory is absent; it never scans or deletes the ZIPs under `backups/`, which `delete` leaves on purpose for recovery and which only the per-profile retention limit prunes. It tries each candidate's mutation lock and skips cleanup when a live session (a held lock or a registered lease) uses that profile. System keychain slots are also purged only when the profile directory is absent, with the profile lock acquired before `swap.lock`. Session lock files remain persistent sentinels and are not removed.
 
 ---
 
@@ -312,7 +317,7 @@ python3 -W error::ResourceWarning -m pytest tests/ -q
 python3 -m unittest discover -s tests -q
 ```
 
-The suite (650+ tests) uses temporary stores and leaves the host home alone.
+The suite uses temporary stores and leaves the host home alone. Native CI matrix (`.github/workflows/tests.yml`) runs the full suite on three runners: Windows 2022 (Python 3.9), Ubuntu 24.04 (Python 3.9) and macOS 15 (Python 3.14); intermediate Python versions are not part of the matrix. It runs on pushes and pull requests targeting `main` or `audit/project-wide-reliability`.
 
 ---
 
