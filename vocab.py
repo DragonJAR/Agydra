@@ -14,6 +14,7 @@ SUBCOMMAND_ALIASES: Dict[str, Tuple[str, ...]] = {
     "create": ("c",),
     "login": ("in",),
     "import": ("imp",),
+    "export": ("exp",),
     "list": ("ls", "l"),
     "default": ("d",),
     "use": ("u",),
