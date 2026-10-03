@@ -150,6 +150,10 @@ class LockError(OSError):
     """
 
 
+class LeaseLimitError(LockError):
+    """Joining the profile would exceed its live-session limit."""
+
+
 class LockHandle:
     """An acquired advisory lock.
 
@@ -252,14 +256,20 @@ def _parse_holders(raw: bytes) -> Optional[List[Holder]]:
     and ``release_lease`` (which holds the flock while parsing) treats it
     as crash residue it may reset.
     """
-    stripped = raw.strip()
+    nul_stripped = raw.strip(b"\0")
+    stripped = nul_stripped.strip()
     if not stripped:
         return []
     if stripped.isdigit():
-        return [Holder(int(stripped), None)]
+        if len(stripped) > 10:
+            return None
+        try:
+            return [Holder(int(stripped), None)]
+        except ValueError:
+            return None
     try:
-        data = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+        data = json.loads(nul_stripped.decode("utf-8"))
+    except (RecursionError, ValueError, UnicodeDecodeError):
         return None
     if not isinstance(data, dict) or not isinstance(data.get("holders"), list):
         return None
@@ -391,6 +401,8 @@ def lease_holders(store, name: str) -> Optional[List[Holder]]:
 
 
 _LEASE_POLL_INTERVAL_S = 0.05
+POLL_INTERVAL_S = _LEASE_POLL_INTERVAL_S
+LEASE_PATIENCE_S = 2.0
 """Bounded polling interval for ``acquire_lease`` patience.
 
 A launch waiting out a rare, brief store-mutation flock checks back this
@@ -406,7 +418,9 @@ def _open_lease_fd(store, name: str) -> int:
     return os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
 
 
-def acquire_lease(store, name: str, patience_s: float = 0.0) -> int:
+def acquire_lease(
+    store, name: str, patience_s: float = 0.0, max_holders: Optional[int] = None
+) -> int:
     """Join ``name``'s registry under a brief exclusive flock.
 
     Registers the current process as one holder and returns the number of
@@ -422,6 +436,13 @@ def acquire_lease(store, name: str, patience_s: float = 0.0) -> int:
     Raises LockError when the exclusive lock cannot be taken within the
     patience budget: the caller surfaces that as a busy failure, the same
     fail-closed policy as an unreadable lock file.
+
+    ``max_holders`` is the per-profile live-session limit, checked under the
+    same flock that registers the entry (so concurrent joins can never
+    overshoot it): when that many OTHER live holders are registered the join
+    is refused with :class:`LeaseLimitError` and nothing is written. ``None``
+    means unbounded (internal callers such as the keychain guard and usage
+    queries, which never open a user session of their own).
     """
     path = lock_path(store, name)
     deadline = time.monotonic() + patience_s
@@ -436,6 +457,11 @@ def acquire_lease(store, name: str, patience_s: float = 0.0) -> int:
                     holders = [] if parsed is None else _prune_holders(parsed)
                     entry = Holder(os.getpid(), _own_start_token())
                     merged = [h for h in holders if h.pid != entry.pid]
+                    if max_holders is not None and len(merged) >= max_holders:
+                        raise LeaseLimitError(
+                            f"profile {name!r} already has {len(merged)} live "
+                            f"session(s) (limit of {max_holders})"
+                        )
                     merged.append(entry)
                     _write_holders(fd, merged)
                     return len(holders)
@@ -606,6 +632,33 @@ def try_lock(store, name: str) -> Optional[LockHandle]:
     be managed at all.
     """
     return _try_lock_path(lock_path(store, name), "session lock", True)
+
+
+def try_mutation_lock(store, name: str) -> Optional[LockHandle]:
+    """Take ``name``'s lock for a store mutation, refusing live leased sessions.
+
+    Sessions join through the holders registry and only hold the flock
+    briefly, so a free flock does not prove the profile is idle. This takes
+    the same non-blocking flock as ``try_lock`` but never inherits it and
+    never truncates the file (that would wipe the registry), then reads the
+    registry through the SAME locked fd: a joiner either registered before
+    this read (seen here) or has to wait for the flock this handle holds,
+    so there is no check-then-act gap. Returns None when the flock is held,
+    a live holder is registered, or the registry cannot be decoded or read
+    (fail closed). Raises LockError only when the lock cannot be managed.
+    """
+    handle = _try_lock_path(lock_path(store, name), "session lock", False)
+    if handle is None:
+        return None
+    try:
+        parsed = _parse_holders(_read_all(handle._fd))
+        if parsed is None or _prune_holders(parsed):
+            handle.release()
+            return None
+    except OSError:
+        handle.release()
+        return None
+    return handle
 
 
 def try_sequence_lock(store) -> Optional[LockHandle]:
