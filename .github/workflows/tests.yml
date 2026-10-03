@@ -1,0 +1,66 @@
+name: Native platform tests
+
+on:
+  push:
+    branches:
+      - main
+      - audit/project-wide-reliability
+  pull_request:
+    branches:
+      - main
+      - audit/project-wide-reliability
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            python: '3.9.13'
+            architecture: x64
+          - os: ubuntu-24.04
+            python: '3.9.25'
+            architecture: x64
+          - os: macos-15
+            python: '3.14.8'
+            architecture: arm64
+    env:
+      AGYDRA_NO_KEYCHAIN: '1'
+      NO_COLOR: '1'
+      PYTHONUTF8: '1'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.architecture }}
+          allow-prereleases: false
+      - name: Runtime evidence
+        run: python -c "import platform, sys; print(sys.version); print(platform.platform()); print(platform.machine())"
+      - name: Packaging build tools
+        run: python -m pip install --disable-pip-version-check "setuptools>=77"
+      - name: Native Windows contracts
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        run: python -m unittest discover -s tests -p test_windows_batch.py -v
+      - name: Full standard-library suite
+        if: ${{ !cancelled() && steps.python.outcome == 'success' }}
+        timeout-minutes: 10
+        run: python -m unittest discover -s tests -p "test_*.py" -v
