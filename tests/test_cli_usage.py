@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from conftest import BaseCase
+from conftest import BaseCase, run_cli
 from store import Store
 
 REAL_USAGE_JSON = {
@@ -175,15 +175,8 @@ class TestUsageCli(BaseCase):
     def test_no_profiles_prints_hint(self):
         empty_store_dir = self._tmp / "empty-store"
         empty_store_dir.mkdir()
-        env = dict(os.environ)
-        env["AGYDRA_HOME"] = str(empty_store_dir)
-        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
-        import subprocess
-
-        res = subprocess.run(
-            [sys.executable, "-m", "agydra", "usage"],
-            capture_output=True, text=True, timeout=60,
-            cwd=str(self._tmp), env=env,
+        res = run_cli(
+            "usage", cwd=self._tmp, extra_env={"AGYDRA_HOME": str(empty_store_dir)}
         )
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("no profiles", res.stdout)
@@ -231,6 +224,7 @@ class TestUsageCli(BaseCase):
             email=profile.email,
             plan="SuperGrok",
             error="no usage data in response",
+            authentication_state="authenticated",
         )
 
         class Args:
@@ -248,6 +242,74 @@ class TestUsageCli(BaseCase):
         self.assertIn("status    : authenticated", stdout.getvalue())
         self.assertNotIn("status    : not authenticated", stdout.getvalue())
         self.assertIn("usage unavailable: no usage data in response", stderr.getvalue())
+
+    def test_grok_401_detail_uses_structured_unauthenticated_state(self):
+        import contextlib
+        import io
+        import urllib.error
+        from types import SimpleNamespace
+        from unittest import mock
+        import cli
+
+        self.store.create("gx", engine="grok")
+        data_dir = self.store.profile_data_dir("gx", engine="grok")
+        (data_dir / "auth.json").write_text(
+            json.dumps({"https://auth.x.ai::client": {
+                "email": "grok@example.com", "key": "expired-token",
+            }}),
+            encoding="utf-8",
+        )
+        expired = urllib.error.HTTPError(
+            "https://cli-chat-proxy.grok.com/v1/billing", 401,
+            "Unauthorized", {}, None,
+        )
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        with mock.patch("usage.fetch_grok_billing_payload", side_effect=expired), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = cli.cmd_usage(self.store, SimpleNamespace(ref="gx"))
+
+        self.assertEqual(code, 1)
+        self.assertIn("status    : not authenticated", stdout.getvalue())
+        self.assertIn("usage unavailable: session expired (401)", stderr.getvalue())
+
+    def test_grok_x_premium_reports_no_quota_on_plan_in_compact_and_detail(self):
+        from datetime import datetime, timedelta, timezone
+        from types import SimpleNamespace
+        from unittest import mock
+        import cli
+        import usage
+
+        self.store.create("gx", engine="grok")
+        premium = usage.UsageResult(
+            "gx", True, engine="grok", plan="X Premium", error=usage.PLAN_WITHOUT_QUOTA
+        )
+        results = [usage.UsageResult(n, False, error="not authenticated") for n in self.store.names()]
+        results[-1] = premium
+        with mock.patch.object(usage, "gather_usage_report", return_value=results), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            cli.cmd_usage(self.store, SimpleNamespace(ref=None))
+        row = next(line for line in out.getvalue().splitlines() if "gx" in line and "X Premium" in line)
+        self.assertIn("no quota on plan", row)
+        self.assertNotIn("no usage data", row)
+        self.assertRegex(row, r"no quota on plan\s+X Premium")
+        failed = [usage.UsageResult("gx", False, engine="grok", plan="SuperGrok", error="no usage data in response")]
+        results[-1] = failed[0]
+        with mock.patch.object(usage, "gather_usage_report", return_value=results), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            cli.cmd_usage(self.store, SimpleNamespace(ref=None))
+        self.assertRegex(out.getvalue(), r"\(no usage data in response\) +SuperGrok")
+        results[-1] = premium
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(cli.usage, "query_profile_usage", return_value=premium), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = cli.cmd_usage(self.store, SimpleNamespace(ref="gx"))
+        self.assertEqual(code, 0)
+        self.assertIn("plan      : X Premium", stdout.getvalue())
+        self.assertIn("usage     : no quota on plan", stdout.getvalue())
+        self.assertIn("status    : authenticated", stdout.getvalue())
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_codex_and_grok_compact_quota_rows_keep_plan_windows_and_errors(self):
         from datetime import datetime, timedelta, timezone

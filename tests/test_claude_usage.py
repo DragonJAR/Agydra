@@ -409,7 +409,10 @@ class TestClaudeUsage(BaseCase):
 
     def test_query_without_snapshot_is_unknown_without_store_mutations(self):
         before = _tree_state(self.store.root)
-        result = usage.query_profile_usage(self.store, self.profile.name)
+        with mock.patch.object(
+            claude_usage, "run_live_usage", return_value=(None, "live_binary_missing")
+        ):
+            result = usage.query_profile_usage(self.store, self.profile.name)
         self.assertTrue(result.ok)
         self.assertEqual(result.quality, "unknown")
         self.assertEqual(result.groups, [])
@@ -736,6 +739,37 @@ class TestClaudeUsage(BaseCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(stderr.getvalue(), "")
         self.assertFalse(self._cache_dir().exists())
+
+
+class TestUsageCacheDirectoryProbe(BaseCase):
+    def test_junction_like_directory_is_rejected(self):
+        directory = self._tmp / "cache-dir"
+        directory.mkdir()
+        real = claude_usage.platforms.is_link
+
+        def probe(path, *, strict=False):
+            return Path(path) == directory or real(path, strict=strict)
+
+        self.assertTrue(claude_usage._safe_existing_directory(directory))
+        with mock.patch.object(claude_usage.platforms, "is_link", side_effect=probe):
+            with self.assertRaises(claude_usage.UsageCacheError):
+                claude_usage._safe_existing_directory(directory)
+
+    def test_inspection_errors_fail_closed_and_dangling_links_are_rejected(self):
+        directory = self._tmp / "cache-dir"
+        directory.mkdir()
+
+        def probe(path, *, strict=False):
+            raise PermissionError("denied")
+
+        with mock.patch.object(claude_usage.platforms, "is_link", side_effect=probe):
+            with self.assertRaises(claude_usage.UsageCacheError):
+                claude_usage._safe_existing_directory(directory)
+        dangling = self._tmp / "dangling"
+        dangling.symlink_to(self._tmp / "nowhere", target_is_directory=True)
+        with self.assertRaises(claude_usage.UsageCacheError):
+            claude_usage._safe_existing_directory(dangling)
+        self.assertTrue(claude_usage._safe_existing_directory(self._tmp / "absent"))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from conftest import BaseCase
 from store import Store
 
+# ``resolver.resolve`` labels a read-only random pick with this reason. The
+# prefix is the stable part; the trailing caveat text is free to change.
+RANDOM_MARKER = "read-only random plan candidate (-r"
+
 
 class TestCliParameterMatrix(BaseCase):
     def setUp(self):
@@ -51,7 +55,7 @@ class TestCliParameterMatrix(BaseCase):
                 res = self._run_cli(flag, "-n")
                 self.assertEqual(res.returncode, 0, res.stderr)
                 self.assertIn("profile :", res.stdout)
-                self.assertIn("(-r)", res.stdout)
+                self.assertIn(RANDOM_MARKER, res.stdout)
 
     def test_launcher_dry_run_flag_alone(self):
         for flag in ("-n", "--dry-run"):
@@ -94,14 +98,14 @@ class TestCliParameterMatrix(BaseCase):
 
     def test_short_flag_bundles_and_combinations(self):
         cases = [
-            (["-nr"], 0, ["(-r)", "profile :"]),
-            (["-rn"], 0, ["(-r)", "profile :"]),
+            (["-nr"], 0, [RANDOM_MARKER, "profile :"]),
+            (["-rn"], 0, [RANDOM_MARKER, "profile :"]),
             (["-np", "beta"], 0, ["profile : beta"]),
             (["-npbeta"], 0, ["profile : beta"]),
             (["-nb", str(self.agy_bin)], 0, [str(self.agy_bin)]),
             (["-n", "-b", str(self.agy_bin), "-p", "beta"], 0, ["profile : beta", str(self.agy_bin)]),
             (["-np", "beta", "-b", str(self.agy_bin)], 0, ["profile : beta", str(self.agy_bin)]),
-            (["-nr", "-b", str(self.agy_bin)], 0, ["(-r)", str(self.agy_bin)]),
+            (["-nr", "-b", str(self.agy_bin)], 0, [RANDOM_MARKER, str(self.agy_bin)]),
         ]
         for args, expected_rc, needles in cases:
             with self.subTest(args=args):
@@ -126,10 +130,10 @@ class TestCliParameterMatrix(BaseCase):
             (["-f", "-p", "alpha", "-n"], "profile : alpha"),
             (["-fpalpha", "-n"], "profile : alpha"),
             (["-fp", "alpha", "-n"], "profile : alpha"),
-            (["-r", "-f", "-n"], "(-r)"),
-            (["-fr", "-n"], "(-r)"),
-            (["-rf", "-n"], "(-r)"),
-            (["-nrf"], "(-r)"),
+            (["-r", "-f", "-n"], RANDOM_MARKER),
+            (["-fr", "-n"], RANDOM_MARKER),
+            (["-rf", "-n"], RANDOM_MARKER),
+            (["-nrf"], RANDOM_MARKER),
         ]
         for args, needle in cases:
             with self.subTest(args=args):

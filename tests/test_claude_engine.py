@@ -296,6 +296,56 @@ class TestOverlayFreeIsolation(ClaudeBase):
         data = self.store.profile_data_dir(profile.name)
         self.assertEqual(stat.S_IMODE(data.stat().st_mode), 0o700)
 
+    def test_chmod_failure_allows_an_already_private_directory(self):
+        profile = self.make_profile()
+        data = self.store.profile_data_dir(profile.name)
+        with mock.patch.object(
+            isolation.os, "chmod", side_effect=PermissionError("secret chmod detail")
+        ):
+            prepared = isolation.prepare_claude_config_dir(data)
+
+        self.assertEqual(prepared, data)
+        self.assertEqual(stat.S_IMODE(data.stat().st_mode) & 0o077, 0)
+
+    def test_chmod_failure_rejects_group_or_other_permissions(self):
+        profile = self.make_profile()
+        data = self.store.profile_data_dir(profile.name)
+        os.chmod(data, 0o750)
+        with mock.patch.object(
+            isolation.os, "chmod", side_effect=PermissionError("secret chmod detail")
+        ):
+            with self.assertRaises(isolation.IsolationError) as raised:
+                isolation.prepare_claude_config_dir(data)
+
+        self.assertIn(str(data), str(raised.exception))
+        self.assertNotIn("secret chmod detail", str(raised.exception))
+
+    def test_chmod_failure_rejects_unverifiable_directory_permissions(self):
+        profile = self.make_profile()
+        data = self.store.profile_data_dir(profile.name)
+        chmod_attempted = False
+        original_lstat = Path.lstat
+
+        def fail_chmod(_path, _mode):
+            nonlocal chmod_attempted
+            chmod_attempted = True
+            raise PermissionError("secret chmod detail")
+
+        def fail_verification(path, *args, **kwargs):
+            if chmod_attempted and Path(path) == data:
+                raise OSError("secret stat detail")
+            return original_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(isolation.os, "chmod", side_effect=fail_chmod), mock.patch.object(
+            Path, "lstat", autospec=True, side_effect=fail_verification
+        ):
+            with self.assertRaises(isolation.IsolationError) as raised:
+                isolation.prepare_claude_config_dir(data)
+
+        self.assertIn(str(data), str(raised.exception))
+        self.assertNotIn("secret chmod detail", str(raised.exception))
+        self.assertNotIn("secret stat detail", str(raised.exception))
+
 
 class TestInspectClaudeAuth(ClaudeBase):
     def setUp(self) -> None:
@@ -885,6 +935,25 @@ class TestRunner(ClaudeBase):
         self.assertFalse((self.fake_home / ".claude").exists())
         self.assertFalse((self.fake_home / ".claude.json").exists())
 
+    def test_unprivateable_config_aborts_before_claude_launch(self):
+        profile = self.make_profile("work")
+        config_dir = self.store.claude_config_dir(profile.name)
+        os.chmod(config_dir, 0o750)
+        plan = self.plan_for("work")
+
+        with mock.patch.object(
+            isolation.os, "chmod", side_effect=PermissionError("secret chmod detail")
+        ), mock.patch.object(runner.platforms, "launch_argv") as launch, mock.patch.object(
+            runner.platforms, "run_wait"
+        ) as waited_launch:
+            with self.assertRaises(isolation.IsolationError) as raised:
+                runner.run(plan, store=self.store)
+
+        self.assertIn(str(config_dir), str(raised.exception))
+        self.assertNotIn("secret chmod detail", str(raised.exception))
+        launch.assert_not_called()
+        waited_launch.assert_not_called()
+
     def test_busy_profile_joins_instead_of_refusing(self):
         """Concurrent sessions of the same profile JOIN (no refusal). A live
         registry holder from another session does not block a launch — the
@@ -1277,6 +1346,7 @@ class TestRunnerUsageIntegration(ClaudeBase):
         cfg = str(self.store.claude_config_dir("work"))
         self.assertIn(f"config  : {cfg}", text)
         self.assertIn(f"CLAUDE_CONFIG_DIR={cfg}", text)
+        self.assertIn(f"HOME={self.fake_home}", text)
         self.assertIn("CLAUDE_CODE_DISABLE_AGENT_VIEW=1", text)
         seq = plan.env.get("AGYDRA_CLAUDE_USAGE_SEQ")
         self.assertIsNotNone(seq)

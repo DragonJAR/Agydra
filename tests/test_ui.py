@@ -128,6 +128,33 @@ class TestUiDiagnostics(unittest.TestCase):
             self.assertIn("error: error message", out)
             self.assertIn("agydra: note: note message", out)
 
+class TestBarNonFinite(unittest.TestCase):
+    def test_non_finite_fraction_renders_neutral_empty_bar(self):
+        for fraction in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(fraction=fraction):
+                self.assertEqual(ui.bar(fraction, width=8), "-" * 8)
+
+    def test_finite_fraction_keeps_clamped_bar_contract(self):
+        self.assertEqual(ui.bar(-0.5, width=8), "-" * 8)
+        self.assertEqual(ui.bar(1.5, width=8), "#" * 8)
+        self.assertEqual(ui.bar(0.5, width=8), "####----")
+
+    def test_huge_integer_fraction_clamps_without_float_overflow(self):
+        huge = 10**10000
+        self.assertEqual(ui.bar(huge, width=8), "#" * 8)
+        self.assertEqual(ui.bar(-huge, width=8), "-" * 8)
+
+    def test_boolean_fraction_keeps_numeric_clamp_behavior(self):
+        self.assertEqual(ui.bar(True, width=8), "#" * 8)
+        self.assertEqual(ui.bar(False, width=8), "-" * 8)
+
+    def test_unsupported_fraction_raises_clear_type_error(self):
+        for fraction in ("0.5", None):
+            with self.subTest(fraction=fraction), self.assertRaisesRegex(
+                TypeError, "fraction must be an int, float, or bool"
+            ):
+                ui.bar(fraction, width=8)
+
 
 if __name__ == "__main__":
     unittest.main()

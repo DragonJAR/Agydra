@@ -770,5 +770,345 @@ class TestSandboxWrap(unittest.TestCase):
         )
 
 
+def _tree_snapshot(root: Path):
+    snapshot = {}
+    for entry in sorted(root.rglob("*")):
+        relative = str(entry.relative_to(root))
+        if entry.is_symlink():
+            snapshot[relative] = ("link", os.readlink(entry))
+        elif entry.is_dir():
+            snapshot[relative] = ("dir", None)
+        else:
+            snapshot[relative] = ("file", entry.read_bytes())
+    return snapshot
+
+
+def _restore_tree_permissions(root: Path) -> None:
+    if not root.exists():
+        return
+    os.chmod(root, 0o700)
+    for entry in root.rglob("*"):
+        if not entry.is_symlink():
+            os.chmod(entry, 0o700)
+
+
+class TestMigrateCleanupFailure(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("alpha")
+        self.data_dir = self.store.profile_data_dir("alpha")
+        self.real_dir = self.fake_home / "real-dir"
+        (self.real_dir / "nested").mkdir(parents=True)
+        (self.real_dir / "nested" / "token.json").write_text("secret", encoding="utf-8")
+        (self.real_dir / "history.jsonl").write_text("line\n", encoding="utf-8")
+
+    def test_surviving_source_after_cleanup_raises_and_keeps_copy(self):
+        with mock.patch.object(isolation.store, "rmtree"):
+            with self.assertRaises(isolation.IsolationError) as cm:
+                isolation.migrate_real_dir_to_store(self.real_dir, self.data_dir)
+        self.assertIn("source cleanup failed", str(cm.exception))
+        self.assertTrue(self.real_dir.exists())
+        self.assertEqual(
+            (self.data_dir / "nested" / "token.json").read_text(encoding="utf-8"), "secret"
+        )
+        self.assertEqual(
+            (self.data_dir / "history.jsonl").read_text(encoding="utf-8"), "line\n"
+        )
+
+    def test_unremovable_source_raises_without_relinking(self):
+        if platforms.is_windows() or os.geteuid() == 0:
+            self.skipTest("POSIX permission semantics for a non-root user")
+        os.chmod(self.real_dir / "nested", 0o555)
+        self.addCleanup(_restore_tree_permissions, self.real_dir)
+        with self.assertRaises(isolation.IsolationError):
+            isolation.migrate_real_dir_to_store(self.real_dir, self.data_dir)
+        self.assertTrue(os.path.lexists(self.real_dir))
+        self.assertEqual(
+            (self.data_dir / "nested" / "token.json").read_text(encoding="utf-8"), "secret"
+        )
+
+    def test_failed_cleanup_never_touches_an_external_tree(self):
+        outside = self.fake_home / "outside"
+        outside.mkdir()
+        (outside / "keep.txt").write_bytes(b"external")
+        before = _tree_snapshot(outside)
+        with mock.patch.object(isolation.store, "rmtree"):
+            with self.assertRaises(isolation.IsolationError):
+                isolation.migrate_real_dir_to_store(self.real_dir, self.data_dir)
+        self.assertEqual(_tree_snapshot(outside), before)
+
+    def test_successful_cleanup_still_returns_none(self):
+        self.assertIsNone(isolation.migrate_real_dir_to_store(self.real_dir, self.data_dir))
+        self.assertFalse(os.path.lexists(self.real_dir))
+
+
+class TestOverlayLinkGuards(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("alpha")
+        self.data_dir = self.store.profile_data_dir("alpha")
+        self.outside = self.fake_home / "outside-tree"
+        self.outside.mkdir()
+        (self.outside / "keep.txt").write_bytes(b"external")
+        self.before = _tree_snapshot(self.outside)
+
+    def _link_dir(self, link: Path, target: Path) -> None:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        isolation._link(target, link)
+        self.assertTrue(isolation._is_link(link))
+
+    def test_overlays_root_link_is_rejected_before_any_write(self):
+        self._link_dir(self.store.overlays_dir, self.outside)
+        with self.assertRaises(isolation.IsolationError) as cm:
+            isolation.build_overlay("alpha", self.data_dir, self.store.root)
+        self.assertIn("overlay", str(cm.exception))
+        self.assertEqual(_tree_snapshot(self.outside), self.before)
+
+    def test_overlay_directory_link_is_rejected_before_any_write(self):
+        self._link_dir(self.store.overlays_dir / "alpha", self.outside)
+        with self.assertRaises(isolation.IsolationError):
+            isolation.build_overlay("alpha", self.data_dir, self.store.root)
+        self.assertEqual(_tree_snapshot(self.outside), self.before)
+
+    def test_profile_data_dir_link_is_rejected_before_any_write(self):
+        import shutil
+
+        shutil.rmtree(self.data_dir)
+        self._link_dir(self.data_dir, self.outside)
+        with self.assertRaises(isolation.IsolationError):
+            isolation.build_overlay("alpha", self.data_dir, self.store.root)
+        self.assertEqual(_tree_snapshot(self.outside), self.before)
+        self.assertFalse((self.store.overlays_dir / "alpha").exists())
+
+    def test_profile_directory_link_is_rejected_before_any_write(self):
+        import shutil
+
+        profile_dir = self.store.profile_dir("alpha")
+        shutil.rmtree(profile_dir)
+        (self.outside / "data").mkdir()
+        before = _tree_snapshot(self.outside)
+        self._link_dir(profile_dir, self.outside)
+        with self.assertRaises(isolation.IsolationError):
+            isolation.build_overlay("alpha", profile_dir / "data", self.store.root)
+        self.assertEqual(_tree_snapshot(self.outside), before)
+
+    def test_codex_config_is_not_written_through_a_data_link(self):
+        import shutil
+
+        self.store.create("cx", engine="codex")
+        data_dir = self.store.profile_data_dir("cx")
+        shutil.rmtree(data_dir)
+        self._link_dir(data_dir, self.outside)
+        with self.assertRaises(isolation.IsolationError):
+            isolation.build_overlay("cx", data_dir, self.store.root, engine="codex")
+        self.assertEqual(_tree_snapshot(self.outside), self.before)
+
+    def test_valid_engine_data_link_still_builds(self):
+        overlay = isolation.build_overlay("alpha", self.data_dir, self.store.root)
+        self.assertTrue(isolation._is_link(overlay / platforms.AGY_DATA_DIR_NAME))
+        again = isolation.build_overlay("alpha", self.data_dir, self.store.root)
+        self.assertEqual(overlay, again)
+
+    def test_central_guard_is_reusable_and_returns_the_overlay(self):
+        overlay = isolation.validate_overlay_roots("alpha", self.data_dir, self.store.root)
+        self.assertEqual(overlay, self.store.overlays_dir / "alpha")
+        self._link_dir(self.store.overlays_dir / "beta", self.outside)
+        with self.assertRaises(isolation.IsolationError):
+            isolation.validate_overlay_roots("beta", self.data_dir, self.store.root)
+
+
+class TestSandboxWrapMasking(unittest.TestCase):
+    def _wrap(self, runtime_dir: Path):
+        return isolation.sandbox_wrap(["agy"], runtime_dir=str(runtime_dir))
+
+    def _mask_of(self, wrapped, path: Path):
+        index = wrapped.index(str(path))
+        return wrapped[index - 1]
+
+    def test_socket_is_masked_with_a_file_bind_not_a_directory_mount(self):
+        import socket
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="agy") as runtime:
+            runtime_dir = Path(runtime)
+            bus = runtime_dir / "bus"
+            listener = socket.socket(socket.AF_UNIX)
+            self.addCleanup(listener.close)
+            listener.bind(str(bus))
+            (runtime_dir / "keyring").mkdir()
+            wrapped = self._wrap(runtime_dir)
+        self.assertNotIn("--dir", wrapped[: wrapped.index(str(bus)) + 1][-2:])
+        index = wrapped.index("--ro-bind")
+        self.assertEqual(wrapped[index + 1 : index + 3], ["/dev/null", str(bus)])
+        self.assertNotIn("--tmpfs " + str(bus), " ".join(wrapped))
+        self.assertEqual(wrapped[-1], "agy")
+
+    def test_directory_and_missing_paths_use_dir_then_tmpfs(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="agy") as runtime:
+            runtime_dir = Path(runtime)
+            (runtime_dir / "keyring").mkdir()
+            wrapped = self._wrap(runtime_dir)
+        for name in ("bus", "keyring"):
+            path = runtime_dir / name
+            first = wrapped.index(str(path))
+            self.assertEqual(wrapped[first - 1], "--dir")
+            second = wrapped.index(str(path), first + 1)
+            self.assertEqual(wrapped[second - 1], "--tmpfs")
+
+
+class TestIsolatedEnvStoreRoot(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.root = self.fake_home / ".local" / "share" / "agydra"
+        self.root.mkdir(parents=True)
+        os.environ.pop("AGYDRA_HOME", None)
+        os.environ["XDG_DATA_HOME"] = str(self.fake_home / ".local" / "share")
+        self.overlay = self.root / "overlays" / "alpha"
+        self.overlay.mkdir(parents=True)
+        self.claude_config = self.root / "claude-config" / "1"
+        self.claude_config.mkdir(parents=True)
+
+    def _env(self, engine, **kwargs):
+        target = self.claude_config if engine == "claude" else self.overlay
+        with mock.patch.object(isolation, "grok_leader_socket", return_value="/s.sock"):
+            return isolation.isolated_env(target, {}, engine=engine, **kwargs)
+
+    def _nested_base_dir(self, env):
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+            platforms, "is_macos", return_value=False
+        ), mock.patch.object(platforms, "is_linux", return_value=True), mock.patch.object(
+            platforms, "is_windows", return_value=False
+        ):
+            return platforms.base_dir()
+
+    def test_every_engine_pins_the_absolute_store_root_for_nested_calls(self):
+        for engine in ("agy", "codex", "grok", "claude"):
+            with self.subTest(engine=engine):
+                env = self._env(engine, store_root=self.root)
+                self.assertEqual(env["AGYDRA_HOME"], str(self.root))
+                self.assertEqual(self._nested_base_dir(env), self.root)
+
+    def test_remapped_xdg_data_home_no_longer_changes_the_nested_store(self):
+        env = self._env("agy")
+        self.assertNotEqual(self._nested_base_dir(env), self.root)
+        pinned = self._env("agy", store_root=self.root)
+        self.assertIn(str(self.overlay), pinned["XDG_DATA_HOME"])
+        self.assertEqual(self._nested_base_dir(pinned), self.root)
+
+    def test_without_store_root_an_explicit_environment_root_is_preserved(self):
+        os.environ["AGYDRA_HOME"] = str(self.fake_home / "explicit-store")
+        for engine in ("agy", "claude"):
+            with self.subTest(engine=engine):
+                env = self._env(engine)
+                self.assertEqual(env["AGYDRA_HOME"], str(self.fake_home / "explicit-store"))
+        os.environ.pop("AGYDRA_HOME")
+        self.assertNotIn("AGYDRA_HOME", self._env("agy"))
+
+    def test_tilde_root_is_expanded_once_and_survives_home_redirection(self):
+        os.environ["AGYDRA_HOME"] = "~/stores/tilde"
+        root = Store().root
+        self.assertEqual(root, self.fake_home / "stores" / "tilde")
+        for engine in ("agy", "claude"):
+            with self.subTest(engine=engine):
+                env = self._env(engine, store_root=root)
+                self.assertEqual(env["AGYDRA_HOME"], str(root))
+                self.assertEqual(self._nested_base_dir(env), root)
+
+    def test_relative_root_is_made_absolute_and_extra_cannot_override_it(self):
+        env = isolation.isolated_env(
+            self.overlay,
+            {"AGYDRA_HOME": "/spoofed"},
+            engine="agy",
+            store_root=Path("relative-store"),
+        )
+        self.assertEqual(env["AGYDRA_HOME"], os.path.abspath("relative-store"))
+        pinned = self._env("claude", store_root=self.root)
+        self.assertEqual(pinned["AGYDRA_HOME"], str(self.root))
+
+    def test_a_child_process_resolves_the_same_store_not_a_nested_one(self):
+        import subprocess
+
+        env = self._env("agy", store_root=self.root)
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+        result = subprocess.run(
+            [sys.executable, "-c", "import platforms; print(platforms.base_dir())"],
+            capture_output=True, text=True, env=env, cwd=str(self._tmp), timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.strip()), self.root)
+
+
+class TestCentralLinkProbe(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("alpha")
+        self.data_dir = self.store.profile_data_dir("alpha")
+
+    def _junction_like(self, target: Path):
+        real = platforms.is_link
+
+        def probe(path, *, strict=False):
+            if Path(path) == target:
+                return True
+            return real(path, strict=strict)
+
+        return mock.patch.object(isolation.platforms, "is_link", side_effect=probe)
+
+    def test_private_probe_delegates_to_the_shared_platform_helper(self):
+        directory = self.fake_home / "plain-dir"
+        directory.mkdir()
+        self.assertFalse(isolation._is_link(directory))
+        with mock.patch.object(isolation.platforms, "is_link", return_value=True) as probe:
+            self.assertTrue(isolation._is_link(directory))
+        probe.assert_called_once_with(directory)
+
+    def test_dangling_symlink_is_detected(self):
+        link = self.fake_home / "dangling"
+        link.symlink_to(self.fake_home / "does-not-exist")
+        self.assertTrue(isolation._is_link(link))
+
+    def test_overlay_guard_rejects_a_junction_like_reparse_point(self):
+        overlay = self.store.overlays_dir / "alpha"
+        overlay.mkdir(parents=True)
+        outside_before = _tree_snapshot(self.store.overlays_dir)
+        with self._junction_like(overlay):
+            with self.assertRaises(isolation.IsolationError):
+                isolation.build_overlay("alpha", self.data_dir, self.store.root)
+        self.assertEqual(_tree_snapshot(self.store.overlays_dir), outside_before)
+
+    def test_overlay_guard_fails_closed_when_inspection_errors(self):
+        def probe(path, *, strict=False):
+            if strict:
+                raise PermissionError("denied")
+            return False
+
+        with mock.patch.object(isolation.platforms, "is_link", side_effect=probe):
+            with self.assertRaises(isolation.IsolationError) as cm:
+                isolation.validate_overlay_roots("alpha", self.data_dir, self.store.root)
+        self.assertIn("cannot inspect", str(cm.exception))
+
+    def test_claude_config_guard_rejects_junction_and_inspection_errors(self):
+        config = self.store.claude_config_root / "1"
+        config.mkdir(parents=True)
+        with self._junction_like(config):
+            with self.assertRaises(isolation.IsolationError):
+                isolation.validate_claude_config_dir(config)
+
+        def probe(path, *, strict=False):
+            if strict:
+                raise PermissionError("denied")
+            return False
+
+        with mock.patch.object(isolation.platforms, "is_link", side_effect=probe):
+            with self.assertRaises(isolation.IsolationError):
+                isolation.validate_claude_config_dir(config)
+        self.assertEqual(isolation.validate_claude_config_dir(config), config)
+
+
 if __name__ == "__main__":
     unittest.main()

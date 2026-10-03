@@ -35,6 +35,23 @@ class TestI18nModule(unittest.TestCase):
         i18n._set_active("es")
         self.assertEqual(i18n.t("cmd.create.ok", name="test"), "Perfil 'test' creado.")
 
+    def test_catalogs_have_identical_keys_and_placeholders(self):
+        import string
+
+        def fields(template):
+            return {
+                field for _, field, _, _ in string.Formatter().parse(template) if field is not None
+            }
+
+        english, spanish = i18n._STRINGS["en"], i18n._STRINGS["es"]
+        self.assertEqual(set(english), set(spanish))
+        mismatched = {
+            key: (fields(english[key]), fields(spanish[key]))
+            for key in english
+            if fields(english[key]) != fields(spanish[key])
+        }
+        self.assertEqual(mismatched, {})
+
     def test_fallback_cascade(self):
         i18n._set_active("es")
         # Clave inexistente en es pero sí en default
@@ -53,6 +70,32 @@ class TestI18nModule(unittest.TestCase):
         self.assertEqual(i18n._get_active(), "en")
 
         os.environ.pop("AGYDRA_LANG", None)
+
+    def _locale_with(self, **env):
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, env, clear=False):
+            for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+                if var not in env:
+                    os.environ.pop(var, None)
+            return i18n._locale_lang()
+
+    def test_locale_first_non_empty_variable_decides(self):
+        self.assertEqual(self._locale_with(LC_ALL="C", LANG="es_AR.UTF-8"), "en")
+        self.assertEqual(self._locale_with(LC_ALL="POSIX", LC_MESSAGES="es_ES"), "en")
+        self.assertEqual(self._locale_with(LC_ALL="fr_FR.UTF-8", LANG="es_ES"), "en")
+        self.assertEqual(self._locale_with(LC_ALL="", LC_MESSAGES="es_CO", LANG="en_US"), "es")
+        self.assertEqual(self._locale_with(LC_ALL="  ", LANG="es_AR.UTF-8"), "es")
+        self.assertEqual(self._locale_with(LC_ALL="ES_mx.UTF-8"), "es")
+
+    def test_locale_falls_back_to_getlocale_only_when_unset(self):
+        from unittest import mock
+
+        with mock.patch.object(i18n.locale, "getlocale", return_value=("es_CO", "UTF-8")):
+            self.assertEqual(self._locale_with(), "es")
+            self.assertEqual(self._locale_with(LC_ALL="C"), "en")
+        with mock.patch.object(i18n.locale, "getlocale", side_effect=ValueError("bad")):
+            self.assertEqual(self._locale_with(), "en")
 
     def test_set_language_validation(self):
         with self.assertRaises(ValueError):

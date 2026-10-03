@@ -1,10 +1,14 @@
 """Platform layer: base_dir overrides, binary cascade, exit codes, home var."""
 import os
 import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
@@ -23,6 +27,18 @@ class TestBaseDir(unittest.TestCase):
         os.environ["AGYDRA_HOME"] = "~/agydra-here"
         self.assertEqual(platforms.base_dir(), Path.home() / "agydra-here")
 
+    def test_relative_override_is_anchored_to_current_directory(self):
+        with tempfile.TemporaryDirectory(prefix="agydra-relative-root-") as directory:
+            previous_directory = Path.cwd()
+            try:
+                os.chdir(directory)
+                os.environ["AGYDRA_HOME"] = "relative-store"
+                self.assertEqual(
+                    platforms.base_dir(), Path.cwd() / "relative-store"
+                )
+            finally:
+                os.chdir(previous_directory)
+
     def test_default_is_under_home_without_override(self):
         os.environ.pop("AGYDRA_HOME", None)
         root = platforms.base_dir()
@@ -38,6 +54,90 @@ class TestBaseDir(unittest.TestCase):
             )
         finally:
             os.environ.pop("LOCALAPPDATA", None)
+
+
+class TestProcessProbes(unittest.TestCase):
+    def test_process_alive_rejects_unrepresentable_pid_without_system_call(self):
+        with mock.patch.object(platforms, "is_windows", return_value=False), mock.patch.object(
+            platforms.os, "kill"
+        ) as kill:
+            self.assertFalse(platforms.process_alive(10**100))
+            kill.assert_not_called()
+
+    def test_process_alive_treats_native_overflow_as_dead(self):
+        with mock.patch.object(platforms, "is_windows", return_value=False), mock.patch.object(
+            platforms.os, "kill", side_effect=OverflowError
+        ):
+            self.assertFalse(platforms.process_alive(1234))
+
+    def test_windows_process_alive_treats_handle_overflow_as_dead(self):
+        with mock.patch.object(platforms, "is_windows", return_value=True), mock.patch.object(
+            platforms, "_windows_process_handle", side_effect=OverflowError
+        ):
+            self.assertFalse(platforms.process_alive(1234))
+
+    def test_process_start_token_rejects_unrepresentable_pid(self):
+        with mock.patch.object(platforms, "is_windows", return_value=False):
+            self.assertIsNone(platforms.process_start_token(10**100))
+
+    def test_windows_process_start_token_treats_handle_overflow_as_unknown(self):
+        with mock.patch.object(platforms, "is_windows", return_value=True), mock.patch.object(
+            platforms, "_windows_process_handle", side_effect=OverflowError
+        ):
+            self.assertIsNone(platforms.process_start_token(1234))
+
+    def test_process_start_token_treats_ps_overflow_as_unknown(self):
+        with mock.patch.object(platforms, "is_windows", return_value=False), mock.patch.object(
+            platforms, "is_linux", return_value=False
+        ), mock.patch.object(platforms.subprocess, "run", side_effect=OverflowError):
+            self.assertIsNone(platforms.process_start_token(1234))
+
+    def test_macos_start_token_probe_uses_a_stable_locale_and_timezone(self):
+        completed = SimpleNamespace(stdout="  Thu Oct  1 12:00:00 2026\n")
+        host_env = {"PATH": "/usr/bin:/bin", "HOME": "/h", "LC_ALL": "es_AR.UTF-8", "TZ": "America/Bogota", "LANG": "es_AR.UTF-8"}
+        with mock.patch.dict(platforms.os.environ, host_env, clear=True), mock.patch.object(
+            platforms, "is_windows", return_value=False
+        ), mock.patch.object(platforms, "is_linux", return_value=False), mock.patch.object(
+            platforms.subprocess, "run", return_value=completed
+        ) as run:
+            token = platforms.process_start_token(1234)
+            self.assertEqual(platforms.os.environ["LC_ALL"], "es_AR.UTF-8")
+            self.assertEqual(platforms.os.environ["TZ"], "America/Bogota")
+        self.assertEqual(token, "Thu Oct  1 12:00:00 2026")
+        run.assert_called_once()
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["ps", "-o", "lstart=", "-p", "1234"])
+        self.assertEqual(kwargs["timeout"], platforms._PS_TOKEN_TIMEOUT_S)
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+        env = kwargs["env"]
+        self.assertEqual((env["LC_ALL"], env["TZ"]), ("C", "UTC"))
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+        self.assertEqual(env["HOME"], "/h")
+        self.assertEqual(env["LANG"], "es_AR.UTF-8")
+
+    def test_macos_start_token_probe_keeps_clean_failure_semantics(self):
+        for failure in (OSError("no ps"), subprocess.TimeoutExpired("ps", 1.0), ValueError("bad")):
+            with self.subTest(failure=type(failure).__name__), mock.patch.object(
+                platforms, "is_windows", return_value=False
+            ), mock.patch.object(platforms, "is_linux", return_value=False), mock.patch.object(
+                platforms.subprocess, "run", side_effect=failure
+            ):
+                self.assertIsNone(platforms.process_start_token(1234))
+        with mock.patch.object(platforms, "is_windows", return_value=False), mock.patch.object(
+            platforms, "is_linux", return_value=False
+        ), mock.patch.object(
+            platforms.subprocess, "run", return_value=SimpleNamespace(stdout="  \n")
+        ):
+            self.assertIsNone(platforms.process_start_token(1234))
+
+    def test_process_alive_still_probes_a_normal_pid(self):
+        with mock.patch.object(platforms, "is_windows", return_value=False), mock.patch.object(
+            platforms.os, "kill", return_value=None
+        ) as kill:
+            self.assertTrue(platforms.process_alive(1234))
+            kill.assert_called_once_with(1234, 0)
+
 
 class TestHomeRedirectVar(unittest.TestCase):
     def test_matches_platform(self):
@@ -228,6 +328,113 @@ class TestLaunch(unittest.TestCase):
         self.assertEqual(code, 126)
 
 
+class TestWaitedInterrupt(unittest.TestCase):
+    def _assert_child_cleanup_survives(self, group_interrupt):
+        with tempfile.TemporaryDirectory(prefix="agydra-interrupt-") as directory:
+            root = Path(directory)
+            completed = root / "cleanup-complete"
+            child = root / "child.py"
+            child.write_text(
+                "import signal, sys, time\n"
+                "from pathlib import Path\n"
+                "def cleanup(signum, frame):\n"
+                "    time.sleep(1.5)\n"
+                "    Path(sys.argv[1]).write_text('complete', encoding='utf-8')\n"
+                "    raise SystemExit(0)\n"
+                "signal.signal(signal.SIGINT, cleanup)\n"
+                "print('ready', flush=True)\n"
+                "if sys.argv[2] == 'parent-only':\n"
+                "    cleanup(None, None)\n"
+                "while True:\n"
+                "    signal.pause()\n",
+                encoding="utf-8",
+            )
+            parent_code = (
+                "import os, sys\n"
+                f"sys.path.insert(0, {str(Path(platforms.__file__).parent)!r})\n"
+                "import platforms\n"
+                "raise SystemExit(platforms.run_wait(sys.argv[1:], dict(os.environ)))\n"
+            )
+            proc = subprocess.Popen(
+                [sys.executable, "-c", parent_code, sys.executable, str(child), str(completed),
+                 "group" if group_interrupt else "parent-only"],
+                cwd=root, start_new_session=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                self.assertEqual(proc.stdout.readline().strip(), "ready")
+                started = time.monotonic()
+                if group_interrupt:
+                    os.killpg(proc.pid, signal.SIGINT)
+                else:
+                    os.kill(proc.pid, signal.SIGINT)
+                _out, err = proc.communicate(timeout=10)
+                elapsed = time.monotonic() - started
+                self.assertEqual(proc.returncode, 130, err)
+                self.assertTrue(completed.exists(), "parent killed child before cleanup completed")
+                self.assertGreaterEqual(elapsed, 1.2)
+            finally:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.communicate(timeout=5)
+
+    @unittest.skipIf(platforms.is_windows(), "real POSIX process-group SIGINT")
+    def test_interrupt_allows_child_cleanup_longer_than_subprocess_grace(self):
+        self._assert_child_cleanup_survives(group_interrupt=True)
+
+    @unittest.skipIf(platforms.is_windows(), "real POSIX parent-only SIGINT")
+    def test_parent_only_interrupt_waits_until_child_cleanup_finishes(self):
+        self._assert_child_cleanup_survives(group_interrupt=False)
+
+    def test_normal_child_exit_code_is_propagated(self):
+        self.assertEqual(
+            platforms.run_wait([sys.executable, "-c", "raise SystemExit(42)"], dict(os.environ)),
+            42,
+        )
+
+    def test_repeated_parent_interrupts_keep_waiting_without_kill(self):
+        proc = mock.Mock()
+        proc.wait.side_effect = [KeyboardInterrupt(), KeyboardInterrupt(), 0]
+        with mock.patch.object(subprocess, "Popen", return_value=proc):
+            self.assertEqual(platforms.run_wait([sys.executable], dict(os.environ)), 130)
+        self.assertEqual(proc.wait.call_count, 3)
+        proc.kill.assert_not_called()
+        proc.send_signal.assert_not_called()
+
+
+class TestLinkDetection(unittest.TestCase):
+    def test_lstat_detects_symlink_and_windows_reparse_metadata(self):
+        for mode, attributes, expected in (
+            (stat.S_IFLNK, 0, True),
+            (stat.S_IFDIR, stat.FILE_ATTRIBUTE_REPARSE_POINT, True),
+            (stat.S_IFREG, stat.FILE_ATTRIBUTE_REPARSE_POINT, True),
+            (stat.S_IFDIR, 0, False),
+        ):
+            with self.subTest(mode=mode, attributes=attributes):
+                metadata = SimpleNamespace(st_mode=mode, st_file_attributes=attributes)
+                with mock.patch.object(Path, "lstat", return_value=metadata):
+                    self.assertEqual(platforms.is_link(Path("entry")), expected)
+
+    def test_missing_path_is_not_link_even_in_strict_mode(self):
+        with mock.patch.object(Path, "lstat", side_effect=FileNotFoundError()):
+            self.assertFalse(platforms.is_link(Path("entry"), strict=True))
+
+    def test_strict_mode_preserves_inspection_failure(self):
+        with mock.patch.object(Path, "lstat", side_effect=PermissionError("denied")):
+            self.assertFalse(platforms.is_link(Path("entry")))
+            with self.assertRaises(PermissionError):
+                platforms.is_link(Path("entry"), strict=True)
+
+    @unittest.skipIf(platforms.is_windows(), "symlink permissions vary on Windows")
+    def test_real_dangling_symlink_is_detected_without_following(self):
+        with tempfile.TemporaryDirectory(prefix="agydra-link-") as directory:
+            path = Path(directory) / "dangling"
+            path.symlink_to(Path(directory) / "missing", target_is_directory=True)
+            self.assertTrue(platforms.is_link(path, strict=True))
+
+
 class TestDrainTtyInput(unittest.TestCase):
     """``drain_tty_input`` discards terminal query responses left in the TTY
     input queue by TUI children (Bubble Tea apps like agy's login) that exit
@@ -319,6 +526,7 @@ class TestKillProcessGroup(unittest.TestCase):
             ["taskkill", "/F", "/T", "/PID", "9999"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=2.0,
         )
         proc.kill.assert_called_once()
 

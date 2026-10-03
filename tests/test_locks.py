@@ -8,6 +8,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import locks
+import platforms
 from store import Store
 
 from conftest import BaseCase
@@ -351,6 +352,223 @@ class TestLockInodeConsistency(BaseCase):
                 second.release()
         finally:
             handle.release()
+
+    def test_try_lock_path_acquire_contention_and_idempotent_release(self):
+        target = self.store.root / "custom" / "mutex.lock"
+        handle1 = locks.try_lock_path(target, "custom mutex")
+        self.assertIsNotNone(handle1)
+        self.assertIsInstance(handle1, locks.LockHandle)
+        self.assertFalse(hasattr(handle1, "fileno"))
+        self.assertFalse(hasattr(handle1, "close"))
+
+        handle2 = locks.try_lock_path(target, "custom mutex")
+        self.assertIsNone(handle2)
+
+        handle1.release()
+        handle1.release()
+
+        handle3 = locks.try_lock_path(target, "custom mutex")
+        self.assertIsNotNone(handle3)
+        handle3.release()
+
+
+class TestMutationLock(BaseCase):
+    """``try_mutation_lock`` refuses a profile that a leased session uses even
+    when the brief flock is free, without disturbing the registry."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("work")
+        self.path = locks.lock_path(self.store, "work")
+
+    def test_live_lease_refuses_with_a_free_flock_and_keeps_the_registry(self):
+        locks.acquire_lease(self.store, "work")
+        before = self.path.read_bytes()
+        self.assertFalse(locks._flock_probe_locked(self.store, "work"))
+        self.assertIsNone(locks.try_mutation_lock(self.store, "work"))
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(
+            [h.pid for h in locks.lease_holders(self.store, "work")], [os.getpid()]
+        )
+        locks.release_lease(self.store, "work")
+
+    def test_releases_its_flock_when_it_refuses(self):
+        locks.acquire_lease(self.store, "work")
+        self.assertIsNone(locks.try_mutation_lock(self.store, "work"))
+        self.assertFalse(locks._flock_probe_locked(self.store, "work"))
+        locks.release_lease(self.store, "work")
+
+    def test_idle_profile_is_locked_and_the_lock_excludes_other_takers(self):
+        handle = locks.try_mutation_lock(self.store, "work")
+        self.assertIsNotNone(handle)
+        self.assertIsNone(locks.try_mutation_lock(self.store, "work"))
+        self.assertIsNone(locks.try_lock(self.store, "work"))
+        handle.release()
+        self.assertFalse(locks.is_locked(self.store, "work"))
+
+    def test_a_held_mutation_lock_makes_a_joiner_fail_closed(self):
+        handle = locks.try_mutation_lock(self.store, "work")
+        try:
+            with self.assertRaises(locks.LockError):
+                locks.acquire_lease(self.store, "work")
+        finally:
+            handle.release()
+        self.assertEqual(locks.lease_holders(self.store, "work"), [])
+
+    def test_a_dead_holder_is_pruned_not_honoured(self):
+        locks.acquire_lease(self.store, "work")
+        with mock.patch.object(locks.platforms, "process_alive", return_value=False):
+            handle = locks.try_mutation_lock(self.store, "work")
+        self.assertIsNotNone(handle)
+        handle.release()
+
+    def test_undecodable_registry_fails_closed(self):
+        self.path.write_bytes(b"{not json")
+        self.assertIsNone(locks.try_mutation_lock(self.store, "work"))
+        self.assertEqual(self.path.read_bytes(), b"{not json")
+
+    def test_unreadable_registry_fails_closed(self):
+        with mock.patch.object(locks, "_read_all", side_effect=OSError("boom")):
+            self.assertIsNone(locks.try_mutation_lock(self.store, "work"))
+        self.assertFalse(locks._flock_probe_locked(self.store, "work"))
+
+    def test_does_not_truncate_the_registry_like_an_inheritable_lock(self):
+        self.path.write_bytes(b'{"holders": []}')
+        handle = locks.try_mutation_lock(self.store, "work")
+        self.assertIsNotNone(handle)
+        handle.release()
+        self.assertEqual(self.path.read_bytes(), b'{"holders": []}')
+
+    def test_nul_seed_parses_as_empty_registry(self):
+        self.path.write_bytes(b"\0")
+
+        self.assertEqual(locks._parse_holders(self.path.read_bytes()), [])
+        self.assertEqual(locks.lease_holders(self.store, "work"), [])
+        self.assertFalse(locks.is_locked(self.store, "work"))
+
+        handle = locks.try_mutation_lock(self.store, "work")
+        self.assertIsNotNone(handle)
+        handle.release()
+        self.assertEqual(self.path.read_bytes(), b"\0")
+
+    def test_legacy_pid_and_large_json_pid_are_handled_safely(self):
+        legacy = str(os.getpid()).encode("ascii")
+        self.assertEqual(
+            locks._parse_holders(legacy),
+            [locks.Holder(os.getpid(), None)],
+        )
+
+        impossible_pid = str(10**100).encode("ascii")
+        self.path.write_bytes(
+            b'{"holders":[{"pid":' + impossible_pid + b',"start":null}]}'
+        )
+
+        self.assertEqual(locks.lease_holders(self.store, "work"), [])
+        self.assertFalse(locks.is_locked(self.store, "work"))
+
+    def test_maximum_width_legacy_pid_is_parsed(self):
+        self.assertEqual(
+            locks._parse_holders(b"2147483647"),
+            [locks.Holder(2147483647, None)],
+        )
+
+    def test_overlong_legacy_pid_boundaries_remain_unknown_and_busy(self):
+        for digits in (11, 4300, 4301):
+            with self.subTest(digits=digits):
+                raw = b"9" * digits
+                self.path.write_bytes(raw)
+
+                self.assertIsNone(locks._parse_holders(raw))
+                self.assertIsNone(locks.lease_holders(self.store, "work"))
+                self.assertTrue(locks.is_locked(self.store, "work"))
+
+    def test_json_pid_values_with_invalid_types_remain_unknown_and_busy(self):
+        for encoded_pid in (b"1.5", b"Infinity", b"-Infinity", b"NaN", b"true", b'"123"'):
+            with self.subTest(encoded_pid=encoded_pid):
+                raw = b'{"holders":[{"pid":' + encoded_pid + b',"start":null}]}'
+                self.path.write_bytes(raw)
+
+                self.assertIsNone(locks._parse_holders(raw))
+                self.assertIsNone(locks.lease_holders(self.store, "work"))
+                self.assertTrue(locks.is_locked(self.store, "work"))
+
+    def test_json_zero_and_negative_pids_are_dead_and_pruned(self):
+        for encoded_pid, pid in ((b"0", 0), (b"-1", -1)):
+            with self.subTest(pid=pid):
+                raw = b'{"holders":[{"pid":' + encoded_pid + b',"start":null}]}'
+                self.path.write_bytes(raw)
+
+                self.assertEqual(
+                    locks._parse_holders(raw), [locks.Holder(pid, None)]
+                )
+                self.assertEqual(locks.lease_holders(self.store, "work"), [])
+                self.assertFalse(locks.is_locked(self.store, "work"))
+
+    def test_json_pid_over_4300_digits_has_a_safe_parser_and_liveness_result(self):
+        raw = b'{"holders":[{"pid":' + (b"9" * 4301) + b',"start":null}]}'
+        self.path.write_bytes(raw)
+
+        parsed = locks._parse_holders(raw)
+        if parsed is None:
+            self.assertIsNone(locks.lease_holders(self.store, "work"))
+            self.assertTrue(locks.is_locked(self.store, "work"))
+        else:
+            self.assertEqual(len(parsed), 1)
+            self.assertIs(type(parsed[0].pid), int)
+            self.assertGreater(parsed[0].pid, 0)
+            self.assertEqual(locks.lease_holders(self.store, "work"), [])
+            self.assertFalse(locks.is_locked(self.store, "work"))
+
+
+class TestInaccessibleProcessKeepsItsLease(BaseCase):
+    """A live process Windows refuses to open must not lose its lease."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("work")
+        self.path = locks.lock_path(self.store, "work")
+        self.registry = b'{"holders":[{"pid":4321,"start":"133"}]}'
+
+    def _open_fails_with(self, error):
+        import ctypes
+
+        kernel32 = mock.Mock()
+        kernel32.OpenProcess = mock.Mock(return_value=None)
+        for patch in (
+            mock.patch.object(platforms, "is_windows", return_value=True),
+            mock.patch.object(ctypes, "WinDLL", mock.Mock(return_value=kernel32), create=True),
+            mock.patch.object(ctypes, "get_last_error", return_value=error, create=True),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_access_denied_retains_the_holder_and_the_registry_bytes(self):
+        self.path.write_bytes(self.registry)
+        self._open_fails_with(5)
+
+        holders = locks.lease_holders(self.store, "work")
+
+        self.assertEqual(holders, [locks.Holder(4321, "133")])
+        self.assertTrue(locks.is_locked(self.store, "work"))
+        self.assertIsNone(locks.try_mutation_lock(self.store, "work"))
+        self.assertEqual(self.path.read_bytes(), self.registry)
+
+    def test_unclassified_error_retains_the_holder(self):
+        self.path.write_bytes(self.registry)
+        self._open_fails_with(1450)
+
+        self.assertEqual(
+            locks.lease_holders(self.store, "work"), [locks.Holder(4321, "133")]
+        )
+
+    def test_confirmed_absence_prunes_the_holder(self):
+        self.path.write_bytes(self.registry)
+        self._open_fails_with(87)
+
+        self.assertEqual(locks.lease_holders(self.store, "work"), [])
+        self.assertFalse(locks.is_locked(self.store, "work"))
 
 
 if __name__ == "__main__":

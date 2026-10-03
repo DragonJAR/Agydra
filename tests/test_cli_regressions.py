@@ -12,16 +12,19 @@ shim (see cmd_list / cmd_import):
    Windows for an empty-but-existing data/ (os.rename FileExistsError),
    fixed by rmdir'ing the empty dir before the swap.
 """
+import argparse
 import contextlib
 import io
 import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from store import Store, StoreError, read_json_object
+import shutil as shutil_mod
 
 import ui
 from ui import strip_ansi
@@ -333,6 +336,8 @@ class TestImportGuards(BaseCase):
         original_copytree = cli.shutil.copytree
         lock_checks = []
         copytree_checks = []
+        swap_active = [False]
+        events = []
 
         def assert_lock_is_held():
             handle = original_try_lock(self.store, "locked-import")
@@ -342,18 +347,37 @@ class TestImportGuards(BaseCase):
 
         def inspect_publication(source, destination):
             assert_lock_is_held()
+            self.assertTrue(swap_active[0])
+            events.append("publication")
             return original_rename(source, destination)
 
         def inspect_copy(source, destination, *args, **kwargs):
             if not copytree_checks:
                 assert_lock_is_held()
+                self.assertTrue(swap_active[0])
+                events.append("copy")
                 copytree_checks.append(True)
             return original_copytree(source, destination, *args, **kwargs)
 
         def inspect_capture(store, name, data_dir):
             assert_lock_is_held()
+            self.assertTrue(swap_active[0])
+            events.append("capture")
             self.assertEqual(data_dir, data)
             self.assertTrue((data_dir / "settings.json").is_file())
+
+        @contextlib.contextmanager
+        def inspect_swap_guard(store):
+            assert_lock_is_held()
+            self.assertEqual(list(data.iterdir()), [])
+            swap_active[0] = True
+            events.append("guard entered")
+            try:
+                yield
+            finally:
+                assert_lock_is_held()
+                swap_active[0] = False
+                events.append("guard released")
 
         class Args:
             ref = "locked-import"
@@ -365,134 +389,89 @@ class TestImportGuards(BaseCase):
             cli.shutil, "copytree", side_effect=inspect_copy
         ), mock.patch.object(
             cli.keychain, "capture_shared_slot_for_import", side_effect=inspect_capture
+        ), mock.patch.object(
+            cli.keychain, "serialized_access", side_effect=inspect_swap_guard
         ):
             result = cli.cmd_import(self.store, Args())
 
         self.assertEqual(result, 0)
         self.assertEqual(copytree_checks, [True])
-        self.assertEqual(lock_checks, [True, True, True])
+        self.assertEqual(lock_checks, [True, True, True, True, True])
+        self.assertEqual(events, ["guard entered", "copy", "publication", "capture", "guard released"])
+        self.assertFalse(swap_active[0])
+        released = original_try_lock(self.store, "locked-import")
+        self.assertIsNotNone(released)
+        released.release()
 
-    def test_import_waits_for_swap_lock_before_keychain_capture(self):
+    def _assert_guard_failure_leaves_import_untouched(self, failure):
         import cli
         import locks
-        import threading
         from unittest import mock
 
-        if cli.keychain.fcntl is None:
-            self.skipTest("keychain bridge serialization requires POSIX flock")
-
-        name = "waiting-import"
+        name = "guard-failure"
         self.store.create(name)
-        source = self._tmp / "import-source"
-        source.mkdir()
-        (source / "settings.json").write_text("{}", encoding="utf-8")
         data = self.store.profile_data_dir(name)
-        original_serialized = cli.keychain.serialized_access
-        original_try_lock = locks.try_lock
-        waiting_for_swap = threading.Event()
-        captured = threading.Event()
+        profile_path = self.store.profile_meta_path(name)
+        profile_before = profile_path.read_bytes()
+        data_before = data.stat()
+        source_file = self.source / "settings.json"
+        source_before = source_file.read_bytes()
         profile_locks_at_swap = []
-        profile_locks_at_capture = []
-        results = []
-        failures = []
-        held_swap = cli.keychain._serialize_lock(self.store)
 
-        @contextlib.contextmanager
-        def inspect_serialized_access(store):
-            waiting_for_swap.set()
-            with original_serialized(store):
-                handle = original_try_lock(store, name)
-                profile_locks_at_swap.append(handle is None)
-                if handle is not None:
-                    handle.release()
-                yield
-
-        def inspect_capture(store, profile_name, data_dir):
-            handle = original_try_lock(store, profile_name)
-            profile_locks_at_capture.append(handle is None)
+        def deny_swap(store):
+            self.assertIs(store, self.store)
+            handle = locks.try_lock(store, name)
+            profile_locks_at_swap.append(handle is None)
             if handle is not None:
                 handle.release()
-            self.assertEqual(profile_name, name)
-            self.assertTrue((data_dir / "settings.json").is_file())
-            captured.set()
+            self.assertEqual(list(data.iterdir()), [])
+            raise failure
 
         class Args:
-            pass
+            ref = name
+            source = str(self.source)
 
-        Args.ref = name
-        Args.source = str(source)
-
-        def import_profile():
-            try:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    results.append(cli.cmd_import(self.store, Args()))
-            except BaseException as exc:
-                failures.append(exc)
-
-        worker = threading.Thread(target=import_profile)
-        try:
-            with mock.patch.object(
-                cli.keychain,
-                "serialized_access",
-                side_effect=inspect_serialized_access,
-            ), mock.patch.object(
-                cli.keychain,
-                "capture_shared_slot_for_import",
-                side_effect=inspect_capture,
-            ):
-                worker.start()
-                self.assertTrue(waiting_for_swap.wait(5))
-                self.assertFalse(captured.wait(0.1))
-                profile_handle = original_try_lock(self.store, name)
-                if profile_handle is not None:
-                    profile_handle.release()
-                self.assertIsNone(profile_handle)
-                held_swap.close()
-                worker.join(5)
-        finally:
-            held_swap.close()
-            if worker.is_alive():
-                worker.join(5)
-
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(failures, [])
-        self.assertEqual(results, [0])
-        self.assertEqual(profile_locks_at_swap, [True])
-        self.assertEqual(profile_locks_at_capture, [True])
-        self.assertTrue(captured.is_set())
-
-    def test_import_skips_keychain_capture_when_swap_lock_cannot_be_acquired(self):
-        import cli
-        from unittest import mock
-
-        name = "skipped-capture"
-        self.store.create(name)
-        source = self._tmp / "skip-import-source"
-        source.mkdir()
-        (source / "settings.json").write_text("{}", encoding="utf-8")
-
-        class Args:
-            pass
-
-        Args.ref = name
-        Args.source = str(source)
-
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+        stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(
-            cli.keychain,
-            "serialized_access",
-            side_effect=OSError("swap lock unavailable"),
+            cli.keychain, "serialized_access", side_effect=deny_swap
         ) as serialized, mock.patch.object(
             cli.keychain, "capture_shared_slot_for_import"
-        ) as capture, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            result = cli.cmd_import(self.store, Args())
+        ) as capture, mock.patch.object(
+            cli.shutil, "copytree"
+        ) as copytree, mock.patch.object(
+            cli, "rename_dir_with_retry"
+        ) as publish, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(type(failure)) as caught:
+                cli.cmd_import(self.store, Args())
 
-        self.assertEqual(result, 0)
+        self.assertIs(caught.exception, failure)
         serialized.assert_called_once_with(self.store)
         capture.assert_not_called()
-        self.assertIn("keychain import capture skipped", stderr.getvalue())
-        self.assertIn("continuing without it", stderr.getvalue())
+        copytree.assert_not_called()
+        publish.assert_not_called()
+        self.assertEqual(profile_locks_at_swap, [True])
+        self.assertEqual(source_file.read_bytes(), source_before)
+        self.assertEqual(profile_path.read_bytes(), profile_before)
+        self.assertEqual(list(data.iterdir()), [])
+        self.assertEqual((data.stat().st_dev, data.stat().st_ino), (data_before.st_dev, data_before.st_ino))
+        self.assertEqual(list(data.parent.glob(".import-*")), [])
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+        released = locks.try_lock(self.store, name)
+        self.assertIsNotNone(released)
+        released.release()
+
+    def test_import_refuses_busy_swap_before_copy(self):
+        import cli
+
+        self._assert_guard_failure_leaves_import_untouched(
+            cli.keychain.KeychainBusyError("shared keychain slot busy")
+        )
+
+    def test_import_aborts_when_swap_lock_cannot_be_acquired(self):
+        self._assert_guard_failure_leaves_import_untouched(
+            OSError("swap lock unavailable")
+        )
 
     def test_import_onto_empty_profile_succeeds(self):
         import cli
@@ -736,6 +715,74 @@ class TestLateFlagsDashDashOrder(BaseCase):
         self.assertEqual(out, "")
 
 
+class TestReadOnlyRandomDryRun(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("cc", engine="claude")
+        os.environ["AGYDRA_CLAUDE_BIN"] = sys.executable
+
+    def test_random_claude_dry_run_uses_read_only_plan_without_native_probe(self):
+        import cli
+
+        original_build_plan = cli.runner.build_plan
+        with mock.patch.object(
+            cli.account,
+            "claude_auth_status",
+            side_effect=AssertionError("random dry-run must not probe native auth"),
+        ) as native_probe, mock.patch.object(
+            cli.runner, "build_plan", wraps=original_build_plan
+        ) as build_plan, mock.patch.object(
+            cli.runner, "run", return_value=0
+        ) as run:
+            code = cli.main(["--random", "--engine", "claude", "--dry-run"])
+
+        self.assertEqual(code, 0)
+        native_probe.assert_not_called()
+        self.assertTrue(build_plan.call_args.kwargs["read_only"])
+        self.assertTrue(run.call_args.kwargs["dry_run"])
+        self.assertEqual(run.call_args.args[0].profile, "cc")
+
+
+class TestStatusDryRunIsReadOnly(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("work")
+
+    def test_status_dry_run_does_not_recover_a_pending_rename_journal(self):
+        import cli
+
+        journal = self.store.rename_journal_path
+        journal_bytes = b"pending rename journal must be preserved\x00\xff"
+        journal.write_bytes(journal_bytes)
+        args = argparse.Namespace(dry_run=True, ref="work", engine=None)
+
+        with mock.patch.object(
+            Store,
+            "_recover_pending_rename",
+            side_effect=AssertionError("status --dry-run must not recover state"),
+        ) as recover, contextlib.redirect_stderr(io.StringIO()) as err:
+            code = cli.cmd_status(self.store, args)
+
+        self.assertEqual(code, 1)
+        self.assertIn("recovery is pending", strip_ansi(err.getvalue()))
+        recover.assert_not_called()
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+
+    def test_status_dry_run_plans_with_the_read_only_flag(self):
+        import cli
+
+        args = argparse.Namespace(dry_run=True, ref="work", engine=None)
+        with mock.patch.object(
+            cli.runner, "build_plan", wraps=cli.runner.build_plan
+        ) as build_plan, contextlib.redirect_stdout(io.StringIO()):
+            code = cli.cmd_status(self.store, args)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(build_plan.call_args.kwargs["read_only"])
+
+
 class TestAssertFreeActionContext(BaseCase):
     """_assert_free should customize the error message according to the action."""
 
@@ -779,8 +826,24 @@ class TestDeleteTOCTOUGuard(BaseCase):
         try:
             with self.assertRaises(StoreError) as ctx:
                 cli._finish_delete(self.store, "victim", no_backup=True)
-            self.assertIn("has a live session", str(ctx.exception))
+            self.assertIn("holder state could not be verified", str(ctx.exception))
+            self.assertNotIn("kill", str(ctx.exception))
             self.assertIn("before deleting the profile", str(ctx.exception))
+        finally:
+            handle.release()
+
+    def test_busy_lock_without_a_verified_lease_never_suggests_kill(self):
+        import cli
+        import locks
+        locks.lock_path(self.store, "victim").write_text("12345", encoding="utf-8")
+        handle = locks.try_lock(self.store, "victim")
+        try:
+            with self.assertRaises(StoreError) as ctx:
+                cli._assert_free(self.store, "victim", "deleting the profile")
+            message = str(ctx.exception)
+            self.assertNotIn("kill", message)
+            self.assertNotIn("12345", message)
+            self.assertIn("could not be verified", message)
         finally:
             handle.release()
 
@@ -808,7 +871,7 @@ class TestShareConfigDeduplication(BaseCase):
         from unittest import mock
 
         self.store.create("zeta")
-        original_try_lock = locks.try_lock
+        original_try_lock = locks.try_mutation_lock
         original_copy = cli.atomic_copy
         acquired_names = []
         lock_checks = []
@@ -829,7 +892,7 @@ class TestShareConfigDeduplication(BaseCase):
             lock_checks.append(available)
             return original_copy(source, destination)
 
-        with mock.patch.object(locks, "try_lock", side_effect=observe_try_lock), mock.patch.object(
+        with mock.patch.object(locks, "try_mutation_lock", side_effect=observe_try_lock), mock.patch.object(
             cli, "atomic_copy", side_effect=inspect_copy
         ):
             copied = cli._share_config(self.store, "src", ["zeta", "target"])
@@ -847,7 +910,7 @@ class TestShareConfigDeduplication(BaseCase):
         self.store.create("zeta")
         target_file = self.store.profile_data_dir("target") / "settings.json"
         target_file.write_text("existing", encoding="utf-8")
-        original_try_lock = locks.try_lock
+        original_try_lock = locks.try_mutation_lock
         removed = []
 
         def remove_last_target_after_lock(store, name):
@@ -858,7 +921,7 @@ class TestShareConfigDeduplication(BaseCase):
             return handle
 
         with mock.patch.object(
-            locks, "try_lock", side_effect=remove_last_target_after_lock
+            locks, "try_mutation_lock", side_effect=remove_last_target_after_lock
         ), mock.patch.object(cli, "atomic_copy") as copy_file:
             with self.assertRaises(StoreError):
                 cli._share_config(self.store, "src", ["target", "zeta"])
@@ -1121,7 +1184,7 @@ os._exit(0)
         from unittest import mock
 
         store = Store(root=root)
-        original_try_lock = locks.try_lock
+        original_try_lock = locks.try_mutation_lock
         original_try_sequence_lock = locks.try_sequence_lock
         original_serialize_lock = keychain._serialize_lock
         recovery_events = []
@@ -1148,7 +1211,7 @@ os._exit(0)
         ), mock.patch.object(
             keychain, "_serialize_lock", side_effect=observe_swap_lock
         ), mock.patch.object(
-            locks, "try_lock", side_effect=observe_profile_lock
+            locks, "try_mutation_lock", side_effect=observe_profile_lock
         ), mock.patch.object(
             locks, "try_sequence_lock", side_effect=observe_sequence_lock
         ), contextlib.redirect_stdout(io.StringIO()):
@@ -1349,5 +1412,293 @@ class TestHelpFormattingRegression(BaseCase):
     def test_doctor_fix_help_does_not_claim_lock_sentinels_are_removed(self):
         result = self._run_cli("doctor", "--help")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("(overlays/keychain/backups)", result.stdout)
-        self.assertNotIn("overlays/locks/keychain/backups", result.stdout)
+        flat = " ".join(result.stdout.split())
+        self.assertIn("(overlays and keychain files)", flat)
+        self.assertIn("backup ZIPs are never scanned or deleted", flat)
+        self.assertNotIn("backups)", flat)
+        self.assertNotIn("overlays/locks/keychain", flat)
+
+
+class TestImportRuntimeExclusion(BaseCase):
+    """Import must skip engine runtime artifacts (sockets, tmp trees).
+
+    A live ``~/.codex`` holds unix sockets (``ipc/ipc.sock``,
+    ``app-server-daemon/*.sock``) and ephemeral ``tmp/arg0`` wrapper trees
+    that vanish mid-copy. Without exclusion the import fails with an
+    unreadable ``shutil.Error`` tuple wall (or copies dead sockets into
+    the profile); with it, only portable configuration lands.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.source = self.fake_home / ".codex"
+        (self.source / "ipc").mkdir(parents=True)
+        (self.source / "ipc" / "ipc.sock").write_bytes(b"")
+        (self.source / "tmp" / "path" / "codex-arg0XYZ").mkdir(parents=True)
+        (self.source / "tmp" / "path" / "codex-arg0XYZ" / "apply_patch").write_bytes(b"")
+        (self.source / "app-server-daemon").mkdir()
+        (self.source / "app-server-daemon" / "daemon-updater.sock").write_bytes(b"")
+        (self.source / "auth.json").write_text("{}", encoding="utf-8")
+
+    def test_codex_runtime_artifacts_are_excluded(self):
+        import cli
+
+        self.store.create("cx", engine="codex")
+
+        class Args:
+            ref = "cx"
+            source = None
+
+        rc = cli.cmd_import(self.store, Args())
+        self.assertEqual(rc, 0)
+        data = self.store.profile_data_dir("cx", engine="codex")
+        self.assertTrue((data / "auth.json").is_file())
+        self.assertFalse((data / "ipc").exists())
+        self.assertFalse((data / "tmp").exists())
+        self.assertFalse((data / "app-server-daemon").exists())
+
+    def test_copytree_failure_is_summarized_not_dumped(self):
+        import cli
+        from unittest import mock
+
+        self.store.create("cx2", engine="codex")
+
+        class Args:
+            ref = "cx2"
+            source = None
+
+        err = shutil_mod.Error(
+            [("/src/a", "/dst/a", "[Errno 13] denied"), ("/src/b", "/dst/b", "[Errno 2] gone")]
+        )
+        with mock.patch.object(cli.shutil, "copytree", side_effect=err):
+            with self.assertRaises(StoreError) as ctx:
+                cli.cmd_import(self.store, Args())
+        message = str(ctx.exception)
+        self.assertIn("import failed", message)
+        self.assertIn("2 entries", message)
+        self.assertIn("/src/a", message)
+        self.assertNotIn("/src/b", message)
+        parent = self.store.profile_data_dir("cx2", engine="codex").parent
+        self.assertFalse(
+            [p for p in parent.iterdir() if p.name.startswith(".import-")],
+            "failed import left temp litter",
+        )
+
+
+class TestSummarizeImportFailure(BaseCase):
+    def test_non_list_or_empty_args_are_summarized_without_crashing(self):
+        import cli
+
+        for error in (shutil_mod.Error(), shutil_mod.Error("plain reason"), shutil_mod.Error([])):
+            with self.subTest(args=error.args):
+                message = cli._summarize_import_failure(error, Path("/src"))
+                self.assertIn("0 entries could not be copied from /src", message)
+
+
+
+class TestLeaseAwareProfileLocks(BaseCase):
+    def setUp(self):
+        super().setUp()
+        import json
+
+        import locks
+        import platforms
+
+        self.json = json
+        self.locks = locks
+        self.platforms = platforms
+        self.store = Store()
+        self.store.create("work")
+        self.store.create("other")
+        self.source = self._tmp / "generic-source"
+        self.source.mkdir()
+        (self.source / "imported.txt").write_text("sandbox", encoding="utf-8")
+        (self.store.profile_data_dir("work") / "settings.json").write_text(
+            '{"from": "work"}', encoding="utf-8"
+        )
+        self.holder = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)"]
+        )
+        self.addCleanup(self._stop_holder)
+
+    def _stop_holder(self):
+        self.holder.kill()
+        self.holder.wait()
+
+    def _register_live_holder(self, name):
+        path = self.locks.lock_path(self.store, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "pid": self.holder.pid,
+            "start": self.platforms.process_start_token(self.holder.pid),
+        }
+        path.write_text(self.json.dumps({"holders": [entry]}), encoding="utf-8")
+        return path
+
+    def _run(self, argv):
+        import cli
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = cli.main(argv)
+        return status, out.getvalue(), err.getvalue()
+
+    def _assert_lease_intact(self, name, path, before):
+        self.assertEqual(path.read_bytes(), before)
+        holders = self.locks.lease_holders(self.store, name)
+        self.assertEqual([h.pid for h in holders], [self.holder.pid])
+        self.assertTrue(self.locks.is_locked(self.store, name))
+
+    def test_import_into_a_profile_with_a_live_holder_is_refused_and_keeps_the_lease(self):
+        lease = self._register_live_holder("work")
+        before = lease.read_bytes()
+        data_dir = self.store.profile_data_dir("work")
+        for leftover in list(data_dir.iterdir()):
+            leftover.unlink()
+
+        status, out, err = self._run(["import", "work", "--source", str(self.source)])
+
+        self.assertEqual(status, 1, err)
+        self.assertIn("live session", err)
+        self.assertIn(f"PID {self.holder.pid}", err)
+        self.assertNotIn("imported generic data", out)
+        self.assertEqual(list(data_dir.iterdir()), [])
+        self._assert_lease_intact("work", lease, before)
+
+    def test_share_config_with_a_live_holder_at_the_source_is_refused(self):
+        lease = self._register_live_holder("work")
+        before = lease.read_bytes()
+
+        status, out, err = self._run(["share-config", "work", "other"])
+
+        self.assertEqual(status, 1, err)
+        self.assertIn("live session", err)
+        self.assertFalse((self.store.profile_data_dir("other") / "settings.json").exists())
+        self._assert_lease_intact("work", lease, before)
+
+    def test_share_config_with_a_live_holder_at_the_destination_is_refused(self):
+        lease = self._register_live_holder("other")
+        before = lease.read_bytes()
+
+        status, out, err = self._run(["share-config", "work", "other"])
+
+        self.assertEqual(status, 1, err)
+        self.assertIn("live session", err)
+        self.assertFalse((self.store.profile_data_dir("other") / "settings.json").exists())
+        self._assert_lease_intact("other", lease, before)
+
+    def test_share_config_with_live_holders_at_source_and_destination_keeps_both_leases(self):
+        source_lease = self._register_live_holder("work")
+        target_lease = self._register_live_holder("other")
+        source_before, target_before = source_lease.read_bytes(), target_lease.read_bytes()
+
+        status, out, err = self._run(["share-config", "work", "other"])
+
+        self.assertEqual(status, 1, err)
+        self.assertIn("live session", err)
+        self._assert_lease_intact("work", source_lease, source_before)
+        self._assert_lease_intact("other", target_lease, target_before)
+
+    def test_idle_profiles_still_import_and_share(self):
+        status, out, err = self._run(["share-config", "work", "other"])
+        self.assertEqual(status, 0, err)
+        self.assertTrue((self.store.profile_data_dir("other") / "settings.json").is_file())
+        for leftover in list(self.store.profile_data_dir("work").iterdir()):
+            leftover.unlink()
+        status, out, err = self._run(["import", "work", "--source", str(self.source)])
+        self.assertEqual(status, 0, err)
+        self.assertTrue((self.store.profile_data_dir("work") / "imported.txt").is_file())
+
+    def test_create_succeeds_without_copying_settings_from_a_busy_default(self):
+        lease = self._register_live_holder("work")
+        before = lease.read_bytes()
+
+        status, out, err = self._run(["create", "fresh"])
+
+        self.assertEqual(status, 0, err)
+        self.assertIn("created profile: fresh", out)
+        self.assertIn("settings not copied from default profile 'work'", err)
+        self.assertIn("live session", err)
+        self.assertFalse((self.store.profile_data_dir("fresh") / "settings.json").exists())
+        self._assert_lease_intact("work", lease, before)
+
+    def test_create_does_not_mask_a_copy_failure_that_is_not_a_busy_profile(self):
+        import cli
+
+        with mock.patch.object(
+            cli, "atomic_copy", side_effect=OSError("disk full")
+        ), self.assertRaises(OSError):
+            cli.cmd_create(self.store, argparse.Namespace(name="fresh", engine="agy", description=""))
+
+    def test_create_does_not_mask_a_non_busy_store_error_from_the_copy(self):
+        import cli
+
+        with mock.patch.object(
+            cli, "_share_config", side_effect=StoreError("cannot safely share config")
+        ), self.assertRaises(StoreError):
+            cli.cmd_create(self.store, argparse.Namespace(name="fresh", engine="agy", description=""))
+
+    def test_an_unreadable_lease_registry_is_reported_as_unverified_and_still_refuses(self):
+        import cli
+
+        path = self.locks.lock_path(self.store, "work")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"{not json")
+        before = path.read_bytes()
+
+        with self.assertRaises(cli.ProfileBusyError) as ctx:
+            cli._assert_free(self.store, "work", "importing into it")
+
+        message = str(ctx.exception)
+        self.assertIn("could not be verified", message)
+        self.assertNotIn("a live session", message)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_assert_free_names_a_pid_only_for_verified_holders(self):
+        import cli
+        from types import SimpleNamespace
+
+        def holder(pid, start):
+            return SimpleNamespace(pid=pid, start=start)
+
+        cases = (
+            ([holder(11, "t1"), holder(22, "t2")], ["2 live sessions", "first PID 11", "kill 11"], []),
+            ([holder(11, None), holder(22, None)], ["2 live sessions", "unverified"], ["kill", "PID"]),
+            ([holder(11, None)], ["a live session", "unverified"], ["kill", "PID"]),
+        )
+        for holders, expected, forbidden in cases:
+            with self.subTest(holders=[(h.pid, h.start) for h in holders]):
+                with mock.patch.object(
+                    cli.locks, "is_locked", return_value=True
+                ), mock.patch.object(cli.locks, "lease_holders", return_value=holders):
+                    with self.assertRaises(cli.ProfileBusyError) as ctx:
+                        cli._assert_free(self.store, "work", "importing into it")
+                message = str(ctx.exception)
+                for text in expected:
+                    self.assertIn(text, message)
+                for text in forbidden:
+                    self.assertNotIn(text, message)
+
+    def test_profile_lock_helper_reports_a_lock_error_as_unsafe_to_proceed(self):
+        import cli
+
+        with mock.patch.object(
+            cli.locks, "try_mutation_lock", side_effect=cli.locks.LockError("registry unreadable")
+        ):
+            with self.assertRaisesRegex(StoreError, "cannot safely proceed") as ctx:
+                cli._acquire_profile_lock(self.store, "work", "importing into it")
+        self.assertNotIsInstance(ctx.exception, cli.ProfileBusyError)
+        self.assertIn("registry unreadable", str(ctx.exception))
+
+    def test_profile_lock_helper_uses_the_lease_aware_mutation_lock(self):
+        import cli
+
+        with mock.patch.object(
+            cli.locks, "try_lock", side_effect=AssertionError("legacy lock")
+        ), mock.patch.object(
+            cli.locks, "try_mutation_lock", return_value=mock.Mock()
+        ) as mutation:
+            handle = cli._acquire_profile_lock(self.store, "work", "importing into it")
+        mutation.assert_called_once_with(self.store, "work")
+        self.assertIsNotNone(handle)

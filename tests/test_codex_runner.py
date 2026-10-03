@@ -40,6 +40,16 @@ class TestCodexRunner(BaseCase):
         self.assertEqual(plan.args, ["--no-daemon", "exec", "test"])
         self.assertEqual(plan.env_home_var, platforms.home_redirect_var())
 
+    def test_describe_shows_effective_codex_home_destination(self):
+        self.store.create("cx-home", engine="codex")
+        plan = runner.build_plan(self.store, [], flag_ref="cx-home")
+        description = plan.describe()
+
+        self.assertIn(
+            f"{platforms.home_redirect_var()}={plan.overlay}", description
+        )
+        self.assertIn(f"CODEX_HOME={plan.overlay / '.codex'}", description)
+
     def test_build_plan_injects_no_daemon_for_codex(self):
         self.store.create("cx-nd", engine="codex")
         plan = runner.build_plan(self.store, [], flag_ref="cx-nd")
@@ -47,6 +57,36 @@ class TestCodexRunner(BaseCase):
 
         plan2 = runner.build_plan(self.store, ["--no-daemon", "status"], flag_ref="cx-nd")
         self.assertEqual(plan2.args, ["--no-daemon", "status"])
+
+    def test_describe_shows_grok_destinations_without_creating_socket_paths(self):
+        import hashlib
+
+        grok_bin = self.bin_dir / "grok"
+        grok_bin.write_text("synthetic grok binary", encoding="utf-8")
+        grok_bin.chmod(0o755)
+        self.store.create("grok-home", engine="grok")
+        preferred = self.store.overlays_dir / "grok-home" / ".grok" / "leader.sock"
+        if platforms.is_windows() or len(os.fsencode(str(preferred))) <= 103:
+            expected_socket = str(preferred)
+        else:
+            digest = hashlib.sha256(os.fsencode(str(preferred))).hexdigest()[:16]
+            expected_socket = str(
+                Path(f"/tmp/agydra-{os.getuid()}") / f"{digest}.sock"
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {platforms.GROK_BIN_ENV: str(grok_bin), "XAI_API_KEY": "synthetic-secret"},
+        ), mock.patch(
+            "isolation.grok_leader_socket",
+            side_effect=AssertionError("planning must not create or reclaim a socket"),
+        ):
+            plan = runner.build_plan(self.store, [], flag_ref="grok-home")
+
+        description = plan.describe()
+        self.assertIn(f"GROK_HOME={plan.overlay / '.grok'}", description)
+        self.assertIn(f"GROK_LEADER_SOCKET={expected_socket}", description)
+        self.assertNotIn("synthetic-secret", description)
 
     def test_run_bypasses_keychain_for_codex(self):
         self.store.create("cx-work", engine="codex")
@@ -58,24 +98,53 @@ class TestCodexRunner(BaseCase):
             self.assertEqual(rc, 0)
             mock_guard.assert_not_called()
 
+    def _authenticate_all_engines(self):
+        for name in ("agy1", "agy2"):
+            token = self.store.profile_data_dir(name) / "antigravity-cli" / "antigravity-oauth-token"
+            token.parent.mkdir(parents=True, exist_ok=True)
+            token.write_text(
+                json.dumps({"token": {"access_token": "t-" + name}}), encoding="utf-8"
+            )
+        for name in ("cx1", "cx2"):
+            (self.store.profile_data_dir(name) / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "tokens": {
+                            "id_token": _make_jwt({"email": name + "@dragonjar.org"}),
+                            "access_token": "t-" + name,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    def _rotate(self, engine, rounds):
+        picks = []
+        for stamp in range(1, rounds + 1):
+            name = resolver.pick_free_profile(self.store, engine=engine).name
+            picks.append(name)
+            profile = self.store.get(name)
+            profile.last_used = f"2026-01-01T00:00:{stamp:02d}.000+00:00"
+            self.store.save(profile)
+        return picks
+
     def test_random_pick_filtered_by_engine(self):
-        self.store.create("agy1", engine="agy")
-        self.store.create("agy2", engine="agy")
-        self.store.create("cx1", engine="codex")
-        self.store.create("cx2", engine="codex")
+        import account
 
-        jwt1 = _make_jwt({"email": "cx1@dragonjar.org"})
-        jwt2 = _make_jwt({"email": "cx2@dragonjar.org"})
-        (self.store.profile_data_dir("cx1") / "auth.json").write_text(
-            json.dumps({"tokens": {"id_token": jwt1, "access_token": "a1"}}), encoding="utf-8"
-        )
-        (self.store.profile_data_dir("cx2") / "auth.json").write_text(
-            json.dumps({"tokens": {"id_token": jwt2, "access_token": "a2"}}), encoding="utf-8"
-        )
+        for name, engine in (
+            ("agy1", "agy"), ("agy2", "agy"), ("cx1", "codex"), ("cx2", "codex"),
+        ):
+            self.store.create(name, engine=engine)
+        self._authenticate_all_engines()
+        for name in ("agy1", "agy2", "cx1", "cx2"):
+            profile = self.store.get(name)
+            state = account.auth_state(
+                self.store.profile_data_dir(name), self.store, name, engine=profile.engine
+            )
+            self.assertEqual(state, "authenticated", name)
 
-        # Pick codex profile
-        res_codex = resolver.pick_free_profile(self.store, engine="codex")
-        self.assertIn(res_codex.name, ["cx1", "cx2"])
+        self.assertEqual(self._rotate("codex", 4), ["cx1", "cx2", "cx1", "cx2"])
+        self.assertEqual(self._rotate("agy", 4), ["agy1", "agy2", "agy1", "agy2"])
 
     def test_cli_create_with_engine(self):
         rc = cli.main(["create", "my-codex", "-e", "codex", "-d", "OpenAI account"])

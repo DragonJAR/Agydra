@@ -1,5 +1,6 @@
 """orphans: reverse scan + cleanup of store artifacts left by a manually
 deleted profile (overlays/, locks/, keychain/, backups/)."""
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -53,20 +54,19 @@ class TestFindOrphans(BaseCase):
         self.assertEqual(scan.overlays, ["ghost"])
         self.assertEqual(scan.keychain_secrets, ["ghost"])
         self.assertEqual(scan.keychain_quarantine, [self.ghost_quarantine.name])
-        self.assertEqual(scan.backups, [self.ghost_backup.name])
         self.assertFalse(scan.is_empty())
 
         desc = scan.describe()
         self.assertIn("overlay directories: overlays/ghost", desc)
         self.assertIn("keychain secret backups: keychain/ghost.secret", desc)
         self.assertIn(f"keychain quarantine files: keychain/{self.ghost_quarantine.name}", desc)
-        self.assertIn(f"backup archives: backups/{self.ghost_backup.name}", desc)
+        self.assertFalse(any("backup archives" in line for line in desc))
 
         actions = scan.describe_actions()
         self.assertIn("remove orphan overlay directory overlays/ghost", actions)
         self.assertIn("remove orphan keychain secret backup keychain/ghost.secret", actions)
         self.assertIn(f"remove orphan keychain quarantine file keychain/{self.ghost_quarantine.name}", actions)
-        self.assertIn(f"remove orphan backup archive backups/{self.ghost_backup.name}", actions)
+        self.assertFalse(any("backups/" in line for line in actions))
 
     def test_clean_store_reports_empty(self):
         store = Store(root=self._tmp / "clean-store")
@@ -93,7 +93,6 @@ class TestFindOrphans(BaseCase):
         self.assertNotIn("alive", scan.overlays)
         self.assertNotIn("alive", scan.keychain_secrets)
         self.assertNotIn(self.alive_quarantine.name, scan.keychain_quarantine)
-        self.assertNotIn(self.alive_backup.name, scan.backups)
         orphans.remove_orphans(self.store, scan)
         self.assertTrue((self.store.overlays_dir / "alive").exists())
         self.assertEqual(
@@ -109,7 +108,7 @@ class TestFindOrphans(BaseCase):
         scan = orphans.find_orphans(self.store, self.store.names())
         orphans.remove_orphans(self.store, scan)
 
-        self.assertNotIn(manual_archive.name, scan.backups)
+        self.assertFalse(any("manual.zip" in line for line in scan.describe()))
         self.assertTrue(manual_archive.exists())
 
     def test_ignores_artifacts_with_names_that_cannot_be_profiles(self):
@@ -176,9 +175,11 @@ class TestRemoveOrphans(BaseCase):
         )
 
         self.assertFalse(self.ghost_quarantine.exists())
-        self.assertFalse(self.ghost_backup.exists())
+        # Store.delete safety archives are recovery data, never orphans.
+        self.assertTrue(self.ghost_backup.exists())
         self.assertTrue(self.alive_backup.exists())
 
+        self.assertFalse(any("backup" in line and "keychain" not in line for line in removed))
         self.assertTrue(any("ghost" in line for line in removed))
         self.assertFalse(any("alive" in line for line in removed))
 
@@ -198,6 +199,48 @@ class TestRemoveOrphans(BaseCase):
         self.assertTrue(self.ghost_quarantine.exists())
         self.assertTrue(self.ghost_backup.exists())
 
+    def test_skips_every_artifact_when_a_leased_session_is_live(self):
+        """A registered lease blocks cleanup even with the flock free."""
+        scan = orphans.find_orphans(self.store, self.store.names())
+        locks.acquire_lease(self.store, "ghost")
+        self.addCleanup(locks.release_lease, self.store, "ghost")
+        self.assertFalse(locks._flock_probe_locked(self.store, "ghost"))
+
+        removed = orphans.remove_orphans(self.store, scan)
+
+        self.assertEqual(removed, [])
+        self.assertTrue((self.store.overlays_dir / "ghost").exists())
+        self.assertEqual(
+            keychain.load_profile_slot(self.store, "ghost"), b"ghost-secret"
+        )
+        self.assertTrue(self.ghost_quarantine.exists())
+
+    def test_delete_safety_archive_survives_cleanup(self):
+        """``Store.delete`` leaves a recovery ZIP for a profile that no longer
+        exists; neither detection nor removal may treat it as an orphan."""
+        self.store.create("gone")
+        (self.store.profile_data_dir("gone") / "keep.txt").write_text("precious")
+        archive = self.store.delete("gone")
+        self.assertIsNotNone(archive)
+        self.assertTrue(archive.is_file())
+
+        scan = orphans.find_orphans(self.store, self.store.names())
+        self.assertFalse(any("gone" in line for line in scan.describe()))
+        self.assertFalse(any("gone" in line for line in scan.describe_actions()))
+        orphans.remove_orphans(self.store, scan)
+        orphans.remove_orphans(self.store, orphans.OrphanScan(overlays=["gone"]))
+
+        self.assertTrue(archive.is_file())
+
+    def test_doctor_fix_keeps_the_delete_safety_archive(self):
+        import doctor
+
+        self.store.create("gone")
+        archive = self.store.delete("gone")
+        with mock.patch.object(doctor.keychain, "supported", return_value=False):
+            doctor.run_checks(self.store, fix=True)
+        self.assertTrue(archive.is_file())
+
     def test_session_lock_files_are_not_cleanup_targets(self):
         scan = orphans.find_orphans(self.store, self.store.names())
 
@@ -211,7 +254,7 @@ class TestRemoveOrphans(BaseCase):
         lock_state = {"held": False}
 
         class LockHandle:
-            def close(self):
+            def release(self):
                 lock_state["held"] = False
 
         def acquire_swap_lock(_store):
@@ -240,7 +283,6 @@ class TestRemoveOrphans(BaseCase):
         (self.store.overlays_dir / "ghost").rmdir()
         keychain.slot_backup_path(self.store, "ghost").unlink()
         self.ghost_quarantine.unlink()
-        self.ghost_backup.unlink()
 
         removed = orphans.remove_orphans(self.store, scan)
 
@@ -273,7 +315,6 @@ class TestRemoveOrphans(BaseCase):
         self.assertIn("ghost", scan.overlays)
         self.assertIn("ghost", scan.keychain_secrets)
         self.assertIn(self.ghost_quarantine.name, scan.keychain_quarantine)
-        self.assertIn(self.ghost_backup.name, scan.backups)
 
         self.store.create("ghost")
         (self.store.overlays_dir / "ghost" / "marker").write_text("fresh")
@@ -383,6 +424,95 @@ class TestCmdDoctorFix(BaseCase):
         rc = cli.cmd_doctor(self.store, NoFixArgs())
         self.assertEqual(rc, 0)
         self.assertTrue((self.store.overlays_dir / "ghost").exists())
+
+
+class TestOrphanLinkSafety(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("alive")
+        self.store.overlays_dir.mkdir(parents=True, exist_ok=True)
+        self.outside = self._tmp / "external-tree"
+        (self.outside / "ghost").mkdir(parents=True)
+        (self.outside / "ghost" / "keep.txt").write_bytes(b"external")
+
+    def _snapshot(self):
+        return sorted(
+            (str(p.relative_to(self.outside)), p.read_bytes() if p.is_file() else b"")
+            for p in self.outside.rglob("*")
+        )
+
+    def test_overlays_root_link_is_never_scanned_or_written_through(self):
+        import shutil
+
+        shutil.rmtree(self.store.overlays_dir)
+        self.store.overlays_dir.symlink_to(self.outside, target_is_directory=True)
+        before = self._snapshot()
+
+        scan = orphans.find_orphans(self.store, self.store.names())
+        removed = orphans.remove_orphans(
+            self.store, orphans.OrphanScan(overlays=["ghost"])
+        )
+
+        self.assertEqual(scan.overlays, [])
+        self.assertEqual(removed, [])
+        self.assertEqual(self._snapshot(), before)
+
+    def test_dangling_overlay_link_is_reported_and_removed_without_following_it(self):
+        link = self.store.overlays_dir / "ghost"
+        link.symlink_to(self._tmp / "missing-target", target_is_directory=True)
+        scan = orphans.find_orphans(self.store, self.store.names())
+        self.assertEqual(scan.overlays, ["ghost"])
+        removed = orphans.remove_orphans(self.store, scan)
+        self.assertEqual(removed, ["overlay: ghost"])
+        self.assertFalse(os.path.lexists(link))
+
+    def test_junction_like_overlay_is_unlinked_never_recursively_deleted(self):
+        entry = self.store.overlays_dir / "ghost"
+        entry.mkdir()
+        (entry / "target-data.txt").write_bytes(b"linked content")
+        real = orphans.platforms.is_link
+
+        def probe(path, *, strict=False):
+            return Path(path) == entry or real(path, strict=strict)
+
+        scan = orphans.OrphanScan(overlays=["ghost"])
+        with mock.patch.object(orphans.platforms, "is_link", side_effect=probe), \
+                mock.patch.object(
+                    orphans.store_mod, "rmtree", side_effect=AssertionError("must not recurse")
+                ):
+            orphans.remove_orphans(self.store, scan)
+        self.assertEqual((entry / "target-data.txt").read_bytes(), b"linked content")
+
+    def test_keychain_roots_that_are_links_are_not_scanned(self):
+        stamp = _backup_stamp()
+        (self.outside / f"ghost-{stamp}.zip").write_bytes(b"zip")
+        (self.outside / "ghost.secret").write_bytes(b"secret")
+        self.store.backups_dir.symlink_to(self.outside, target_is_directory=True)
+        keychain._slots_dir(self.store).symlink_to(self.outside, target_is_directory=True)
+        before = self._snapshot()
+        scan = orphans.find_orphans(self.store, self.store.names())
+        orphans.remove_orphans(self.store, orphans.OrphanScan(
+            keychain_secrets=["ghost"]
+        ))
+        self.assertTrue(scan.is_empty())
+        self.assertEqual(self._snapshot(), before)
+
+
+class TestOrphanKeychainBusy(BaseCase):
+    def test_busy_swap_lock_skips_keychain_artifacts_without_raising(self):
+        store = Store()
+        store.create("alive")
+        keychain.save_profile_slot(store, "ghost", b"ghost-secret")
+        scan = orphans.OrphanScan(keychain_secrets=["ghost"])
+        with mock.patch.object(orphans.keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    orphans.keychain, "_serialize_lock",
+                    side_effect=keychain.KeychainBusyError("busy"),
+                ):
+            removed = orphans.remove_orphans(store, scan)
+        self.assertEqual(removed, [])
+        self.assertEqual(keychain.load_profile_slot(store, "ghost"), b"ghost-secret")
 
 
 if __name__ == "__main__":

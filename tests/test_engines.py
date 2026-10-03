@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import sys
 import unittest
+import unittest.mock
+from dataclasses import fields
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -56,6 +58,12 @@ class TestEngineDriverRegistry(BaseCase):
         all_eng = engines.all_engines()
         self.assertEqual({e.name for e in all_eng}, {"agy", "codex", "grok", "claude"})
 
+    def test_flag_translation_maps_are_not_dataclass_fields(self):
+        for driver in engines.all_engines():
+            with self.subTest(engine=driver.name):
+                field_names = {item.name for item in fields(type(driver))}
+                self.assertNotIn("UNIVERSAL_FLAG_TRANSLATIONS", field_names)
+
     def test_resolve_binary_explicit(self):
         driver = engines.get_engine("codex")
         explicit_bin = self._tmp / "bin" / "custom_codex"
@@ -73,6 +81,75 @@ class TestEngineDriverRegistry(BaseCase):
         self.assertEqual(driver.prepare_args([]), ["--no-daemon"])
         self.assertEqual(driver.prepare_args(["chat"]), ["--no-daemon", "chat"])
         self.assertEqual(driver.prepare_args(["--no-daemon", "chat"]), ["--no-daemon", "chat"])
+
+
+class TestUniversalFlagTranslation(BaseCase):
+    """``--dangerously-skip-permissions`` is Claude's spelling; Agydra
+    translates it onto each engine's native permission flag, drops it
+    when no equivalent exists, and leaves engines that natively accept it
+    untouched. Translation runs once per token in
+    ``EngineDriver.translate_universal_flags``, called from each driver's
+    ``prepare_args``."""
+
+    def test_codex_translates_to_bypass_approvals(self):
+        driver = engines.get_engine("codex")
+        self.assertEqual(
+            driver.prepare_args(["--dangerously-skip-permissions"]),
+            ["--no-daemon", "--dangerously-bypass-approvals-and-sandbox"],
+        )
+
+    def test_codex_translation_preserves_other_args(self):
+        driver = engines.get_engine("codex")
+        self.assertEqual(
+            driver.prepare_args(["chat", "--dangerously-skip-permissions", "-x"]),
+            ["--no-daemon", "chat", "--dangerously-bypass-approvals-and-sandbox", "-x"],
+        )
+
+    def test_grok_drops_flag_with_other_args_preserved(self):
+        driver = engines.get_engine("grok")
+        self.assertEqual(
+            driver.prepare_args(["chat", "--dangerously-skip-permissions", "-x"]),
+            ["chat", "-x"],
+        )
+
+    def test_grok_drops_flag_alone(self):
+        driver = engines.get_engine("grok")
+        self.assertEqual(
+            driver.prepare_args(["--dangerously-skip-permissions"]),
+            [],
+        )
+
+    def test_translation_and_drop_are_announced_with_a_warning(self):
+        for engine, expected in (
+            ("grok", "no native equivalent"),
+            ("codex", "translating --dangerously-skip-permissions"),
+        ):
+            with self.subTest(engine=engine):
+                with unittest.mock.patch.object(engines.ui, "warn") as warning:
+                    engines.get_engine(engine).prepare_args(["--dangerously-skip-permissions"])
+                warning.assert_called_once()
+                self.assertIn(expected, warning.call_args[0][0])
+
+    def test_agy_passes_flag_through(self):
+        driver = engines.get_engine("agy")
+        self.assertEqual(
+            driver.prepare_args(["--dangerously-skip-permissions"]),
+            ["--dangerously-skip-permissions"],
+        )
+
+    def test_claude_passes_flag_through(self):
+        driver = engines.get_engine("claude")
+        self.assertEqual(
+            driver.prepare_args(["--dangerously-skip-permissions"]),
+            ["--dangerously-skip-permissions"],
+        )
+
+    def test_unknown_engine_specific_args_are_preserved(self):
+        driver = engines.get_engine("codex")
+        self.assertEqual(
+            driver.prepare_args(["--yolo", "build"]),
+            ["--no-daemon", "--yolo", "build"],
+        )
 
 
 if __name__ == "__main__":

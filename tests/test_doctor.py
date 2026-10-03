@@ -130,10 +130,84 @@ class TestDoctor(BaseCase):
         }).encode("utf-8")
         return b"go-keyring-base64:" + base64.b64encode(payload)
 
+    def _hermetic_keychain(self):
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(keychain, "supported", return_value=True))
+        stack.enter_context(mock.patch.object(keychain, "_ensure_target_keychain", return_value=None))
+        stack.enter_context(mock.patch.object(keychain, "read_slot", return_value=None))
+        stack.enter_context(mock.patch.object(keychain, "orphan_slots", return_value=[]))
+        return stack
+
     def _ctx(self):
         return doctor._DoctorContext(
             scan=self.store.scan(), names=self.store.names(),
         )
+
+    def test_bootstrap_check_accepts_pip_managed_install_without_inspecting_shim(self):
+        import bootstrap
+
+        fake_root = self._tmp / "pip-managed-install"
+        state = {
+            "venv": True,
+            "console": True,
+            "shim_ok": True,
+            "shim_state": "pip-managed",
+            "on_path": True,
+            "installed": True,
+        }
+        with mock.patch.object(bootstrap, "project_root", return_value=fake_root), \
+                mock.patch.object(bootstrap, "check_state", return_value=state) as check_state, \
+                mock.patch.object(
+                    bootstrap,
+                    "shim_path",
+                    side_effect=AssertionError("pip-managed installs have no Agydra shim"),
+                ) as shim_path, \
+                mock.patch.object(doctor.platforms, "is_windows", return_value=False):
+            status, message = doctor._check_bootstrap(None, None)
+
+        self.assertEqual(
+            (status, message),
+            (
+                doctor.OK,
+                "install: pip-managed package (pip/pipx; no Agydra shim expected)",
+            ),
+        )
+        check_state.assert_called_once_with(fake_root)
+        shim_path.assert_not_called()
+        self.assertFalse(fake_root.exists())
+
+    def test_bootstrap_check_warns_when_the_editable_install_is_behind_the_repo(self):
+        import bootstrap
+
+        fake_root = self._tmp / "source-checkout"
+        fake_root.mkdir(parents=True, exist_ok=True)
+        state = {
+            "venv": True,
+            "console": True,
+            "shim_ok": True,
+            "shim_state": "ok",
+            "on_path": True,
+        }
+        for unimportable, expected_status in (([], doctor.OK), (["i18n"], doctor.WARN)):
+            with mock.patch.object(bootstrap, "project_root", return_value=fake_root), \
+                    mock.patch.object(bootstrap, "check_state", return_value=dict(state)), \
+                    mock.patch.object(
+                        bootstrap, "unimportable_modules", return_value=unimportable
+                    ) as drift, \
+                    mock.patch.object(doctor.platforms, "is_windows", return_value=False):
+                status, message = doctor._check_bootstrap(None, None)
+
+            self.assertEqual(status, expected_status)
+            drift.assert_called_once()
+            if unimportable:
+                # The message has to name the missing modules AND the fix:
+                # this is the only place the failure is visible before the
+                # console script dies with a bare ModuleNotFoundError.
+                self.assertIn("editable install is stale", message)
+                self.assertIn("i18n", message)
+                self.assertIn("agydra setup", message)
+            else:
+                self.assertNotIn("editable install is stale", message)
 
     def test_keychain_check_flags_identity_mismatch(self):
         self.store.create("alpha")
@@ -160,7 +234,7 @@ class TestDoctor(BaseCase):
             self.store, "alpha", self._secret_for("alpha@example.com")
         )
 
-        with mock.patch.object(keychain, "supported", return_value=True):
+        with self._hermetic_keychain():
             status, _ = doctor._check_keychain(self.store, self._ctx())
         self.assertEqual(status, doctor.OK)
 
@@ -184,7 +258,7 @@ class TestDoctor(BaseCase):
             self.store, "alpha", self._secret_for("whoever@example.com")
         )
 
-        with mock.patch.object(keychain, "supported", return_value=True):
+        with self._hermetic_keychain():
             status, _ = doctor._check_keychain(self.store, self._ctx())
         self.assertEqual(status, doctor.OK)
 
@@ -204,6 +278,40 @@ class TestDoctor(BaseCase):
         self.assertEqual(status, doctor.WARN)
         self.assertIn("ghost", message)
         self.assertIn("doctor --fix", message)
+
+    def test_keychain_check_warns_when_swap_lock_is_held(self):
+        """A wedged swap.lock (leftover or pre-upgrade session holding it
+        for its whole lifetime) must be visible on a plain ``agydra
+        doctor`` run, before the next launch fails with the shared-slot
+        busy error."""
+        import locks
+
+        if keychain.fcntl is None:
+            self.skipTest("swap.lock contention requires POSIX fcntl")
+        lock_path = keychain.swap_lock_path(self.store)
+        platforms.ensure_dir(lock_path.parent)
+        holder = locks.try_lock_path(lock_path, "test holder")
+        self.assertIsNotNone(holder)
+        try:
+            with mock.patch.object(keychain, "supported", return_value=True):
+                status, message = doctor._check_keychain(self.store, self._ctx())
+        finally:
+            holder.release()
+        self.assertEqual(status, doctor.WARN)
+        self.assertIn("swap lock is held", message)
+        self.assertIn("lsof", message)
+
+    def test_keychain_check_warns_when_swap_lock_probe_raises(self):
+        lock_path = keychain.swap_lock_path(self.store)
+        platforms.ensure_dir(lock_path.parent)
+        lock_path.touch()
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    doctor.locks, "try_lock_path", side_effect=doctor.locks.LockError("denied")
+                ):
+            status, message = doctor._check_keychain(self.store, self._ctx())
+        self.assertEqual(status, doctor.WARN)
+        self.assertIn("not inspectable", message)
 
     def test_keychain_check_reports_bridge_disabled_via_env(self):
         """When AGYDRA_NO_KEYCHAIN is active, doctor must report that the bridge
@@ -401,7 +509,7 @@ class TestIsolationRecovery(BaseCase):
 
         data_dir = self.store.profile_data_dir("alpha")
         link = self.store.overlays_dir / "alpha" / platforms.AGY_DATA_DIR_NAME
-        original_try_lock = locks.try_lock
+        original_try_lock = locks.try_mutation_lock
         original_migrate = isolation.migrate_real_dir_to_store
         original_build_overlay = isolation.build_overlay
         lock_checks = []
@@ -440,6 +548,28 @@ class TestIsolationRecovery(BaseCase):
         self.assertTrue(isolation._is_link(link),
                         "build_overlay must relink after migrate")
 
+    def test_fix_is_silent_for_healthy_symlinked_overlay(self):
+        """A healthy overlay whose data dir is properly symlinked into the
+        profile store is not a migration candidate: ``_apply_fixes`` must
+        skip it silently instead of warning that the owner cannot be
+        established."""
+        import shutil
+        from unittest import mock
+
+        link = self.store.overlays_dir / "alpha" / platforms.AGY_DATA_DIR_NAME
+        shutil.rmtree(link)
+        isolation.build_overlay("alpha", self.store.profile_data_dir("alpha"), self.store.root)
+        self.assertTrue(isolation._is_link(link))
+
+        output = io.StringIO()
+        with mock.patch.object(keychain, "supported", return_value=False), \
+                mock.patch.object(isolation, "migrate_real_dir_to_store") as migrate, \
+                contextlib.redirect_stderr(output):
+            doctor._apply_fixes(self.store, self._ctx())
+
+        migrate.assert_not_called()
+        self.assertNotIn("skipping overlay recovery", output.getvalue())
+
     def test_fix_skips_overlay_recovery_when_profile_lock_is_held(self):
         import locks
         from unittest import mock
@@ -462,6 +592,31 @@ class TestIsolationRecovery(BaseCase):
         self.assertFalse((data_dir / "antigravity-cli" / "token.json").exists())
         self.assertIn("profile lock is held", output.getvalue())
 
+    def test_fix_skips_overlay_recovery_when_a_leased_session_is_live(self):
+        """A session registered in the lease registry blocks the overlay
+        migration even though its flock is free."""
+        import locks
+        from unittest import mock
+
+        data_dir = self.store.profile_data_dir("alpha")
+        link = self.store.overlays_dir / "alpha" / platforms.AGY_DATA_DIR_NAME
+        source_token = link / "antigravity-cli" / "token.json"
+        locks.acquire_lease(self.store, "alpha")
+        self.addCleanup(locks.release_lease, self.store, "alpha")
+        self.assertFalse(locks._flock_probe_locked(self.store, "alpha"))
+        registry = locks.lock_path(self.store, "alpha").read_bytes()
+        output = io.StringIO()
+        with mock.patch.object(keychain, "supported", return_value=False), \
+                mock.patch.object(isolation, "migrate_real_dir_to_store") as migrate, \
+                contextlib.redirect_stderr(output):
+            doctor._apply_fixes(self.store, self._ctx())
+
+        migrate.assert_not_called()
+        self.assertTrue(source_token.is_file())
+        self.assertFalse((data_dir / "antigravity-cli" / "token.json").exists())
+        self.assertIn("profile lock is held", output.getvalue())
+        self.assertEqual(locks.lock_path(self.store, "alpha").read_bytes(), registry)
+
     def test_fix_skips_overlay_recovery_when_profile_owner_changed(self):
         import locks
         from unittest import mock
@@ -469,7 +624,7 @@ class TestIsolationRecovery(BaseCase):
         data_dir = self.store.profile_data_dir("alpha")
         link = self.store.overlays_dir / "alpha" / platforms.AGY_DATA_DIR_NAME
         source_token = link / "antigravity-cli" / "token.json"
-        original_try_lock = locks.try_lock
+        original_try_lock = locks.try_mutation_lock
         changed = []
 
         def change_profile_owner(store, name):
@@ -483,7 +638,7 @@ class TestIsolationRecovery(BaseCase):
 
         output = io.StringIO()
         with mock.patch.object(keychain, "supported", return_value=False), \
-                mock.patch.object(locks, "try_lock", side_effect=change_profile_owner), \
+                mock.patch.object(locks, "try_mutation_lock", side_effect=change_profile_owner), \
                 mock.patch.object(isolation, "migrate_real_dir_to_store") as migrate, \
                 contextlib.redirect_stderr(output):
             doctor._apply_fixes(self.store, self._ctx())
@@ -503,7 +658,7 @@ class TestIsolationRecovery(BaseCase):
         moved_overlay = self.fake_home / "alpha-before-replacement"
         replacement_token = self.fake_home / "replacement-token.txt"
         replacement_token.write_text("foreign overlay", encoding="utf-8")
-        original_try_lock = locks.try_lock
+        original_try_lock = locks.try_mutation_lock
         replaced = []
 
         def replace_overlay_after_lock(store, name):
@@ -519,7 +674,7 @@ class TestIsolationRecovery(BaseCase):
 
         output = io.StringIO()
         with mock.patch.object(keychain, "supported", return_value=False), \
-                mock.patch.object(locks, "try_lock", side_effect=replace_overlay_after_lock), \
+                mock.patch.object(locks, "try_mutation_lock", side_effect=replace_overlay_after_lock), \
                 mock.patch.object(isolation, "migrate_real_dir_to_store") as migrate, \
                 contextlib.redirect_stderr(output):
             doctor._apply_fixes(self.store, self._ctx())
@@ -620,7 +775,7 @@ class TestIsolationRecovery(BaseCase):
 
     def test_fix_rechecks_profile_directory_after_acquiring_its_lock(self):
         import locks
-        original_try_lock = locks.try_lock
+        original_try_lock = locks.try_mutation_lock
         corrupt_dir = self.store.profile_dir("ghost")
         fake_path = Path("/fake/login.keychain-db")
         deleted = []
@@ -645,7 +800,7 @@ class TestIsolationRecovery(BaseCase):
                 mock.patch.object(
                     doctor.keychain, "delete_slot", side_effect=fake_delete_slot
                 ), \
-                mock.patch.object(locks, "try_lock", side_effect=create_owner_during_lock):
+                mock.patch.object(locks, "try_mutation_lock", side_effect=create_owner_during_lock):
             doctor._apply_fixes(self.store, self._ctx())
 
         self.assertEqual(deleted, [])

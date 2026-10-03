@@ -87,12 +87,11 @@ class TestResolverForce(BaseCase):
             resolver.pick_free_profile(unauth, force=True)
         self.assertIn("authenticated", str(ctx.exception))
 
-    def test_force_marker_beats_pick(self):
-        """``.agydra`` marker still wins over ``-r -f`` (marker precedence
-        invariant is independent of force)."""
+    def test_random_force_ignores_project_marker_pin(self):
+        """Random selection ignores project pins independently of force."""
         project = self._tmp / "project" / "sub"
         project.mkdir(parents=True)
-        (self._tmp / "project" / ".agydra").write_text("alpha", encoding="utf-8")
+        (self._tmp / "project" / ".agydra").write_text("beta", encoding="utf-8")
         handle_a = locks.try_lock(self.store, "alpha")
         handle_b = locks.try_lock(self.store, "beta")
         try:
@@ -100,25 +99,26 @@ class TestResolverForce(BaseCase):
                 self.store, cwd=project, force=True,
             )
             self.assertEqual(resolved.name, "alpha")
-            self.assertIn("marker", resolved.reason)
+            self.assertNotIn("marker", resolved.reason)
         finally:
             handle_b.release()
             handle_a.release()
 
-    def test_force_allows_single_profile_floor(self):
-        """Without force, a one-profile store raises the 2-profile floor.
-        With force, that floor only matters for ``-r`` vacuously: a
-        single authenticated profile is enough."""
-        lone_root = self._tmp / "lone-store"
-        lone = Store(lone_root)
+    def test_single_profile_is_picked_free_or_joined_when_busy(self):
+        lone = Store(self._tmp / "lone-store")
         lone.create("solo")
         _authenticate(lone, "solo")
-        with self.assertRaises(StoreError) as ctx:
-            resolver.pick_free_profile(lone)
-        self.assertIn("only 1 profile", str(ctx.exception))
-
-        resolved = resolver.pick_free_profile(lone, force=True)
-        self.assertEqual(resolved.name, "solo")
+        free = resolver.pick_free_profile(lone)
+        self.assertEqual(free.name, "solo")
+        self.assertIn("free profile", free.reason)
+        handle = locks.try_lock(lone, "solo")
+        try:
+            for force in (False, True):
+                joined = resolver.pick_free_profile(lone, force=force)
+                self.assertEqual(joined.name, "solo")
+                self.assertIn("joining busy profile", joined.reason)
+        finally:
+            handle.release()
 
 
 class TestRunnerForce(BaseCase):
@@ -144,6 +144,44 @@ class TestRunnerForce(BaseCase):
         )
         rc = runner.run(plan, store=self.store, dry_run=True)
         self.assertEqual(rc, 0)
+
+    def test_random_force_fallback_preserves_binary_and_launch_options(self):
+        import keychain
+
+        self.store.create("beta")
+        _authenticate(self.store, "beta")
+        project = self._tmp / "forced-project"
+        project.mkdir()
+        (project / ".agydra").write_text("work", encoding="utf-8")
+        config = self.store.load_config()
+        config.settings["max_sessions_per_profile"] = 1
+        self.store.save_config(config)
+        plan = runner.build_plan(
+            self.store,
+            ["chat"],
+            random_pick=True,
+            cwd=project,
+            force=True,
+            binary_override=str(self.agy_bin),
+            launch_as_child=True,
+        )
+
+        with mock.patch.object(locks, "is_locked", return_value=True), \
+                mock.patch.object(locks, "lease_holders", return_value=[object()]):
+            retry = runner._next_random_plan(
+                self.store,
+                plan,
+                set(),
+                keychain.KeychainBusyError("synthetic busy slot"),
+            )
+
+        self.assertEqual(retry.profile, "beta")
+        self.assertTrue(retry.force)
+        self.assertEqual(retry.binary_override, str(self.agy_bin))
+        self.assertEqual(retry.binary, self.agy_bin)
+        self.assertTrue(retry.launch_as_child)
+        self.assertEqual(retry.cwd, project)
+        self.assertEqual(retry.args, ["chat"])
 
     def _spawn_recorder(self, observed):
         def fake_launch(argv, env):

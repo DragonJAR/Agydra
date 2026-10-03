@@ -373,18 +373,25 @@ class TestRandomProfileSelection(BaseCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("authenticate one with", result.stderr)
 
-    def test_r_errors_with_single_profile(self):
+    def test_r_works_with_a_single_profile(self):
         self.store.delete("lab")
         result = self._run_cli("-r")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("at least 2 profiles", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PROFILE=work", result.stdout)
+
+    def test_r_reuses_the_only_profile_while_it_is_busy(self):
+        self.store.delete("lab")
+        with held_cli_session("-p", "work", cwd=self._tmp):
+            result = self._run_cli("-r")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("PROFILE=work", result.stdout)
 
     def test_r_errors_with_no_profiles(self):
         self.store.delete("work")
         self.store.delete("lab")
         result = self._run_cli("-r")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("at least 2 profiles", result.stderr)
+        self.assertIn("no profiles exist yet", result.stderr)
 
     def test_r_respects_live_session(self):
         with held_cli_session("-p", "work", cwd=self._tmp):
@@ -404,16 +411,15 @@ class TestBusyGuards(BaseCase):
         try:
             result = self._run_cli("delete", "work", "-f")
             self.assertEqual(result.returncode, 1)
-            self.assertIn("live session", result.stderr)
+            self.assertIn("holder state could not be verified", result.stderr)
         finally:
             handle.release()
 
     def test_delete_refuses_busy_profile_names_holder_pid(self):
-        """The busy message must name the holder's PID (and how to kill
-        it) on POSIX, when the lock was taken on the plain-exec launch
-        path that recorded it (``LockHandle.record_holder_pid()``) --
-        simulated here since this test acquires the lock directly rather
-        than through a real launch."""
+        """A legacy raw PID recorded by ``LockHandle.record_holder_pid()``
+        is not a verified lease holder: the busy message must say the
+        holder state could not be verified and must never suggest
+        ``kill`` for it."""
         if sys.platform.startswith("win"):
             self.skipTest("PID recording is POSIX-only by design")
         handle = locks.try_lock(self.store, "work")
@@ -421,9 +427,9 @@ class TestBusyGuards(BaseCase):
         try:
             result = self._run_cli("delete", "work", "-f")
             self.assertEqual(result.returncode, 1)
-            pid = os.getpid()
-            self.assertIn(f"PID {pid}", result.stderr)
-            self.assertIn(f"kill {pid}", result.stderr)
+            self.assertIn("holder state could not be verified", result.stderr)
+            self.assertNotIn("kill", result.stderr)
+            self.assertNotIn(f"PID {os.getpid()}", result.stderr)
         finally:
             handle.release()
 
@@ -437,7 +443,7 @@ class TestBusyGuards(BaseCase):
                 fh.write(b"not-a-pid")
             result = self._run_cli("delete", "work", "-f")
             self.assertEqual(result.returncode, 1)
-            self.assertIn("live session", result.stderr)
+            self.assertIn("holder state could not be verified", result.stderr)
             self.assertNotIn("PID", result.stderr)
         finally:
             handle.release()
@@ -465,7 +471,7 @@ class TestBusyGuards(BaseCase):
         try:
             result = self._run_cli("rename", "work", "new")
             self.assertEqual(result.returncode, 1)
-            self.assertIn("live session", result.stderr)
+            self.assertIn("holder state could not be verified", result.stderr)
         finally:
             handle.release()
 
@@ -501,7 +507,7 @@ class TestDeleteRecoversCorruptProfile(BaseCase):
         try:
             result = self._run_cli("delete", "broken", "-f")
             self.assertEqual(result.returncode, 1)
-            self.assertIn("live session", result.stderr)
+            self.assertIn("holder state could not be verified", result.stderr)
             self.assertTrue(self.store.profile_dir("broken").exists())
         finally:
             handle.release()

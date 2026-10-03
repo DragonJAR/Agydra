@@ -5,6 +5,7 @@ import os
 import shutil
 import socket
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -131,57 +132,6 @@ class TestGrokEngine(unittest.TestCase):
         self.assertEqual(info["user_id"], "u_1")
         self.assertEqual(info["first_name"], "Test")
 
-    def test_save_grok_tokens(self):
-        non_existent = self._tmp / "does_not_exist"
-        self.assertFalse(account.save_grok_tokens(non_existent, {"access_token": "abc"}))
-
-        self.store.create("grok-save", engine="grok")
-        data_dir = self.store.profile_data_dir("grok-save", engine="grok")
-        (data_dir / "auth.json").write_text(json.dumps({"unrelated": 123}), encoding="utf-8")
-        self.assertFalse(account.save_grok_tokens(data_dir, {"access_token": "abc"}))
-
-        auth_payload = {
-            "https://auth.x.ai::client_1": {
-                "email": "save@x.ai",
-                "key": "old_key",
-                "refresh_token": "old_ref",
-            }
-        }
-        (data_dir / "auth.json").write_text(json.dumps(auth_payload), encoding="utf-8")
-
-        success = account.save_grok_tokens(
-            data_dir,
-            {
-                "access_token": "new_key",
-                "refresh_token": "new_ref",
-                "expires_in": 3600,
-            },
-        )
-        self.assertTrue(success)
-
-        updated = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
-        cred = updated["https://auth.x.ai::client_1"]
-        self.assertEqual(cred["key"], "new_key")
-        self.assertEqual(cred["refresh_token"], "new_ref")
-        self.assertEqual(cred["email"], "save@x.ai")
-        self.assertIn("expires_at", cred)
-        self.assertTrue(cred["expires_at"].endswith("Z"))
-        self.assertIn("create_time", cred)
-
-        success2 = account.save_grok_tokens(
-            data_dir,
-            {
-                "key": "direct_key",
-                "expires_at": "2026-12-31T23:59:59Z",
-            },
-        )
-        self.assertTrue(success2)
-        updated2 = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
-        cred2 = updated2["https://auth.x.ai::client_1"]
-        self.assertEqual(cred2["key"], "direct_key")
-        self.assertEqual(cred2["refresh_token"], "new_ref")
-        self.assertEqual(cred2["expires_at"], "2026-12-31T23:59:59Z")
-
     def test_overlay_creation_and_env(self):
         self.store.create("gk", engine="grok")
         data_dir = self.store.profile_data_dir("gk", engine="grok")
@@ -299,7 +249,8 @@ class TestGrokEngine(unittest.TestCase):
         self.assertEqual(p.description, "test xAI profile")
 
         # Status dry-run
-        ret_status = cli.main(["status", "gk-test", "-n"])
+        with mock.patch.dict(os.environ, {platforms.GROK_BIN_ENV: sys.executable}):
+            ret_status = cli.main(["status", "gk-test", "-n"])
         self.assertEqual(ret_status, 0)
 
     def test_cli_import_grok(self):
@@ -427,7 +378,8 @@ class TestGrokEngine(unittest.TestCase):
         with patch("usage.fetch_grok_billing_payload", side_effect=expired):
             res_401 = usage.query_grok_usage(data_dir, "grok-mock")
             self.assertFalse(res_401.ok)
-            self.assertEqual(res_401.error, "session expired (401)")
+            self.assertIn("session expired (401)", res_401.error)
+            self.assertIn("agydra login grok-mock", res_401.error)
         self.assertEqual(closed, [True])
 
     def test_cli_usage_grok_table_and_recs(self):

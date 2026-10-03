@@ -144,6 +144,87 @@ class Helpers(unittest.TestCase):
             self.assertTrue(str(bootstrap.venv_python(root)).endswith("bin/python"))
             self.assertTrue(str(bootstrap.console_script(root)).endswith("bin/agydra"))
 
+
+class RuntimeModuleDrift(unittest.TestCase):
+    """The editable install resolves top-level modules through a generated
+    finder, not a copy. Adding a module to the repo therefore leaves that
+    finder stale: `agydra` works from the repo (cwd shadows the finder) and
+    dies with ModuleNotFoundError everywhere else. These tests pin the
+    detection of that state, which no other check can see.
+    """
+
+    def test_runtime_modules_is_derived_from_disk_and_ignores_non_sources(self):
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=False)
+            (proj / "cli.py").write_text("", encoding="utf-8")
+            (proj / "runner.py").write_text("", encoding="utf-8")
+            (proj / "notes.md").write_text("", encoding="utf-8")
+            (proj / "tests").mkdir()
+            (proj / "tests" / "test_cli.py").write_text("", encoding="utf-8")
+            self.assertEqual(bootstrap.runtime_modules(proj), ["agydra", "cli", "runner"])
+
+    def test_runtime_modules_is_empty_without_a_source_checkout(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(bootstrap.runtime_modules(Path(td)), [])
+
+    def test_unimportable_reports_only_modules_the_install_cannot_reach(self):
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            (proj / "cli.py").write_text("", encoding="utf-8")
+            (proj / "fresh.py").write_text("", encoding="utf-8")
+            seen = {}
+
+            def fake_run(argv, cwd=None):
+                seen["argv"] = argv
+                seen["cwd"] = cwd
+                return subprocess.CompletedProcess(argv, 0, stdout="fresh", stderr="")
+
+            with mock.patch.object(bootstrap, "_run", fake_run):
+                bad = bootstrap.unimportable_modules(
+                    proj, bootstrap.venv_python(proj)
+                )
+            self.assertEqual(bad, ["fresh"])
+            # The probe must run somewhere that is NOT the project root: from
+            # inside it the cwd shadows the stale finder and hides the drift.
+            self.assertNotEqual(Path(seen["cwd"]).resolve(), proj.resolve())
+            self.assertIn("'fresh'", seen["argv"][-1])
+
+    def test_unimportable_is_quiet_when_the_install_is_healthy(self):
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            (proj / "cli.py").write_text("", encoding="utf-8")
+
+            def ok_run(argv, cwd=None):
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+            with mock.patch.object(bootstrap, "_run", ok_run):
+                self.assertEqual(
+                    bootstrap.unimportable_modules(proj, bootstrap.venv_python(proj)),
+                    [],
+                )
+
+    def test_unimportable_does_not_claim_a_broken_interpreter_is_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            (proj / "cli.py").write_text("", encoding="utf-8")
+
+            def broken_run(argv, cwd=None):
+                return subprocess.CompletedProcess(argv, 1, stdout="boom", stderr="")
+
+            with mock.patch.object(bootstrap, "_run", broken_run):
+                self.assertEqual(
+                    bootstrap.unimportable_modules(proj, bootstrap.venv_python(proj)),
+                    [],
+                )
+
+    def test_unimportable_ignores_a_missing_venv(self):
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=False)
+            self.assertEqual(
+                bootstrap.unimportable_modules(proj, proj / "nope" / "python"),
+                [],
+            )
+
     def test_shim_content_carries_marker_and_target(self):
         s = bootstrap._shim_content(Path("/abs/path/venv/bin/agydra"))
         self.assertIn(bootstrap.SHIM_MARKER, s)
@@ -763,6 +844,207 @@ class RunDispatch(unittest.TestCase):
                 self.assertEqual(code, 0)
                 self.assertIn(bootstrap.SHIM_MARKER, expected.read_text(encoding="utf-8"))
                 self.assertTrue(any("setup: agydra is installed and ready" in msg for msg in captured))
+
+
+def _isfile_hiding_console_script(installed_flag=None):
+    """``os.path.isfile`` that reports the venv console script as missing until
+    ``installed_flag`` (a list) gets an item; every other path is real."""
+    real_isfile = os.path.isfile
+
+    def isfile(path):
+        name = Path(path).name
+        if name in ("agydra", "agydra.exe") and ".venv" in Path(path).parts:
+            return bool(installed_flag)
+        return real_isfile(path)
+
+    return isfile
+
+
+class RootEntryForceContract(unittest.TestCase):
+    """``python3 agydra.py`` forces a shim overwrite only for an explicit setup request."""
+
+    def _first_run_force(self, argv):
+        import agydra
+
+        forced = []
+
+        installed = []
+
+        def fake_run(root=None, force=False, out=None):
+            forced.append(force)
+            installed.append(True)
+            return 0
+
+        with tempfile.TemporaryDirectory() as td:
+            with _sandbox_home(Path(td)), \
+                    mock.patch.object(sys, "argv", ["agydra.py", *argv]), \
+                    mock.patch.object(agydra.os.path, "isfile", side_effect=_isfile_hiding_console_script(installed)), \
+                    mock.patch.object(bootstrap, "run", side_effect=fake_run), \
+                    mock.patch("platforms.launch_argv", return_value=0):
+                self.assertEqual(agydra.main(), 0)
+        return forced
+
+    def test_launcher_force_flag_never_forces_shim_overwrite(self):
+        for argv in (["-f"], ["--force"], ["-p", "work", "-f", "prompt"], ["-rf", "prompt"], ["login", "-f"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(self._first_run_force(argv), [False])
+
+    def test_explicit_setup_force_is_honored(self):
+        for argv in (["setup", "-f"], ["setup", "--force"], ["install", "-f"], ["--setup", "--force"], ["-install", "-f"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(self._first_run_force(argv), [True])
+
+    def test_setup_without_force_does_not_force(self):
+        self.assertEqual(self._first_run_force(["setup"]), [False])
+        self.assertEqual(self._first_run_force([]), [False])
+
+    def test_setup_request_runs_bootstrap_even_with_existing_console_script(self):
+        """Regression: a stale editable install breaks the console script's
+        imports (new runtime module missing from the finder), so delegating
+        an explicit ``setup`` to it bricks the installer. A non-dry-run
+        setup request must run bootstrap directly."""
+        import agydra
+
+        forced = []
+
+        def fake_run(root=None, force=False, out=None):
+            forced.append(force)
+            return 0
+
+        with tempfile.TemporaryDirectory() as td:
+            with _sandbox_home(Path(td)), \
+                    mock.patch.object(sys, "argv", ["agydra.py", "setup"]), \
+                    mock.patch.object(agydra.os.path, "isfile", side_effect=_isfile_hiding_console_script([True])), \
+                    mock.patch.object(bootstrap, "run", side_effect=fake_run), \
+                    mock.patch("platforms.launch_argv", return_value=0) as launch:
+                self.assertEqual(agydra.main(), 0)
+        launch.assert_not_called()
+        self.assertEqual(forced, [False])
+
+    def test_setup_dry_run_still_delegates_to_the_console_script(self):
+        """``setup -n`` is a read-only report owned by the installed CLI;
+        with a healthy installation the launcher keeps delegating it."""
+        import agydra
+
+        with tempfile.TemporaryDirectory() as td:
+            with _sandbox_home(Path(td)), \
+                    mock.patch.object(sys, "argv", ["agydra.py", "setup", "-n"]), \
+                    mock.patch.object(agydra.os.path, "isfile", side_effect=_isfile_hiding_console_script([True])), \
+                    mock.patch.object(bootstrap, "run") as run, \
+                    mock.patch("platforms.launch_argv", return_value=0) as launch:
+                self.assertEqual(agydra.main(), 0)
+        run.assert_not_called()
+        launch.assert_called_once()
+
+    def test_foreign_shim_survives_launcher_force_on_first_run(self):
+        if sys.platform.startswith("win"):
+            self.skipTest("POSIX-only")
+        import agydra
+
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            with _sandbox_home(Path(td)):
+                shim = bootstrap.shim_path()
+                shim.parent.mkdir(parents=True, exist_ok=True)
+                shim.write_text("#!/bin/sh\necho foreign\n", encoding="utf-8")
+                real_ensure_venv = bootstrap.ensure_venv
+                real_install_editable = bootstrap.install_editable
+                bootstrap.ensure_venv = lambda _root, _out: bootstrap.venv_python(proj)
+                bootstrap.install_editable = lambda _root, _vpy, _out: None
+                try:
+                    with mock.patch.object(sys, "argv", ["agydra.py", "-f"]), \
+                            mock.patch.object(agydra.os.path, "isfile", side_effect=_isfile_hiding_console_script()), \
+                            mock.patch("platforms.canonical_path", return_value=proj), \
+                            mock.patch("builtins.print"):
+                        code = agydra.main()
+                finally:
+                    bootstrap.ensure_venv = real_ensure_venv
+                    bootstrap.install_editable = real_install_editable
+                self.assertEqual(code, 1)
+                self.assertEqual(shim.read_text(encoding="utf-8"), "#!/bin/sh\necho foreign\n")
+
+
+class PackageInstallationSemantics(unittest.TestCase):
+    """Without project sources (pip/pipx install) setup never writes anything."""
+
+    def _package_dir(self, td):
+        package = Path(td) / "site-packages"
+        package.mkdir()
+        (package / "bootstrap.py").write_text("", encoding="utf-8")
+        return package
+
+    def _assert_untouched(self, td, package):
+        self.assertEqual([p.name for p in package.iterdir()], ["bootstrap.py"])
+        self.assertFalse((Path(td) / "fakehome" / ".local").exists())
+
+    def test_setup_run_reports_pip_management_and_writes_nothing(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows), tempfile.TemporaryDirectory() as td:
+                package = self._package_dir(td)
+                captured: list[str] = []
+                with _sandbox_home(Path(td)), \
+                        mock.patch("bootstrap.platforms.is_windows", return_value=windows), \
+                        mock.patch.object(bootstrap, "ensure_venv", side_effect=AssertionError("venv")), \
+                        mock.patch.object(bootstrap, "install_editable", side_effect=AssertionError("pip")), \
+                        mock.patch.object(bootstrap, "ensure_path_shim", side_effect=AssertionError("shim")):
+                    self.assertEqual(bootstrap.run(captured.append, root=package, force=True), 0)
+                self.assertEqual(captured, [bootstrap.INSTALLED_NOTICE])
+                self._assert_untouched(td, package)
+
+    def test_check_state_is_honest_and_read_only_for_a_package_installation(self):
+        for windows in (False, True):
+            with self.subTest(windows=windows), tempfile.TemporaryDirectory() as td:
+                package = self._package_dir(td)
+                with _sandbox_home(Path(td)), \
+                        mock.patch("bootstrap.platforms.is_windows", return_value=windows):
+                    state = bootstrap.check_state(package)
+                self.assertTrue(state["installed"])
+                self.assertEqual(state["shim_state"], "pip-managed")
+                self._assert_untouched(td, package)
+
+    def test_windows_console_binary_path_in_a_source_checkout(self):
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=False)
+            with mock.patch("bootstrap.platforms.is_windows", return_value=True), \
+                    mock.patch("platforms.VENV_BIN_SUBDIR", "Scripts"), \
+                    mock.patch("platforms._EXE_SUFFIX", ".exe"):
+                script = bootstrap.console_script(proj)
+                state = bootstrap.check_state(proj)
+            self.assertEqual(script.parent.name, "Scripts")
+            self.assertEqual(script.name, "agydra.exe")
+            self.assertEqual(state["shim_state"], "n/a")
+            self.assertNotIn("installed", state)
+
+    def test_source_checkout_keeps_venv_and_foreign_shim_guard(self):
+        if sys.platform.startswith("win"):
+            self.skipTest("POSIX-only")
+        with tempfile.TemporaryDirectory() as td:
+            proj = _make_fake_project(Path(td), with_console=True)
+            self.assertTrue(bootstrap.is_source_checkout(proj))
+            self.assertNotIn("installed", bootstrap.check_state(proj))
+
+    def test_module_entry_of_a_package_installation_enters_the_cli_directly(self):
+        import importlib.util
+
+        with tempfile.TemporaryDirectory() as td:
+            package = self._package_dir(td)
+            source = Path(__file__).resolve().parent.parent / "agydra.py"
+            copy = package / "agydra.py"
+            copy.write_bytes(source.read_bytes())
+            spec = importlib.util.spec_from_file_location("agydra_package_copy", copy)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            saved_path = list(sys.path)
+            try:
+                with _sandbox_home(Path(td)), \
+                        mock.patch("cli.main", return_value=7) as entered, \
+                        mock.patch.object(bootstrap, "run", side_effect=AssertionError("bootstrap")):
+                    self.assertEqual(module.main(), 7)
+                entered.assert_called_once_with()
+            finally:
+                sys.path[:] = saved_path
+            self.assertFalse((package / ".venv").exists())
+            self.assertFalse((Path(td) / "fakehome" / ".local").exists())
 
 
 class RunHelperOSError(unittest.TestCase):

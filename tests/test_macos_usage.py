@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import contextlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import unittest
@@ -22,7 +24,7 @@ import usage
 from conftest import BaseCase, _make_jwt
 from store import Store, StoreError
 
-_FAKE_KEYCHAIN = Path("/fake/login.keychain-db")
+from test_keychain import _FAKE_KEYCHAIN
 
 
 def _rc(code: int, out: bytes = b""):
@@ -39,17 +41,29 @@ class _MemoryKeychain:
         self.shared = initial
         self.calls: list = []
 
+    def external_write(self, payload: bytes) -> None:
+        self.shared = payload
+
+    def _interactive(self, input_bytes):
+        tokens = shlex.split(input_bytes.decode("utf-8"))
+        if tokens[0] != "add-generic-password":
+            raise AssertionError(f"unexpected interactive security command: {tokens[0]}")
+        if "-w" in tokens:
+            raise AssertionError("credential must reach security as -X hex on stdin")
+        self.shared = binascii.unhexlify(tokens[tokens.index("-X") + 1])
+        self.calls.append(("write", self.shared))
+        return _rc(0)
+
     def run(self, args, input_bytes=None):
+        if list(args) == ["-i", "-q"]:
+            return self._interactive(input_bytes)
         verb = args[0]
         if verb == "find-generic-password":
             if self.shared is None:
                 return _rc(44)
             return _rc(0, out=self.shared)
         if verb == "add-generic-password":
-            secret = args[args.index("-w") + 1]
-            self.shared = secret.encode()
-            self.calls.append(("write", self.shared))
-            return _rc(0)
+            raise AssertionError("credential must never be passed to security in argv")
         if verb == "delete-generic-password":
             self.calls.append(("delete", None))
             self.shared = None
@@ -502,9 +516,7 @@ class TestMacosSlotLease(BaseCase):
         self._seed_secret("alpha", "alpha@example.com")
         with self._patched_keychain():
             self._join_lease("alpha")
-            self.kc.run(["add-generic-password", "-U", "-s", "gemini",
-                         "-a", "antigravity", "-w",
-                         refreshed.decode("ascii", "replace")])
+            self.kc.external_write(refreshed)
             keychain._save_slot_lease(
                 self.store, "alpha",
                 _go_keyring_secret("beta@example.com"),
@@ -551,9 +563,7 @@ class TestMacosSlotLease(BaseCase):
         refreshed = _slot_payload_json("alpha@example.com")
         with self._patched_keychain():
             self._join_lease("alpha")
-            self.kc.run(["add-generic-password", "-U", "-s", "gemini",
-                         "-a", "antigravity", "-w",
-                         refreshed.decode("ascii", "replace")])
+            self.kc.external_write(refreshed)
             keychain._save_slot_lease(
                 self.store, "alpha",
                 _go_keyring_secret("beta@example.com"),
@@ -593,9 +603,7 @@ class TestMacosSlotLease(BaseCase):
         with self._patched_keychain():
             self._join_lease("alpha")
             with keychain.launch_guard(self.store, "alpha"):
-                self.kc.run(["add-generic-password", "-U", "-s", "gemini",
-                             "-a", "antigravity", "-w",
-                             refreshed.decode("ascii", "replace")])
+                self.kc.external_write(refreshed)
             secret = keychain.load_profile_slot(self.store, "alpha")
             decoded = keychain.decode_go_keyring_secret(secret)
             self.assertEqual(decoded["token"]["access_token"], "acc-2")

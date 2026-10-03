@@ -20,6 +20,7 @@ from conftest import BaseCase
 import account
 import cli
 import usage
+import usage_snapshot
 from store import Store, StoreError
 
 
@@ -61,9 +62,11 @@ class TestClaudeCli(BaseCase):
 
     def test_login_native_arguments_and_no_codex_flags(self):
         self.store.create("cc", engine="claude")
-        native = account.ClaudeAuthStatus("unauthenticated")
-        with patch.object(account, "claude_auth_status", return_value=native), patch.object(cli.runner, "run", return_value=0) as run:
+        original_build_plan = cli.runner.build_plan
+        with patch.object(account, "claude_auth_status", side_effect=AssertionError("dry-run must not probe native auth")) as auth_probe, patch.object(cli.runner, "build_plan", wraps=original_build_plan) as build_plan, patch.object(cli.runner, "run", return_value=0) as run:
             self.assertEqual(cli.cmd_login(self.store, SimpleNamespace(ref="cc", dry_run=True, force=False)), 0)
+        auth_probe.assert_not_called()
+        self.assertTrue(build_plan.call_args.kwargs["read_only"])
         plan = run.call_args.args[0]
         self.assertEqual(plan.args[-2:], ["auth", "login"])
         self.assertNotIn("--no-daemon", plan.args)
@@ -140,21 +143,103 @@ class TestClaudeCli(BaseCase):
             cli._share_config(self.store, "work", ["cc"])
         self.assertEqual(list(self.store.claude_config_dir("cc").iterdir()), [])
 
-    def test_usage_snapshot_separate_and_same_compact_detail_formatters(self):
+    def _live(self, name, five, seven, reset5=None):
+        now = datetime.now(timezone.utc)
+        buckets = []
+        if five is not None:
+            buckets.append(usage.UsageBucket("claude-five-hour", "5 Hours", "5h", five, reset5))
+        buckets.append(usage.UsageBucket("claude-seven-day", "7 Days", "weekly", seven, now + timedelta(days=2, hours=9)))
+        return usage.UsageResult(
+            name=name, engine="claude", ok=True, groups=[usage.UsageGroup("Claude Code", buckets)],
+            source="claude_cli_usage", quality="observed", observed_at=now, identity_verified=True,
+        )
+
+    def test_compact_claude_section_uses_the_standard_columns_and_detail_keeps_the_prose(self):
         self.store.create("cc", engine="claude")
         result = self._snapshot()
-        with patch.object(usage, "gather_usage_report", return_value=[result]), contextlib.redirect_stdout(io.StringIO()) as compact:
+        with patch.object(account, "sync_profile_email", return_value=None), patch.object(usage, "gather_usage_report", return_value=[result]), contextlib.redirect_stdout(io.StringIO()) as compact:
             self.assertEqual(cli.cmd_usage(self.store, SimpleNamespace(ref=None)), 0)
         with patch.object(usage, "query_profile_usage", return_value=result), contextlib.redirect_stdout(io.StringIO()) as detail:
             self.assertEqual(cli.cmd_usage(self.store, SimpleNamespace(ref="cc")), 0)
-        for line in cli._claude_usage_lines(result, 10):
-            self.assertIn(line, compact.getvalue())
-            self.assertIn(line, detail.getvalue())
-        self.assertIn("ANTHROPIC CLAUDE CODE", compact.getvalue())
+        table = compact.getvalue()
+        self.assertIn("ANTHROPIC CLAUDE CODE", table)
+        header = next(line for line in table.splitlines() if "PROFILE" in line and "STATE" in line)
+        for column in ("#", "PROFILE", "ACCOUNT", "AVAILABLE", "WK · 5H", "↻", "STATE"):
+            self.assertIn(column, header)
+        row = next(line for line in table.splitlines() if " cc " in line)
+        self.assertIn("snapshot", row)
+        for prose in cli._claude_usage_lines(result, 10)[:2]:
+            self.assertNotIn(prose, table)
+            self.assertIn(prose, detail.getvalue())
         self.assertIn("identity unverified", detail.getvalue())
-        self.assertNotIn("USE NOW", compact.getvalue())
-        self.assertNotIn("authenticated", detail.getvalue())
-        self.assertNotIn("CLAUDE + GPT", compact.getvalue())
+        self.assertNotIn("source:", table)
+        self.assertNotIn("USE NOW", table)
+        self.assertNotIn("CLAUDE + GPT", table)
+
+    def test_live_rows_fill_the_shared_columns_and_feed_the_use_now_line(self):
+        for name in ("claudio", "claudia", "viejo"):
+            self.store.create(name, engine="claude")
+        results = [
+            self._live("claudio", 0.49, 0.24, datetime.now(timezone.utc) + timedelta(minutes=5)),
+            self._live("claudia", 1.0, 0.86),
+            usage.UsageResult(name="viejo", engine="claude", ok=True, quality="stale",
+                              source="claude_status_line", identity_verified=False,
+                              error="live quota unavailable: claude /usage timed out"),
+        ]
+        with patch.object(account, "sync_profile_email", return_value=None), patch.object(usage, "gather_usage_report", return_value=results), contextlib.redirect_stdout(io.StringIO()) as out:
+            cli.cmd_usage(self.store, SimpleNamespace(ref=None))
+        lines = out.getvalue().splitlines()
+        claudio = next(line for line in lines if " claudio " in line)
+        claudia = next(line for line in lines if " claudia " in line)
+        viejo = next(line for line in lines if " viejo " in line)
+        self.assertRegex(claudio, r"24\s+24 ·\s+49\s+\d+[dhm]( \d+[hm])?\s+live")
+        self.assertRegex(claudia, r"86\s+86 · 100\s+\d+[dhm]( \d+[hm])?\s+live")
+        self.assertRegex(viejo, r"unavailable\s+stale")
+        self.assertNotIn("timed out", out.getvalue())
+        self.assertIn("Claude Code → claudia 86%", out.getvalue())
+        self.assertNotIn("claudio 24%", out.getvalue())
+
+    def test_partial_or_untrusted_readings_never_fill_the_quota_columns(self):
+        for name in ("parcial", "ambigua"):
+            self.store.create(name, engine="claude")
+        partial = self._live("parcial", None, 0.30)
+        partial.quality = "unknown"
+        ambiguous = self._live("ambigua", 0.5, 0.5)
+        ambiguous.quality = "ambiguous"
+        with patch.object(account, "sync_profile_email", return_value=None), \
+                patch.object(usage, "gather_usage_report", return_value=[partial, ambiguous]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            cli.cmd_usage(self.store, SimpleNamespace(ref=None))
+        lines = out.getvalue().splitlines()
+        for name, state in (("parcial", "unknown"), ("ambigua", "ambiguous")):
+            row = next(line for line in lines if f" {name} " in line)
+            self.assertRegex(row, rf"unavailable\s+{state}")
+            self.assertNotIn("█", row)
+        self.assertNotIn("USE NOW", out.getvalue())
+
+    def test_account_column_is_filled_once_for_claude_profiles_only(self):
+        self.store.create("cc", engine="claude")
+        self.store.create("work")
+        known = self.store.create("known", engine="claude")
+        known.email = "known@example.com"
+        self.store.save(known)
+        results = [
+            usage.UsageResult(name="work", ok=False, error="not authenticated"),
+            self._live("cc", 0.5, 0.5),
+            self._live("known", 0.5, 0.5),
+        ]
+        with patch.object(account, "sync_profile_email", return_value="dev@example.com") as sync, \
+                patch.object(usage, "gather_usage_report", return_value=results), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            cli.cmd_usage(self.store, SimpleNamespace(ref=None))
+        sync.assert_called_once_with(self.store, "cc")
+        text = out.getvalue()
+        self.assertIn("dev@example.com", next(line for line in text.splitlines() if " cc " in line))
+        self.assertIn("known@example.com", next(line for line in text.splitlines() if " known " in line))
+        with patch.object(account, "sync_profile_email", side_effect=OSError("boom")), \
+                patch.object(usage, "gather_usage_report", return_value=results), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.cmd_usage(self.store, SimpleNamespace(ref=None)), 0)
 
     def test_expired_partial_snapshot_does_not_infer_full_quota(self):
         result = self._snapshot(reset=datetime.now(timezone.utc) - timedelta(seconds=1))
@@ -277,11 +362,217 @@ class TestClaudeCli(BaseCase):
                  for path in self.store.root.rglob("*") if path.is_file()}
         self.assertEqual(before, after)
 
-    def test_snapshot_reader_does_not_mutate_profile_or_authenticate(self):
-        self.store.create("cc", engine="claude")
+    def _store_files(self):
         root = self.store.root
-        before = {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()}
-        with contextlib.redirect_stdout(io.StringIO()), patch.object(account, "claude_auth_status", side_effect=AssertionError("usage must not probe auth")):
+        return {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    def test_usage_command_uses_live_reader_without_auth_probe_or_profile_mutation(self):
+        import claude_usage
+
+        self.store.create("cc", engine="claude")
+        before = self._store_files()
+        synthetic = usage.UsageResult(
+            name="cc", ok=True, engine="claude", source="live", quality="live"
+        )
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(
+            account, "claude_auth_status",
+            side_effect=AssertionError("usage must not probe auth"),
+        ), patch.object(
+            claude_usage, "query_claude_usage_live", return_value=synthetic
+        ) as live:
             cli.cmd_usage(self.store, SimpleNamespace(ref="cc"))
-        after = {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()}
-        self.assertEqual(before, after)
+        after = self._store_files()
+
+        live.assert_called_once()
+        self.assertEqual(live.call_args.args[1], "cc")
+        changed = {
+            name
+            for name in before.keys() | after.keys()
+            if before.get(name) != after.get(name)
+        }
+        self.assertEqual(changed, {usage_snapshot.SNAPSHOT_FILENAME})
+
+
+class TestClaudeCaptureEnable(BaseCase):
+    """``usage --claude-settings PROFILE --apply`` writes the opt-in
+    statusLine into the profile settings.json — explicit user action with
+    merge guards: atomic write, never clobber an existing statusLine,
+    never touch an unparseable file."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        os.environ["AGYDRA_CLAUDE_BIN"] = sys.executable
+
+    def _settings_path(self, name="cc"):
+        profile = self.store.get_readonly(name)
+        return self.store.claude_config_dir_for_seq(profile.seq) / "settings.json"
+
+    def _run_apply(self, name="cc"):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = cli.cmd_usage(
+                self.store, SimpleNamespace(
+                    ref=None, claude_settings=name, claude_settings_apply=True,
+                )
+            )
+        return rc, out.getvalue()
+
+    def test_apply_writes_statusline_when_settings_absent(self):
+        self.store.create("cc", engine="claude")
+        rc, out = self._run_apply()
+        self.assertEqual(rc, 0)
+        settings = json.loads(self._settings_path().read_text(encoding="utf-8"))
+        self.assertEqual(settings["statusLine"]["type"], "command")
+        self.assertIn("claude_usage", settings["statusLine"]["command"])
+        self.assertIn("capture enabled", out)
+
+    def test_apply_merges_preserving_existing_keys(self):
+        self.store.create("cc", engine="claude")
+        path = self._settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"model": "opus", "verbose": True}), encoding="utf-8")
+        rc, _ = self._run_apply()
+        self.assertEqual(rc, 0)
+        settings = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(settings["model"], "opus")
+        self.assertTrue(settings["verbose"])
+        self.assertEqual(settings["statusLine"]["type"], "command")
+
+    def test_apply_is_idempotent_when_statusline_matches(self):
+        self.store.create("cc", engine="claude")
+        self._run_apply()
+        rc, out = self._run_apply()
+        self.assertEqual(rc, 0)
+        self.assertIn("already enabled", out)
+
+    def test_apply_refuses_to_overwrite_foreign_statusline(self):
+        self.store.create("cc", engine="claude")
+        path = self._settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"statusLine": {"type": "command", "command": "my-own"}}),
+            encoding="utf-8",
+        )
+        with self.assertRaises(StoreError) as ctx:
+            self._run_apply()
+        self.assertIn("already defines a statusLine", str(ctx.exception))
+        settings = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(settings["statusLine"]["command"], "my-own")
+
+    def test_apply_refuses_unparseable_settings(self):
+        self.store.create("cc", engine="claude")
+        path = self._settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not json", encoding="utf-8")
+        with self.assertRaises(StoreError) as ctx:
+            self._run_apply()
+        self.assertIn("not valid JSON", str(ctx.exception))
+        self.assertEqual(path.read_text(encoding="utf-8"), "not json")
+
+    def test_apply_requires_claude_profile(self):
+        self.store.create("wk")
+        with self.assertRaises(StoreError):
+            self._run_apply("wk")
+
+    def test_apply_validates_physical_config_directory(self):
+        self.store.create("cc", engine="claude")
+        config_dir = self.store.claude_config_dir("cc")
+        outside = self._tmp / "outside-claude-config"
+        outside.mkdir()
+        config_dir.rmdir()
+        config_dir.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaises(cli.isolation.IsolationError):
+            self._run_apply()
+
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_apply_refuses_a_busy_profile(self):
+        self.store.create("cc", engine="claude")
+        handle = cli.locks.try_lock(self.store, "cc")
+        try:
+            with self.assertRaises(cli.ProfileBusyError):
+                self._run_apply()
+        finally:
+            handle.release()
+
+    def test_apply_holds_mutation_lock_through_recheck_and_atomic_write(self):
+        self.store.create("cc", engine="claude")
+        original_get = self.store.get_readonly
+        original_write = cli.atomic_write_text
+        read_lock_checks = []
+        write_lock_checks = []
+        reads = [0]
+
+        def inspect_read(name):
+            reads[0] += 1
+            if reads[0] > 1:
+                handle = cli.locks.try_lock(self.store, name)
+                read_lock_checks.append(handle is None)
+                if handle is not None:
+                    handle.release()
+            return original_get(name)
+
+        def inspect_write(path, text):
+            handle = cli.locks.try_lock(self.store, "cc")
+            write_lock_checks.append(handle is None)
+            if handle is not None:
+                handle.release()
+            return original_write(path, text)
+
+        with patch.object(self.store, "get_readonly", side_effect=inspect_read), patch.object(
+            cli, "atomic_write_text", side_effect=inspect_write
+        ):
+            rc, _out = self._run_apply()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(read_lock_checks, [True, True])
+        self.assertEqual(write_lock_checks, [True])
+
+    def test_apply_fails_if_profile_is_deleted_before_mutation_lock(self):
+        self.store.create("cc", engine="claude")
+        original_get = self.store.get_readonly
+        reads = [0]
+
+        def delete_after_initial_read(name):
+            reads[0] += 1
+            profile = original_get(name)
+            if reads[0] == 1:
+                with patch.object(Store, "_guard_claude_supervisor"):
+                    self.store.delete(name, backup=False)
+            return profile
+
+        with patch.object(self.store, "get_readonly", side_effect=delete_after_initial_read), patch.object(
+            cli, "atomic_write_text"
+        ) as write:
+            with self.assertRaises(StoreError):
+                self._run_apply()
+
+        write.assert_not_called()
+        self.assertFalse(self.store.exists("cc"))
+
+    def test_apply_rechecks_profile_sequence_before_publication(self):
+        import dataclasses
+
+        self.store.create("cc", engine="claude")
+        original_get = self.store.get_readonly
+        reads = [0]
+
+        def change_identity_on_final_read(name):
+            reads[0] += 1
+            profile = original_get(name)
+            if reads[0] == 3:
+                profile = dataclasses.replace(profile, seq=profile.seq + 1)
+            return profile
+
+        with patch.object(self.store, "get_readonly", side_effect=change_identity_on_final_read), patch.object(
+            cli, "atomic_write_text"
+        ) as write:
+            with self.assertRaisesRegex(StoreError, "identity changed"):
+                self._run_apply()
+
+        write.assert_not_called()

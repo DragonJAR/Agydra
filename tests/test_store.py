@@ -2,6 +2,7 @@
 import errno
 import json
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -25,6 +26,303 @@ class TestStore(BaseCase):
             capture_output=True,
             text=True,
             timeout=10,
+        )
+
+    def _tree_snapshot(self, root):
+        return tuple(
+            (
+                str(path.relative_to(root)),
+                path.read_bytes() if path.is_file() else None,
+            )
+            for path in sorted((root, *root.rglob("*")))
+        )
+
+    def _external_snapshot(self, root):
+        return tuple(
+            (
+                str(path.relative_to(root)),
+                path.lstat().st_dev,
+                path.lstat().st_ino,
+                stat.S_IMODE(path.lstat().st_mode),
+                path.read_bytes() if stat.S_ISREG(path.lstat().st_mode) else None,
+            )
+            for path in sorted((root, *root.rglob("*")))
+        )
+
+    def test_relative_store_root_is_anchored_at_construction(self):
+        previous_directory = Path.cwd()
+        try:
+            os.chdir(self._tmp)
+            store = Store(root=Path("relative-store"))
+            expected_root = Path.cwd() / "relative-store"
+            self.assertEqual(store.root, expected_root)
+            os.chdir(self.fake_home)
+            self.assertEqual(store.profile_dir("alpha"), expected_root / "profiles" / "alpha")
+        finally:
+            os.chdir(previous_directory)
+
+    def test_store_root_symlink_is_allowed_when_profiles_directory_is_real(self):
+        physical_root = self._tmp / "physical-store"
+        alias_root = self._tmp / "store-alias"
+        physical_root.mkdir()
+        try:
+            alias_root.symlink_to(physical_root, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"directory symlink is unavailable: {exc}")
+
+        store = Store(root=alias_root)
+        profile = store.create("alpha")
+
+        self.assertEqual(profile.name, "alpha")
+        self.assertTrue(store.profiles_dir.is_dir())
+        self.assertFalse(store.profiles_dir.is_symlink())
+
+    def test_store_root_symlink_is_allowed_when_profiles_directory_is_real(self):
+        physical_root = self._tmp / "physical-store"
+        alias_root = self._tmp / "store-alias"
+        physical_root.mkdir()
+        try:
+            alias_root.symlink_to(physical_root, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"directory symlink is unavailable: {exc}")
+
+        store = Store(root=alias_root)
+        profile = store.create("alpha")
+
+        self.assertEqual(profile.name, "alpha")
+        self.assertTrue(store.profiles_dir.is_dir())
+        self.assertFalse(store.profiles_dir.is_symlink())
+
+    def test_profile_directory_symlink_is_unreadable_and_never_touched(self):
+        store = Store()
+        external = self._tmp / "outside-profile"
+        (external / "data").mkdir(parents=True)
+        metadata = {
+            "name": "alpha",
+            "seq": 11,
+            "created": "2026-01-01T00:00:00Z",
+            "description": "external",
+            "engine": "agy",
+        }
+        (external / "profile.json").write_text(json.dumps(metadata), encoding="utf-8")
+        (external / "data" / "sentinel").write_bytes(b"outside-data")
+        store.profiles_dir.mkdir(parents=True, exist_ok=True)
+        profile_link = store.profile_dir("alpha")
+        try:
+            profile_link.symlink_to(external, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"directory symlink is unavailable: {exc}")
+        before = self._tree_snapshot(external)
+        root_before = self._tree_snapshot(store.root)
+
+        self.assertEqual(store.scan_readonly(), ([], ["alpha"]))
+        with self.assertRaisesRegex(StoreError, "symlink or junction"):
+            store.get_readonly("alpha")
+        self.assertEqual(self._tree_snapshot(external), before)
+        self.assertEqual(self._tree_snapshot(store.root), root_before)
+
+        operations = (
+            lambda: store.get("alpha"),
+            lambda: store.profile_data_dir("alpha"),
+            lambda: store.create("alpha"),
+            lambda: store.rename("alpha", "renamed"),
+            lambda: store.delete("alpha", backup=False),
+            lambda: store.save(store_mod.Profile(name="alpha")),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                StoreError, "symlink or junction"
+            ):
+                operation()
+
+        self.assertEqual(self._tree_snapshot(external), before)
+        self.assertFalse(store.sequence_state_path.exists())
+        self.assertFalse(store.profile_dir("renamed").exists())
+
+    def test_profiles_root_symlink_blocks_reads(self):
+        root = self._tmp / "profiles-root-store"
+        store = Store(root=root)
+        external = self._tmp / "outside-profiles-read"
+        profile_dir = external / "alpha"
+        (profile_dir / "data").mkdir(parents=True)
+        (profile_dir / "profile.json").write_text(
+            json.dumps(store_mod.Profile(name="alpha", seq=1).to_dict()),
+            encoding="utf-8",
+        )
+        sentinel = profile_dir / "data" / "sentinel"
+        sentinel.write_bytes(b"external profile")
+        os.chmod(sentinel, 0o640)
+        root.mkdir(parents=True)
+        try:
+            store.profiles_dir.symlink_to(external, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"directory symlink is unavailable: {exc}")
+        before = self._external_snapshot(external)
+
+        operations = (
+            store.scan_readonly,
+            store.scan,
+            lambda: store.get_readonly("alpha"),
+            lambda: store.get("alpha"),
+            lambda: store.profile_data_dir("alpha"),
+        )
+        failures = []
+        for operation in operations:
+            try:
+                operation()
+            except StoreError as exc:
+                failures.append(str(exc))
+
+        self.assertEqual(len(failures), len(operations))
+        self.assertTrue(all("profiles" in message for message in failures))
+        self.assertEqual(self._external_snapshot(external), before)
+
+    def test_profiles_root_symlink_blocks_crud_and_preserves_external_tree(self):
+        root = self._tmp / "profiles-root-mutation-store"
+        store = Store(root=root)
+        external = self._tmp / "outside-profiles-mutation"
+        profile_dir = external / "alpha"
+        (profile_dir / "data").mkdir(parents=True)
+        metadata = store_mod.Profile(name="alpha", seq=1).to_dict()
+        (profile_dir / "profile.json").write_text(
+            json.dumps(metadata), encoding="utf-8"
+        )
+        sentinel = profile_dir / "data" / "sentinel"
+        sentinel.write_bytes(b"outside-profile")
+        os.chmod(sentinel, 0o604)
+        root.mkdir(parents=True)
+        try:
+            store.profiles_dir.symlink_to(external, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"directory symlink is unavailable: {exc}")
+        before = self._external_snapshot(external)
+
+        operations = (
+            lambda: store.create("new"),
+            lambda: store.save(store_mod.Profile(name="alpha", seq=1)),
+            lambda: store.rename("alpha", "renamed"),
+            lambda: store.delete("alpha", backup=False),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                StoreError, "profiles"
+            ):
+                operation()
+
+        self.assertEqual(self._external_snapshot(external), before)
+        self.assertTrue(store.profiles_dir.is_symlink())
+
+    def test_profile_data_symlink_blocks_resolution_and_reads(self):
+        store = Store()
+        store.create("alpha")
+        data_dir = store.profile_dir("alpha") / "data"
+        data_dir.rmdir()
+        external = self._tmp / "outside-profile-data-read"
+        external.mkdir()
+        sentinel = external / "sentinel"
+        sentinel.write_bytes(b"external data")
+        os.chmod(sentinel, 0o644)
+        try:
+            data_dir.symlink_to(external, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"directory symlink is unavailable: {exc}")
+        before = self._external_snapshot(external)
+
+        self.assertEqual(store.scan_readonly(), ([], ["alpha"]))
+        operations = (
+            lambda: store.get_readonly("alpha"),
+            lambda: store.get("alpha"),
+            lambda: store.profile_data_dir("alpha"),
+            lambda: store.profile_data_dir("alpha", engine="agy"),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                StoreError, "data .* symlink or junction"
+            ):
+                operation()
+
+        self.assertEqual(self._external_snapshot(external), before)
+
+    def test_profile_data_symlink_blocks_mutations_without_touching_target(self):
+        store = Store()
+        store.create("alpha")
+        profile = store.get("alpha")
+        data_dir = store.profile_dir("alpha") / "data"
+        data_dir.rmdir()
+        external = self._tmp / "outside-profile-data-mutation"
+        external.mkdir()
+        sentinel = external / "sentinel"
+        sentinel.write_bytes(b"must stay")
+        os.chmod(sentinel, 0o604)
+        try:
+            data_dir.symlink_to(external, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"directory symlink is unavailable: {exc}")
+        before = self._external_snapshot(external)
+
+        operations = (
+            lambda: store.save(profile),
+            lambda: store.create("alpha"),
+            lambda: store.rename("alpha", "renamed"),
+            lambda: store.delete("alpha", backup=False),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                StoreError, "data .* symlink or junction"
+            ):
+                operation()
+
+        self.assertEqual(self._external_snapshot(external), before)
+        self.assertTrue(data_dir.is_symlink())
+
+    def test_profile_metadata_symlink_is_unreadable_and_never_touched(self):
+        store = Store()
+        profile_dir = store.profile_dir("alpha")
+        (profile_dir / "data").mkdir(parents=True)
+        external_metadata = self._tmp / "outside-profile.json"
+        external_metadata.write_text(
+            json.dumps({"name": "alpha", "seq": 7, "engine": "agy"}),
+            encoding="utf-8",
+        )
+        metadata_link = profile_dir / "profile.json"
+        try:
+            metadata_link.symlink_to(external_metadata)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"file symlink is unavailable: {exc}")
+        before = external_metadata.read_bytes()
+        root_before = self._tree_snapshot(store.root)
+
+        self.assertEqual(store.scan_readonly(), ([], ["alpha"]))
+        with self.assertRaisesRegex(StoreError, "metadata .* symlink or junction"):
+            store.get_readonly("alpha")
+        self.assertEqual(external_metadata.read_bytes(), before)
+        self.assertEqual(self._tree_snapshot(store.root), root_before)
+        with self.assertRaisesRegex(StoreError, "metadata .* symlink or junction"):
+            store.delete("alpha", backup=False)
+        self.assertEqual(external_metadata.read_bytes(), before)
+        self.assertTrue(metadata_link.is_symlink())
+
+    def test_profile_metadata_name_must_match_directory_for_reads(self):
+        store = Store()
+        profile_dir = store.profile_dir("alpha")
+        (profile_dir / "data").mkdir(parents=True)
+        (profile_dir / "profile.json").write_text(
+            json.dumps({"name": "beta", "seq": 8, "engine": "agy"}),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(store.scan_readonly(), ([], ["alpha"]))
+        for read in (lambda: store.get("alpha"), lambda: store.get_readonly("alpha")):
+            with self.subTest(read=read), self.assertRaisesRegex(
+                StoreError, "unreadable metadata"
+            ):
+                read()
+        with self.assertRaisesRegex(StoreError, "unreadable metadata"):
+            store.profile_data_dir("alpha")
+        self.assertFalse(store.profile_dir("beta").exists())
+        self.assertEqual(
+            json.loads(store.profile_meta_path("alpha").read_text(encoding="utf-8"))["name"],
+            "beta",
         )
 
     def test_create_and_get(self):
@@ -128,6 +426,43 @@ class TestStore(BaseCase):
         self.assertLess(seqs["zeta"], seqs["alpha"])
         self.assertLess(seqs["alpha"], seqs["mid"])
 
+    def test_legacy_non_claude_profiles_read_list_and_rename_without_migration(self):
+        store = Store()
+        metadata = {
+            "legacy-agy": {"name": "legacy-agy", "engine": "agy"},
+            "legacy-codex": {"name": "legacy-codex", "engine": "codex", "seq": 0},
+            "legacy-grok": {"name": "legacy-grok", "engine": "grok", "seq": 0},
+        }
+        original = {}
+        for name, contents in metadata.items():
+            profile_dir = store.profile_dir(name)
+            (profile_dir / "data").mkdir(parents=True)
+            profile_path = store.profile_meta_path(name)
+            original[name] = json.dumps(contents, separators=(",", ":")).encode()
+            profile_path.write_bytes(original[name])
+
+        listed = store.list_readonly()
+        self.assertEqual(
+            [(profile.name, profile.engine, profile.seq) for profile in listed],
+            [
+                ("legacy-agy", "agy", 0),
+                ("legacy-codex", "codex", 0),
+                ("legacy-grok", "grok", 0),
+            ],
+        )
+        self.assertEqual(store.get_readonly("legacy-agy").seq, 0)
+        for name, contents in original.items():
+            self.assertEqual(store.profile_meta_path(name).read_bytes(), contents)
+
+        renamed = store.rename("legacy-agy", "renamed-agy")
+        self.assertEqual((renamed.name, renamed.engine, renamed.seq), ("renamed-agy", "agy", 0))
+        self.assertEqual(store.get("renamed-agy").seq, 0)
+
+        first_new = store.create("new-profile")
+        second_new = store.create("next-profile")
+        self.assertEqual((first_new.seq, second_new.seq), (1, 2))
+        self.assertEqual(len({first_new.seq, second_new.seq}), 2)
+
     def test_delete_then_create_does_not_reuse_sequence(self):
         store = Store()
         first = store.create("first")
@@ -147,9 +482,9 @@ class TestStore(BaseCase):
         sequence_path.unlink()
         original_delete = store._delete_locked
 
-        def inspect_sequence_before_delete(name, backup):
+        def inspect_sequence_before_delete(name, config_dir, backup_path):
             self.assertEqual(read_json_object(sequence_path), {"last_seq": 2})
-            return original_delete(name, backup)
+            return original_delete(name, config_dir, backup_path)
 
         with unittest.mock.patch.object(
             store, "_delete_locked", side_effect=inspect_sequence_before_delete
@@ -444,6 +779,48 @@ class TestStore(BaseCase):
         self.assertTrue(backup.exists())
         self.assertEqual(store.default_name(), "second")
 
+    def test_delete_refuses_when_identity_changes_after_backup(self):
+        store = Store()
+        store.create("victim")
+        payload = store.profile_dir("victim") / "data" / "payload"
+        payload.parent.mkdir(exist_ok=True)
+        payload.write_text("keep", encoding="utf-8")
+        original_prepare = store._prepare_delete_backup
+        other_config = store.claude_config_root / "99"
+
+        def prepare_then_change_identity(*args, **kwargs):
+            result = original_prepare(*args, **kwargs)
+            store._claude_config_of = lambda _name: other_config
+            return result
+
+        with unittest.mock.patch.object(
+            store, "_prepare_delete_backup", side_effect=prepare_then_change_identity
+        ):
+            with self.assertRaisesRegex(StoreError, "identity changed"):
+                store.delete("victim")
+        self.assertEqual(payload.read_text(encoding="utf-8"), "keep")
+
+    def test_delete_reports_profile_that_survives_removal(self):
+        store = Store()
+        store.create("stubborn")
+        with unittest.mock.patch.object(store_mod, "rmtree"):
+            with self.assertRaisesRegex(StoreError, "could not be fully removed"):
+                store.delete("stubborn", backup=False)
+        self.assertTrue(store.profile_dir("stubborn").is_dir())
+
+    def test_delete_warns_when_default_reassignment_cannot_be_saved(self):
+        store = Store()
+        store.create("first")
+        store.create("second")
+        store.set_default("first")
+        with unittest.mock.patch.object(
+            store, "save_config", side_effect=StoreError("disk full")
+        ), unittest.mock.patch.object(store_mod, "warn") as warning:
+            store.delete("first", backup=False)
+        self.assertFalse(store.profile_dir("first").exists())
+        warning.assert_called_once()
+        self.assertIn("could not update default profile", warning.call_args[0][0])
+
     def test_delete_no_backup(self):
         store = Store()
         store.create("solo")
@@ -468,12 +845,12 @@ class TestStore(BaseCase):
                 handle.release()
             return original_sequence_lock(store_argument)
 
-        def inspect_sequence_lock(name, backup):
+        def inspect_sequence_lock(name, config_dir, backup_path):
             handle = locks.try_sequence_lock(store)
             sequence_lock_states.append(handle is None)
             if handle is not None:
                 handle.release()
-            return original_delete(name, backup)
+            return original_delete(name, config_dir, backup_path)
 
         def after_delete():
             self.assertFalse(store.profile_dir("callback-profile").exists())
@@ -692,6 +1069,180 @@ class TestStore(BaseCase):
         with self.assertRaises(StoreError):
             store.resolve_ref("nope")
 
+    def test_resolve_ref_rejects_non_ascii_digits_and_oversized_numbers(self):
+        profile = store_mod.Profile(name="alpha", seq=1)
+        with self.assertRaisesRegex(StoreError, "unknown profile"):
+            Store._resolve_ref_in([profile], [], "²")
+        with self.assertRaisesRegex(StoreError, "out of range"):
+            Store._resolve_ref_in([profile], [], "9" * 5000)
+
+    def test_read_json_object_normalizes_recursion_failures(self):
+        path = self._tmp / "deep.json"
+        path.write_text("{}", encoding="utf-8")
+        with unittest.mock.patch(
+            "store.json.loads", side_effect=RecursionError("deep input")
+        ):
+            self.assertIsNone(read_json_object(path, tolerant=True))
+            with self.assertRaisesRegex(ValueError, "nesting exceeds"):
+                read_json_object(path)
+
+    def test_readonly_removal_retry_preserves_mode_and_reports_failure(self):
+        path = self._tmp / "readonly"
+        path.write_text("payload", encoding="utf-8")
+        os.chmod(path, 0o755)
+
+        def fail_without_mode_change(target):
+            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o755)
+            raise PermissionError("still busy")
+
+        with self.assertRaisesRegex(PermissionError, "still busy"):
+            store_mod._rmtree_readonly_ok(fail_without_mode_change, str(path), None)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o755)
+
+    def test_readonly_removal_restores_readonly_mode_after_failed_retry(self):
+        path = self._tmp / "readonly-file"
+        path.write_text("payload", encoding="utf-8")
+        os.chmod(path, 0o444)
+
+        def fail_after_retry(target):
+            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o644)
+            raise PermissionError("still busy")
+
+        with self.assertRaisesRegex(PermissionError, "still busy"):
+            store_mod._rmtree_readonly_ok(fail_after_retry, str(path), None)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o444)
+
+    def test_rmtree_propagates_retry_failure(self):
+        path = self._tmp / "busy-tree"
+        path.mkdir()
+
+        def failing_rmtree(target, *, onexc=None, onerror=None):
+            callback = onexc or onerror
+
+            def fail(_path):
+                raise PermissionError("still busy")
+
+            callback(fail, str(target), PermissionError("still busy"))
+
+        with unittest.mock.patch("store.shutil.rmtree", side_effect=failing_rmtree):
+            with unittest.mock.patch("store.warn") as warning:
+                with self.assertRaisesRegex(PermissionError, "still busy"):
+                    store_mod.rmtree(path)
+        warning.assert_not_called()
+
+    def test_rmtree_failure_reports_cleanup_and_restore_errors_together(self):
+        path = self._tmp / "doomed"
+        restore_errors = [(path / "child", PermissionError("chmod denied"))]
+        with self.assertRaises(OSError) as ctx:
+            store_mod._raise_rmtree_failure(
+                path, PermissionError("still busy"), restore_errors
+            )
+        message = str(ctx.exception)
+        self.assertIn("still busy", message)
+        self.assertIn("chmod denied", message)
+        self.assertIn("could not restore original permissions", message)
+
+    def test_rmtree_restores_mode_of_surviving_readonly_directory(self):
+        if os.name != "posix" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+            self.skipTest("requires non-root POSIX directory permission semantics")
+        import shutil
+
+        root = self._tmp / "readonly-tree"
+        readonly = root / "nested"
+        readonly.mkdir(parents=True)
+        payload = readonly / "payload"
+        payload.write_text("data", encoding="utf-8")
+        os.chmod(readonly, 0o555)
+        original = readonly.lstat()
+        original_mode = stat.S_IMODE(original.st_mode)
+
+        try:
+            with self.assertRaises(OSError):
+                store_mod.rmtree(root)
+            current = readonly.lstat()
+            self.assertEqual((current.st_dev, current.st_ino), (original.st_dev, original.st_ino))
+            self.assertEqual(stat.S_IMODE(current.st_mode), original_mode)
+            self.assertEqual(payload.read_text(encoding="utf-8"), "data")
+        finally:
+            if readonly.exists():
+                os.chmod(readonly, 0o755)
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_rmtree_mode_restore_does_not_follow_replaced_path(self):
+        path = self._tmp / "cleanup-target"
+        target = self._tmp / "external-cleanup-target"
+        path.write_text("temporary", encoding="utf-8")
+        target.write_text("external", encoding="utf-8")
+        os.chmod(path, 0o400)
+        os.chmod(target, 0o640)
+        original = path.lstat()
+        target_info = target.lstat()
+        target_before = (
+            target_info.st_dev,
+            target_info.st_ino,
+            stat.S_IMODE(target_info.st_mode),
+            target.read_bytes(),
+        )
+        path.unlink()
+        try:
+            path.symlink_to(target)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"file symlink is unavailable: {exc}")
+
+        failures = store_mod._restore_rmtree_modes(
+            [(path, original.st_dev, original.st_ino, stat.S_IMODE(original.st_mode))]
+        )
+
+        self.assertEqual(len(failures), 1)
+        target_info = target.lstat()
+        self.assertEqual(
+            (
+                target_info.st_dev,
+                target_info.st_ino,
+                stat.S_IMODE(target_info.st_mode),
+                target.read_bytes(),
+            ),
+            target_before,
+        )
+        self.assertTrue(path.is_symlink())
+
+    def test_duplicate_positive_claude_sequences_fail_closed(self):
+        store = Store()
+        profile_bytes = {}
+        for name in ("alpha", "beta"):
+            profile_dir = store.profile_dir(name)
+            profile_dir.mkdir(parents=True)
+            metadata = store_mod.Profile(
+                name=name, seq=1, engine="claude"
+            ).to_dict()
+            meta_path = profile_dir / "profile.json"
+            meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+            profile_bytes[name] = meta_path.read_bytes()
+
+        expected = "duplicate positive profile sequence 1 is shared by 'alpha', 'beta'"
+        operations = (
+            store.scan,
+            store.list,
+            store.unreadable_profiles,
+            store.scan_readonly,
+            lambda: store.get_readonly("alpha"),
+            lambda: store.get("alpha"),
+            lambda: store.claude_config_dir("alpha"),
+            lambda: store.profile_data_dir("alpha"),
+            lambda: store.save(store_mod.Profile(name="gamma", seq=1, engine="claude")),
+            lambda: store.create("gamma"),
+            lambda: store.delete("alpha", backup=False),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                StoreError, expected
+            ):
+                operation()
+
+        for name, contents in profile_bytes.items():
+            self.assertEqual(store.profile_meta_path(name).read_bytes(), contents)
+        self.assertFalse(store.claude_config_root.exists())
+
     def test_config_atomic_write(self):
         store = Store()
         config = store.load_config()
@@ -731,6 +1282,60 @@ class TestStore(BaseCase):
             with self.assertRaises(OSError):
                 store._write_backup("payload-fail")
         self.assertEqual(list(store.backups_dir.glob("*.tmp")), [])
+
+    def test_backup_clamps_pre_1980_timestamps_instead_of_failing(self):
+        """Codex extracts its plugin cache with mtime=1 (one second after
+        the Unix epoch), and the ZIP format cannot encode anything before
+        1980-01-01. ``ZipFile.write`` raises on those, which used to make
+        such a profile undeletable: the verified backup is written before
+        the purge, so the whole delete failed closed on a cosmetic field.
+        The entry must land in the archive with its content intact and the
+        timestamp clamped to the ZIP floor."""
+        import os
+        import zipfile
+
+        store = Store()
+        store.create("epoch-cache")
+        data = store.profile_data_dir("epoch-cache")
+        cached = data / "plugins" / "cache" / "pkg"
+        cached.mkdir(parents=True, exist_ok=True)
+        plugin = cached / "plugin.json"
+        plugin.write_text('{"name": "pkg"}', encoding="utf-8")
+        os.utime(plugin, (1, 1))
+
+        backup = store._write_backup("epoch-cache")
+
+        with zipfile.ZipFile(backup) as zf:
+            self.assertIsNone(zf.testzip())
+            names = zf.namelist()
+            entry = next(n for n in names if n.endswith("plugin.json"))
+            self.assertEqual(zf.read(entry), b'{"name": "pkg"}')
+            self.assertGreaterEqual(
+                zf.getinfo(entry).date_time[0], 1980,
+                "entry timestamp must be clamped into the ZIP range",
+            )
+
+    def test_delete_succeeds_for_profile_with_epoch_cached_files(self):
+        """End-to-end guard for the clamp: a codex profile carrying an
+        epoch-dated plugin cache must delete normally (backup + purge),
+        not wedge on the backup step."""
+        import os
+
+        store = Store()
+        store.create("epoch-delete")
+        data = store.profile_data_dir("epoch-delete")
+        cache = data / "plugins" / "cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        marker = cache / "SKILL.md"
+        marker.write_text("cached", encoding="utf-8")
+        os.utime(marker, (1, 1))
+
+        store.delete("epoch-delete")
+
+        self.assertFalse(store.exists("epoch-delete"))
+        self.assertTrue(list(store.backups_dir.glob("epoch-delete-*.zip")))
+
+
 
     def test_atomic_copy_preserves_source_mode_and_mtime(self):
         """``atomic_copy`` now does copystat *inside* the skeleton's open-fh
@@ -1134,6 +1739,36 @@ store.rename("old", "new")
                     [expected_name],
                 )
 
+    def test_rename_recovery_rejects_duplicate_positive_sequence_without_mutation(self):
+        store = Store()
+        renamed = store.create("old")
+        store.create("peer")
+        peer_metadata_path = store.profile_meta_path("peer")
+        peer_metadata = json.loads(peer_metadata_path.read_text(encoding="utf-8"))
+        peer_metadata["seq"] = renamed.seq
+        peer_metadata_path.write_text(json.dumps(peer_metadata), encoding="utf-8")
+
+        store._write_rename_journal("old", "new", False)
+        store.profile_dir("old").rename(store.profile_dir("new"))
+        new_metadata_path = store.profile_meta_path("new")
+        new_metadata = json.loads(new_metadata_path.read_text(encoding="utf-8"))
+        new_metadata["name"] = "new"
+        new_metadata_path.write_text(json.dumps(new_metadata), encoding="utf-8")
+
+        profile_names = ("new", "peer")
+        profiles_before = {
+            name: self._tree_snapshot(store.profile_dir(name)) for name in profile_names
+        }
+        journal_before = store.rename_journal_path.read_bytes()
+
+        with self.assertRaisesRegex(StoreError, "duplicate positive profile sequence 1"):
+            store.list()
+
+        self.assertTrue(store.rename_journal_path.is_file())
+        self.assertEqual(store.rename_journal_path.read_bytes(), journal_before)
+        for name, snapshot in profiles_before.items():
+            self.assertEqual(self._tree_snapshot(store.profile_dir(name)), snapshot)
+
     def test_rename_overlay_cleanup_failure_keeps_journal_for_recovery(self):
         store = Store()
         original = store.create("old")
@@ -1236,7 +1871,7 @@ Store(root=root).rename("old", "new")
         before = sorted(
             (str(p), p.read_bytes() if p.is_file() else b"") for p in store.root.rglob("*")
         )
-        with mock.patch("locks.try_lock") as lock, mock.patch("locks.try_sequence_lock") as seq_lock:
+        with mock.patch("locks.try_lock") as lock, mock.patch("locks.try_mutation_lock") as mutation_lock, mock.patch("locks.try_sequence_lock") as seq_lock:
             self.assertTrue(store.has_pending_rename())
             for read in (
                 lambda: store.get_readonly("old"),
@@ -1246,6 +1881,7 @@ Store(root=root).rename("old", "new")
                 with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
                     read()
         lock.assert_not_called()
+        mutation_lock.assert_not_called()
         seq_lock.assert_not_called()
         after = sorted(
             (str(p), p.read_bytes() if p.is_file() else b"") for p in store.root.rglob("*")
@@ -1523,6 +2159,232 @@ Store(root=root).rename("old", "new")
         store._prune_backups("work", keep=1)
         remaining = list(store.backups_dir.glob("work-*.zip"))
         self.assertEqual(len(remaining), 1)
+
+
+class TestLeasedSessionBlocksMutations(BaseCase):
+    """A session registered in the lease registry blocks delete/rename even
+    though its flock is free (sessions only hold it briefly)."""
+
+    def setUp(self):
+        super().setUp()
+        import locks
+
+        self.locks = locks
+        self.store = Store()
+        self.store.create("work")
+        self.marker = self.store.profile_data_dir("work") / "tokens.json"
+        self.marker.write_text("{}", encoding="utf-8")
+        self.locks.acquire_lease(self.store, "work")
+        self.addCleanup(self.locks.release_lease, self.store, "work")
+        self.registry = self.locks.lock_path(self.store, "work").read_bytes()
+
+    def _tree(self):
+        return sorted(
+            (str(p), p.read_bytes() if p.is_file() else b"")
+            for p in self.store.root.rglob("*")
+            if p.parent != self.store.backups_dir
+            and self.locks.lock_dir(self.store) not in p.parents
+            and p != self.locks.lock_dir(self.store)
+        )
+
+    def test_flock_is_free_but_delete_is_refused_with_data_untouched(self):
+        self.assertFalse(self.locks._flock_probe_locked(self.store, "work"))
+        before = self._tree()
+        with self.assertRaisesRegex(StoreError, "live session"):
+            self.store.delete("work")
+        self.assertEqual(self._tree(), before)
+        self.assertEqual(self.locks.lock_path(self.store, "work").read_bytes(), self.registry)
+        self.assertTrue(self.marker.is_file())
+
+    def test_rename_is_refused_for_either_endpoint(self):
+        before = self._tree()
+        with self.assertRaisesRegex(StoreError, "live session"):
+            self.store.rename("work", "other")
+        self.assertEqual(self._tree(), before)
+        self.store.create("spare")
+        with self.assertRaisesRegex(StoreError, "live session"):
+            self.store.rename("spare", "work")
+        self.assertTrue(self.marker.is_file())
+
+    def test_mutations_work_again_once_the_lease_is_released(self):
+        self.locks.release_lease(self.store, "work")
+        self.store.rename("work", "other")
+        self.assertTrue(
+            (self.store.profile_data_dir("other") / "tokens.json").is_file()
+        )
+        self.store.delete("other")
+        self.assertFalse(self.store.exists("other"))
+
+
+def _write_profile_metadata(store, name, **fields):
+    profile_dir = store.profile_dir(name)
+    (profile_dir / "data").mkdir(parents=True, exist_ok=True)
+    metadata = {"name": name, "created": "2026-01-01T00:00:00.000+00:00"}
+    metadata.update(fields)
+    meta_path = profile_dir / "profile.json"
+    meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+    return meta_path
+
+
+class TestProfileSequenceIdentity(BaseCase):
+    def test_duplicate_positive_sequence_fails_closed_across_different_engines(self):
+        store = Store()
+        agy = _write_profile_metadata(store, "alpha", seq=4, engine="agy")
+        codex = _write_profile_metadata(store, "beta", seq=4, engine="codex")
+        before = (agy.read_bytes(), codex.read_bytes())
+        expected = "duplicate positive profile sequence 4 is shared by 'alpha', 'beta'"
+        for operation in (
+            store.scan,
+            store.list,
+            store.scan_readonly,
+            lambda: store.get("alpha"),
+            lambda: store.get_readonly("beta"),
+            lambda: store.create("gamma"),
+        ):
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                StoreError, expected
+            ):
+                operation()
+        self.assertEqual((agy.read_bytes(), codex.read_bytes()), before)
+
+    def test_new_profile_with_a_sequence_held_by_another_engine_is_refused(self):
+        store = Store()
+        _write_profile_metadata(store, "alpha", seq=2, engine="codex")
+        store.profile_dir("beta").mkdir(parents=True)
+        with self.assertRaisesRegex(StoreError, "duplicate positive profile sequence 2"):
+            store.save(store_mod.Profile(name="beta", seq=2, engine="grok"))
+        self.assertFalse(store.profile_meta_path("beta").exists())
+
+    def test_legacy_zero_sequences_coexist_across_engines(self):
+        store = Store()
+        _write_profile_metadata(store, "alpha", engine="agy")
+        _write_profile_metadata(store, "beta", seq=None, engine="codex")
+        _write_profile_metadata(store, "gamma", seq=0, engine="grok")
+        profiles, unreadable = store.scan()
+        self.assertEqual([(p.name, p.seq) for p in profiles], [
+            ("alpha", 0), ("beta", 0), ("gamma", 0),
+        ])
+        self.assertEqual(unreadable, [])
+
+    def test_engine_spelling_cannot_hide_a_claude_profile_without_a_sequence(self):
+        store = Store()
+        _write_profile_metadata(store, "spelled", engine="Claude")
+        profiles, unreadable = store.scan()
+        self.assertEqual(profiles, [])
+        self.assertEqual(unreadable, ["spelled"])
+
+    def test_claude_spelling_is_still_a_claude_profile_for_config_resolution(self):
+        store = Store()
+        _write_profile_metadata(store, "spelled", seq=7, engine=" Claude ")
+        self.assertEqual(store.get("spelled").engine, "claude")
+        self.assertEqual(store.claude_config_dir("spelled"), store.claude_config_dir_for_seq(7))
+        self.assertEqual(store.profile_data_dir("spelled"), store.claude_config_dir_for_seq(7))
+        self.assertEqual(store._claude_config_of("spelled"), store.claude_config_dir_for_seq(7))
+
+    def test_saving_a_claude_profile_without_a_positive_sequence_is_refused_whatever_the_spelling(self):
+        store = Store()
+        store.profile_dir("spelled").mkdir(parents=True)
+        profile = store_mod.Profile(name="spelled", seq=1, engine="claude")
+        profile.engine = "Claude"
+        profile.seq = 0
+        with self.assertRaisesRegex(StoreError, "invalid profile sequence"):
+            store.save(profile)
+
+
+class TestRoutineSaveSkipsTheWholeStoreScan(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        for name in ("alpha", "beta", "gamma"):
+            self.store.create(name)
+
+    def _scans_during(self, operation):
+        scans = []
+        original = self.store._scan
+
+        def counting_scan():
+            scans.append(1)
+            return original()
+
+        with unittest.mock.patch.object(self.store, "_scan", side_effect=counting_scan):
+            operation()
+        return len(scans)
+
+    def test_routine_update_does_not_scan_and_persists_the_change(self):
+        profile = self.store.get("beta")
+        profile.touch()
+        profile.email = "beta@example.com"
+        self.assertEqual(self._scans_during(lambda: self.store.save(profile)), 0)
+        saved = self.store.get("beta")
+        self.assertEqual((saved.email, saved.last_used), ("beta@example.com", profile.last_used))
+        self.assertEqual(saved.seq, profile.seq)
+
+    def test_path_integrity_is_still_checked_without_a_scan(self):
+        import shutil
+
+        profile = self.store.get("alpha")
+        outside = self._tmp / "outside"
+        outside.mkdir()
+        (outside / "profile.json").write_text("{}", encoding="utf-8")
+        before = (outside / "profile.json").read_bytes()
+        shutil.rmtree(self.store.profile_dir("alpha"))
+        self.store.profile_dir("alpha").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(StoreError, "symlink|junction|real"):
+            self.store.save(profile)
+        self.assertEqual((outside / "profile.json").read_bytes(), before)
+
+    def test_changed_sequence_still_takes_the_full_scan_and_duplicate_check(self):
+        profile = self.store.get("alpha")
+        profile.seq = self.store.get("beta").seq
+        scans = []
+        original = self.store._scan
+        with unittest.mock.patch.object(
+            self.store, "_scan", side_effect=lambda: scans.append(1) or original()
+        ):
+            with self.assertRaisesRegex(StoreError, "duplicate positive profile sequence"):
+                self.store.save(profile)
+        self.assertEqual(len(scans), 1)
+        self.assertNotEqual(
+            json.loads(self.store.profile_meta_path("alpha").read_text())["seq"], profile.seq
+        )
+
+    def test_changed_engine_missing_file_and_corrupt_file_take_the_full_scan(self):
+        changed = self.store.get("alpha")
+        changed.engine = "codex"
+        self.assertEqual(self._scans_during(lambda: self.store.save(changed)), 1)
+
+        fresh = self.store.get("beta")
+        self.store.profile_meta_path("beta").unlink()
+        self.assertEqual(self._scans_during(lambda: self.store.save(fresh)), 1)
+
+        corrupt = self.store.get("gamma")
+        self.store.profile_meta_path("gamma").write_text("{broken", encoding="utf-8")
+        self.assertEqual(self._scans_during(lambda: self.store.save(corrupt)), 1)
+        self.assertEqual(self.store.get("gamma").name, "gamma")
+
+    def test_rename_still_validates_through_the_full_scan(self):
+        scans = []
+        original = self.store._scan
+        with unittest.mock.patch.object(
+            self.store, "_scan", side_effect=lambda: scans.append(1) or original()
+        ):
+            renamed = self.store.rename("alpha", "omega")
+        self.assertEqual(renamed.name, "omega")
+        self.assertTrue(scans)
+        self.assertEqual(self.store.get("omega").seq, renamed.seq)
+
+    def test_scans_stay_fail_closed_after_a_routine_save_in_a_duplicated_store(self):
+        alpha = self.store.get("alpha")
+        beta_path = self.store.profile_meta_path("beta")
+        beta = json.loads(beta_path.read_text())
+        beta["seq"] = alpha.seq
+        beta_path.write_text(json.dumps(beta), encoding="utf-8")
+        before = beta_path.read_bytes()
+        alpha.touch()
+        self.store.save(alpha)
+        with self.assertRaisesRegex(StoreError, "duplicate positive profile sequence"):
+            self.store.list()
+        self.assertEqual(beta_path.read_bytes(), before)
 
 
 if __name__ == "__main__":

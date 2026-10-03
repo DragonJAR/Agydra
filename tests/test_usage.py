@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import keychain
+import platforms
 import usage
 from conftest import BaseCase, _make_jwt
 from store import Store
@@ -223,47 +224,43 @@ class TestQueryProfileUsageFailureModes(_UsageBase):
         self.assertIn("could not run agy", result.error)
 
 
-class TestQueryProfileUsageOverlayRace(_UsageBase):
-    """isolation.build_overlay can raise a bare FileExistsError (an OSError
-    subclass, not isolation.IsolationError) on the TOCTOU race in `_link`'s
-    symlink-creation window -- exactly the scenario this module's docstring
-    names as the primary use case: `agydra usage` running concurrently
-    against a profile whose overlay a real launch is also building. This
-    must degrade to UsageResult(ok=False, ...), never propagate."""
+class TestQueryProfileUsageCredentialUnavailable(_UsageBase):
+    """When no credential is resolvable (disk token gone AND no keychain
+    backup carrying a matching identity) `query_profile_usage` must
+    degrade to a clean UsageResult error without ever launching agy."""
 
-    def test_bare_file_exists_error_degrades_without_raising(self):
+    def test_unresolvable_credential_degrades_without_raising(self):
         with mock.patch.object(
-            usage.isolation, "build_overlay",
-            side_effect=FileExistsError("race on .gemini link"),
+            usage.usage_agy, "scoped_token_bytes", return_value=None,
         ):
-            result = usage.query_profile_usage(self.store, "alpha")
+            with mock.patch.object(platforms, "run_with_group_kill") as mock_run:
+                result = usage.query_profile_usage(self.store, "alpha")
         self.assertFalse(result.ok)
-        self.assertIn("overlay error", result.error)
+        self.assertIn("credential not found", result.error)
+        mock_run.assert_not_called()
 
 
 class TestGatherUsageReportSurvivesPerProfileFailures(_UsageBase):
-    """A single profile's overlay-build race or any other unexpected
+    """A single profile's unresolvable credential or any other unexpected
     failure must never abort the whole multi-profile report -- see
     usage.py's module docstring invariant."""
 
-    def test_overlay_race_on_one_profile_does_not_abort_the_report(self):
+    def test_unresolvable_credential_on_one_profile_does_not_abort_the_report(self):
         self.store.create("beta")
         self._authenticate("beta")
         self._write_response(REAL_USAGE_JSON)
 
-        real_build_overlay = usage.isolation.build_overlay
-
-        def flaky_build_overlay(name, *args, **kwargs):
+        def flaky_token_bytes(store, name, profile, data_dir):
             if name == "alpha":
-                raise FileExistsError("race on .gemini link")
-            return real_build_overlay(name, *args, **kwargs)
+                return None
+            return b'{"access_token": "x"}'
 
-        with mock.patch.object(usage.isolation, "build_overlay", side_effect=flaky_build_overlay):
+        with mock.patch.object(usage.usage_agy, "scoped_token_bytes", side_effect=flaky_token_bytes):
             results = usage.gather_usage_report(self.store, ["alpha", "beta"])
 
         self.assertEqual([r.name for r in results], ["alpha", "beta"])
         self.assertFalse(results[0].ok)
-        self.assertIn("overlay error", results[0].error)
+        self.assertIn("credential not found", results[0].error)
         self.assertTrue(results[1].ok, results[1].error)
 
     def test_query_profile_usage_gracefully_handles_codex_engine(self):
@@ -345,31 +342,26 @@ class TestQueryProfileUsageTimeoutKillsProcessGroup(_UsageBase):
         )
 
 
-class TestQueryProfileUsageLaunchGuard(_UsageBase):
-    def test_goes_through_launch_guard(self):
+class TestQueryProfileUsageDoesNotUseLaunchGuard(_UsageBase):
+    """The Antigravity query path is keychain-free: it stages the profile's
+    own credential into a throwaway HOME and never asks ``launch_guard``
+    to swap the shared macOS keychain slot -- even on a platform whose
+    keychain bridge is supported."""
+
+    def test_does_not_call_launch_guard(self):
         self._write_response(REAL_USAGE_JSON)
-        guard = mock.MagicMock()
-        guard.__enter__ = mock.Mock(return_value=guard)
-        guard.__exit__ = mock.Mock(return_value=False)
-        with mock.patch.object(usage.keychain, "launch_guard", return_value=guard) as mock_guard:
+        with mock.patch.object(keychain, "launch_guard") as mock_guard, \
+                mock.patch.object(keychain, "supported", return_value=True):
             result = usage.query_profile_usage(self.store, "alpha")
-        mock_guard.assert_called_once_with(
-            self.store, "alpha", capture=False, persist_on_exit=False
-        )
-        guard.__enter__.assert_called_once()
-        guard.__exit__.assert_called_once()
+        mock_guard.assert_not_called()
         self.assertTrue(result.ok, result.error)
 
 
 class TestQueryProfileUsageAlreadyBusyKeychainNoop(_UsageBase):
-    """The keychain-swap regression this feature is built around: querying
-    usage for a profile whose OWN credential is already in the shared
-    keychain slot (a real interactive session for that same profile is
-    already running -- the feature's primary intended use case) must not
-    touch the shared slot at all. Before the fix, `launch_guard` swapped
-    the profile's own `.secret` in and then restored the pre-call snapshot
-    on exit unconditionally -- discarding any OAuth refresh the live
-    session wrote to the shared slot during this call's up-to-20s window.
+    """Querying usage must leave the shared macOS keychain slot untouched,
+    even on a host whose keychain bridge is enabled. The staged-HOME path
+    achieves this structurally: agy reads the staged file token via
+    ``SSH_TTY`` and never consults the shared slot at all.
     """
 
     def test_usage_on_busy_profile_leaves_shared_slot_untouched(self):
@@ -433,52 +425,6 @@ class TestUsageRenderingHelpers(unittest.TestCase):
         self.assertEqual(usage.usage_color(0.2), "yellow")
         self.assertEqual(usage.usage_color(0.19), "red")
         self.assertEqual(usage.usage_color(0.0), "red")
-
-    def test_column_header_is_derived_dynamically(self):
-        self.assertEqual(usage.column_header("Gemini Models", "weekly"), "GEMINI WK")
-        self.assertEqual(usage.column_header("Gemini Models", "5h"), "GEMINI 5H")
-        self.assertEqual(
-            usage.column_header("Claude and GPT models", "weekly"),
-            "CLAUDE AND GPT WK",
-        )
-        self.assertEqual(usage.column_header("A Brand New Group", "monthly"), "A BRAND NEW GR MONT")
-
-    def test_collect_bucket_columns_union_first_seen_order(self):
-        first = usage.UsageResult(
-            name="alpha", ok=True,
-            groups=[usage.UsageGroup(
-                name="Gemini Models",
-                buckets=[usage.UsageBucket("gemini-weekly", "W", "weekly", 0.9, None)],
-            )],
-        )
-        second = usage.UsageResult(
-            name="beta", ok=True,
-            groups=[usage.UsageGroup(
-                name="Gemini Models",
-                buckets=[
-                    usage.UsageBucket("gemini-weekly", "W", "weekly", 0.5, None),
-                    usage.UsageBucket("gemini-5h", "5H", "5h", 0.5, None),
-                ],
-            )],
-        )
-        columns = usage.collect_bucket_columns([first, second])
-        self.assertEqual([c.id for c in columns], ["gemini-weekly", "gemini-5h"])
-
-    def test_collect_bucket_columns_skips_failed_results(self):
-        failed = usage.UsageResult(name="alpha", ok=False, error="not authenticated")
-        self.assertEqual(usage.collect_bucket_columns([failed]), [])
-
-    def test_bucket_by_id_lookup(self):
-        result = usage.UsageResult(
-            name="alpha", ok=True,
-            groups=[usage.UsageGroup(
-                name="Gemini Models",
-                buckets=[usage.UsageBucket("gemini-weekly", "W", "weekly", 0.9, None)],
-            )],
-        )
-        found = usage.bucket_by_id(result, "gemini-weekly")
-        self.assertIsNotNone(found)
-        self.assertIsNone(usage.bucket_by_id(result, "missing"))
 
     def test_format_countdown_variants(self):
         from datetime import datetime, timedelta, timezone
@@ -659,8 +605,7 @@ class TestCodexUsage(BaseCase):
         self.assertEqual(res.email, "unavailable@example.com")
         self.assertEqual(res.groups, [])
 
-    @mock.patch("usage.refresh_codex_tokens")
-    def test_query_codex_usage_without_access_token_is_read_only(self, mock_refresh):
+    def test_query_codex_usage_without_access_token_is_read_only(self):
         auth_data = {"tokens": {"refresh_token": "ref_tok"}}
         data_dir = self._tmp / "codex_data_refresh_only"
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -671,12 +616,10 @@ class TestCodexUsage(BaseCase):
 
         self.assertFalse(res.ok)
         self.assertEqual(res.error, "missing access token")
-        mock_refresh.assert_not_called()
         self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8")), auth_data)
 
-    @mock.patch("usage.refresh_codex_tokens")
     @mock.patch("usage.fetch_codex_usage_payload")
-    def test_query_codex_usage_401_is_read_only(self, mock_fetch, mock_refresh):
+    def test_query_codex_usage_401_is_read_only(self, mock_fetch):
         import urllib.error
 
         expired = urllib.error.HTTPError("http://...", 401, "Unauthorized", {}, None)
@@ -702,24 +645,53 @@ class TestCodexUsage(BaseCase):
         self.assertFalse(res.ok)
         self.assertEqual(res.error, "session expired (401)")
         self.assertEqual(mock_fetch.call_count, 1)
-        mock_refresh.assert_not_called()
         self.assertEqual(closed, [True])
         saved_auth = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
         self.assertEqual(saved_auth, auth_data)
 
 
 class TestUsageRobustnessAndEdgeCases(unittest.TestCase):
-    def test_parse_reset_time_lowercase_z(self):
-        dt = usage._parse_reset_time("2026-10-01T07:43:10z")
+    def test_parse_iso_utc_lowercase_z(self):
+        dt = usage.parse_iso_utc("2026-10-01T07:43:10z")
         self.assertIsNotNone(dt)
         self.assertEqual(dt.year, 2026)
 
-    def test_parse_reset_time_invalid_values(self):
-        self.assertIsNone(usage._parse_reset_time(True))
-        self.assertIsNone(usage._parse_reset_time(False))
-        self.assertIsNone(usage._parse_reset_time("not-a-date"))
-        self.assertIsNone(usage._parse_reset_time(None))
-        self.assertIsNone(usage._parse_reset_time(1e25))
+    def test_parse_iso_utc_invalid_values(self):
+        self.assertIsNone(usage.parse_iso_utc(True))
+        self.assertIsNone(usage.parse_iso_utc(False))
+        self.assertIsNone(usage.parse_iso_utc("not-a-date"))
+        self.assertIsNone(usage.parse_iso_utc(None))
+        self.assertIsNone(usage.parse_iso_utc(1e25))
+
+    def test_parse_iso_utc_normalizes_naive_and_trailing_only(self):
+        """Naive strings read as UTC (never as host-local), and only a
+        TRAILING ``Z``/``z`` is rewritten. The CLI display path used to
+        re-implement this inline with ``str.replace("Z", ...)``, which
+        rewrote an interior ``Z`` and dropped the naive-as-UTC rule."""
+        from datetime import timezone
+
+        naive = usage.parse_iso_utc("2026-10-01T07:43:10")
+        self.assertIsNotNone(naive)
+        self.assertEqual(naive.tzinfo, timezone.utc)
+        for stamp in ("2026-10-01T07:43:10Z", "2026-10-01T07:43:10z"):
+            parsed = usage.parse_iso_utc(stamp)
+            self.assertIsNotNone(parsed, stamp)
+            self.assertEqual(parsed.utcoffset().total_seconds(), 0)
+        self.assertIsNone(
+            usage.parse_iso_utc("Z2026-10-01T07:43:10"),
+            "an interior Z must not be silently rewritten",
+        )
+
+    def test_parse_iso_utc_require_utc_rejects_non_utc(self):
+        self.assertIsNone(
+            usage.parse_iso_utc("2026-10-01T07:43:10-05:00", require_utc=True)
+        )
+        self.assertIsNone(
+            usage.parse_iso_utc("2026-10-01T07:43:10", require_utc=True)
+        )
+        self.assertIsNotNone(
+            usage.parse_iso_utc("2026-10-01T07:43:10Z", require_utc=True)
+        )
 
     def test_parse_bucket_robustness(self):
         self.assertIsNone(usage._parse_bucket({"id": "b1", "remaining_fraction": True}))
@@ -748,6 +720,15 @@ class TestUsageRobustnessAndEdgeCases(unittest.TestCase):
         self.assertEqual(groups[0].buckets[0].id, "codex-weekly")
         self.assertEqual(groups[0].buckets[0].remaining_fraction, 0.0)
         self.assertIsNone(groups[0].buckets[0].reset_time)
+
+    def test_parse_codex_usage_payload_normalizes_email(self):
+        _groups, _plan, email = usage.parse_codex_usage_payload(
+            {"email": "  codex@example.invalid \t"}
+        )
+        self.assertEqual(email, "codex@example.invalid")
+
+        _groups, _plan, email = usage.parse_codex_usage_payload({"email": " \t "})
+        self.assertIsNone(email)
 
     def test_external_numeric_overflow_is_rejected_without_raising(self):
         oversized = 10 ** 10000
@@ -884,6 +865,34 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
         self.assertFalse(res.ok)
         self.assertEqual(res.error, "no usage data in response")
 
+    def _grok_empty_with_tier(self, tier, billing):
+        data_dir = self._tmp / f"grok_tier_{abs(hash((tier, str(billing))))}"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "auth.json").write_text(
+            json.dumps({"issuer::client": {"key": "token"}}), encoding="utf-8"
+        )
+        settings = {"subscription_tier_display": tier} if tier else None
+        with mock.patch("usage.fetch_grok_settings_payload", return_value=settings), \
+                mock.patch("usage.fetch_grok_billing_payload", return_value=billing):
+            return usage.query_grok_usage(data_dir, "gx_tier")
+
+    def test_grok_x_premium_without_quota_is_a_healthy_known_state(self):
+        for tier in ("X Premium", " x premium "):
+            for billing in (None, {}, {"config": {}}):
+                with self.subTest(tier=tier, billing=billing):
+                    res = self._grok_empty_with_tier(tier, billing)
+                    self.assertTrue(res.ok)
+                    self.assertEqual(res.error, usage.PLAN_WITHOUT_QUOTA)
+                    self.assertEqual(res.plan, tier)
+                    self.assertEqual(res.groups, [])
+
+    def test_grok_other_plans_with_empty_billing_still_fail_explicitly(self):
+        for tier in ("SuperGrok", "X Premium+", "Grok Pro", None):
+            with self.subTest(tier=tier):
+                res = self._grok_empty_with_tier(tier, {"config": {}})
+                self.assertFalse(res.ok)
+                self.assertEqual(res.error, "no usage data in response")
+
     def test_query_grok_usage_success_with_existing_access_token_is_read_only(self):
         data_dir = self._tmp / "grok_success_response"
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -982,7 +991,6 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
         info = account.inspect_codex_auth(data_dir)
         self.assertIsNotNone(info)
         self.assertEqual(info.get("account_id"), "org-jwt123")
-        self.assertEqual(account.detect_codex_account_id(data_dir), "org-jwt123")
 
         with mock.patch("urllib.request.urlopen") as mock_open:
             mock_resp = mock.MagicMock()
@@ -1157,7 +1165,7 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
     @mock.patch("usage.refresh_grok_tokens")
     @mock.patch("usage.fetch_grok_billing_payload")
     @mock.patch("usage.fetch_grok_settings_payload")
-    def test_query_grok_usage_401_is_read_only(self, mock_settings, mock_billing, mock_refresh):
+    def test_query_grok_usage_401_refreshes_retries_and_persists(self, mock_settings, mock_billing, mock_refresh):
         data_dir = self._tmp / "grok_reactive"
         data_dir.mkdir(parents=True, exist_ok=True)
         auth_data = {
@@ -1165,6 +1173,7 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
                 "key": "stale_token",
                 "refresh_token": "valid_ref",
                 "email": "elon@x.ai",
+                "expires_at": 9999999999999,
             }
         }
         (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
@@ -1178,17 +1187,143 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
 
         expired.close = _close_mock
 
-        mock_billing.side_effect = [expired]
+        billing_payload = {
+            "config": {
+                "creditUsagePercent": 40.0,
+                "billingPeriodEnd": "2026-10-15T00:00:00Z",
+            }
+        }
+        mock_billing.side_effect = [expired, billing_payload]
+        mock_refresh.return_value = {
+            "access_token": "fresh_token",
+            "refresh_token": "rotated_ref",
+        }
+        mock_settings.return_value = {"subscription_tier_display": "Grok Pro"}
 
         res = usage.query_grok_usage(data_dir, "grok_rx")
-        self.assertFalse(res.ok)
-        self.assertEqual(res.error, "session expired (401)")
-        self.assertEqual(mock_billing.call_count, 1)
-        mock_refresh.assert_not_called()
-        mock_settings.assert_not_called()
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(mock_billing.call_count, 2)
+        self.assertEqual(mock_billing.call_args_list[0][0][0], "stale_token")
+        self.assertEqual(mock_billing.call_args_list[1][0][0], "fresh_token")
+        mock_refresh.assert_called_once()
         self.assertTrue(closed)
         saved = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
-        self.assertEqual(saved, auth_data)
+        entry = saved["https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"]
+        self.assertEqual(entry["key"], "fresh_token")
+        self.assertEqual(entry["refresh_token"], "rotated_ref")
+        self.assertEqual(entry["email"], "elon@x.ai")
+        self.assertEqual(entry["expires_at"], 9999999999999)
+
+    @mock.patch("usage.fetch_grok_settings_payload")
+    @mock.patch("usage.fetch_grok_billing_payload")
+    @mock.patch("usage.refresh_grok_tokens")
+    def test_query_grok_usage_401_with_dead_refresh_names_relogin(self, mock_refresh, mock_billing, mock_settings):
+        data_dir = self._tmp / "grok_dead_refresh"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        auth_data = {
+            "https://auth.x.ai::client": {
+                "key": "stale_token",
+                "refresh_token": "revoked_ref",
+            }
+        }
+        (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
+        expired = urllib.error.HTTPError("http://...", 401, "Unauthorized", {}, None)
+        mock_billing.side_effect = [expired]
+        mock_refresh.return_value = None
+
+        res = usage.query_grok_usage(data_dir, "grok_dead")
+
+        self.assertFalse(res.ok)
+        self.assertIn("session expired (401)", res.error)
+        self.assertIn("agydra login grok_dead", res.error)
+        mock_refresh.assert_called_once()
+        self.assertEqual(
+            json.loads((data_dir / "auth.json").read_text(encoding="utf-8")),
+            auth_data,
+        )
+
+    @mock.patch("usage.fetch_grok_settings_payload")
+    @mock.patch("usage.fetch_grok_billing_payload")
+    @mock.patch("usage.refresh_grok_tokens")
+    def test_query_grok_usage_401_without_refresh_token_names_relogin(self, mock_refresh, mock_billing, mock_settings):
+        data_dir = self._tmp / "grok_no_refresh"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        auth_data = {"https://auth.x.ai::client": {"key": "stale_token"}}
+        (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
+        expired = urllib.error.HTTPError("http://...", 401, "Unauthorized", {}, None)
+        mock_billing.side_effect = [expired, expired]
+
+        res = usage.query_grok_usage(data_dir, "grok_nr")
+
+        self.assertFalse(res.ok)
+        self.assertIn("agydra login grok_nr", res.error)
+        mock_refresh.assert_not_called()
+
+    def _grok_dir_with_refresh_token(self, label):
+        data_dir = self._tmp / label
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "auth.json").write_text(
+            json.dumps(
+                {"https://auth.x.ai::client": {"key": "stale", "refresh_token": "ref"}}
+            ),
+            encoding="utf-8",
+        )
+        return data_dir
+
+    @staticmethod
+    def _unauthorized():
+        return urllib.error.HTTPError("http://...", 401, "Unauthorized", {}, None)
+
+    @mock.patch("usage.fetch_grok_settings_payload")
+    @mock.patch("usage.fetch_grok_billing_payload")
+    @mock.patch("usage.refresh_grok_tokens")
+    def test_query_grok_usage_second_401_after_refresh_names_relogin(
+        self, mock_refresh, mock_billing, mock_settings
+    ):
+        data_dir = self._grok_dir_with_refresh_token("grok_second_401")
+        mock_billing.side_effect = [self._unauthorized(), self._unauthorized()]
+        mock_refresh.return_value = {"access_token": "fresh", "refresh_token": "next"}
+
+        res = usage.query_grok_usage(data_dir, "grok_s401")
+
+        self.assertFalse(res.ok)
+        self.assertIn("re-login required: agydra login grok_s401", res.error)
+        self.assertEqual(mock_billing.call_count, 2)
+        mock_refresh.assert_called_once()
+
+    @mock.patch("usage.fetch_grok_settings_payload")
+    @mock.patch("usage.fetch_grok_billing_payload")
+    @mock.patch("usage.refresh_grok_tokens")
+    def test_query_grok_usage_refresh_without_access_token_names_relogin(
+        self, mock_refresh, mock_billing, mock_settings
+    ):
+        data_dir = self._grok_dir_with_refresh_token("grok_blank_grant")
+        mock_billing.side_effect = [self._unauthorized()]
+        mock_refresh.return_value = {"access_token": " "}
+
+        res = usage.query_grok_usage(data_dir, "grok_blank")
+
+        self.assertFalse(res.ok)
+        self.assertIn("re-login required: agydra login grok_blank", res.error)
+        self.assertEqual(mock_billing.call_count, 1)
+        mock_refresh.assert_called_once()
+
+    @mock.patch("usage.fetch_grok_settings_payload", return_value=None)
+    @mock.patch("usage.fetch_grok_billing_payload")
+    @mock.patch("usage.refresh_grok_tokens")
+    def test_query_grok_usage_survives_token_persistence_failure(
+        self, mock_refresh, mock_billing, mock_settings
+    ):
+        data_dir = self._grok_dir_with_refresh_token("grok_persist_fails")
+        payload = {"config": {"creditUsagePercent": 10.0}}
+        mock_billing.side_effect = [self._unauthorized(), payload]
+        mock_refresh.return_value = {"access_token": "fresh", "refresh_token": "next"}
+
+        with mock.patch("account.update_grok_tokens", side_effect=OSError("disk full")):
+            res = usage.query_grok_usage(data_dir, "grok_pf")
+
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(mock_billing.call_args_list[1][0][0], "fresh")
 
 
 if __name__ == "__main__":

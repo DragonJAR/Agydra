@@ -13,7 +13,6 @@
 import contextlib
 import io
 import os
-import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -21,6 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cli import (
+    main,
     _LAUNCH_FLAGS,
     _check_no_launcher_long_flag_collision,
     _check_no_launcher_short_flag_collision,
@@ -35,7 +35,7 @@ from cli import (
 from store import Store, StoreError
 
 import vocab
-from conftest import BaseCase
+from conftest import BaseCase, run_cli
 
 
 class TestShortFlagBundles(unittest.TestCase):
@@ -427,10 +427,8 @@ class TestRuntimeCreateRefusesReservedName(BaseCase):
     """End-to-end through the real CLI binary in a subprocess."""
 
     def _run(self, *args):
-        return subprocess.run(
-            [sys.executable, "-m", "agydra", *args],
-            capture_output=True, text=True, timeout=60,
-            env={**os.environ, "AGYDRA_HOME": str(self.store_root)},
+        return run_cli(
+            *args, cwd=self._tmp, extra_env={"AGYDRA_HOME": str(self.store_root)}
         )
 
     def test_create_status_is_actionable(self):
@@ -443,6 +441,123 @@ class TestRuntimeCreateRefusesReservedName(BaseCase):
         result = self._run("create", "ls")
         self.assertEqual(result.returncode, 1)
         self.assertIn("reserved profile name", result.stderr)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class _CliSurfaceCase(BaseCase):
+    def _main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                status = main(argv)
+            except SystemExit as exit_info:
+                status = exit_info.code
+        return status, out.getvalue(), err.getvalue()
+
+
+class TestStatusWithoutEngineBinary(_CliSurfaceCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("work")
+        os.environ["AGYDRA_AGY_BIN"] = str(self._tmp / "missing" / "agy")
+        os.environ["PATH"] = str(self._tmp / "empty-bin")
+
+    def test_status_reports_the_profile_when_the_binary_is_not_installed(self):
+        status, out, err = self._main(["status", "work"])
+        self.assertEqual(status, 0, err)
+        self.assertIn("profile   : work", out)
+        self.assertIn("engine    : agy", out)
+        self.assertIn("binary    : (not found", out)
+        self.assertIn("AGYDRA_AGY_BIN", out)
+        self.assertNotIn("could not find the agy binary", err)
+
+    def test_status_still_prints_the_binary_path_when_installed(self):
+        os.environ["AGYDRA_AGY_BIN"] = str(self.agy_bin)
+        status, out, err = self._main(["status", "work"])
+        self.assertEqual(status, 0, err)
+        self.assertIn(f"binary    : {self.agy_bin}", out)
+
+    def test_status_dry_run_plan_still_requires_the_binary(self):
+        status, out, err = self._main(["status", "work", "-n"])
+        self.assertEqual(status, 1)
+        self.assertIn("could not find the agy binary", err)
+
+    def test_status_of_an_unknown_profile_is_still_an_error(self):
+        status, out, err = self._main(["status", "ghost"])
+        self.assertEqual(status, 1)
+        self.assertIn("unknown profile", err)
+
+
+class TestOptionsWithoutEffectAreRejected(_CliSurfaceCase):
+    def test_doctor_force_requires_fix(self):
+        status, out, err = self._main(["doctor", "-f"])
+        self.assertEqual(status, 2)
+        self.assertIn("--fix", err)
+        self.assertNotIn("agydra doctor", out)
+
+    def test_doctor_accepts_its_valid_combinations(self):
+        for argv in (["doctor"], ["doctor", "--fix", "-f"], ["doctor", "--fix", "--force"]):
+            with self.subTest(argv=argv):
+                status, out, err = self._main(argv)
+                self.assertNotEqual(status, 2, err)
+
+    def test_usage_apply_requires_claude_settings(self):
+        status, out, err = self._main(["usage", "--apply"])
+        self.assertEqual(status, 2)
+        self.assertIn("--claude-settings", err)
+
+    def test_usage_apply_with_claude_settings_reaches_the_command(self):
+        status, out, err = self._main(["usage", "--claude-settings", "ghost", "--apply"])
+        self.assertNotEqual(status, 2, err)
+        self.assertIn("ghost", err)
+
+
+class TestHelpMatchesBehaviour(_CliSurfaceCase):
+    def setUp(self):
+        super().setUp()
+        os.environ["NO_COLOR"] = "1"
+
+    def test_launcher_help_matches_the_real_flag_semantics(self):
+        status, out, err = self._main(["help"])
+        self.assertEqual(status, 0)
+        flat = " ".join(out.split())
+        self.assertNotIn("2+ profiles", flat)
+        self.assertIn("all engines by default", flat)
+        self.assertIn("unused profiles first", flat)
+        self.assertIn("saved quota ranks repeats", flat)
+        self.assertIn("max_sessions_per_profile", flat)
+        self.assertNotIn("compatibility alias", flat)
+        self.assertIn("--lang CODE", flat)
+
+    def test_readmes_do_not_claim_two_profiles_or_a_skipped_lock(self):
+        for name in ("README.md", "README.es.md"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            with self.subTest(readme=name):
+                for stale in ("needs two profiles", "pide dos perfiles", "Skip the session lock", "Omite el lock de sesión"):
+                    self.assertNotIn(stale, text)
+                self.assertIn("max_sessions_per_profile", text)
+
+    def test_readme_command_tables_match_the_vocabulary_and_required_arguments(self):
+        import re
+
+        for name in ("README.md", "README.es.md"):
+            text = (ROOT / name).read_text(encoding="utf-8")
+            rows = {}
+            for match in re.finditer(r"^\| `([a-z-]+)([^`]*)` \| ((?:`[^`]+`(?:, )?)*) \|", text, re.M):
+                rows[match.group(1)] = (match.group(2), match.group(3))
+            with self.subTest(readme=name):
+                for canonical, aliases in vocab.SUBCOMMAND_ALIASES.items():
+                    if canonical == "version":
+                        continue
+                    self.assertIn(canonical, rows, f"{name} lacks the {canonical} row")
+                    for alias in aliases:
+                        self.assertIn(f"`{alias}`", rows[canonical][1], f"{name}: {canonical} alias {alias}")
+                self.assertIn("-f", rows["setup"][0])
+                self.assertNotIn("[", rows["use"][0])
+                self.assertIn("--apply", text)
 
 
 if __name__ == "__main__":

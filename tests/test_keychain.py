@@ -1,10 +1,13 @@
 """Lightweight checks for the keychain bridge naming and descriptor shape."""
 from __future__ import annotations
 
+import atexit
 import base64
 import binascii
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +20,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import keychain
 from conftest import BaseCase, _make_jwt, isolated_store_env
 from store import Store
+
+
+def _as_direct_args(args, input_bytes):
+    """Translate ``security -i -q`` + a stdin command into the equivalent direct argv."""
+    if list(args) != ["-i", "-q"] or input_bytes is None:
+        return args
+    tokens = shlex.split(input_bytes.decode("utf-8"))
+    direct = []
+    iterator = iter(tokens)
+    for token in iterator:
+        if token == "-X":
+            direct += ["-w", binascii.unhexlify(next(iterator)).decode("utf-8", "replace")]
+        else:
+            direct.append(token)
+    return direct
 
 
 def _rc(code, out: bytes = b""):
@@ -159,7 +177,10 @@ class _StoreStub:
         self.root = root
 
 
-_FAKE_KEYCHAIN = Path("/fake/login.keychain-db")
+_FAKE_KEYCHAIN_DIR = Path(tempfile.mkdtemp(prefix="agydra-fake-keychain-"))
+atexit.register(shutil.rmtree, _FAKE_KEYCHAIN_DIR, ignore_errors=True)
+_FAKE_KEYCHAIN = _FAKE_KEYCHAIN_DIR / "login.keychain-db"
+_FAKE_KEYCHAIN.write_bytes(keychain.KEYCHAIN_FILE_MAGIC + bytes(16))
 
 
 class _MemoryKeychain:
@@ -175,6 +196,7 @@ class _MemoryKeychain:
         self.calls: list = []
 
     def run(self, args, input_bytes=None):
+        args = _as_direct_args(args, input_bytes)
         verb = args[0]
         if verb == "find-generic-password":
             if self.shared is None:
@@ -313,6 +335,7 @@ class TestLaunchGuardRestore(unittest.TestCase):
         kc = _MemoryKeychain(b"someone-elsses-token")
 
         def exploding_run(args, input_bytes=None):
+            args = _as_direct_args(args, input_bytes)
             if args[0] == "add-generic-password":
                 return _rc(45)
             return kc.run(args, input_bytes)
@@ -869,6 +892,7 @@ class TestEnsureTargetKeychain(unittest.TestCase):
             calls = []
 
             def fake_run(args, input_bytes=None):
+                args = _as_direct_args(args, input_bytes)
                 calls.append(args)
                 assert args[0] == "default-keychain"
                 return _rc(0, out=f'    "{existing}"\n'.encode())
@@ -889,6 +913,7 @@ class TestEnsureTargetKeychain(unittest.TestCase):
             calls = []
 
             def fake_run(args, input_bytes=None, **kwargs):
+                args = _as_direct_args(args, input_bytes)
                 calls.append(args)
                 verb = args[0]
                 if verb == "default-keychain" and "-s" not in args:
@@ -918,6 +943,7 @@ class TestEnsureTargetKeychain(unittest.TestCase):
             store = _StoreStub(Path(tmp) / "store")
 
             def failing_run(args, input_bytes=None, **kwargs):
+                args = _as_direct_args(args, input_bytes)
                 if args[0] == "default-keychain":
                     return _rc(51)
                 if args[0] == "create-keychain":
@@ -932,6 +958,7 @@ class TestEnsureTargetKeychain(unittest.TestCase):
             self.assertTrue(marker.exists())
 
             def exploding_run(args, input_bytes=None):
+                args = _as_direct_args(args, input_bytes)
                 raise AssertionError("must not shell out again once skip is marked")
 
             with mock.patch.object(keychain, "_run", exploding_run):
@@ -989,17 +1016,18 @@ class TestPurgeProfileSlot(BaseCase):
         calls = []
 
         def fake_run(args, input_bytes=None):
+            args = _as_direct_args(args, input_bytes)
             calls.append(args)
             return _rc(0)
 
         with mock.patch.object(keychain, "supported", return_value=True), \
-                mock.patch.object(keychain, "_ensure_target_keychain", return_value=Path("/fake/login.keychain-db")), \
+                mock.patch.object(keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN), \
                 mock.patch.object(keychain, "_run", fake_run):
             keychain.purge_profile_slot(self.store, "work")
 
         self.assertFalse(self.backup.exists(), "file backup must be unlinked")
         self.assertIn(
-            ["delete-generic-password", "-s", "gemini/agydra/work", "-a", "antigravity", "/fake/login.keychain-db"],
+            ["delete-generic-password", "-s", "gemini/agydra/work", "-a", "antigravity", str(_FAKE_KEYCHAIN.resolve(strict=True))],
             calls,
             "real keychain entry must be deleted targeting the resolved keychain",
         )
@@ -1009,6 +1037,7 @@ class TestPurgeProfileSlot(BaseCase):
         calls = []
 
         def fake_run(args, input_bytes=None):
+            args = _as_direct_args(args, input_bytes)
             calls.append(args)
             return _rc(0)
 
@@ -1029,6 +1058,7 @@ class TestPurgeProfileSlot(BaseCase):
         calls = []
 
         def exploding_run(args, input_bytes=None):
+            args = _as_direct_args(args, input_bytes)
             calls.append(args)
             raise AssertionError("no keychain bridge expected here")
 
@@ -1041,6 +1071,7 @@ class TestPurgeProfileSlot(BaseCase):
     def test_purge_swallows_keychain_error(self):
         """A failing `security` delete must not abort profile deletion."""
         def failing_run(args, input_bytes=None, **kwargs):
+            args = _as_direct_args(args, input_bytes)
             return _rc(45)
 
         with mock.patch.object(keychain, "supported", return_value=True), \
@@ -1065,6 +1096,7 @@ class TestOrphanSlots(BaseCase):
             f'    "svce"<blob>="{s}"\n' for s in services
         )
         def fake_run(args, input_bytes=None):
+            args = _as_direct_args(args, input_bytes)
             seen_args.append(args)
             assert args[0] == "dump-keychain", args
             return _rc(0, dump.encode())
@@ -1091,7 +1123,9 @@ class TestOrphanSlots(BaseCase):
         p1, p2, p3 = self._patch_dump([], seen_args)
         with p1, p2, p3:
             keychain.orphan_slots(self.store, known_names=[])
-        self.assertEqual(seen_args, [["dump-keychain", str(_FAKE_KEYCHAIN)]])
+        self.assertEqual(
+            seen_args, [["dump-keychain", str(_FAKE_KEYCHAIN.resolve(strict=True))]]
+        )
 
     def test_explicit_keychain_path_skips_resolution(self):
         """A caller that already resolved the keychain path (e.g. doctor's
@@ -1101,6 +1135,7 @@ class TestOrphanSlots(BaseCase):
         dump = '    "svce"<blob>="gemini/agydra/stale"\n'
 
         def fake_run(args, input_bytes=None):
+            args = _as_direct_args(args, input_bytes)
             seen_args.append(args)
             return _rc(0, dump.encode())
 
@@ -1116,10 +1151,13 @@ class TestOrphanSlots(BaseCase):
                 self.store, known_names=[], keychain_path=_FAKE_KEYCHAIN
             )
         self.assertEqual(orphans, ["stale"])
-        self.assertEqual(seen_args, [["dump-keychain", str(_FAKE_KEYCHAIN)]])
+        self.assertEqual(
+            seen_args, [["dump-keychain", str(_FAKE_KEYCHAIN.resolve(strict=True))]]
+        )
 
     def test_unsupported_bridge_returns_empty(self):
         def exploding_run(args, input_bytes=None):
+            args = _as_direct_args(args, input_bytes)
             raise AssertionError("no bridge, no shell-out")
 
         with mock.patch.object(keychain, "supported", return_value=False), \
@@ -1131,6 +1169,7 @@ class TestOrphanSlots(BaseCase):
         genuinely orphan-free store -- every other fallible operation in
         this module warns on failure; this one silently returned ``[]``."""
         def exploding_run(args, input_bytes=None):
+            args = _as_direct_args(args, input_bytes)
             raise OSError("security is unavailable")
 
         with mock.patch.object(keychain, "supported", return_value=True), \
@@ -1148,6 +1187,7 @@ class TestOrphanSlots(BaseCase):
         seen_args = []
 
         def fake_run(args, input_bytes=None):
+            args = _as_direct_args(args, input_bytes)
             seen_args.append(args)
             return _rc(1, b"")
 
@@ -1262,6 +1302,7 @@ class TestKeychainSlotFormat(BaseCase):
         write_calls = []
 
         def fake_run(args, input_bytes=None):
+            args = _as_direct_args(args, input_bytes)
             write_calls.append(args)
             if args[0] == "delete-generic-password":
                 return _rc(0)
@@ -1273,7 +1314,7 @@ class TestKeychainSlotFormat(BaseCase):
                 mock.patch.object(keychain, "_run", fake_run), \
                 mock.patch.object(
                     keychain, "_ensure_target_keychain",
-                    return_value=Path("/tmp/fake-keychain"),
+                    return_value=_FAKE_KEYCHAIN,
                 ), \
                 mock.patch.object(keychain, "_serialize_lock", return_value=None):
             with keychain.launch_guard(self.store, "work") as guard:
@@ -1323,6 +1364,7 @@ class TestDescribeSharedFormat(unittest.TestCase):
                 self.shared = payload
 
             def run(self, args, input_bytes=None):
+                args = _as_direct_args(args, input_bytes)
                 if args[0] == "find-generic-password" and "-w" in args:
                     if self.shared is None:
                         return _rc(44)
@@ -1477,7 +1519,7 @@ class TestKeychainCheckFlagsStaleSharedFormat(unittest.TestCase):
             status, message = doctor._check_keychain(store, ctx)
         self.assertEqual(status, doctor.WARN)
         self.assertIn("not valid JSON", message)
-        self.assertIn("self-heals", message)
+        self.assertIn("rewrites the slot", message)
 
 
 class TestPersistClassification(unittest.TestCase):
@@ -1582,6 +1624,7 @@ class TestLaunchGuardPersistOnExit(unittest.TestCase):
             kc = _MemoryKeychain(had)
 
             def fake_run(args, input_bytes=None):
+                args = _as_direct_args(args, input_bytes)
                 return _rc(0)
 
             # A .secret so the swap happens (non-empty slot → swapped).
@@ -1789,25 +1832,325 @@ class TestLaunchGuardExitRedundantRead(unittest.TestCase):
             self.assertEqual(read_count, 1)
 
 
-class TestWriteSlotSelfHealing(unittest.TestCase):
-    def test_write_slot_retries_on_rc_45_duplicate(self):
+class TestWriteSlotNeverExposesTheSecret(unittest.TestCase):
+    SECRET = b'{"token":{"access_token":"SYNTH-SECRET-TOKEN"}}'
+
+    def _capture(self, returncode=0, stderr=b""):
         calls = []
 
         def fake_run(args, input_bytes=None, **kwargs):
-            calls.append(list(args))
-            if args[0] == "add-generic-password" and len(calls) == 1:
+            calls.append((list(args), input_bytes))
+
+            class Result:
+                pass
+
+            Result.returncode = returncode
+            Result.stdout = b""
+            Result.stderr = stderr
+            return Result
+
+        return calls, fake_run
+
+    def test_argv_never_contains_the_secret_or_its_hex_form(self):
+        calls, fake_run = self._capture()
+        with mock.patch.object(keychain, "_run", side_effect=fake_run):
+            keychain.write_slot("gemini", self.SECRET, _FAKE_KEYCHAIN)
+
+        argv, stdin = calls[0]
+        joined = " ".join(argv)
+        self.assertEqual(argv, ["-i", "-q"])
+        self.assertNotIn("SYNTH-SECRET-TOKEN", joined)
+        self.assertNotIn(binascii.hexlify(self.SECRET).decode(), joined)
+        self.assertIn(binascii.hexlify(self.SECRET), stdin)
+        self.assertNotIn(b"SYNTH-SECRET-TOKEN", stdin)
+
+    def test_stdin_command_carries_service_account_and_explicit_keychain(self):
+        calls, fake_run = self._capture()
+        spaced = _FAKE_KEYCHAIN_DIR / "with space"
+        spaced.mkdir(exist_ok=True)
+        target = spaced / "fake.keychain"
+        target.write_bytes(keychain.KEYCHAIN_FILE_MAGIC + bytes(16))
+        with mock.patch.object(keychain, "_run", side_effect=fake_run):
+            keychain.write_slot("gemini", self.SECRET, target)
+            keychain.write_slot("gemini", self.SECRET)
+
+        explicit = shlex.split(calls[0][1].decode())
+        default = shlex.split(calls[1][1].decode())
+        self.assertEqual(explicit[:2], ["add-generic-password", "-U"])
+        self.assertEqual(explicit[explicit.index("-s") + 1], "gemini")
+        self.assertEqual(explicit[explicit.index("-a") + 1], keychain.SHARED_ACCOUNT)
+        self.assertEqual(explicit[-1], str(target.resolve(strict=True)))
+        self.assertNotIn(str(target), default)
+        self.assertEqual(default[-1], binascii.hexlify(self.SECRET).decode())
+
+    def test_every_failure_text_is_redacted(self):
+        leaked = (
+            b"boom " + binascii.hexlify(self.SECRET) + b" "
+            + binascii.hexlify(self.SECRET).upper() + b" " + self.SECRET
+        )
+        calls, fake_run = self._capture(returncode=1, stderr=leaked)
+        with mock.patch.object(keychain, "_run", side_effect=fake_run):
+            with self.assertRaises(keychain.KeychainError) as ctx:
+                keychain.write_slot("gemini", self.SECRET)
+
+        message = str(ctx.exception)
+        self.assertIn("rc=1", message)
+        self.assertNotIn("SYNTH-SECRET-TOKEN", message)
+        self.assertNotIn(binascii.hexlify(self.SECRET).decode(), message.lower())
+
+    def test_duplicate_item_failure_never_deletes_or_retries(self):
+        calls, fake_run = self._capture(returncode=45)
+        with mock.patch.object(keychain, "_run", side_effect=fake_run):
+            with self.assertRaises(keychain.KeychainError) as ctx:
+                keychain.write_slot("gemini", self.SECRET)
+
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn(b"delete-generic-password", calls[0][1])
+        self.assertIn("rc=45", str(ctx.exception))
+
+    def test_failed_update_retains_the_existing_item(self):
+        kc = _MemoryKeychain(b"old-credential")
+
+        def failing_update(args, input_bytes=None, **kwargs):
+            direct = _as_direct_args(args, input_bytes)
+            if direct[0] == "add-generic-password":
                 return _rc(45)
+            return kc.run(args, input_bytes)
+
+        with mock.patch.object(keychain, "_run", side_effect=failing_update):
+            with self.assertRaises(keychain.KeychainError):
+                keychain.write_slot("gemini", self.SECRET)
+
+        self.assertEqual(kc.shared, b"old-credential")
+        self.assertNotIn("delete", [kind for kind, _ in kc.calls])
+
+    def test_empty_credential_is_refused_before_running_security(self):
+        with mock.patch.object(keychain, "_run") as run:
+            with self.assertRaises(keychain.KeychainError):
+                keychain.write_slot("gemini", b"")
+
+        run.assert_not_called()
+
+    def test_lf_in_service_is_refused_before_running_security(self):
+        with mock.patch.object(keychain, "_run") as run:
+            with self.assertRaises(keychain.KeychainError):
+                keychain.write_slot("gemini\ninvalid", self.SECRET)
+
+        run.assert_not_called()
+
+    def test_cr_in_service_is_refused_before_running_security(self):
+        with mock.patch.object(keychain, "_run") as run:
+            with self.assertRaises(keychain.KeychainError):
+                keychain.write_slot("gemini\rinvalid", self.SECRET)
+
+        run.assert_not_called()
+
+    def test_nul_in_service_is_refused_before_running_security(self):
+        with mock.patch.object(keychain, "_run") as run:
+            with self.assertRaises(keychain.KeychainError):
+                keychain.write_slot("gemini\x00invalid", self.SECRET)
+
+        run.assert_not_called()
+
+    def test_interactive_command_boundary_counts_utf8_bytes_and_nul_terminator(self):
+        base = keychain._add_generic_password_command("", self.SECRET, None)
+        service_growth = 4095 - (len(base) - 1)
+        service = "x" * (service_growth - 2) + "é"
+        calls, fake_run = self._capture()
+
+        with mock.patch.object(keychain, "_run", side_effect=fake_run) as run:
+            keychain.write_slot(service, self.SECRET)
+
+            submitted = calls[0][1]
+            self.assertEqual(len(submitted), 4096)
+            self.assertEqual(submitted[-1:], b"\n")
+            self.assertEqual(len(submitted[:-1]), 4095)
+            self.assertIn("é", submitted.decode("utf-8"))
+
+            run.reset_mock()
+            with self.assertRaises(keychain.KeychainError) as ctx:
+                keychain.write_slot(service + "x", self.SECRET)
+
+            run.assert_not_called()
+
+        message = str(ctx.exception)
+        self.assertIn("interactive command exceeds maximum line length", message)
+        self.assertNotIn("SYNTH-SECRET-TOKEN", message)
+        self.assertNotIn(binascii.hexlify(self.SECRET).decode(), message.lower())
+
+    def test_quotes_and_backslashes_survive_the_interactive_parser(self):
+        odd = _FAKE_KEYCHAIN_DIR / 'odd"dir\\x'
+        odd.mkdir(exist_ok=True)
+        target = odd / "k.keychain"
+        target.write_bytes(keychain.KEYCHAIN_FILE_MAGIC + bytes(16))
+        command = keychain._add_generic_password_command('svc "x"', self.SECRET, target)
+
+        tokens = shlex.split(command.decode())
+        self.assertEqual(tokens[tokens.index("-s") + 1], 'svc "x"')
+        self.assertEqual(tokens[-1], str(target.resolve(strict=True)))
+
+
+class TestExplicitKeychainPathIsVerifiedFirst(unittest.TestCase):
+    SECRET = b'{"token":{"access_token":"SYNTH-SECRET-TOKEN"}}'
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="agydra-kc-path-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _invalid_paths(self):
+        directory = self.tmp / "dir.keychain-db"
+        directory.mkdir()
+        not_a_keychain = self.tmp / "plain.keychain-db"
+        not_a_keychain.write_bytes(b"SQLite format 3\x00")
+        wrong_suffix = self.tmp / "login.txt"
+        wrong_suffix.write_bytes(keychain.KEYCHAIN_FILE_MAGIC)
+        dangling = self.tmp / "dangling.keychain-db"
+        dangling.symlink_to(self.tmp / "missing-target.keychain-db")
+        alias_to_plain = self.tmp / "alias.keychain-db"
+        alias_to_plain.symlink_to(not_a_keychain)
+        return {
+            "absent": self.tmp / "absent.keychain-db",
+            "directory": directory,
+            "not a keychain file": not_a_keychain,
+            "wrong suffix": wrong_suffix,
+            "dangling alias": dangling,
+            "alias to a non-keychain file": alias_to_plain,
+            "relative": Path("login.keychain-db"),
+        }
+
+    def test_invalid_explicit_paths_never_start_a_subprocess(self):
+        kc = _MemoryKeychain(b"previous-credential")
+        operations = {
+            "write": lambda path: keychain.write_slot("gemini", self.SECRET, path),
+            "read": lambda path: keychain.read_slot("gemini", path),
+            "delete": lambda path: keychain.delete_slot("gemini", path),
+        }
+        with mock.patch.object(keychain.platforms, "run_with_group_kill") as spawn, \
+                mock.patch.object(keychain, "_run", side_effect=kc.run) as run:
+            for label, path in self._invalid_paths().items():
+                for name, operation in operations.items():
+                    with self.subTest(path=label, operation=name):
+                        with self.assertRaises(keychain.KeychainError):
+                            operation(path)
+
+        spawn.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(kc.shared, b"previous-credential")
+        self.assertEqual(kc.calls, [])
+
+    def test_invalid_path_error_never_contains_the_secret(self):
+        with self.assertRaises(keychain.KeychainError) as ctx:
+            keychain.write_slot("gemini", self.SECRET, self.tmp / "absent.keychain-db")
+
+        self.assertNotIn("SYNTH-SECRET-TOKEN", str(ctx.exception))
+        self.assertNotIn(binascii.hexlify(self.SECRET).decode(), str(ctx.exception))
+
+    def test_orphan_scan_with_an_invalid_explicit_path_is_skipped(self):
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(keychain, "_run") as run, \
+                mock.patch.object(keychain, "warn"):
+            found = keychain.orphan_slots(
+                _StoreStub(self.tmp), [], self.tmp / "absent.keychain-db"
+            )
+
+        self.assertEqual(found, [])
+        run.assert_not_called()
+
+    def test_alias_to_a_real_keychain_file_is_accepted(self):
+        alias = self.tmp / "alias.keychain-db"
+        alias.symlink_to(_FAKE_KEYCHAIN)
+
+        self.assertEqual(
+            keychain._verified_keychain_arg(alias),
+            str(_FAKE_KEYCHAIN.resolve(strict=True)),
+        )
+
+    def test_write_command_keeps_canonical_path_after_alias_is_removed(self):
+        target = self.tmp / "canonical.keychain-db"
+        target.write_bytes(keychain.KEYCHAIN_FILE_MAGIC + bytes(16))
+        alias = self.tmp / "alias.keychain-db"
+        alias.symlink_to(target)
+
+        command = keychain._add_generic_password_command(
+            "gemini", self.SECRET, alias
+        )
+        alias.unlink()
+
+        tokens = shlex.split(command.decode("utf-8"))
+        self.assertEqual(tokens[-1], str(target.resolve(strict=True)))
+        self.assertNotIn(str(alias), tokens)
+
+    def test_default_keychain_path_is_not_verified(self):
+        calls = []
+
+        def fake_run(args, input_bytes=None, **kwargs):
+            calls.append((list(args), input_bytes))
             return _rc(0)
 
         with mock.patch.object(keychain, "_run", side_effect=fake_run):
-            keychain.write_slot("gemini", b"payload-bytes", Path("/tmp/fake.keychain"))
+            keychain.write_slot("gemini", self.SECRET)
+            keychain.delete_slot("gemini")
 
-        # Verify: first add-generic-password failed with 45, then delete-generic-password was invoked,
-        # then second add-generic-password succeeded cleanly.
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(calls[0][0], "add-generic-password")
-        self.assertEqual(calls[1][0], "delete-generic-password")
-        self.assertEqual(calls[2][0], "add-generic-password")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn(".keychain", calls[0][1].decode())
+
+
+@unittest.skipUnless(
+    sys.platform == "darwin" and os.environ.get("AGYDRA_REAL_KEYCHAIN_TEST") == "1",
+    "opt-in: set AGYDRA_REAL_KEYCHAIN_TEST=1 on macOS to use a disposable keychain",
+)
+class TestRealDisposableKeychain(unittest.TestCase):
+    SERVICE = "agydra-disposable-test"
+    TOKEN_ONE = b'{"token":{"access_token":"SYNTH-ONE","refresh_token":"r1"}}'
+    TOKEN_TWO = b'{"token":{"access_token":"SYNTH-TWO","refresh_token":"r2"}}'
+
+    def setUp(self):
+        import ctypes
+        import ctypes.util
+
+        self.tmp = Path(tempfile.mkdtemp(prefix="agydra-real-kc-"))
+        self.path = self.tmp / "disposable.keychain-db"
+        security = ctypes.CDLL(ctypes.util.find_library("Security"))
+        security.SecKeychainCreate.argtypes = [
+            ctypes.c_char_p, ctypes.c_uint32, ctypes.c_char_p,
+            ctypes.c_bool, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+        ]
+        security.SecKeychainCreate.restype = ctypes.c_int32
+        reference = ctypes.c_void_p()
+        status = security.SecKeychainCreate(
+            str(self.path).encode(), 4, b"test", False, None, ctypes.byref(reference)
+        )
+        self.assertEqual(status, 0)
+        self.addCleanup(self._dispose)
+
+    def _dispose(self):
+        subprocess.run(
+            ["/usr/bin/security", "delete-keychain", str(self.path)],
+            capture_output=True, timeout=30, check=False,
+        )
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_write_read_and_update_round_trip_in_the_disposable_keychain(self):
+        keychain.write_slot(self.SERVICE, self.TOKEN_ONE, self.path)
+        plain = subprocess.run(
+            ["/usr/bin/security", "find-generic-password", "-s", self.SERVICE,
+             "-a", keychain.SHARED_ACCOUNT, "-w", str(self.path)],
+            capture_output=True, timeout=30, check=False,
+        )
+        self.assertEqual(plain.returncode, 0)
+        self.assertEqual(plain.stdout.strip(), self.TOKEN_ONE)
+
+        keychain.write_slot(self.SERVICE, self.TOKEN_TWO, self.path)
+        self.assertEqual(keychain.read_slot(self.SERVICE, self.path), self.TOKEN_TWO)
+
+    def test_absent_explicit_path_cannot_fall_back_to_another_keychain(self):
+        with mock.patch.object(keychain.platforms, "run_with_group_kill") as spawn:
+            with self.assertRaises(keychain.KeychainError):
+                keychain.write_slot(
+                    self.SERVICE, self.TOKEN_ONE, self.tmp / "absent.keychain-db"
+                )
+
+        spawn.assert_not_called()
 
 
 class TestKeychainRenameRecovery(BaseCase):
@@ -2009,6 +2352,7 @@ class TestSwapLockFailClosed(BaseCase):
 
     def test_import_capture_read_failure_is_explicit(self):
         def failing_run(args, input_bytes=None, **kwargs):
+            args = _as_direct_args(args, input_bytes)
             return _rc(1)
 
         data_dir = self.store.profile_data_dir("alpha")
@@ -2017,6 +2361,406 @@ class TestSwapLockFailClosed(BaseCase):
         ), mock.patch.object(keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN):
             with self.assertRaises(keychain.KeychainError):
                 keychain.capture_shared_slot_for_import(self.store, "alpha", data_dir)
+
+
+def _payload_of(name: str) -> bytes:
+    return keychain.token_payload_for_slot(_go_keyring_secret(f"{name}@example.com"))
+
+
+class TestEmailCaseInsensitiveTrust(unittest.TestCase):
+    """Email claims name the same account regardless of letter case; every
+    keychain trust decision must accept casing-only differences and still
+    reject genuinely different or missing identities."""
+
+    def _env(self):
+        tmp = isolated_store_env()
+        tmp.__enter__()
+        self.addCleanup(tmp.__exit__, None, None, None)
+        store = Store()
+        store.create("a")
+        profile = store.get("a")
+        profile.email = "alice@example.com"
+        store.save(profile)
+        return store
+
+    def _keychain(self, shared):
+        kc = _MemoryKeychain(shared)
+        for patch in (
+            mock.patch.object(keychain, "_run", kc.run),
+            mock.patch.object(keychain, "supported", return_value=True),
+            mock.patch.object(
+                keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+            ),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        return kc
+
+    def test_persist_accepts_a_casing_only_difference(self):
+        store = self._env()
+        incoming = _go_keyring_secret("ALICE@Example.com")
+
+        keychain._persist_if_trusted(store, "a", incoming)
+
+        self.assertEqual(keychain.load_profile_slot(store, "a"), incoming)
+
+    def test_persist_still_rejects_a_different_identity(self):
+        store = self._env()
+        keychain.save_profile_slot(store, "a", _go_keyring_secret("alice@example.com"))
+        before = keychain.load_profile_slot(store, "a")
+
+        with mock.patch.object(keychain, "warn"):
+            keychain._persist_if_trusted(
+                store, "a", _go_keyring_secret("mallory@example.com")
+            )
+
+        self.assertEqual(keychain.load_profile_slot(store, "a"), before)
+
+    def test_launch_guard_does_not_quarantine_a_casing_only_difference(self):
+        store = self._env()
+        slot = _go_keyring_secret("ALICE@EXAMPLE.COM")
+        keychain.save_profile_slot(store, "a", slot)
+        kc = self._keychain(None)
+
+        guard = keychain.launch_guard(store, "a", capture=False)
+        guard.__enter__()
+        try:
+            self.assertEqual(kc.shared, keychain.token_payload_for_slot(slot))
+            self.assertEqual(keychain.load_profile_slot(store, "a"), slot)
+        finally:
+            guard.__exit__(None, None, None)
+
+    def test_launch_guard_still_quarantines_a_different_identity(self):
+        store = self._env()
+        keychain.save_profile_slot(store, "a", _go_keyring_secret("mallory@example.com"))
+        kc = self._keychain(None)
+
+        guard = keychain.launch_guard(store, "a", capture=False)
+        with mock.patch.object(keychain, "warn"):
+            guard.__enter__()
+        try:
+            self.assertIsNone(keychain.load_profile_slot(store, "a"))
+            self.assertIsNone(kc.shared)
+        finally:
+            guard.__exit__(None, None, None)
+
+    def test_import_capture_accepts_a_casing_only_difference(self):
+        store = self._env()
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            cli_dir = data_dir / "antigravity-cli"
+            cli_dir.mkdir(parents=True)
+            (cli_dir / "antigravity-oauth-token").write_text(json.dumps({
+                "token": {"access_token": "a", "refresh_token": "r"},
+                "id_token": _make_jwt({"email": "alice@example.com"}),
+            }))
+            kc = self._keychain(_go_keyring_secret("Alice@Example.COM"))
+
+            keychain.capture_shared_slot_for_import(store, "a", data_dir)
+
+        self.assertEqual(keychain.load_profile_slot(store, "a"), kc.shared)
+
+    def test_shared_still_owned_ignores_case_but_not_identity(self):
+        credential = keychain.OwnerCredential(
+            identity="alice@example.com", fingerprint="unrelated"
+        )
+
+        self.assertTrue(
+            keychain._shared_still_owned(_slot_payload_json("ALICE@example.com"), credential)
+        )
+        self.assertFalse(
+            keychain._shared_still_owned(_slot_payload_json("bob@example.com"), credential)
+        )
+
+    def test_blank_claims_never_prove_ownership(self):
+        credential = keychain.OwnerCredential(identity="   ", fingerprint="unrelated")
+
+        self.assertFalse(
+            keychain._shared_still_owned(_slot_payload_json("   "), credential)
+        )
+
+
+class TestSlotLeaseOwnerCrash(unittest.TestCase):
+    """A crashed slot owner leaves its credential in the shared slot and an
+    expired lease. The next owner must inherit the ORIGINAL pre-ownership
+    login recorded in that lease, never capture the dead owner's credential
+    as if it were the user's own."""
+
+    ORIGINAL = _slot_payload_json("user@example.com")
+
+    def _crash_scenario(self, original, second_has_slot=True):
+        tmp = isolated_store_env()
+        tmp.__enter__()
+        self.addCleanup(tmp.__exit__, None, None, None)
+        import locks as locks_module
+
+        store = Store()
+        for name in ("a", "b"):
+            store.create(name)
+            profile = store.get(name)
+            profile.email = f"{name}@example.com"
+            store.save(profile)
+            if name == "b" and not second_has_slot:
+                continue
+            keychain.save_profile_slot(
+                store, name, _go_keyring_secret(f"{name}@example.com")
+            )
+        kc = _MemoryKeychain(original)
+        patches = (
+            mock.patch.object(keychain, "_run", kc.run),
+            mock.patch.object(keychain, "supported", return_value=True),
+            mock.patch.object(
+                keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+            ),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+        owner = keychain.launch_guard(store, "a", capture=False)
+        owner.__enter__()
+        self.assertEqual(kc.shared, _payload_of("a"))
+        # The owner dies without running __exit__: its registry entry is gone.
+        locks_module.lock_path(store, "a").write_bytes(b'{"holders": []}')
+        return store, kc
+
+    def test_next_owner_restores_the_original_login_not_the_dead_owners(self):
+        store, kc = self._crash_scenario(self.ORIGINAL)
+
+        self.assertIsNone(keychain._load_slot_lease(store).owner)
+        self.assertEqual(
+            keychain._decode_shared(keychain._load_slot_lease(store).had_shared),
+            self.ORIGINAL,
+        )
+        guard = keychain.launch_guard(store, "b", capture=False)
+        guard.__enter__()
+        self.assertEqual(kc.shared, _payload_of("b"))
+        self.assertEqual(
+            keychain._decode_shared(keychain._load_slot_lease(store).had_shared),
+            self.ORIGINAL,
+        )
+        guard.__exit__(None, None, None)
+
+        self.assertEqual(kc.shared, self.ORIGINAL)
+        self.assertIsNone(keychain._load_slot_lease(store).owner)
+
+    def test_an_originally_empty_slot_is_emptied_not_left_with_the_dead_owner(self):
+        store, kc = self._crash_scenario(None)
+
+        guard = keychain.launch_guard(store, "b", capture=False)
+        guard.__enter__()
+        guard.__exit__(None, None, None)
+
+        self.assertIsNone(kc.shared)
+
+    def test_the_same_profile_relaunching_after_its_own_crash_restores_too(self):
+        store, kc = self._crash_scenario(self.ORIGINAL)
+
+        guard = keychain.launch_guard(store, "a", capture=False)
+        guard.__enter__()
+        guard.__exit__(None, None, None)
+
+        self.assertEqual(kc.shared, self.ORIGINAL)
+
+    @staticmethod
+    def _login(email, refresh):
+        return json.dumps({
+            "token": {"access_token": "t", "refresh_token": refresh},
+            "auth_method": "consumer",
+            "id_token": _make_jwt({"email": email}),
+        }, separators=(",", ":")).encode("utf-8")
+
+    def _launch_and_exit(self, store, name):
+        guard = keychain.launch_guard(store, name, capture=False)
+        guard.__enter__()
+        guard.__exit__(None, None, None)
+
+    def test_a_login_made_after_the_crash_survives_the_next_session(self):
+        store, kc = self._crash_scenario(self.ORIGINAL)
+        newer = self._login("z@example.com", "refresh-z")
+        kc.shared = newer
+        private_a = keychain.load_profile_slot(store, "a")
+
+        guard = keychain.launch_guard(store, "b", capture=False)
+        guard.__enter__()
+        self.assertEqual(kc.shared, _payload_of("b"))
+        self.assertEqual(
+            keychain._decode_shared(keychain._load_slot_lease(store).had_shared),
+            newer,
+        )
+        guard.__exit__(None, None, None)
+
+        self.assertEqual(kc.shared, newer)
+        self.assertEqual(keychain.load_profile_slot(store, "a"), private_a)
+        self.assertIsNone(keychain._load_slot_lease(store).owner)
+
+    def test_a_different_identity_with_the_owners_refresh_token_is_newer(self):
+        store, kc = self._crash_scenario(self.ORIGINAL)
+        newer = self._login("z@example.com", "r")
+        kc.shared = newer
+
+        self._launch_and_exit(store, "b")
+
+        self.assertEqual(kc.shared, newer)
+
+    def test_a_slot_emptied_after_the_crash_stays_empty(self):
+        store, kc = self._crash_scenario(self.ORIGINAL)
+        kc.shared = None
+
+        self._launch_and_exit(store, "b")
+
+        self.assertIsNone(kc.shared)
+
+    def test_unchanged_owner_credential_recovers_the_original_and_is_saved(self):
+        store, kc = self._crash_scenario(self.ORIGINAL)
+        refreshed = json.dumps({
+            "token": {"access_token": "t2", "refresh_token": "r"},
+            "auth_method": "consumer",
+            "id_token": _make_jwt({"email": "a@example.com"}),
+        }, separators=(",", ":")).encode("utf-8")
+        kc.shared = refreshed
+
+        self._launch_and_exit(store, "b")
+
+        self.assertEqual(kc.shared, self.ORIGINAL)
+        saved = keychain.decode_go_keyring_secret(keychain.load_profile_slot(store, "a"))
+        self.assertEqual(saved["token"]["access_token"], "t2")
+
+    def test_owner_refresh_without_identity_claim_is_still_recognised(self):
+        store, kc = self._crash_scenario(self.ORIGINAL)
+        kc.shared = json.dumps({
+            "token": {"access_token": "t2", "refresh_token": "r"},
+            "auth_method": "consumer",
+        }, separators=(",", ":")).encode("utf-8")
+
+        self._launch_and_exit(store, "b")
+
+        self.assertEqual(kc.shared, self.ORIGINAL)
+
+    def test_empty_original_slot_never_leaks_the_dead_owner_to_a_slotless_profile(self):
+        store, kc = self._crash_scenario(None, second_has_slot=False)
+        self.assertIsNone(keychain.load_profile_slot(store, "b"))
+        self.assertEqual(kc.shared, _payload_of("a"))
+
+        calls_before = len(kc.calls)
+        guard = keychain.launch_guard(store, "b", capture=False)
+        guard.__enter__()
+        self.assertIsNone(kc.shared)
+        self.assertEqual(kc.calls[calls_before:], [("delete", None)])
+        guard.__exit__(None, None, None)
+
+        self.assertIsNone(kc.shared)
+        self.assertIsNone(keychain._load_slot_lease(store).owner)
+
+    def test_unprovable_shared_credential_is_hidden_from_a_slotless_profile(self):
+        store, kc = self._crash_scenario(self.ORIGINAL, second_has_slot=False)
+        unproven = json.dumps({
+            "token": {"access_token": "t3", "refresh_token": "rotated"},
+            "auth_method": "consumer",
+        }, separators=(",", ":")).encode("utf-8")
+        kc.shared = unproven
+
+        guard = keychain.launch_guard(store, "b", capture=False)
+        guard.__enter__()
+        self.assertIsNone(kc.shared)
+        guard.__exit__(None, None, None)
+
+        self.assertEqual(kc.shared, unproven)
+
+    def test_legacy_lease_without_owner_credential_trusts_the_current_slot(self):
+        store, kc = self._crash_scenario(self.ORIGINAL)
+        lease = keychain._slot_lease_path(store)
+        record = json.loads(lease.read_text())
+        record.pop("owner_credential")
+        lease.write_text(json.dumps(record))
+
+        self._launch_and_exit(store, "b")
+
+        self.assertEqual(kc.shared, _payload_of("a"))
+
+    def test_malformed_owner_credential_is_ignored_and_trusts_the_current_slot(self):
+        for malformed in (["x"], "x", 5, None):
+            with self.subTest(owner_credential=malformed):
+                store, kc = self._crash_scenario(self.ORIGINAL)
+                lease = keychain._slot_lease_path(store)
+                record = json.loads(lease.read_text())
+                record["owner_credential"] = malformed
+                lease.write_text(json.dumps(record))
+
+                state = keychain._load_slot_lease(store)
+                self.assertTrue(state.expired)
+                self.assertIsNone(state.owner_credential)
+                self._launch_and_exit(store, "b")
+
+                self.assertEqual(kc.shared, _payload_of("a"))
+
+    def test_expired_owner_without_a_profile_creates_no_ghost_slot(self):
+        store, kc = self._crash_scenario(self.ORIGINAL)
+        lease = keychain._slot_lease_path(store)
+        record = json.loads(lease.read_text())
+        record["owner"] = "ghost"
+        lease.write_text(json.dumps(record))
+
+        self._launch_and_exit(store, "b")
+
+        self.assertFalse(keychain.slot_backup_path(store, "ghost").exists())
+        self.assertIsNone(keychain.load_profile_slot(store, "ghost"))
+        self.assertEqual(kc.shared, self.ORIGINAL)
+
+    def test_a_missing_lease_still_snapshots_the_live_slot(self):
+        """No lease at all (first launch) keeps the original behaviour."""
+        with isolated_store_env():
+            store = Store()
+            store.create("b")
+            keychain.save_profile_slot(store, "b", _go_keyring_secret("b@example.com"))
+            kc = _MemoryKeychain(self.ORIGINAL)
+            with mock.patch.object(keychain, "_run", kc.run), \
+                    mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                    ):
+                guard = keychain.launch_guard(store, "b", capture=False)
+                guard.__enter__()
+                guard.__exit__(None, None, None)
+            self.assertEqual(kc.shared, self.ORIGINAL)
+
+
+class TestKnownIdentityWhitespaceEmail(unittest.TestCase):
+    """A whitespace-only cached email is not an identity."""
+
+    def _store_with_blank_email(self):
+        tmp = isolated_store_env()
+        tmp.__enter__()
+        self.addCleanup(tmp.__exit__, None, None, None)
+        store = Store()
+        store.create("a")
+        profile = store.get("a")
+        profile.email = " \t "
+        store.save(profile)
+        keychain.save_profile_slot(store, "a", _go_keyring_secret("a@example.com"))
+        return store
+
+    def test_blank_cached_email_falls_through_to_the_saved_secret(self):
+        store = self._store_with_blank_email()
+
+        self.assertIsNone(keychain._known_identity(store, "a", include_secret=False))
+        self.assertEqual(keychain._known_identity(store, "a"), "a@example.com")
+
+    def test_blank_cached_email_does_not_authenticate_an_unrelated_slot(self):
+        store = self._store_with_blank_email()
+        before = keychain.load_profile_slot(store, "a")
+
+        keychain._persist_if_trusted(store, "a", _go_keyring_secret("other@example.com"))
+
+        self.assertEqual(keychain.load_profile_slot(store, "a"), before)
+
+    def test_padded_cached_email_is_trimmed_before_comparison(self):
+        store = self._store_with_blank_email()
+        profile = store.get("a")
+        profile.email = "  a@example.com "
+        store.save(profile)
+
+        self.assertEqual(keychain._known_identity(store, "a"), "a@example.com")
 
 
 if __name__ == "__main__":

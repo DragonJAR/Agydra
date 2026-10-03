@@ -107,6 +107,40 @@ class TestResolver(BaseCase):
                 resolver.resolve(empty_store, cwd=self.fake_home, env={})
             mock_warn.assert_not_called()
 
+    def test_read_only_plan_fails_closed_without_changing_pending_journal(self):
+        journal = self.store.rename_journal_path
+        journal_bytes = b"pending rename journal must be preserved\x00\xff"
+        journal.write_bytes(journal_bytes)
+
+        with mock.patch.object(
+            Store,
+            "_recover_pending_rename",
+            side_effect=AssertionError("read-only planning must not recover state"),
+        ):
+            with self.assertRaisesRegex(StoreError, "recovery is pending"):
+                runner.build_plan(
+                    self.store, [], flag_ref="work", read_only=True
+                )
+
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+
+    def test_read_only_random_plan_skips_auth_and_recovery_probes(self):
+        with mock.patch.object(
+            resolver.account,
+            "auth_state",
+            side_effect=AssertionError("read-only planning must not probe auth"),
+        ), mock.patch.object(
+            Store,
+            "_recover_pending_rename",
+            side_effect=AssertionError("read-only planning must not recover state"),
+        ):
+            plan = runner.build_plan(
+                self.store, [], random_pick=True, cwd=self.fake_home, read_only=True
+            )
+
+        self.assertEqual(plan.profile, "personal")
+        self.assertIn("not probed", plan.reason)
+
 
 class TestPickFreeProfileAuthAndBusyOrder(BaseCase):
     """pick_free_profile filter order: authenticated profiles are verified
@@ -172,9 +206,8 @@ class TestPickFreeProfileAuthAndBusyOrder(BaseCase):
         finally:
             handle.release()
 
-    def test_single_profile_with_marker_respects_pin(self):
-        """When store has only 1 profile and a marker points to it,
-        pick_free_profile respects the pin instead of raising for MIN_PROFILES floor."""
+    def test_single_profile_random_pick_ignores_marker_pin(self):
+        """A project pin affects normal resolution, never random selection."""
         single_root = self._tmp / "single-store"
         single_store = Store(single_root)
         single_store.create("solo")
@@ -188,11 +221,37 @@ class TestPickFreeProfileAuthAndBusyOrder(BaseCase):
         (proj / ".agydra").write_text("solo\n", encoding="utf-8")
         res = resolver.pick_free_profile(single_store, cwd=proj)
         self.assertEqual(res.name, "solo")
-        self.assertIn("marker", res.reason)
+        self.assertIn("rotation", res.reason)
+        self.assertNotIn("marker", res.reason)
 
-        with self.assertRaises(StoreError) as ctx:
-            resolver.pick_free_profile(single_store, cwd=self._tmp)
-        self.assertIn("at least 2 profiles", str(ctx.exception))
+        res = resolver.pick_free_profile(single_store, cwd=self._tmp)
+        self.assertEqual(res.name, "solo")
+        self.assertIn("rotation", res.reason)
+
+    def test_random_pick_ignores_project_marker_pin(self):
+        self._authenticate("alpha")
+        self._authenticate("beta")
+        project = self._tmp / "pinned-project"
+        project.mkdir()
+        (project / ".agydra").write_text("beta", encoding="utf-8")
+
+        result = resolver.pick_free_profile(self.store, cwd=project)
+
+        self.assertEqual(result.name, "alpha")
+        self.assertNotIn("marker", result.reason)
+
+    def test_random_retry_exclusion_is_applied_with_project_marker_present(self):
+        self._authenticate("alpha")
+        self._authenticate("beta")
+        project = self._tmp / "pinned-project"
+        project.mkdir()
+        (project / ".agydra").write_text("alpha", encoding="utf-8")
+
+        result = resolver.pick_free_profile(
+            self.store, cwd=project, exclude={"alpha"}
+        )
+
+        self.assertEqual(result.name, "beta")
 
 
 class TestPickFreeProfileLazyProbing(BaseCase):
@@ -243,7 +302,7 @@ class TestPickFreeProfileLazyProbing(BaseCase):
         try:
             states = {n: "authenticated" for n in ("alpha", "beta", "gamma")}
             res, probed, _ = self._probed_names(states)
-            self.assertEqual((res.name, probed), ("beta", ["alpha", "beta"]))
+            self.assertEqual((res.name, probed), ("beta", ["beta"]))
         finally:
             handle.release()
 
@@ -255,7 +314,7 @@ class TestPickFreeProfileLazyProbing(BaseCase):
         handles = [locks.try_lock(self.store, n) for n in ("alpha", "beta", "gamma")]
         try:
             res, probed, _ = self._probed_names({"beta": "authenticated"})
-            self.assertEqual((res.name, probed), ("beta", ["alpha", "beta", "gamma"]))
+            self.assertEqual((res.name, probed), ("beta", ["alpha", "beta"]))
             self.assertIn("joining busy profile", res.reason)
         finally:
             for handle in handles:
