@@ -40,7 +40,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         'lang.set_ok': 'Language set to English and saved.',
         'lang.unknown': 'Unknown language {lang!r}. Supported: {supported}.',
         'lang.env_override': 'Language forced by AGYDRA_LANG={lang}.',
-        'launcher.description': 'Agydra — profile manager for agy, codex, grok, and claude.\n\nRun without arguments to launch agy with the default profile.\nUse -p <name> to pick a specific one, -r to pick a free one.',
+        'launcher.description': 'Agydra — profile manager for agy, codex, grok, and claude.\n\nRun without arguments to launch agy with the default profile.\nUse -p <name> to pick one directly, -r to choose unused authenticated profiles first and rank repeats by saved quota; -e limits the pool to one engine.',
+        'launcher.random_help': 'cycle through authenticated profiles in the selected pool: all engines by default, or only -e; unused profiles first, saved quota ranks repeats; ignores the .agydra project pin',
         'launcher.hint_no_profiles': 'No profiles yet. Create one with: agydra create <name>',
         'launcher.profile_busy': 'Profile {name!r} is busy: another live session is using it.',
         'launcher.no_free_profile': 'No free authenticated profile available. Use -r or create a new one with: agydra create <name>',
@@ -197,6 +198,13 @@ _STRINGS: dict[str, dict[str, str]] = {
         'usage.reset': 'Resets    : {date}',
         'usage.unlimited': 'unlimited',
         'usage.unavailable': 'unavailable',
+        'usage.plan_no_quota': 'no quota on plan',
+        'usage.header_state': 'STATE',
+        'usage.state_live': 'live',
+        'usage.state_snapshot': 'snapshot',
+        'usage.state_stale': 'stale',
+        'usage.state_ambiguous': 'ambiguous',
+        'usage.state_unknown': 'unknown',
         'usage.header_profile': 'PROFILE',
         'usage.header_account': 'ACCOUNT',
         'usage.header_available': 'AVAILABLE',
@@ -216,7 +224,9 @@ _STRINGS: dict[str, dict[str, str]] = {
         'claude.import_unsupported': 'Claude Code import is unavailable: configure this profile explicitly and use agydra login; OAuth credentials and native Keychain entries are never copied.',
         'claude.share_unsupported': 'share-config does not support Claude Code profiles; configure their settings explicitly without copying credentials.',
         'usage.section_claude_code': 'ANTHROPIC CLAUDE CODE',
-        'usage.snapshot_notice': 'Informational local snapshot; account identity unverified. No live server quota query.',
+        'usage.snapshot_notice': 'Informational local snapshot from Claude statusLine; account identity unverified.',
+        'usage.snapshot_notice_live': "Server-confirmed quota reported by this profile's own claude /usage (cached 5 min).",
+        'usage.snapshot_observed_live': 'live (server-confirmed)',
         'usage.snapshot_metadata': 'source: {source} · state: {state} · observed: {observed}',
         'usage.snapshot_observed': 'observed (cached snapshot)',
         'usage.snapshot_cached': 'cached',
@@ -229,6 +239,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'usage.snapshot_reset_unknown': 'unknown',
         'claude.binary_hint': 'Set AGYDRA_CLAUDE_BIN or pass -b with the Claude Code executable path.',
         'claude.settings_help': 'print opt-in Claude statusLine JSON for this profile; never edits settings',
+        'claude.settings_apply_help': 'with --claude-settings, write the statusLine into this profile settings.json (refuses to overwrite an existing one)',
         'claude.settings_profile_required': '--claude-settings requires a Claude Code profile.',
     },
     'es': {
@@ -236,7 +247,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         'lang.set_ok': 'Idioma cambiado a Español y guardado.',
         'lang.unknown': 'Idioma desconocido {lang!r}. Soportados: {supported}.',
         'lang.env_override': 'Idioma forzado por AGYDRA_LANG={lang}.',
-        'launcher.description': 'Agydra — gestor de perfiles para agy, codex, grok y claude.\n\nSin argumentos lanza agy con el perfil predeterminado.\nUsa -p <nombre> para elegir uno, -r para tomar uno libre.',
+        'launcher.description': 'Agydra — gestor de perfiles para agy, codex, grok y claude.\n\nSin argumentos lanza agy con el perfil predeterminado.\nUsa -p <nombre> para elegir uno directamente, -r para elegir primero perfiles autenticados sin usar y priorizar las repeticiones por cuota guardada; -e limita el grupo a un motor.',
+        'launcher.random_help': 'recorre los perfiles autenticados del grupo seleccionado: todos los motores por defecto o solo el indicado con -e; primero perfiles no usados y cuota guardada para las repeticiones; ignora el perfil fijado en .agydra',
         'launcher.hint_no_profiles': 'Aún no hay perfiles. Crea uno con: agydra create <nombre>',
         'launcher.profile_busy': 'El perfil {name!r} está ocupado: otra sesión activa lo está usando.',
         'launcher.no_free_profile': 'No hay ningún perfil autenticado y libre. Usa -r o crea uno nuevo con: agydra create <nombre>',
@@ -393,6 +405,13 @@ _STRINGS: dict[str, dict[str, str]] = {
         'usage.reset': 'Renovación : {date}',
         'usage.unlimited': 'ilimitado',
         'usage.unavailable': 'no disponible',
+        'usage.plan_no_quota': 'sin cuota en plan',
+        'usage.header_state': 'ESTADO',
+        'usage.state_live': 'en vivo',
+        'usage.state_snapshot': 'snapshot',
+        'usage.state_stale': 'obsoleto',
+        'usage.state_ambiguous': 'ambiguo',
+        'usage.state_unknown': 'desconocido',
         'usage.header_profile': 'PERFIL',
         'usage.header_account': 'CUENTA',
         'usage.header_available': 'DISPONIBLE',
@@ -412,7 +431,9 @@ _STRINGS: dict[str, dict[str, str]] = {
         'claude.import_unsupported': 'Import no admite Claude Code: configura este perfil explícitamente y usa agydra login; nunca se copian credenciales OAuth ni entradas del llavero nativo.',
         'claude.share_unsupported': 'share-config no admite perfiles Claude Code; configura sus ajustes explícitamente sin copiar credenciales.',
         'usage.section_claude_code': 'ANTHROPIC CLAUDE CODE',
-        'usage.snapshot_notice': 'Snapshot local informativo; identidad de cuenta no verificada. No consulta cuotas en vivo al servidor.',
+        'usage.snapshot_notice': 'Snapshot local informativo del statusLine de Claude; identidad de cuenta no verificada.',
+        'usage.snapshot_notice_live': 'Cuota confirmada por el servidor que informa el propio claude /usage de este perfil (en caché 5 min).',
+        'usage.snapshot_observed_live': 'en vivo (confirmado por el servidor)',
         'usage.snapshot_metadata': 'fuente: {source} · estado: {state} · observado: {observed}',
         'usage.snapshot_observed': 'observado (snapshot en caché)',
         'usage.snapshot_cached': 'en caché',
@@ -425,6 +446,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'usage.snapshot_reset_unknown': 'desconocido',
         'claude.binary_hint': 'Define AGYDRA_CLAUDE_BIN o pasa -b con la ruta del ejecutable Claude Code.',
         'claude.settings_help': 'imprime JSON statusLine opt-in para este perfil Claude; nunca modifica ajustes',
+        'claude.settings_apply_help': 'con --claude-settings, escribe el statusLine en settings.json del perfil (rechaza sobreescribir uno existente)',
         'claude.settings_profile_required': '--claude-settings requiere un perfil Claude Code.',
     },
 }
@@ -488,19 +510,17 @@ def _normalize(lang: str) -> Optional[str]:
 
 
 def _locale_lang() -> str:
-    """Detecta el idioma del sistema evaluando LC_ALL, LC_MESSAGES, LANG y locale.getlocale().
+    """Detecta el idioma del sistema con la precedencia POSIX de LC_ALL, LC_MESSAGES y LANG.
 
-    Retorna ``'es'`` si el locale empieza por ``'es'``; ``'en'`` en cualquier
-    otro caso (incluyendo locales no determinados o errores de la API).
+    La primera variable no vacía decide: ``'es'`` si empieza por ``'es'`` y
+    ``'en'`` en cualquier otro caso (incluidos ``C``/``POSIX`` y locales no
+    soportados). Solo si ninguna está definida se consulta
+    ``locale.getlocale()``; los errores de la API devuelven ``'en'``.
     """
     for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
-        val = os.environ.get(var)
+        val = os.environ.get(var, "").strip().lower()
         if val:
-            val_clean = val.strip().lower()
-            if val_clean.startswith("es"):
-                return "es"
-            if val_clean.startswith("en"):
-                return "en"
+            return "es" if val.startswith("es") else DEFAULT_LANG
     try:
         loc, _ = locale.getlocale()
         if loc and loc.lower().startswith("es"):
@@ -561,8 +581,8 @@ Retorna el código del idioma resuelto (``'en'`` o ``'es'``).
 def set_language(store: object, lang: str) -> None:
     """Valida ``lang`` y lo persiste atómicamente en ``agydra.json``.
 
-Usa el mecanismo atómico de escritura del store (``save_config`` +
-``os.replace`` interno) para que ningún crash deje el archivo corrupto.
+Usa la transacción atómica del store (``update_config`` bajo el lock de
+secuencia, sin lecturas obsoletas) para que ningún crash deje el archivo corrupto.
 
 Lanza ``ValueError`` si ``lang`` no es un idioma soportado.
 Lanza ``store.StoreError`` si ``save_config`` falla (archivo corrupto,
@@ -578,9 +598,7 @@ necesidad de reiniciar.
     if normalized is None:
         supported_str = ", ".join(repr(s) for s in SUPPORTED_LANGS)
         raise ValueError(t("lang.unknown", lang=lang, supported=supported_str))
-    config = store.load_config()
-    config.settings[_SETTINGS_KEY] = normalized
-    store.save_config(config)
+    store.update_config(lambda config: config.settings.__setitem__(_SETTINGS_KEY, normalized))
     _set_active(normalized)
 
 
@@ -602,4 +620,3 @@ def format_usage_timestamp(dt: Optional[object] = None) -> str:
         day_str = days[dt.weekday()]
         mo_str = months[dt.month]
         return f"{day_str} {mo_str} {dt.day} · {dt.strftime('%H:%M')}"
-

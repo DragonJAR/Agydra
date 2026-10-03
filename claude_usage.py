@@ -4,20 +4,35 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import stat
+import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 
 import locks
+import platforms
 
 if TYPE_CHECKING:
     from models import Profile
     from usage import UsageGroup, UsageResult
 
 SOURCE = "claude_status_line"
+LIVE_SOURCE = "claude_cli_usage"
+LIVE_SESSION_ID = "0a07f000-0000-4000-8000-00000000c1a0"
+LIVE_MIN_INTERVAL_SECONDS = 300
+LIVE_TIMEOUT_SECONDS = 25.0
+LIVE_COMMAND = ("-p", "/usage", "--no-session-persistence", "--safe-mode")
+LIVE_REASON_TEXT = {
+    "live_binary_missing": "live quota unavailable: claude executable not found (set AGYDRA_CLAUDE_BIN or pass -b)",
+    "live_timeout": "live quota unavailable: claude /usage timed out",
+    "live_failed": "live quota unavailable: claude /usage could not be run",
+    "live_no_usage": "live quota unavailable: claude reported no subscription usage for this profile (not logged in, or an API-key login)",
+    "live_not_cached": "live quota unavailable: the observation could not be cached safely",
+}
 DEFAULT_TTL_SECONDS = 900
 MAX_INPUT_BYTES = 64 * 1024
 MAX_CACHE_BYTES = 16 * 1024
@@ -93,12 +108,13 @@ def _generation_path(store: Any, seq: int) -> Path:
 
 def _safe_existing_directory(path: Path) -> bool:
     try:
+        linked = platforms.is_link(path, strict=True)
         mode = path.lstat().st_mode
     except FileNotFoundError:
         return True
     except OSError as exc:
         raise UsageCacheError(f"cannot inspect usage cache directory ({exc})") from exc
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+    if linked or not stat.S_ISDIR(mode):
         raise UsageCacheError("usage cache directory is not a regular directory")
     return True
 
@@ -153,7 +169,7 @@ def _parse_utc_time(raw: object) -> Optional[datetime]:
     usage = _usage_module()
     if not isinstance(raw, str):
         return None
-    return usage._parse_reset_time(raw, require_utc=True)
+    return usage.parse_iso_utc(raw, require_utc=True)
 
 
 def parse_claude_usage_payload(payload: object) -> ClaudeUsageSnapshot:
@@ -407,7 +423,13 @@ def capture_statusline(
     generation: int,
     session_id: Optional[str] = None,
     observed_at: Optional[datetime] = None,
+    authoritative: bool = False,
 ) -> bool:
+    """Cache one quota observation.
+
+    ``authoritative`` marks a server-confirmed reading (each call is a new
+    observation, so unchanged values must not keep their old timestamps).
+    """
     try:
         if not _valid_sequence(seq) or not _valid_generation(generation):
             return False
@@ -445,7 +467,7 @@ def capture_statusline(
             ):
                 return False
             try:
-                previous = _read_cache_record(path, seq, selected_session)
+                previous = None if authoritative else _read_cache_record(path, seq, selected_session)
             except UsageCacheError:
                 previous = None
             record = _cache_record(
@@ -620,6 +642,7 @@ def _result(
     error: Optional[str] = None,
     observed_at: Optional[datetime] = None,
     quality: str = "unknown",
+    live: bool = False,
 ) -> "UsageResult":
     usage = _usage_module()
     return usage.UsageResult(
@@ -628,10 +651,10 @@ def _result(
         engine="claude",
         groups=groups or [],
         error=error,
-        source=SOURCE,
+        source=LIVE_SOURCE if live else SOURCE,
         observed_at=observed_at,
         quality=quality,
-        identity_verified=False,
+        identity_verified=live,
     )
 
 
@@ -755,6 +778,17 @@ def query_claude_usage(
             if any(value is not None and value > current for value in future_times):
                 return _result(name, quality="unknown", error="local clock moved backward")
 
+        live_records = [
+            record
+            for record in records
+            if record["session_id"] == LIVE_SESSION_ID
+            and record["state"] == "observed"
+            and not _is_stale(record["observed_at"], current, ttl_seconds)
+        ]
+        live = bool(live_records)
+        if live:
+            records = live_records
+
         fresh_unknown_records = []
         active_records = []
         stale_observations = []
@@ -801,7 +835,8 @@ def query_claude_usage(
             }
         earliest = min(value["observed_at"] for value in windows.values())
         complete = set(windows) == REQUIRED_WINDOWS and all(
-            value["resets_at"] is not None for value in windows.values()
+            value["resets_at"] is not None or (live and value["used_percentage"] == 0)
+            for value in windows.values()
         )
         quality = "observed" if complete else "unknown"
         return _result(
@@ -809,9 +844,182 @@ def query_claude_usage(
             groups=_build_groups(windows),
             observed_at=earliest,
             quality=quality,
+            live=live,
         )
     except Exception:
         return _result(name, ok=False, error="Claude usage could not be read", quality="corrupt")
+
+
+_USAGE_LINE_RE = re.compile(
+    r"^\s*Current (?P<label>session|week \(all models\)):\s*(?P<pct>\d+(?:\.\d+)?)%\s*used"
+    r"(?:\s*[·•-]\s*resets\s+(?P<reset>[^\r\n]*))?",
+    re.IGNORECASE | re.MULTILINE,
+)
+_RESET_RE = re.compile(
+    r"^(?:(?P<month>[A-Za-z]{3,9})\s+(?P<day>\d{1,2})(?:,?\s+(?P<year>\d{4}))?\s+at\s+)?"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<meridiem>[ap]m)\s*\((?P<zone>[^)]+)\)",
+    re.IGNORECASE,
+)
+_USAGE_LABEL_KEY = {"session": "five_hour", "week (all models)": "seven_day"}
+
+
+def _usage_reset_time(raw: str, now: datetime) -> Optional[datetime]:
+    """Resolve a ``/usage`` reset phrase to UTC, or ``None`` when unreadable."""
+    match = _RESET_RE.match(raw.strip())
+    if match is None:
+        return None
+    zone_name = match.group("zone").strip()
+    try:
+        if zone_name.upper() in ("UTC", "GMT"):
+            zone = timezone.utc
+        else:
+            from zoneinfo import ZoneInfo
+
+            zone = ZoneInfo(zone_name)
+        hour = int(match.group("hour")) % 12 + (12 if match.group("meridiem").lower() == "pm" else 0)
+        minute = int(match.group("minute") or 0)
+        local_now = now.astimezone(zone)
+        if match.group("month"):
+            month = datetime.strptime(match.group("month")[:3].title(), "%b").month
+            year = int(match.group("year") or local_now.year)
+            candidate = datetime(year, month, int(match.group("day")), hour, minute, tzinfo=zone)
+            if not match.group("year") and candidate < local_now - timedelta(days=1):
+                candidate = candidate.replace(year=year + 1)
+        else:
+            candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate <= local_now:
+                candidate += timedelta(days=1)
+        return candidate.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def parse_usage_text(text: str, now: datetime) -> dict:
+    """Map ``claude -p /usage`` text onto the statusLine ``rate_limits`` shape,
+    so one parser, cache and renderer serve both sources."""
+    windows = {}
+    for match in _USAGE_LINE_RE.finditer(text):
+        key = _USAGE_LABEL_KEY.get(match.group("label").lower())
+        if key is None or key in windows:
+            continue
+        reset = _usage_reset_time(match.group("reset") or "", now)
+        windows[key] = {
+            "used_percentage": float(match.group("pct")),
+            "resets_at": reset.isoformat() if reset is not None else None,
+        }
+    return {"rate_limits": windows}
+
+
+def run_live_usage(
+    binary: Optional[Path], env: Mapping[str, str], now: datetime, timeout: float = LIVE_TIMEOUT_SECONDS
+) -> Tuple[Optional[dict], Optional[str]]:
+    """Run ``claude -p /usage`` once; returns ``(rate_limits, None)`` or
+    ``(None, reason)``. ``--safe-mode`` skips the profile's hooks, plugins and
+    MCP servers; ``TZ=UTC`` makes the reset times zone-database free."""
+    if binary is None:
+        return None, "live_binary_missing"
+    try:
+        proc = platforms.run_with_group_kill(
+            [str(binary), *LIVE_COMMAND],
+            env={**env, "TZ": "UTC"},
+            timeout=timeout,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return None, "live_timeout"
+    except (OSError, ValueError):
+        return None, "live_failed"
+    rate_limits = parse_usage_text(proc.stdout or "", now)
+    if not rate_limits["rate_limits"]:
+        return None, "live_no_usage"
+    return rate_limits, None
+
+
+def _live_cache_is_fresh(store: Any, seq: int, now: datetime) -> bool:
+    path = _cache_dir(store, seq) / f"{LIVE_SESSION_ID}.json"
+    try:
+        record = _read_cache_record(path, seq, LIVE_SESSION_ID)
+    except UsageCacheError:
+        return False
+    age = (now - record["observed_at"]).total_seconds()
+    return record["state"] == "observed" and 0 <= age < LIVE_MIN_INTERVAL_SECONDS
+
+
+def refresh_live_usage(
+    store: Any,
+    profile: "Profile",
+    *,
+    now: Optional[datetime] = None,
+    runner: Optional[Any] = None,
+) -> Optional[str]:
+    """Refresh the profile's server-confirmed observation; return a reason code
+    on failure and ``None`` on success or when a recent one is still cached.
+
+    The profile's own ``claude`` reports its quota (it handles its login and
+    token renewal itself, so Agydra never reads or refreshes credentials) and
+    the result is cached as one more snapshot: TTL, generations, tombstones and
+    rendering are shared with the statusLine source.
+    """
+    import account
+
+    try:
+        seq = profile.seq
+        current = _utc_datetime(now)
+        if not _valid_sequence(seq) or _current_claude_profile(store, seq) is None:
+            return "live_not_cached"
+        generation, deleted = _read_generation(store, seq)
+        if deleted:
+            return "live_not_cached"
+        if _live_cache_is_fresh(store, seq, current):
+            return None
+        config_dir = Path(store.claude_config_dir_for_seq(seq))
+        binary, env, reason = account.claude_cli_context(config_dir, store)
+        if env is None:
+            return "live_failed"
+        rate_limits, reason = (runner or run_live_usage)(binary, env, current)
+        if rate_limits is None:
+            return reason
+        if parse_claude_usage_payload(rate_limits).state != "observed":
+            return "live_no_usage"
+        stored = capture_statusline(
+            rate_limits,
+            store,
+            seq=seq,
+            generation=generation,
+            session_id=LIVE_SESSION_ID,
+            observed_at=current,
+            authoritative=True,
+        )
+        return None if stored else "live_not_cached"
+    except Exception:
+        return "live_not_cached"
+
+
+def query_claude_usage_live(
+    store: Any,
+    name: str,
+    *,
+    profile: Optional["Profile"] = None,
+    now: Optional[datetime] = None,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    runner: Optional[Any] = None,
+) -> "UsageResult":
+    """Prefer a fresh server-confirmed reading, falling back to the statusLine
+    snapshots; a failure reason is surfaced only when nothing is known."""
+    try:
+        if profile is None:
+            profile = _read_profile_without_recovery(store, name)
+    except Exception:
+        return query_claude_usage(store, name, profile=profile, now=now, ttl_seconds=ttl_seconds)
+    reason = None
+    if profile.engine == "claude" and not _usage_module()._has_pending_profile_rename(store):
+        reason = refresh_live_usage(store, profile, now=now, runner=runner)
+    result = query_claude_usage(store, name, profile=profile, now=now, ttl_seconds=ttl_seconds)
+    if reason and result.ok and not result.groups and result.error is None:
+        result.error = LIVE_REASON_TEXT.get(reason)
+    return result
 
 
 class _SilentArgumentParser(argparse.ArgumentParser):

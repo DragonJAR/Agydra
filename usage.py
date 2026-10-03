@@ -20,31 +20,30 @@ lock (``locks.try_lock``). ``usage`` must keep working while a profile is
 busy; this is the one documented exception alongside ``-f/--force`` (see
 AGENTS.md's lock-exceptions bullet).
 
-Codex and Grok usage requests only use access tokens already present in
-their profile data. This read-only command never exchanges refresh tokens or
+Codex usage requests only use access tokens already present in the
+profile data: this read-only path never exchanges refresh tokens or
 rewrites ``auth.json``; missing and expired access tokens return explicit
-errors so an inspection cannot rotate credentials behind a running session.
+errors so an inspection cannot rotate credentials behind a running
+session. Grok usage self-heals an expired session instead: a 401 from
+the billing endpoint triggers one OIDC ``refresh_token`` grant, the
+billing query is retried with the fresh access token, and the grant is
+persisted through ``account.update_grok_tokens`` — compare-and-swap on
+the token seen at inspection time, so a live session's concurrent
+rotation always wins and this writer silently stands down. When the
+refresh itself fails the error names the re-login command.
 
-Keychain-safety note: on macOS, when the profile being queried already
-owns the shared keychain slot (a real session for it is already running
-and put its own credential there), ``keychain.launch_guard`` recognizes
-that and becomes a true no-op -- it swaps nothing in and restores nothing
-on exit, so ``usage`` genuinely stays a pure read against a busy profile.
-Only when the shared slot currently holds a DIFFERENT profile's
-credential does the guard still perform its existing, ``swap.lock``-
-serialized swap-and-restore around this call.
+Antigravity queries run keychain-free through ``usage_agy``: the
+profile's own credential is staged into a throwaway ``HOME`` whose
+``SSH_TTY`` flag makes agy read the on-disk token file instead of the
+shared macOS keychain slot, so a query never swaps credentials, never
+takes ``swap.lock``, and coexists with live sessions of any profile. Any
+OAuth refresh agy performs lands inside the staging directory and is
+discarded with it.
 
-Sequential-across-PROFILES is a different matter, and a CORRECTNESS
-requirement, not a style choice: there is exactly one shared macOS
-keychain slot (``svce=gemini``/``acct=antigravity``) that
-``keychain.launch_guard`` swaps into and restores for the duration of one
-query. Running two ``query_profile_usage`` calls for DIFFERENT profiles
-concurrently would race on that single slot -- profile B's swap could
-land while profile A's subprocess is still reading it, so A would observe
-B's account, under B's credential, and vice versa. ``gather_usage_report``
-below is the ONLY place that iterates multiple profiles; it MUST call
-``query_profile_usage`` one profile at a time, never via a thread pool,
-``asyncio``, or ``concurrent.futures``. Do not "optimize" this loop.
+``gather_usage_report`` below iterates profiles strictly one at a time.
+With per-profile scoped staging there is no shared-slot race left, but
+the sequential loop keeps report output deterministic and one engine
+subprocess on the machine at a time. Do not "optimize" this loop.
 
 The meaning of ``UsageResult.ok`` is engine-specific. The agy subprocess
 path reports failures as ``ok=False``. For Codex and Grok, missing
@@ -71,19 +70,16 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Literal, Optional, Tuple
 
-import isolation
-import keychain
 import platforms
 import resolver
-from account import auth_state
+import usage_agy
+from account import auth_state, normalize_email, _has_credential
 from models import Profile
 
 DEFAULT_TIMEOUT_S = 20
 
-OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-OPENAI_REFRESH_URL = "https://auth.openai.com/oauth/token"
 OPENAI_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
 GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
@@ -93,6 +89,7 @@ GROK_DEFAULT_OIDC_ISSUER = "https://auth.x.ai"
 GROK_DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 
 ProgressCallback = Callable[[int, int, str], None]
+AuthenticationState = Literal["authenticated", "unauthenticated"]
 
 
 @dataclass
@@ -124,6 +121,7 @@ class UsageResult:
     observed_at: Optional[datetime] = None
     quality: Optional[str] = None
     identity_verified: Optional[bool] = None
+    authentication_state: Optional[AuthenticationState] = None
 
 
 class UsageResponseError(ValueError):
@@ -139,24 +137,20 @@ def _is_finite_number(value: object) -> bool:
         return False
 
 
-@dataclass
-class BucketColumn:
-    """One column of the compact multi-profile table: a bucket ``id`` plus
-    its precomputed, dynamically-derived header text."""
+def parse_iso_utc(raw: object, *, require_utc: bool = False) -> Optional[datetime]:
+    """Decode an ISO-8601 UTC timestamp or unix epoch into a ``datetime``.
 
-    id: str
-    header: str
-
-
-def _parse_reset_time(raw: object, *, require_utc: bool = False) -> Optional[datetime]:
-    """Decode an ISO-8601 UTC ``reset_time`` or unix timestamp.
+    Single source of truth for every timestamp Agydra reads: quota reset
+    times, snapshot ``observed_at`` stamps and Claude usage windows all
+    go through here, so the edge cases are handled exactly once.
 
     ``datetime.fromisoformat`` only accepts the trailing ``Z`` shorthand
-    starting with Python 3.11; this project's floor is 3.9, so the ``Z``
-    is normalized to ``+00:00`` by hand before parsing. Numeric timestamps
-    (seconds or milliseconds) are also supported. Malformed/missing
-    values degrade to ``None`` rather than raising -- callers treat a
-    bucket with no reset time as "unknown", never a hard error.
+    starting with Python 3.11; this project's floor is 3.9, so a trailing
+    ``Z``/``z`` is normalized to ``+00:00`` by hand before parsing. Numeric
+    timestamps (seconds or milliseconds) are also supported. A naive
+    string is read as UTC unless ``require_utc`` rejects it outright.
+    Malformed/missing values degrade to ``None`` rather than raising, so a
+    caller reports "unknown" instead of failing the whole report.
     """
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
         try:
@@ -203,7 +197,7 @@ def _parse_bucket(raw: object) -> Optional[UsageBucket]:
         name=str(raw.get("name") or bucket_id),
         window=str(raw.get("window") or ""),
         remaining_fraction=clamped,
-        reset_time=_parse_reset_time(raw.get("reset_time")),
+        reset_time=parse_iso_utc(raw.get("reset_time")),
     )
 
 
@@ -228,7 +222,7 @@ def _parse_window_bucket(
         return None
     rem = max(0.0, min(1.0, (100.0 - used_percent) / 100.0))
     raw_reset = raw_window.get(reset_key)
-    reset_dt = _parse_reset_time(raw_reset, require_utc=strict_reset_utc)
+    reset_dt = parse_iso_utc(raw_reset, require_utc=strict_reset_utc)
     if strict_reset_utc and raw_reset is not None and reset_dt is None:
         return None
     return UsageBucket(
@@ -319,22 +313,6 @@ def _post_token_refresh(
     return None
 
 
-def refresh_codex_tokens(refresh_token: str, *, timeout: float = 10.0) -> Optional[dict]:
-    """Call OpenAI OAuth refresh endpoint to exchange refresh_token for a fresh access_token."""
-    body = json.dumps({
-        "client_id": OPENAI_CLIENT_ID,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }).encode("utf-8")
-    return _post_token_refresh(
-        OPENAI_REFRESH_URL,
-        body,
-        "application/json",
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-        timeout=timeout,
-    )
-
-
 def refresh_grok_tokens(
     refresh_token: str,
     *,
@@ -388,7 +366,7 @@ def parse_codex_usage_payload(
     if not isinstance(payload, dict):
         return [], None, None
 
-    detected_email = payload.get("email") if isinstance(payload.get("email"), str) else None
+    detected_email = normalize_email(payload.get("email"))
     raw_plan = payload.get("plan_type")
     detected_plan = None
     if isinstance(raw_plan, str) and raw_plan:
@@ -484,7 +462,7 @@ def parse_codex_usage_payload(
         if _is_finite_number(rem_pct):
             rem_fraction = max(0.0, min(1.0, float(rem_pct) / 100.0))
             reset_raw = spend_limit.get("reset_at") or spend_limit.get("resets_at")
-            reset_dt = _parse_reset_time(reset_raw)
+            reset_dt = parse_iso_utc(reset_raw)
             buckets.append(
                 UsageBucket(
                     id="codex-spend",
@@ -514,7 +492,7 @@ def query_codex_usage(
 
     auth_info = account.inspect_codex_auth(data_dir)
     detected_plan = plan or account.detect_codex_plan(data_dir)
-    detected_email = email or account.detect_codex_email(data_dir)
+    detected_email = normalize_email(email) or account.detect_codex_email(data_dir)
 
     if auth_info is None:
         return UsageResult(
@@ -524,6 +502,7 @@ def query_codex_usage(
             email=detected_email,
             plan=detected_plan,
             error="not authenticated",
+            authentication_state="unauthenticated",
         )
 
     if auth_info.get("auth_type") == "api_key":
@@ -533,6 +512,7 @@ def query_codex_usage(
             engine="codex",
             email=detected_email,
             plan=detected_plan or "OpenAI API Key",
+            authentication_state="authenticated",
         )
 
     access_token = auth_info.get("access_token")
@@ -546,6 +526,7 @@ def query_codex_usage(
             email=detected_email,
             plan=detected_plan,
             error="missing access token",
+            authentication_state="unauthenticated",
         )
 
     payload = None
@@ -561,6 +542,7 @@ def query_codex_usage(
                 email=detected_email,
                 plan=detected_plan,
                 error="session expired (401)",
+                authentication_state="unauthenticated",
             )
         else:
             return UsageResult(
@@ -570,6 +552,7 @@ def query_codex_usage(
                 email=detected_email,
                 plan=detected_plan or "ChatGPT Plus",
                 error=f"usage unavailable (HTTP {exc.code})",
+                authentication_state="authenticated",
             )
     except UsageResponseError as exc:
         return UsageResult(
@@ -579,6 +562,7 @@ def query_codex_usage(
             email=detected_email,
             plan=detected_plan,
             error=f"invalid usage response ({exc})",
+            authentication_state="authenticated",
         )
     except Exception as exc:
         _close_http_error(exc)
@@ -589,6 +573,7 @@ def query_codex_usage(
             email=detected_email,
             plan=detected_plan or "ChatGPT Plus",
             error=f"offline ({exc})",
+            authentication_state="authenticated",
         )
 
     if not payload:
@@ -599,6 +584,7 @@ def query_codex_usage(
             email=detected_email,
             plan=detected_plan or "ChatGPT Plus",
             error="no usage data in response",
+            authentication_state="authenticated",
         )
 
     groups, api_plan, api_email = parse_codex_usage_payload(payload)
@@ -613,6 +599,7 @@ def query_codex_usage(
             email=final_email,
             plan=final_plan,
             error="no usage data in response",
+            authentication_state="authenticated",
         )
 
     return UsageResult(
@@ -622,6 +609,7 @@ def query_codex_usage(
         email=final_email,
         plan=final_plan,
         groups=groups,
+        authentication_state="authenticated",
     )
 
 
@@ -703,7 +691,7 @@ def parse_grok_billing_payload(
     if not reset_raw:
         reset_raw = cfg.get("billingPeriodEnd")
 
-    reset_dt = _parse_reset_time(reset_raw) if reset_raw else None
+    reset_dt = parse_iso_utc(reset_raw) if reset_raw else None
 
     bucket = UsageBucket(
         id="grok-weekly",
@@ -740,6 +728,51 @@ def parse_grok_billing_payload(
     return [UsageGroup(name="xAI Grok", buckets=buckets)], reset_dt
 
 
+def _refresh_grok_safely(auth_info: dict, timeout: float) -> Optional[dict]:
+    """Call the xAI OIDC refresh endpoint; swallow network/HTTP failures.
+
+    Returns the parsed token grant on success, ``None`` otherwise. Usage
+    callers treat any failure here as ``needs re-login`` rather than
+    surfacing transport noise to the user inspecting quotas.
+    """
+    refresh_token = auth_info.get("refresh_token")
+    if not refresh_token:
+        return None
+    try:
+        return refresh_grok_tokens(
+            refresh_token,
+            client_id=auth_info.get("oidc_client_id"),
+            issuer=auth_info.get("oidc_issuer"),
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+
+
+GROK_PLANS_WITHOUT_QUOTA = frozenset({"x premium"})
+PLAN_WITHOUT_QUOTA = "plan without usage quota"
+
+
+def _grok_empty_usage_result(
+    name: str, email: Optional[str], plan: Optional[str]
+) -> "UsageResult":
+    """Result for a Grok billing response with no quota windows.
+
+    Plans known not to expose quota data (``GROK_PLANS_WITHOUT_QUOTA``, exact
+    match) are a healthy, expected state, not a failed query.
+    """
+    metered = (plan or "").strip().lower() not in GROK_PLANS_WITHOUT_QUOTA
+    return UsageResult(
+        name=name,
+        ok=not metered,
+        engine="grok",
+        email=email,
+        plan=plan or "Grok (xAI)",
+        error="no usage data in response" if metered else PLAN_WITHOUT_QUOTA,
+        authentication_state="authenticated",
+    )
+
+
 def query_grok_usage(
     data_dir: Path,
     name: str,
@@ -753,7 +786,7 @@ def query_grok_usage(
 
     auth_info = account.inspect_grok_auth(data_dir)
     detected_plan = plan or account.detect_grok_plan(data_dir)
-    detected_email = email or account.detect_grok_email(data_dir)
+    detected_email = normalize_email(email) or account.detect_grok_email(data_dir)
 
     if auth_info is None:
         return UsageResult(
@@ -763,6 +796,7 @@ def query_grok_usage(
             email=detected_email,
             plan=detected_plan,
             error="not authenticated",
+            authentication_state="unauthenticated",
         )
 
     if auth_info.get("auth_type") == "api_key":
@@ -772,6 +806,7 @@ def query_grok_usage(
             engine="grok",
             email=detected_email,
             plan=detected_plan or "xAI API Key",
+            authentication_state="authenticated",
         )
 
     token = auth_info.get("token") or auth_info.get("key")
@@ -783,78 +818,95 @@ def query_grok_usage(
             email=detected_email,
             plan=detected_plan,
             error="missing access token",
+            authentication_state="unauthenticated",
         )
 
     billing_payload = None
-    try:
-        billing_payload = fetch_grok_billing_payload(token, timeout=timeout)
-    except urllib.error.HTTPError as exc:
-        _close_http_error(exc)
-        if exc.code == 401:
+    used_token = token
+    used_previous = auth_info.get("key") if auth_info else None
+    for attempt in (0, 1):
+        try:
+            billing_payload = fetch_grok_billing_payload(used_token, timeout=timeout)
+            break
+        except urllib.error.HTTPError as exc:
+            _close_http_error(exc)
+            if exc.code != 401:
+                return UsageResult(
+                    name=name,
+                    ok=True,
+                    engine="grok",
+                    email=detected_email,
+                    plan=detected_plan or "Grok (xAI)",
+                    error=f"usage unavailable (HTTP {exc.code})",
+                    authentication_state="authenticated",
+                )
+            if attempt == 0 and (auth_info or {}).get("refresh_token"):
+                grant = _refresh_grok_safely(auth_info, timeout)
+                if grant and _has_credential(grant.get("access_token")):
+                    new_access = grant["access_token"]
+                    new_refresh = (
+                        grant.get("refresh_token")
+                        if _has_credential(grant.get("refresh_token"))
+                        else None
+                    )
+                    try:
+                        account.update_grok_tokens(
+                            data_dir,
+                            access_token=new_access,
+                            refresh_token=new_refresh,
+                            previous_access_token=used_previous,
+                        )
+                    except Exception:
+                        pass
+                    used_token = new_access
+                    used_previous = new_access
+                    continue
             return UsageResult(
                 name=name,
                 ok=False,
                 engine="grok",
                 email=detected_email,
                 plan=detected_plan,
-                error="session expired (401)",
+                error=(
+                    "session expired (401); re-login required: agydra login "
+                    + name
+                ),
+                authentication_state="unauthenticated",
             )
-        else:
+        except UsageResponseError as exc:
+            return UsageResult(
+                name=name,
+                ok=False,
+                engine="grok",
+                email=detected_email,
+                plan=detected_plan,
+                error=f"invalid usage response ({exc})",
+                authentication_state="authenticated",
+            )
+        except Exception as exc:
+            _close_http_error(exc)
             return UsageResult(
                 name=name,
                 ok=True,
                 engine="grok",
                 email=detected_email,
                 plan=detected_plan or "Grok (xAI)",
-                error=f"usage unavailable (HTTP {exc.code})",
+                error=f"offline ({exc})",
+                authentication_state="authenticated",
             )
-    except UsageResponseError as exc:
-        return UsageResult(
-            name=name,
-            ok=False,
-            engine="grok",
-            email=detected_email,
-            plan=detected_plan,
-            error=f"invalid usage response ({exc})",
-        )
-    except Exception as exc:
-        _close_http_error(exc)
-        return UsageResult(
-            name=name,
-            ok=True,
-            engine="grok",
-            email=detected_email,
-            plan=detected_plan or "Grok (xAI)",
-            error=f"offline ({exc})",
-        )
 
     final_plan = detected_plan
-    settings_payload = fetch_grok_settings_payload(token, timeout=min(timeout, 4.0))
+    settings_payload = fetch_grok_settings_payload(used_token, timeout=min(timeout, 4.0))
     if isinstance(settings_payload, dict):
         tier_display = settings_payload.get("subscription_tier_display")
         if isinstance(tier_display, str) and tier_display:
             final_plan = tier_display
 
-    if not billing_payload:
-        return UsageResult(
-            name=name,
-            ok=False,
-            engine="grok",
-            email=detected_email,
-            plan=final_plan or "Grok (xAI)",
-            error="no usage data in response",
-        )
-
-    groups, _reset_dt = parse_grok_billing_payload(billing_payload)
+    groups: List[UsageGroup] = []
+    if billing_payload:
+        groups, _reset_dt = parse_grok_billing_payload(billing_payload)
     if not groups:
-        return UsageResult(
-            name=name,
-            ok=False,
-            engine="grok",
-            email=detected_email,
-            plan=final_plan or "Grok (xAI)",
-            error="no usage data in response",
-        )
+        return _grok_empty_usage_result(name, detected_email, final_plan)
     return UsageResult(
         name=name,
         ok=True,
@@ -862,6 +914,7 @@ def query_grok_usage(
         email=detected_email,
         plan=final_plan or "Grok (xAI)",
         groups=groups,
+        authentication_state="authenticated",
     )
 
 
@@ -874,25 +927,13 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     docstring), so skipping it shortens real elapsed time, not just log
     noise.
     """
-    try:
-        profile_metadata = _get_profile_readonly(store, name)
-    except Exception:
-        if _has_pending_profile_rename(store):
-            return UsageResult(
-                name=name,
-                ok=False,
-                error="profile rename recovery pending",
-                quality="unknown",
-            )
-        return UsageResult(
-            name=name,
-            ok=False,
-            error="profile metadata unavailable",
-            quality="unknown",
-        )
-
-    if profile_metadata is not None and profile_metadata.engine == "claude":
-        if _has_pending_profile_rename(store):
+    if _has_pending_profile_rename(store):
+        try:
+            profile_metadata = _get_profile_readonly(store, name)
+            engine = profile_metadata.engine if profile_metadata else None
+        except Exception:
+            engine = None
+        if engine == "claude":
             return UsageResult(
                 name=name,
                 ok=True,
@@ -902,22 +943,39 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
                 identity_verified=False,
                 error="profile rename recovery pending",
             )
+        return UsageResult(
+            name=name,
+            ok=False,
+            engine=engine,
+            error="profile rename recovery pending",
+            quality="unknown",
+        )
+
+    try:
+        profile_metadata = _get_profile_readonly(store, name)
+    except Exception:
+        profile_metadata = None
+
+    if profile_metadata is None:
+        return UsageResult(
+            name=name,
+            ok=False,
+            error="profile metadata unavailable",
+            quality="unknown",
+        )
+
+    if profile_metadata.engine == "claude":
         import claude_usage
 
-        return claude_usage.query_claude_usage(
+        return claude_usage.query_claude_usage_live(
             store,
             name,
             profile=profile_metadata,
         )
 
-    profile = store.get(name)
+    profile = profile_metadata
     engine = profile.engine
     data_dir = store.profile_data_dir(name, engine=engine)
-
-    if engine == "claude":
-        import claude_usage
-
-        return claude_usage.query_claude_usage(store, name, profile=profile)
 
     if engine == "codex":
         return query_codex_usage(
@@ -957,29 +1015,18 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
             error=f"agy binary not found (set {platforms.AGY_BIN_ENV} or PATH)",
         )
 
-    try:
-        overlay = isolation.build_overlay(name, data_dir, store.root)
-    except (isolation.IsolationError, OSError) as exc:
-        return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error=f"overlay error: {exc}")
+    token_bytes = usage_agy.scoped_token_bytes(store, name, profile, data_dir)
+    if token_bytes is None:
+        return UsageResult(
+            name=name, ok=False, engine=engine, email=profile.email,
+            error="credential not found or identity unverified in profile data/keychain backup (launch once or re-login to refresh)",
+        )
 
-    env = isolation.isolated_env(
-        overlay,
-        extra={resolver.PROFILE_ENV: name},
-        config_windows_redirect_home=bool(config.settings.get("windows_redirect_home")),
-    )
-
-    argv = [str(binary), "--print", "/usage", "--output-format", "json"]
     try:
-        with keychain.launch_guard(store, name, capture=False,
-                                  persist_on_exit=False):
-            proc = platforms.run_with_group_kill(
-                argv,
-                env=env,
-                timeout=timeout,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
+        proc = usage_agy.run_scoped_usage_query(
+            store, name, binary, token_bytes,
+            timeout=timeout, config=config,
+        )
     except subprocess.TimeoutExpired:
         return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error="timed out")
     except (OSError, ValueError) as exc:
@@ -1014,7 +1061,7 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     if not groups:
         return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error="no usage data in response")
 
-    return UsageResult(name=name, ok=True, engine=engine, email=profile.email, groups=groups)
+    return UsageResult(name=name, ok=True, engine=engine, email=profile.email, groups=groups, source="cli")
 
 
 def gather_usage_report(
@@ -1026,13 +1073,12 @@ def gather_usage_report(
 ) -> List[UsageResult]:
     """Query usage for every profile in ``names``, ONE AT A TIME.
 
-    This is a CORRECTNESS requirement, not a performance choice -- see
-    this module's docstring. The one shared macOS keychain slot that
-    ``keychain.launch_guard`` swaps per profile would be raced by two
-    concurrent queries for different profiles, each possibly reporting
-    the WRONG account's quota under the WRONG credential. Do not
-    parallelize this loop with a thread pool, ``asyncio``, or
-    ``concurrent.futures`` -- ever.
+    Determinism, not a shared-resource race -- see this module's
+    docstring: each Antigravity query stages its own throwaway HOME via
+    ``usage_agy``, so there is no shared keychain slot left to race, but
+    the sequential loop keeps report output stable and one engine
+    subprocess on the machine at a time. Do not parallelize this loop
+    with a thread pool, ``asyncio``, or ``concurrent.futures``.
 
     ``on_progress(index, total, name)``, when given, is called right
     BEFORE each profile's query starts (1-based ``index``), so a caller
@@ -1041,10 +1087,11 @@ def gather_usage_report(
 
     Per-profile failure isolation: ``query_profile_usage`` itself already
     degrades every expected failure to a ``UsageResult(ok=False, error=..)``
-    (timeout, agy exit code, overlay race, ...). An UNEXPECTED exception
-    from one profile must degrade the same way instead of aborting the
-    whole report -- one broken profile never hides the other accounts'
-    data, mirroring the degradation pattern the single-query path uses.
+    (timeout, agy exit code, missing credential, ...). An UNEXPECTED
+    exception from one profile must degrade the same way instead of
+    aborting the whole report -- one broken profile never hides the
+    other accounts' data, mirroring the degradation pattern the
+    single-query path uses.
     """
     results: List[UsageResult] = []
     total = len(names)
@@ -1093,6 +1140,7 @@ def extract_model_summary(groups: List[UsageGroup]) -> dict:
     summary = {
         "gemini": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
         "claude": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
+        "claude_code": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
         "codex": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
         "grok": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
     }
@@ -1101,6 +1149,8 @@ def extract_model_summary(groups: List[UsageGroup]) -> dict:
         key = None
         if "gemini" in lower_name:
             key = "gemini"
+        elif "claude code" in lower_name:
+            key = "claude_code"
         elif any(k in lower_name for k in ("claude", "gpt", "3p")):
             key = "claude"
         elif any(k in lower_name for k in ("codex", "openai")):
@@ -1128,7 +1178,7 @@ def extract_model_summary(groups: List[UsageGroup]) -> dict:
                 summary[key]["weekly"] = bucket.remaining_fraction
                 summary[key]["weekly_reset"] = bucket.reset_time
 
-    for key in ("gemini", "claude", "codex", "grok"):
+    for key in ("gemini", "claude", "claude_code", "codex", "grok"):
         w = summary[key]["weekly"]
         f = summary[key]["five_h"]
         w_reset = summary[key].get("weekly_reset")
@@ -1148,82 +1198,6 @@ def extract_model_summary(groups: List[UsageGroup]) -> dict:
             summary[key]["reset_time"] = f_reset
 
     return summary
-
-
-def _abbreviate_group(name: str) -> str:
-    """Compact, deterministic column-header text for a group name.
-
-    Strips a trailing "models"/"model" word (present in every group name
-    seen so far, e.g. "Gemini Models") and uppercases the rest, truncating
-    to 14 characters so an unusually long future group name still fits a
-    table cell. Never a hand-written literal per group -- always derived
-    from whatever ``group["name"]`` the live response held.
-    """
-    text = name.strip()
-    for suffix in (" models", " model"):
-        if text.lower().endswith(suffix):
-            text = text[: -len(suffix)]
-            break
-    text = text.upper()
-    if len(text) > 14:
-        text = text[:14].rstrip()
-    return text
-
-
-_WINDOW_ABBREVIATIONS = {
-    "weekly": "WK",
-    "5h": "5H",
-}
-
-
-def _abbreviate_window(window: str) -> str:
-    text = (window or "").strip().lower()
-    if not text:
-        return "?"
-    return _WINDOW_ABBREVIATIONS.get(text, text[:4].upper())
-
-
-def column_header(group_name: str, window: str) -> str:
-    """Column header text for a bucket, derived from live response data.
-
-    Never a hardcoded literal like ``"Gemini Weekly"``: always computed
-    from ``group["name"]`` + ``bucket["window"]`` so a schema change (a
-    renamed or added model group) is reflected automatically.
-    """
-    return f"{_abbreviate_group(group_name)} {_abbreviate_window(window)}".strip()
-
-
-def collect_bucket_columns(results: List[UsageResult]) -> List[BucketColumn]:
-    """Union of every bucket ``id`` seen across ``results``, first-seen order.
-
-    Most accounts expose the same 4 buckets today
-    (``gemini-weekly``/``gemini-5h``/``3p-weekly``/``3p-5h``), but nothing
-    here assumes exactly those 4 or those names -- a profile whose account
-    exposes a different set of groups/buckets just adds/omits columns.
-    """
-    seen: dict = {}
-    order: List[BucketColumn] = []
-    for result in results:
-        if not result.ok:
-            continue
-        for group in result.groups:
-            for bucket in group.buckets:
-                if bucket.id in seen:
-                    continue
-                seen[bucket.id] = True
-                order.append(
-                    BucketColumn(id=bucket.id, header=column_header(group.name, bucket.window))
-                )
-    return order
-
-
-def bucket_by_id(result: UsageResult, bucket_id: str) -> Optional[UsageBucket]:
-    """First bucket matching ``bucket_id`` across every group of ``result``."""
-    for group in result.groups:
-        for bucket in group.buckets:
-            if bucket.id == bucket_id:
-                return bucket
-    return None
 
 
 def format_countdown(reset_time: Optional[datetime], *, now: Optional[datetime] = None) -> str:

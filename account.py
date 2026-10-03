@@ -17,13 +17,42 @@ import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional, Tuple
+from typing import Iterator, Mapping, Optional, Tuple
 
 import platforms
 import store
 
 AGY_CLI_DIR = "antigravity-cli"
 TOKEN_FILE = "antigravity-oauth-token"
+
+
+def _normalize_nonblank_text(value: object) -> Optional[str]:
+    """Return trimmed text when nonblank, otherwise None."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _has_credential(value: object) -> bool:
+    """Whether a credential value contains non-whitespace text."""
+    return _normalize_nonblank_text(value) is not None
+
+
+def normalize_email(value: object) -> Optional[str]:
+    """Return a trimmed nonblank email claim, otherwise None."""
+    return _normalize_nonblank_text(value)
+
+
+def same_email(first: object, second: object) -> bool:
+    """True when both claims are nonblank and name the same address ignoring case.
+
+    Email addresses are compared case-insensitively for identity decisions
+    (``Alice@X.com`` and ``alice@x.com`` are one account); blank or non-text
+    claims never match anything, including each other.
+    """
+    left, right = normalize_email(first), normalize_email(second)
+    return left is not None and right is not None and left.casefold() == right.casefold()
 
 
 def _decode_jwt_payload(token: str) -> dict:
@@ -33,7 +62,7 @@ def _decode_jwt_payload(token: str) -> dict:
     padding = "=" * (-len(parts[1]) % 4)
     try:
         decoded = json.loads(base64.urlsafe_b64decode(parts[1] + padding))
-    except (binascii.Error, ValueError):
+    except (binascii.Error, RecursionError, ValueError):
         return {}
     return decoded if isinstance(decoded, dict) else {}
 
@@ -131,8 +160,7 @@ def email_from_raw(raw: dict) -> Optional[str]:
     if id_token is None:
         return None
     claims = _decode_jwt_payload(id_token)
-    email = claims.get("email")
-    return email if isinstance(email, str) and email else None
+    return normalize_email(claims.get("email"))
 
 
 CODEX_AUTH_FILE = "auth.json"
@@ -148,9 +176,13 @@ def inspect_codex_auth(data_dir: Path) -> Optional[dict]:
     if not isinstance(raw, dict):
         return None
     tokens = raw.get("tokens")
-    if isinstance(tokens, dict) and (
-        tokens.get("access_token") or tokens.get("id_token") or tokens.get("refresh_token")
+    if isinstance(tokens, dict) and any(
+        _has_credential(tokens.get(key))
+        for key in ("access_token", "id_token", "refresh_token")
     ):
+        access_token = tokens.get("access_token")
+        id_token = tokens.get("id_token")
+        refresh_token = tokens.get("refresh_token")
         account_id = None
         for key in ("account_id", "accountId"):
             val = tokens.get(key) or raw.get(key)
@@ -158,8 +190,7 @@ def inspect_codex_auth(data_dir: Path) -> Optional[dict]:
                 account_id = val.strip()
                 break
         if not account_id:
-            id_token = tokens.get("id_token")
-            if id_token and isinstance(id_token, str):
+            if _has_credential(id_token):
                 claims = _decode_jwt_payload(id_token)
                 auth_claim = claims.get("https://api.openai.com/auth")
                 if isinstance(auth_claim, dict):
@@ -174,15 +205,16 @@ def inspect_codex_auth(data_dir: Path) -> Optional[dict]:
                             break
         return {
             "auth_type": "chatgpt",
-            "access_token": tokens.get("access_token"),
-            "refresh_token": tokens.get("refresh_token"),
-            "id_token": tokens.get("id_token"),
+            "access_token": access_token if _has_credential(access_token) else None,
+            "refresh_token": refresh_token if _has_credential(refresh_token) else None,
+            "id_token": id_token if _has_credential(id_token) else None,
             "account_id": account_id,
         }
-    if raw.get("OPENAI_API_KEY"):
+    api_key = raw.get("OPENAI_API_KEY")
+    if _has_credential(api_key):
         return {
             "auth_type": "api_key",
-            "api_key": raw.get("OPENAI_API_KEY"),
+            "api_key": api_key,
         }
     return None
 
@@ -198,11 +230,9 @@ def detect_codex_email(data_dir: Path) -> Optional[str]:
     tokens = raw.get("tokens")
     if isinstance(tokens, dict):
         id_token = tokens.get("id_token")
-        if id_token and isinstance(id_token, str):
+        if _has_credential(id_token):
             claims = _decode_jwt_payload(id_token)
-            email = claims.get("email")
-            if isinstance(email, str) and email:
-                return email
+            return normalize_email(claims.get("email"))
     return None
 
 
@@ -217,7 +247,7 @@ def detect_codex_plan(data_dir: Path) -> Optional[str]:
     tokens = raw.get("tokens")
     if isinstance(tokens, dict):
         id_token = tokens.get("id_token")
-        if id_token and isinstance(id_token, str):
+        if _has_credential(id_token):
             claims = _decode_jwt_payload(id_token)
             auth_claim = claims.get("https://api.openai.com/auth")
             if isinstance(auth_claim, dict):
@@ -231,53 +261,73 @@ def detect_codex_plan(data_dir: Path) -> Optional[str]:
                         "free": "ChatGPT Free",
                     }
                     return plan_map.get(plan_type.lower(), f"ChatGPT {plan_type.capitalize()}")
-    if raw.get("OPENAI_API_KEY"):
+    if _has_credential(raw.get("OPENAI_API_KEY")):
         return "OpenAI API Key"
     return None
-
-
-def detect_codex_account_id(data_dir: Path) -> Optional[str]:
-    """Extract ChatGPT account or workspace ID from Codex auth.json if present."""
-    auth = inspect_codex_auth(data_dir)
-    return auth.get("account_id") if isinstance(auth, dict) else None
-
-
-def save_codex_tokens(data_dir: Path, tokens_data: dict) -> bool:
-    """Update tokens and last_refresh in Codex auth.json atomically."""
-    path = Path(data_dir) / CODEX_AUTH_FILE
-    if not path.is_file():
-        return False
-    raw = store.read_json_object(path, tolerant=True)
-    if not isinstance(raw, dict):
-        return False
-    tokens = raw.get("tokens")
-    if not isinstance(tokens, dict):
-        tokens = {}
-    for key in ("access_token", "refresh_token", "id_token", "account_id"):
-        if key in tokens_data and tokens_data[key]:
-            tokens[key] = tokens_data[key]
-    raw["tokens"] = tokens
-    from models import _utcnow_iso
-    raw["last_refresh"] = _utcnow_iso()
-    try:
-        store._atomic_write_json(path, raw)
-        return True
-    except Exception:
-        return False
 
 
 GROK_AUTH_FILE = "auth.json"
 GROK_CONFIG_FILE = "config.toml"
 
 
+def update_grok_tokens(
+    data_dir: Path,
+    *,
+    access_token: str,
+    refresh_token: Optional[str] = None,
+    previous_access_token: Optional[str] = None,
+) -> bool:
+    """Persist a server-issued Grok OIDC grant into the profile auth file.
+
+    Compare-and-swap on ``previous_access_token``: when provided and the
+    file's active credential no longer holds that exact token (a live
+    session rotated it first), nothing is written and False is returned —
+    a usage inspection may never clobber tokens a running session just
+    refreshed. Only ``key`` and ``refresh_token`` are touched; every other
+    field (identity, issuer metadata, expiry as the CLI wrote it) is
+    preserved verbatim. The write is atomic (sibling temp + ``os.replace``).
+    """
+    path = Path(data_dir) / GROK_AUTH_FILE
+    if not path.is_file():
+        return False
+    try:
+        raw = store.read_json_object(path, tolerant=True)
+    except (ValueError, OSError):
+        return False
+    credential = _first_grok_credential(raw)
+    if credential is None or not _has_credential(access_token):
+        return False
+    if (
+        previous_access_token is not None
+        and credential.get("key") != previous_access_token
+    ):
+        return False
+    credential["key"] = access_token
+    if _has_credential(refresh_token):
+        credential["refresh_token"] = refresh_token
+    try:
+        store.atomic_write_bytes(
+            path, json.dumps(raw, separators=(",", ":")).encode("utf-8")
+        )
+    except OSError:
+        return False
+    return True
+
+
+def _grok_credentials(raw: object) -> Iterator[Tuple[str, dict]]:
+    if not isinstance(raw, dict):
+        return
+    for key, credential in raw.items():
+        if isinstance(credential, dict) and (
+            _has_credential(credential.get("key"))
+            or _has_credential(credential.get("refresh_token"))
+        ):
+            yield key, credential
+
+
 def _first_grok_credential(raw: dict) -> Optional[dict]:
     """Find the active authentication record in Grok auth.json."""
-    if not isinstance(raw, dict):
-        return None
-    for _k, v in raw.items():
-        if isinstance(v, dict) and (v.get("key") or v.get("refresh_token") or v.get("email")):
-            return v
-    return None
+    return next((credential for _key, credential in _grok_credentials(raw)), None)
 
 
 def inspect_grok_auth(data_dir: Path) -> Optional[dict]:
@@ -287,22 +337,28 @@ def inspect_grok_auth(data_dir: Path) -> Optional[dict]:
         raw = store.read_json_object(path, tolerant=True)
         cred = _first_grok_credential(raw)
         if cred is not None:
+            key = cred.get("key")
+            refresh_token = cred.get("refresh_token")
+            email = cred.get("email")
             return {
                 "auth_type": cred.get("auth_mode") or "oidc",
-                "key": cred.get("key"),
-                "token": cred.get("key"),
-                "refresh_token": cred.get("refresh_token"),
-                "email": cred.get("email"),
+                "key": key if _has_credential(key) else None,
+                "token": key if _has_credential(key) else None,
+                "refresh_token": (
+                    refresh_token if _has_credential(refresh_token) else None
+                ),
+                "email": normalize_email(email),
                 "user_id": cred.get("user_id"),
                 "first_name": cred.get("first_name"),
                 "oidc_issuer": cred.get("oidc_issuer"),
                 "oidc_client_id": cred.get("oidc_client_id"),
                 "expires_at": cred.get("expires_at"),
             }
-        if isinstance(raw, dict) and raw.get("XAI_API_KEY"):
+        api_key = raw.get("XAI_API_KEY") if isinstance(raw, dict) else None
+        if _has_credential(api_key):
             return {
                 "auth_type": "api_key",
-                "api_key": raw.get("XAI_API_KEY"),
+                "api_key": api_key,
             }
     cfg_path = Path(data_dir) / GROK_CONFIG_FILE
     if cfg_path.is_file():
@@ -311,8 +367,8 @@ def inspect_grok_auth(data_dir: Path) -> Optional[dict]:
             for line in content.splitlines():
                 line = line.strip()
                 if line.startswith("api_key") and "=" in line:
-                    val = line.split("=", 1)[1].strip().strip('"\'')
-                    if val:
+                    val = line.split("=", 1)[1].strip().strip('"\'').strip()
+                    if _has_credential(val):
                         return {"auth_type": "api_key", "api_key": val}
         except OSError:
             pass
@@ -328,14 +384,13 @@ def detect_grok_email(data_dir: Path) -> Optional[str]:
     cred = _first_grok_credential(raw)
     if cred is not None:
         email = cred.get("email")
-        if isinstance(email, str) and email:
-            return email
+        normalized_email = normalize_email(email)
+        if normalized_email is not None:
+            return normalized_email
         key = cred.get("key")
-        if isinstance(key, str) and key:
+        if _has_credential(key):
             claims = _decode_jwt_payload(key)
-            jwt_email = claims.get("email")
-            if isinstance(jwt_email, str) and jwt_email:
-                return jwt_email
+            return normalize_email(claims.get("email"))
     return None
 
 
@@ -348,10 +403,10 @@ def detect_grok_plan(data_dir: Path) -> Optional[str]:
     cred = _first_grok_credential(raw)
     if cred is not None:
         sub_tier = cred.get("subscription_tier")
-        if isinstance(sub_tier, str) and sub_tier:
+        if _has_credential(sub_tier):
             return sub_tier.capitalize() if not sub_tier.lower().startswith("super") else "SuperGrok"
         key = cred.get("key")
-        if isinstance(key, str) and key:
+        if _has_credential(key):
             claims = _decode_jwt_payload(key)
             tier = claims.get("tier")
             if tier is not None:
@@ -364,7 +419,7 @@ def detect_grok_plan(data_dir: Path) -> Optional[str]:
                 }
                 return tier_map.get(tier_str, f"Grok Tier {tier_str}")
         return "Grok (xAI)"
-    if isinstance(raw, dict) and raw.get("XAI_API_KEY"):
+    if isinstance(raw, dict) and _has_credential(raw.get("XAI_API_KEY")):
         return "xAI API Key"
     cfg_path = Path(data_dir) / GROK_CONFIG_FILE
     if cfg_path.is_file():
@@ -373,52 +428,12 @@ def detect_grok_plan(data_dir: Path) -> Optional[str]:
             for line in content.splitlines():
                 line = line.strip()
                 if line.startswith("api_key") and "=" in line:
-                    val = line.split("=", 1)[1].strip().strip('"\'')
-                    if val:
+                    val = line.split("=", 1)[1].strip().strip('"\'').strip()
+                    if _has_credential(val):
                         return "xAI API Key"
         except OSError:
             pass
     return None
-
-
-def save_grok_tokens(data_dir: Path, tokens_data: dict) -> bool:
-    """Update active Grok credential tokens in auth.json atomically."""
-    try:
-        path = Path(data_dir) / GROK_AUTH_FILE
-        if not path.is_file():
-            return False
-        raw = store.read_json_object(path, tolerant=True)
-        if not isinstance(raw, dict):
-            return False
-        target_key = None
-        for k, v in raw.items():
-            if isinstance(v, dict) and (v.get("key") or v.get("refresh_token") or v.get("email")):
-                target_key = k
-                break
-        if target_key is None:
-            return False
-        cred = raw[target_key]
-        new_token = tokens_data.get("access_token") or tokens_data.get("key")
-        if new_token:
-            cred["key"] = new_token
-        new_refresh = tokens_data.get("refresh_token")
-        if new_refresh:
-            cred["refresh_token"] = new_refresh
-        expires_in = tokens_data.get("expires_in")
-        if isinstance(expires_in, (int, float)) and expires_in > 0:
-            from datetime import datetime, timedelta, timezone
-
-            exp_dt = datetime.now(timezone.utc) + timedelta(seconds=float(expires_in))
-            cred["expires_at"] = exp_dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        elif tokens_data.get("expires_at"):
-            cred["expires_at"] = str(tokens_data["expires_at"])
-        from models import _utcnow_iso
-
-        cred["create_time"] = _utcnow_iso()
-        store._atomic_write_json(path, raw)
-        return True
-    except Exception:
-        return False
 
 
 CLAUDE_STATUS_TIMEOUT = 15.0
@@ -569,20 +584,36 @@ def inspect_claude_auth(
     )
 
 
-def claude_auth_status(data_dir: Path, store=None) -> ClaudeAuthStatus:
-    """One status call for a profile's physical claude config directory."""
+def claude_cli_context(data_dir: Path, store=None) -> Tuple[Optional[Path], Optional[dict], Optional[str]]:
+    """Binary and isolated environment for running ``claude`` against one profile.
+
+    Returns ``(binary, env, reason)``; ``reason`` is set (and ``env`` is
+    ``None``) when the config directory fails the central isolation guard.
+    ``binary`` may be ``None`` when no claude executable can be found.
+    """
     import engines
     import isolation
 
-    driver = engines.get_engine("claude")
     try:
         isolation.validate_claude_config_dir(Path(data_dir))
     except isolation.IsolationError as exc:
-        return _claude_unknown(str(exc))
+        return None, None, str(exc)
+    driver = engines.get_engine("claude")
     config = store.load_config() if store is not None else None
     binary = driver.resolve_binary(getattr(config, "claude_binary", None))
-    env = isolation.isolated_env(Path(data_dir), {}, engine="claude")
-    return driver.inspect_auth(binary, Path(data_dir), env)
+    store_root = store.root if store is not None else None
+    env = isolation.isolated_env(Path(data_dir), {}, engine="claude", store_root=store_root)
+    return binary, env, None
+
+
+def claude_auth_status(data_dir: Path, store=None) -> ClaudeAuthStatus:
+    """One status call for a profile's physical claude config directory."""
+    import engines
+
+    binary, env, reason = claude_cli_context(data_dir, store)
+    if env is None:
+        return _claude_unknown(reason)
+    return engines.get_engine("claude").inspect_auth(binary, Path(data_dir), env)
 
 
 def detect_email_source(
@@ -606,7 +637,7 @@ def detect_email_source(
         email = detect_grok_email(data_dir)
         return email, ("disk" if email else None)
     if engine == "claude":
-        email = claude_auth_status(data_dir, store).email
+        email = normalize_email(claude_auth_status(data_dir, store).email)
         return email, (_SOURCE_CLI if email else None)
 
     data_dir = Path(data_dir)
@@ -654,7 +685,8 @@ def auth_state(
     for raw, _source in _iter_tokens(data_dir, store, name):
         token = _token_payload(raw)
         if isinstance(token, dict) and (
-            token.get("access_token") or token.get("refresh_token")
+            _has_credential(token.get("access_token"))
+            or _has_credential(token.get("refresh_token"))
         ):
             return "authenticated"
     return "not-authenticated"
@@ -663,8 +695,9 @@ def auth_state(
 def sync_profile_email(store, name: str) -> Optional[str]:
     """Refresh the cached email in profile metadata; returns the email.
 
-    Acquires the session lock before saving and reloads the profile while
-    holding it, so a launch that wins the race cannot have its fresh
+    Acquires the lease-aware mutation lock before saving (a live session
+    keeps its own metadata: nothing is persisted while one is registered)
+    and reloads the profile while holding it, so a launch that wins the race cannot have its fresh
     ``last_used`` clobbered by a stale full-profile snapshot.
 
     Refuses to overwrite an already-set, DIFFERENT cached email when the
@@ -685,23 +718,26 @@ def sync_profile_email(store, name: str) -> Optional[str]:
     profile = store.get(name)
     engine = getattr(profile, "engine", "agy") or "agy"
     email, source = detect_email_source(store.profile_data_dir(name, engine=engine), store, name, engine=engine)
-    if not email:
+    email = normalize_email(email)
+    if email is None:
         return None
-    if profile.email and profile.email != email and source == _SOURCE_KEYCHAIN:
+    cached_email = normalize_email(profile.email)
+    if cached_email is not None and not same_email(cached_email, email) and source == _SOURCE_KEYCHAIN:
         return None
-    if profile.email == email:
+    if same_email(profile.email, email):
         return email
     try:
-        handle = locks.try_lock(store, name)
+        handle = locks.try_mutation_lock(store, name)
     except locks.LockError:
         return email
     if handle is None:
         return email
     try:
         profile = store.get(name)
-        if profile.email and profile.email != email and source == _SOURCE_KEYCHAIN:
+        cached_email = normalize_email(profile.email)
+        if cached_email is not None and not same_email(cached_email, email) and source == _SOURCE_KEYCHAIN:
             return None
-        if profile.email != email:
+        if not same_email(profile.email, email):
             profile.email = email
             store.save(profile)
     finally:
