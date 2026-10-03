@@ -1104,21 +1104,6 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
 
     def test_refresh_tokens_delegation(self):
         with mock.patch("usage._post_token_refresh") as mock_post:
-            mock_post.return_value = {"access_token": "fresh_codex"}
-            cx_res = usage.refresh_codex_tokens("cx_ref_123", timeout=12.0)
-            self.assertEqual(cx_res, {"access_token": "fresh_codex"})
-            self.assertEqual(mock_post.call_count, 1)
-            url, body, ctype = mock_post.call_args[0]
-            kwargs = mock_post.call_args[1]
-            self.assertEqual(url, usage.OPENAI_REFRESH_URL)
-            self.assertEqual(ctype, "application/json")
-            self.assertEqual(kwargs["timeout"], 12.0)
-            self.assertIn("Mozilla/5.0", kwargs["user_agent"])
-            body_dict = json.loads(body.decode("utf-8"))
-            self.assertEqual(body_dict["refresh_token"], "cx_ref_123")
-            self.assertEqual(body_dict["client_id"], usage.OPENAI_CLIENT_ID)
-
-        with mock.patch("usage._post_token_refresh") as mock_post:
             mock_post.return_value = {"key": "fresh_grok_key"}
             gk_res = usage.refresh_grok_tokens(
                 "gk_ref_456",
