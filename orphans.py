@@ -4,7 +4,7 @@
 outward (profile -> overlay, profile -> keychain slot, ...). Manually
 deleting a profile directory (instead of going through ``agydra delete``)
 leaves ``overlays/<name>/``, ``locks/<name>.lock``,
-``keychain/<name>.secret`` and ``backups/<name>-*.zip`` behind —
+``keychain/<name>.secret`` behind —
 those checks never look the other way (artifact -> profile) and so never
 notice.
 
@@ -26,7 +26,11 @@ Safety invariants:
 - An overlay or keychain secret is only ever removed when its name is
   still absent from the profile directory at fix time, including directories
   whose metadata is unreadable. The caller's name list can omit such profiles.
-- Nothing here needs a backup-before-delete (unlike ``Store.delete``):
+- ``backups/*.zip`` is never scanned or removed: those archives are the
+  safety copies ``Store.delete`` leaves behind for recovery and are governed
+  only by ``Store``'s retention pruning, so a deleted profile's archive is
+  expected, not an orphan.
+- Nothing else here needs a backup-before-delete (unlike ``Store.delete``):
   everything reported is, by definition, unreachable from any current
   profile, so there is no live data at stake.
 - A ``keychain/*.secret.corrupt-*`` quarantine file is only flagged when
@@ -42,6 +46,7 @@ from typing import Iterable, List, Optional
 
 import keychain
 import locks
+import platforms
 import store as store_mod
 
 _QUARANTINE_INFIX = keychain.QUARANTINE_INFIX
@@ -53,12 +58,10 @@ class OrphanScan:
     overlays: List[str] = field(default_factory=list)
     keychain_secrets: List[str] = field(default_factory=list)
     keychain_quarantine: List[str] = field(default_factory=list)
-    backups: List[str] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not (
             self.overlays or self.keychain_secrets or self.keychain_quarantine
-            or self.backups
         )
 
     def describe(self) -> List[str]:
@@ -73,9 +76,6 @@ class OrphanScan:
         if self.keychain_quarantine:
             paths = ", ".join(f"keychain/{f}" for f in self.keychain_quarantine)
             lines.append(f"keychain quarantine files: {paths}")
-        if self.backups:
-            paths = ", ".join(f"backups/{f}" for f in self.backups)
-            lines.append(f"backup archives: {paths}")
         return lines
 
     def describe_actions(self) -> List[str]:
@@ -87,9 +87,11 @@ class OrphanScan:
             lines.append(f"remove orphan keychain secret backup keychain/{name}{_SECRET_SUFFIX}")
         for filename in self.keychain_quarantine:
             lines.append(f"remove orphan keychain quarantine file keychain/{filename}")
-        for filename in self.backups:
-            lines.append(f"remove orphan backup archive backups/{filename}")
         return lines
+
+
+def _real_directory(path: Path) -> bool:
+    return path.is_dir() and not platforms.is_link(path)
 
 
 def find_orphans(store, names: Iterable[str]) -> OrphanScan:
@@ -109,9 +111,9 @@ def find_orphans(store, names: Iterable[str]) -> OrphanScan:
         known.update(entry.name for entry in profiles_dir.iterdir() if entry.is_dir())
 
     overlays_dir = store.overlays_dir
-    if overlays_dir.is_dir():
+    if _real_directory(overlays_dir):
         for entry in sorted(overlays_dir.iterdir()):
-            if not (entry.is_dir() or entry.is_symlink()) or entry.name.startswith("."):
+            if not (entry.is_dir() or platforms.is_link(entry)) or entry.name.startswith("."):
                 continue
             if not _valid_profile_name(store, entry.name):
                 continue
@@ -119,7 +121,7 @@ def find_orphans(store, names: Iterable[str]) -> OrphanScan:
                 scan.overlays.append(entry.name)
 
     keychain_dir = keychain._slots_dir(store)
-    if keychain_dir.is_dir():
+    if _real_directory(keychain_dir):
         for entry in sorted(keychain_dir.glob(f"*{_SECRET_SUFFIX}")):
             name = entry.name[: -len(_SECRET_SUFFIX)]
             if _valid_profile_name(store, name) and name not in known:
@@ -129,31 +131,12 @@ def find_orphans(store, names: Iterable[str]) -> OrphanScan:
             if _valid_profile_name(store, name) and name not in known:
                 scan.keychain_quarantine.append(entry.name)
 
-    backups_dir = store.backups_dir
-    if backups_dir.is_dir():
-        for entry in sorted(backups_dir.glob("*.zip")):
-            owner = _backup_owner(entry.name)
-            if owner is not None and _valid_profile_name(store, owner) and owner not in known:
-                scan.backups.append(entry.name)
-
     return scan
-
-
-def _backup_owner(filename: str) -> Optional[str]:
-    if not filename.endswith(".zip"):
-        return None
-    stem = filename[:-4]
-    for index, character in enumerate(stem):
-        if character == "-":
-            name = stem[:index]
-            if name and store_mod.backup_owner(name, filename):
-                return name
-    return None
 
 
 def _profile_path_exists(store, name: str) -> bool:
     path = store.profile_dir(name)
-    return path.exists() or path.is_symlink()
+    return path.exists() or platforms.is_link(path)
 
 
 def _valid_profile_name(store, name: str) -> bool:
@@ -184,6 +167,12 @@ def remove_orphans(store, scan: OrphanScan) -> List[str]:
     earlier holder still owns the original inode.
     """
     removed: List[str] = []
+    keychain_root_ok = _real_directory(keychain._slots_dir(store))
+    scan = OrphanScan(
+        overlays=scan.overlays if _real_directory(store.overlays_dir) else [],
+        keychain_secrets=scan.keychain_secrets if keychain_root_ok else [],
+        keychain_quarantine=scan.keychain_quarantine if keychain_root_ok else [],
+    )
     owners = {
         name
         for name in scan.overlays + scan.keychain_secrets
@@ -196,19 +185,10 @@ def remove_orphans(store, scan: OrphanScan) -> List[str]:
             store, filename.split(_QUARANTINE_INFIX, 1)[0]
         )
     )
-    backup_owners = {
-        filename: _backup_owner(filename)
-        for filename in scan.backups
-    }
-    owners.update(
-        name
-        for name in backup_owners.values()
-        if name is not None and _valid_profile_name(store, name)
-    )
 
     for name in sorted(owners):
         try:
-            handle = locks.try_lock(store, name)
+            handle = locks.try_mutation_lock(store, name)
         except OSError:
             continue
         if handle is None:
@@ -219,7 +199,7 @@ def remove_orphans(store, scan: OrphanScan) -> List[str]:
 
             if name in scan.overlays:
                 path = store.overlays_dir / name
-                if path.is_symlink():
+                if platforms.is_link(path):
                     _unlink_if_present(path, f"overlay: {name}", removed)
                 elif path.is_dir():
                     store_mod.rmtree(path)
@@ -239,7 +219,7 @@ def remove_orphans(store, scan: OrphanScan) -> List[str]:
             if keychain_supported:
                 try:
                     keychain_lock = keychain._serialize_lock(store)
-                except OSError:
+                except (OSError, keychain.KeychainError):
                     keychain_lock = None
             if not keychain_supported or keychain_lock is not None:
                 try:
@@ -257,15 +237,7 @@ def remove_orphans(store, scan: OrphanScan) -> List[str]:
                         )
                 finally:
                     if keychain_lock is not None:
-                        keychain_lock.close()
-
-            for filename, owner in backup_owners.items():
-                if owner == name:
-                    _unlink_if_present(
-                        store.backups_dir / filename,
-                        f"backup: {filename}",
-                        removed,
-                    )
+                        keychain_lock.release()
         finally:
             handle.release()
 

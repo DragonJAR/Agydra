@@ -5,7 +5,12 @@ This single file is the repo-root entry point AND the package identity:
 
 - ``python3 agydra.py`` (any Python >= 3.9, stdlib-only) installs the
   project: venv + editable package + PATH shim, then re-executes the
-  installed ``agydra`` command with the remaining arguments.
+  installed ``agydra`` command with the remaining arguments. An explicit
+  non-dry-run ``setup`` request never re-executes: it runs ``bootstrap``
+  directly, so the installer can always repair a stale installation whose
+  console script no longer imports.
+- ``python -m agydra`` from a package installation (no ``pyproject.toml``
+  beside this file) enters the CLI directly and never builds a venv.
 - ``VERSION``/``__version__`` are the single source of truth setuptools
   reads for the package version (pyproject: ``attr = "agydra.VERSION"``).
 
@@ -47,6 +52,22 @@ def _venv_script(repo: Path) -> str:
     return str(platforms.console_script(Path(repo) / ".venv"))
 
 
+def _is_setup_request(args: list) -> bool:
+    """True when the first CLI token names the ``setup`` subcommand or an alias.
+
+    Resolution mirrors ``cli._resolve_subcommand`` (bare, ``-name`` and
+    ``--name`` forms) against the shared ``vocab`` table, so launcher flags
+    such as ``-f`` never imply a forced shim overwrite.
+    """
+    import vocab
+
+    if not args:
+        return False
+    token = args[0]
+    name = token[2:] if token.startswith("--") else token[1:] if token.startswith("-") else token
+    return vocab.CANONICAL.get(name) == "setup"
+
+
 def main() -> int:
     if tuple(sys.version_info[:2]) < MIN_PYTHON:
         return _fail(
@@ -57,10 +78,26 @@ def main() -> int:
 
     here = Path(__file__).resolve().parent
     sys.path.insert(0, str(here))
+    if not (here / "pyproject.toml").is_file():
+        import cli
+
+        return cli.main()
     import platforms
 
     repo = platforms.canonical_path(here)
     script = _venv_script(repo)
+    setup_request = _is_setup_request(sys.argv[1:])
+    setup_dry_run = setup_request and (
+        "-n" in sys.argv[2:] or "--dry-run" in sys.argv[2:]
+    )
+    force = setup_request and ("-f" in sys.argv[2:] or "--force" in sys.argv[2:])
+
+    if setup_request and not setup_dry_run:
+        try:
+            import bootstrap
+        except ImportError as exc:
+            return _fail(f"cannot import bootstrap from {repo}: {exc}")
+        return bootstrap.run(root=repo, force=force)
 
     if not os.path.isfile(script):
         try:
@@ -68,7 +105,6 @@ def main() -> int:
         except ImportError as exc:
             return _fail(f"cannot import bootstrap from {repo}: {exc}")
         print("agydra.py: no installation detected — running setup...")
-        force = "-f" in sys.argv[1:] or "--force" in sys.argv[1:]
         code = bootstrap.run(root=repo, force=force)
         if code != 0:
             return code

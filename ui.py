@@ -15,11 +15,13 @@ Terminal and most CI runners already translate ANSI).
 """
 from __future__ import annotations
 
+import builtins
+import math
 import os
 import sys
 from typing import Optional, Sequence, Union
 
-from platforms import is_windows
+from platforms import enable_windows_console_vt, is_windows
 
 RESET = "\x1b[0m"
 
@@ -33,6 +35,41 @@ _STYLES: dict[str, str] = {
 }
 
 _ANSI_RE = None
+_ASCII_GLYPHS = str.maketrans({
+    "█": "#", "░": "-", "■": "*", "↻": "R", "→": "->", "▸": ">",
+    "─": "-", "✗": "x", "✓": "+", "…": "...", "—": "--", "·": ".",
+})
+
+
+def console_text(text: str, stream: Optional[object] = None) -> str:
+    """Preserve encodable output and give legacy streams readable fallbacks."""
+    target = sys.stdout if stream is None else stream
+    encoding = getattr(target, "encoding", None)
+    if not isinstance(encoding, str) or not encoding:
+        return text
+    try:
+        text.encode(encoding)
+    except UnicodeEncodeError:
+        return text.translate(_ASCII_GLYPHS).encode(encoding, "backslashreplace").decode(encoding)
+    return text
+
+
+def console_print(
+    *values: object,
+    sep: Optional[str] = " ",
+    end: Optional[str] = "\n",
+    file: Optional[object] = None,
+    flush: bool = False,
+) -> None:
+    """Print using the destination encoding without changing process streams."""
+    target = sys.stdout if file is None else file
+    builtins.print(
+        *(console_text(str(value), target) for value in values),
+        sep=console_text(sep, target) if sep is not None else None,
+        end=console_text(end, target) if end is not None else None,
+        file=target,
+        flush=flush,
+    )
 
 
 def _supports_ansi(stream) -> bool:
@@ -64,6 +101,7 @@ def paint(
     Unknown style names raise immediately: an invalid palette entry is a
     code bug, not something to render silently.
     """
+    text = console_text(text, stream)
     if not styles:
         return text
     codes = "".join(_STYLES[name] for name in styles)
@@ -126,6 +164,7 @@ def pad(painted: str, width: int) -> str:
     cell ends in a reset code, place filler spaces before the trailing RESET
     so styling covers the cell and resets cleanly at the end of the padded cell.
     """
+    painted = console_text(painted)
     visible = visible_width(painted)
     filler = " " * max(width - visible, 0)
     if painted.endswith(RESET):
@@ -150,14 +189,7 @@ def _enable_windows_vt() -> None:
         return
     _vt_done = True
     try:
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32
-        for std_handle in (-11, -12):
-            handle = kernel32.GetStdHandle(std_handle)
-            mode = ctypes.c_uint32()
-            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        enable_windows_console_vt()
     except Exception:
         pass
 
@@ -170,22 +202,31 @@ def bar(fraction: float, width: int = 24, *, filled: str = "#", empty: str = "-"
     themselves for coloring, keeping this module free of caller-specific
     semantics like quota thresholds. ASCII-only so it renders identically
     on every supported terminal, including legacy Windows ``conhost``.
+    Non-finite fractions render a neutral empty bar.
     """
+    if isinstance(fraction, bool):
+        fraction = float(fraction)
+    elif isinstance(fraction, int):
+        fraction = 1.0 if fraction > 0 else 0.0
+    elif not isinstance(fraction, float):
+        raise TypeError("fraction must be an int, float, or bool")
+    if not math.isfinite(fraction):
+        return empty * width
     fraction = max(0.0, min(1.0, fraction))
     filled_len = round(width * fraction)
     return filled * filled_len + empty * (width - filled_len)
 
 
 def warn(message: str) -> None:
-    print(paint("agydra: warning:", "yellow", stream=sys.stderr) + f" {message}",
+    console_print(paint("agydra: warning:", "yellow", stream=sys.stderr) + f" {message}",
           file=sys.stderr)
 
 
 def error(message: str) -> None:
-    print(paint("error:", "red", "bold", stream=sys.stderr) + f" {message}",
+    console_print(paint("error:", "red", "bold", stream=sys.stderr) + f" {message}",
           file=sys.stderr)
 
 
 def note(message: str) -> None:
-    print(paint("agydra: note:", "yellow", stream=sys.stderr) + f" {message}",
+    console_print(paint("agydra: note:", "yellow", stream=sys.stderr) + f" {message}",
           file=sys.stderr)

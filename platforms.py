@@ -599,13 +599,80 @@ _WINDOWS_STILL_ACTIVE = 259
 """``GetExitCodeProcess`` value Windows reports for a live process."""
 
 
+def _process_id_is_representable(pid: object) -> bool:
+    if type(pid) is not int or pid <= 0:
+        return False
+    maximum = 0xFFFFFFFF if is_windows() else 0x7FFFFFFF
+    return pid <= maximum
+
+
+_WINDOWS_ERROR_INVALID_PARAMETER = 87
+"""``GetLastError`` after ``OpenProcess`` on a pid that names no process."""
+
+
+class _ProcessQueryUndetermined(Exception):
+    """``OpenProcess`` failed for a reason that does not prove the pid is gone."""
+
+
+def _windows_process_api() -> Any:
+    """Declare the process-query signatures on a private ``kernel32``.
+
+    The library is loaded with ``use_last_error=True`` so ``ctypes.get_last_error``
+    returns the error of the immediately preceding call; the shared
+    ``ctypes.windll.kernel32`` does not capture it reliably.
+    """
+    import ctypes
+    import ctypes.wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle_type = ctypes.c_void_p
+    dword_type = ctypes.c_uint32
+    bool_type = ctypes.c_int32
+    filetime_pointer = ctypes.POINTER(ctypes.wintypes.FILETIME)
+
+    kernel32.OpenProcess.argtypes = (
+        dword_type,
+        bool_type,
+        dword_type,
+    )
+    kernel32.OpenProcess.restype = handle_type
+    kernel32.GetExitCodeProcess.argtypes = (
+        handle_type,
+        ctypes.POINTER(dword_type),
+    )
+    kernel32.GetExitCodeProcess.restype = bool_type
+    kernel32.GetProcessTimes.argtypes = (
+        handle_type,
+        filetime_pointer,
+        filetime_pointer,
+        filetime_pointer,
+        filetime_pointer,
+    )
+    kernel32.GetProcessTimes.restype = bool_type
+    kernel32.CloseHandle.argtypes = (handle_type,)
+    kernel32.CloseHandle.restype = bool_type
+    return kernel32
+
+
 def _windows_process_handle(pid: int) -> Any:
+    """Open ``pid`` for limited queries; None only when it provably does not exist.
+
+    Raises ``_ProcessQueryUndetermined`` when ``OpenProcess`` fails with anything
+    but ERROR_INVALID_PARAMETER (notably ERROR_ACCESS_DENIED): an inaccessible
+    process may well be alive, so callers must not treat that as absence.
+    """
     import ctypes
 
+    kernel32 = _windows_process_api()
+
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    return ctypes.windll.kernel32.OpenProcess(
-        PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-    )
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if handle:
+        return handle
+    error = ctypes.get_last_error()
+    if error == _WINDOWS_ERROR_INVALID_PARAMETER:
+        return None
+    raise _ProcessQueryUndetermined(error)
 
 
 def process_alive(pid: int) -> bool:
@@ -614,32 +681,40 @@ def process_alive(pid: int) -> bool:
     Never raises for a missing or recycled pid. POSIX uses the signal-0
     probe (ESRCH means dead, EPERM means alive but owned by someone else);
     Windows opens the process and reads its exit code, treating the
-    STILL_ACTIVE sentinel as alive. An exit code that legitimately equals
+    STILL_ACTIVE sentinel as alive; only ERROR_INVALID_PARAMETER from
+    ``OpenProcess`` proves absence, while access denied or any unclassified
+    failure counts as alive so an inaccessible process is never pruned. An exit code that legitimately equals
     STILL_ACTIVE is indistinguishable from liveness here — the caller's
     ``process_start_token`` check is what catches that rare reuse case.
     """
-    if pid <= 0:
+    if not _process_id_is_representable(pid):
         return False
     if is_windows():
         import ctypes
 
-        handle = _windows_process_handle(pid)
+        try:
+            handle = _windows_process_handle(pid)
+        except OverflowError:
+            return False
+        except _ProcessQueryUndetermined:
+            return True
         if not handle:
             return False
+        kernel32 = _windows_process_api()
         try:
             import ctypes.wintypes
 
-            exit_code = ctypes.wintypes.DWORD()
-            if not ctypes.windll.kernel32.GetExitCodeProcess(
-                handle, ctypes.byref(exit_code)
-            ):
+            exit_code = ctypes.c_uint32()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
                 return True
             return exit_code.value == _WINDOWS_STILL_ACTIVE
         finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
+        return False
+    except OverflowError:
         return False
     except OSError:
         return True
@@ -652,7 +727,9 @@ def process_start_token(pid: int) -> Optional[str]:
     Used to distinguish a reused pid from the original holder: two calls on
     the same live process return equal strings; a recycled pid yields a
     different token (or None). Linux reads ``/proc`` (no subprocess), macOS
-    shells out to ``ps -o lstart=`` (rare path, bounded timeout), Windows
+    shells out to ``ps -o lstart=`` (rare path, bounded timeout, run with
+    ``LC_ALL=C`` and ``TZ=UTC`` so every Agydra process formats the token
+    identically), Windows
     reads ``GetProcessTimes`` via ctypes. None means "cannot identify" —
     callers must treat that conservatively (keep the holder) rather than
     pruning it. Granularity differs per OS (Linux: kernel jiffies; Windows:
@@ -660,21 +737,25 @@ def process_start_token(pid: int) -> Optional[str]:
     minute share a token there, so a same-minute pid reuse on macOS is
     pruned only when the recycled process itself dies).
     """
-    if pid <= 0:
+    if not _process_id_is_representable(pid):
         return None
     if is_windows():
         import ctypes
         import ctypes.wintypes
 
-        handle = _windows_process_handle(pid)
+        try:
+            handle = _windows_process_handle(pid)
+        except (OverflowError, _ProcessQueryUndetermined):
+            return None
         if not handle:
             return None
+        kernel32 = _windows_process_api()
         try:
             creation = ctypes.wintypes.FILETIME()
             exit_time = ctypes.wintypes.FILETIME()
             kernel = ctypes.wintypes.FILETIME()
             user = ctypes.wintypes.FILETIME()
-            if not ctypes.windll.kernel32.GetProcessTimes(
+            if not kernel32.GetProcessTimes(
                 handle,
                 ctypes.byref(creation),
                 ctypes.byref(exit_time),
@@ -685,11 +766,11 @@ def process_start_token(pid: int) -> Optional[str]:
             value = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
             return str(value)
         finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+            kernel32.CloseHandle(handle)
     if is_linux():
         try:
             stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-        except (OSError, UnicodeDecodeError):
+        except (OSError, OverflowError, UnicodeDecodeError, ValueError):
             return None
         tail = stat_text.rsplit(")", 1)
         if len(tail) != 2:
@@ -698,14 +779,16 @@ def process_start_token(pid: int) -> Optional[str]:
         if len(fields) <= 19:
             return None
         return fields[19]
+    probe_env = {**os.environ, "LC_ALL": "C", "TZ": "UTC"}
     try:
         result = subprocess.run(
             ["ps", "-o", "lstart=", "-p", str(pid)],
             capture_output=True,
             text=True,
             timeout=_PS_TOKEN_TIMEOUT_S,
+            env=probe_env,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, OverflowError, subprocess.SubprocessError, ValueError):
         return None
     token = result.stdout.strip()
     return token or None

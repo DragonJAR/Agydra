@@ -12,6 +12,7 @@ from agydra import __version__
 import account
 import isolation
 import keychain
+import locks
 import platforms
 from store import Store, StoreError
 from ui import paint, warn
@@ -345,21 +346,38 @@ def _check_keychain(store: Store, ctx: "_DoctorContext"):
             "orphaned keychain slots: " + ", ".join(orphans)
             + " (run `agydra doctor --fix` to purge)"
         )
+    swap_held = False
+    swap_lock = keychain.swap_lock_path(store)
+    if swap_lock.exists():
+        try:
+            probe = locks.try_lock_path(swap_lock, description="swap lock probe")
+        except locks.LockError:
+            probe = None
+        if probe is None:
+            swap_held = True
+            lines.append(
+                "keychain swap lock is held by another process (or not "
+                "inspectable right now); agy launches will fail with the "
+                f"shared-slot busy error -- {keychain.lock_holder_hint(swap_lock)}"
+            )
+        else:
+            probe.release()
     shared_format = report.get("shared_format")
     if shared and shared_format not in (None, "json"):
         lines.append(
             "shared slot payload is not valid JSON "
             f"(format: {shared_format!r}) — agy may ask you to log in "
-            "again; launching agy once through agydra self-heals it"
+            "again; `agydra login <profile>` (or a plain `agy` login once) "
+            "rewrites the slot to a valid credential"
         )
         return WARN, "\n".join(lines)
-    if mismatches or orphans or has_skip_marker:
+    if mismatches or orphans or has_skip_marker or swap_held:
         return WARN, "\n".join(lines)
     return OK, "\n".join(lines)
 
 
 def _check_orphans(store: Store, ctx: "_DoctorContext"):
-    """Reverse-scan ``overlays/``, ``keychain/`` and ``backups/`` for
+    """Reverse-scan ``overlays/`` and ``keychain/`` for
     artifacts whose owning profile is no longer in
     ``profiles/`` -- confirmed possible when a profile directory is
     deleted by hand instead of through ``agydra delete``/``rename``, which
@@ -412,6 +430,8 @@ def _check_bootstrap(_store: Store, _ctx: "_DoctorContext"):
     if not state["console"]:
         return WARN, "install: console script missing — re-run `agydra setup`"
     shim_state = state["shim_state"]
+    if shim_state == "pip-managed":
+        return OK, "install: pip-managed package (pip/pipx; no Agydra shim expected)"
     if shim_state == "ok":
         parts.append(f"shim ok ({bootstrap.shim_path()})")
     elif shim_state == "foreign":
@@ -428,7 +448,30 @@ def _check_bootstrap(_store: Store, _ctx: "_DoctorContext"):
     if not state["on_path"]:
         parts.append(f"{bootstrap.user_bin_dir()} not on PATH")
         status = WARN
+    stale = _editable_install_drift(root, bootstrap.venv_python(root))
+    if stale:
+        parts.append(
+            f"editable install is stale, missing {', '.join(stale)} — "
+            "re-run `agydra setup` (works from the repo now, fails elsewhere)"
+        )
+        status = WARN
     return status, "install: " + "; ".join(parts)
+
+
+def _editable_install_drift(root: Path, vpy: Path) -> List[str]:
+    """Runtime modules this checkout added that the venv install cannot import.
+
+    An editable install maps top-level modules through a generated finder
+    instead of copying them, so a module added to the repo since the last
+    ``pip install -e .`` is missing from that map: ``agydra`` then dies with a
+    bare ``ModuleNotFoundError``, but ONLY outside the repo -- inside it the
+    cwd shadows the finder and hides the drift. This is the only check that
+    interrogates the install the way the shim does, so it is also the only one
+    that can see the failure before it happens.
+    """
+    import bootstrap
+
+    return bootstrap.unimportable_modules(root, vpy)
 
 
 CHECKS = [
@@ -559,12 +602,18 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
                 or not store.overlays_dir.is_dir()
                 or isolation._is_link(overlay)
                 or not overlay.is_dir()
-                or not link.is_dir()
-                or isolation._is_link(link)
             ):
                 warn(
                     f"skipping overlay recovery for {name!r}: "
                     "cannot safely establish the profile or overlay owner"
+                )
+                continue
+            if not link.exists() or isolation._is_link(link):
+                continue
+            if not link.is_dir():
+                warn(
+                    f"skipping overlay recovery for {name!r}: "
+                    "overlay data owner is not a real directory"
                 )
                 continue
             profile_identity = _directory_identity(profile_dir)
@@ -577,7 +626,7 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
             )
             continue
         try:
-            handle = locks.try_lock(store, name)
+            handle = locks.try_mutation_lock(store, name)
         except OSError as exc:
             warn(f"could not lock profile {name!r} for overlay recovery ({exc})")
             continue
@@ -657,10 +706,12 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
     current_names = store.names()
     default = store.default_name()
     if default and default not in current_names:
-        config = store.load_config()
-        config.default_profile = None
+        def clear_observed_default(config) -> None:
+            if config.default_profile == default:
+                config.default_profile = None
+
         try:
-            store.save_config(config)
+            store.update_config(clear_observed_default)
             print(
                 paint("[fix]", "cyan", "bold")
                 + f" cleared dangling default profile {default!r}"
@@ -681,7 +732,7 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
             )
             continue
         try:
-            handle = locks.try_lock(store, orphan)
+            handle = locks.try_mutation_lock(store, orphan)
         except OSError as exc:
             warn(f"could not lock orphan profile {orphan!r} before purge ({exc})")
             continue

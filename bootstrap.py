@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,11 @@ MIN_PYTHON = (3, 9)
 VENV_DIRNAME = ".venv"
 PIP_FLOOR = (21, 3)
 SHIM_MARKER = "Managed by agydra setup"
+INSTALLED_NOTICE = (
+    "agydra is installed as a package: pip/pipx manages this installation, so "
+    "setup has nothing to create or repair (update or remove it with pip/pipx; "
+    "run `agydra setup` from a source checkout to build a development venv)"
+)
 
 
 class BootstrapError(Exception):
@@ -48,12 +54,18 @@ def python_ok(version_info: Sequence[int]) -> bool:
     return tuple(version_info[:2]) >= MIN_PYTHON
 
 
+def is_source_checkout(root: Path) -> bool:
+    """True when ``root`` holds the project sources (pyproject.toml + agydra.py)."""
+    return (Path(root) / "pyproject.toml").is_file() and (Path(root) / "agydra.py").is_file()
+
+
 def project_root(cwd: Optional[Path] = None) -> Path:
     """Locate the project root (dir holding pyproject.toml + agydra.py).
 
     Candidates, in order: explicit cwd, the directory that contains this
     module, then the process CWD. Returns the first candidate that looks
-    like the project; otherwise the first candidate so callers can report it.
+    like the project; otherwise the first candidate so callers can report it
+    (``is_source_checkout`` tells the two apart).
     """
     here = platforms.canonical_path(Path(__file__).resolve().parent)
     candidates: List[Path] = []
@@ -64,7 +76,7 @@ def project_root(cwd: Optional[Path] = None) -> Path:
     if process_cwd not in candidates:
         candidates.append(process_cwd)
     for cand in candidates:
-        if (cand / "pyproject.toml").is_file() and (cand / "agydra.py").is_file():
+        if is_source_checkout(cand):
             return cand
     return candidates[0]
 
@@ -85,6 +97,63 @@ def console_script(root: Path) -> Path:
 def user_bin_dir() -> Path:
     """User-writable PATH directory for the shim (``~/.local/bin``)."""
     return platforms.real_home() / ".local" / "bin"
+
+
+def runtime_modules(root: Path) -> List[str]:
+    """Top-level runtime module names shipped by this checkout.
+
+    The repo is a flat layout, so the authoritative list is the ``*.py`` at
+    the project root. ``pyproject.toml``'s ``py-modules`` is a hand-maintained
+    mirror of that set, and PEP 660 editable installs bake a SECOND copy of it
+    into a ``__editable__*.py`` finder in site-packages. Both mirrors go stale
+    when a module is added, which is why every consumer here derives the list
+    from disk instead of trusting either copy.
+    """
+    if not is_source_checkout(root):
+        return []
+    return sorted(p.stem for p in Path(root).glob("*.py"))
+
+
+def unimportable_modules(root: Path, vpy: Path) -> List[str]:
+    """Runtime modules that the venv's active install cannot import.
+
+    An editable install resolves top-level modules through a generated finder
+    rather than copying the files, so adding a module to the repo leaves the
+    finder pointing at a map that lacks it. The console script then dies with
+    a bare ``ModuleNotFoundError`` the moment it is run from OUTSIDE the repo,
+    while the same command works inside it (cwd shadows the finder). That
+    asymmetry is the whole failure mode, and it is invisible to every check
+    that imports in-process.
+
+    Detection therefore has to interrogate the venv the way the shim does:
+    a subprocess whose cwd is somewhere other than the project root, importing
+    each module by name. Returns the names that failed; empty means the
+    install matches the checkout. Never raises -- an unusable interpreter is
+    reported as "everything is broken" only insofar as the probe itself
+    fails, which callers read as a WARN, not a correctness claim.
+    """
+    modules = runtime_modules(root)
+    if not modules or not Path(vpy).exists():
+        return []
+    with tempfile.TemporaryDirectory(prefix="agydra-probe-") as tmp:
+        probe = ", ".join(repr(m) for m in modules)
+        code = (
+            "import importlib, sys\n"
+            f"bad = []\n"
+            f"for name in [{probe}]:\n"
+            "    try:\n"
+            "        importlib.import_module(name)\n"
+            "    except Exception:\n"
+            "        bad.append(name)\n"
+            "sys.stdout.write('\\n'.join(bad))\n"
+        )
+        try:
+            proc = _run([str(vpy), "-c", code], cwd=Path(tmp))
+        except BootstrapError:
+            return []
+    if proc.returncode != 0:
+        return []
+    return [line for line in (proc.stdout or "").splitlines() if line in modules]
 
 
 def shim_path() -> Path:
@@ -119,7 +188,7 @@ def _shim_content(target: Path) -> str:
 
 
 
-def _run(argv: Sequence[str]) -> subprocess.CompletedProcess:
+def _run(argv: Sequence[str], cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
     display = " ".join(str(a) for a in argv[:4])
     try:
         return subprocess.run(
@@ -129,6 +198,7 @@ def _run(argv: Sequence[str]) -> subprocess.CompletedProcess:
             text=True,
             encoding="utf-8",
             errors="replace",
+            cwd=None if cwd is None else str(cwd),
         )
     except OSError as exc:
         raise BootstrapError(f"cannot run {display}: {exc}") from exc
@@ -314,8 +384,19 @@ def check_state(root: Path) -> dict:
     """Doctor-style status of every bootstrap precondition (no mutations).
 
     Keys: ``venv`` (bool), ``console`` (bool), ``shim_ok`` (bool),
-    ``shim_state`` (``ok|stale|foreign|missing``), ``on_path`` (bool).
+    ``shim_state`` (``ok|stale|foreign|missing``), ``on_path`` (bool). A
+    package installation (no sources next to the module) reports
+    ``shim_state == "pip-managed"`` and ``installed == True``: pip owns it.
     """
+    if not is_source_checkout(root):
+        return {
+            "venv": True,
+            "console": True,
+            "shim_ok": True,
+            "shim_state": "pip-managed",
+            "on_path": shutil.which("agydra") is not None,
+            "installed": True,
+        }
     vpy = venv_python(root)
     script = console_script(root)
     state = {
@@ -354,10 +435,15 @@ def run(
     """Full bootstrap: venv -> editable install -> shim -> verify.
 
     Idempotent: safe to re-run at any time (``agydra setup``). Returns a
-    process exit code: 0 ok, 1 on any BootstrapError.
+    process exit code: 0 ok, 1 on any BootstrapError. Without project sources
+    (pip/pipx installation) nothing is written: the notice is printed and 0
+    is returned.
     """
     say = out if out is not None else (lambda line: print(line))
     target_root = platforms.canonical_path(root) if root is not None else project_root()
+    if not is_source_checkout(target_root):
+        say(INSTALLED_NOTICE)
+        return 0
     try:
         if not python_ok(sys.version_info):
             raise BootstrapError(
