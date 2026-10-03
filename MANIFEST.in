@@ -1,0 +1,2 @@
+include LICENSE README.md README.es.md AGENTS.md logo.png
+include tests/*.py
