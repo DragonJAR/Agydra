@@ -31,7 +31,7 @@ agydra -e grok -r   → el siguiente perfil de Grok sin usar, priorizado por cuo
 
 - Cada perfil se autentica con la CLI oficial. Los tokens quedan dentro de ese perfil.
 - Los locks del kernel (`fcntl.flock` / `msvcrt.locking`) se liberan al salir el proceso, también tras un `SIGKILL`.
-- `agydra -r` usa cada perfil elegible una vez por ciclo del motor y elige primero el perfil sin usar con más cuota restante en un snapshot reciente de `agydra usage`. La cuota desconocida queda detrás de la conocida; actualízala con `agydra usage`.
+- `agydra -r` usa cada perfil elegible una vez por ciclo del ámbito de selección. Sin `-e`, el grupo incluye perfiles autenticados de todos los motores; `-e` lo limita a un motor. Primero elige perfiles sin usar, priorizando una sesión libre y luego más cuota guardada. Cuando se agota el grupo, las repeticiones priorizan la cuota guardada. La cuota desconocida queda detrás de la conocida; actualízala con `agydra usage`.
 - `agydra usage` muestra en una sola vista las cuotas en vivo de Antigravity, Codex y Grok.
 
 ---
@@ -95,7 +95,7 @@ agydra -e grok -r "Haz una revisión de seguridad"
 agydra usage
 ```
 
-`agydra list` muestra el correo, el motor y el estado de autenticación. `-r` conserva un ciclo por motor y selecciona cada perfil elegible antes de repetir; cuando todos se usaron, la siguiente ejecución inicia otro ciclo. Entre perfiles aún sin usar, prioriza la mayor cuota restante de un snapshot de no más de 15 minutos; lecturas ausentes, obsoletas, vencidas o inválidas quedan al final. Ejecuta `agydra usage` para actualizar las cuotas. `.agydra` fija la resolución normal del perfil, mientras que `-r` lo ignora. Las sesiones simultáneas son ilimitadas por defecto; define `settings.max_sessions_per_profile` en `agydra.json` para limitarlas. `-f` omite ese límite sin cambiar el orden de rotación.
+`agydra list` muestra el correo, el motor y el estado de autenticación. `-r` conserva un ciclo por ámbito de selección: todos los motores si se omite `-e`, o el motor indicado si se especifica. Selecciona cada perfil elegible antes de repetir; cuando todos se usaron, la siguiente ejecución inicia otro ciclo. Entre perfiles sin usar, prioriza una sesión libre y luego la mayor cuota restante de un snapshot de no más de 15 minutos. Al repetir, prioriza la cuota, después la prioridad de sesión y el menor uso reciente. Las lecturas ausentes, obsoletas, vencidas o inválidas quedan al final. Ejecuta `agydra usage` para actualizar las cuotas. `.agydra` fija la resolución normal del perfil, mientras que `-r` lo ignora. Las sesiones simultáneas son ilimitadas por defecto; define `settings.max_sessions_per_profile` en `agydra.json` para limitarlas. `-f` omite ese límite sin cambiar el orden de rotación.
 
 ```text
 agydra usage                                     4 perfiles · dom 27 sep · 23:18
@@ -148,9 +148,9 @@ Copia o combina el objeto `statusLine` impreso **manualmente en `settings.json` 
 
 ## 🚀 Flujos principales
 
-**Fijar un directorio.** `agydra use cliente-acme` escribe `.agydra`. La resolución normal del perfil en ese árbol usa el perfil fijado; un `-r` explícito ignora el marcador y rota dentro del ciclo del motor.
+**Fijar un directorio.** `agydra use cliente-acme` escribe `.agydra`. La resolución normal del perfil en ese árbol usa el perfil fijado; un `-r` explícito ignora el marcador y rota dentro del ciclo de su ámbito de selección.
 
-**Rotar.** `agydra -r` se queda en `agy`. `agydra -e codex -r`, `agydra -e grok -r` y `agydra -e claude -r` rotan dentro de ese motor, agotan los perfiles sin usar antes de empezar otro ciclo y priorizan la cuota guardada reciente.
+**Rotar.** `agydra -r` considera perfiles autenticados de todos los motores. Añade `-e codex`, `-e grok`, `-e claude` o `-e agy` para limitar el grupo. Cada ámbito agota los perfiles sin usar antes de repetir: los no usados priorizan una sesión libre y luego la cuota guardada; las repeticiones priorizan la cuota guardada, después la prioridad de sesión y el menor uso reciente. En macOS, si otro perfil `agy` es dueño del slot compartido de Keychain, `-e agy -r` informa el conflicto en vez de unirse a esa cuenta; cierra sus sesiones antes de cambiar de perfil.
 
 **Compartir configuración y dejar las credenciales.** `agydra share-config trabajo personal pruebas` copia `settings.json`, `mcp.json` y `config.toml`. `auth.json` se queda en el perfil de origen.
 
@@ -198,8 +198,8 @@ Los flags del lanzador van **antes** de los argumentos del motor.
 | Flag | Forma larga | Descripción |
 |:---:|---|---|
 | `-p NOMBRE\|#` | `--profile` | Perfil por nombre o índice. |
-| `-r` | `--random` (`--rotate`) | Usa cada perfil elegible una vez por ciclo del motor y prioriza la mayor cuota guardada reciente; cuota desconocida al final. Ignora `.agydra`. `-e` limita el pool. |
-| `-e MOTOR` | `--engine` | `agy` (por defecto), `codex`, `grok` o `claude`. |
+| `-r` | `--random` (`--rotate`) | Usa cada perfil elegible una vez por ciclo del ámbito antes de repetir. Sin `-e`, incluye perfiles autenticados de todos los motores; con `-e`, solo ese motor. Los no usados priorizan sesión libre y luego cuota guardada; las repeticiones priorizan cuota. Ignora `.agydra`. |
+| `-e MOTOR` | `--engine` | `agy` (motor normal por defecto), `codex`, `grok` o `claude`. Con `-r`, limita el grupo a ese motor. |
 | `--lang CÓDIGO` | — | Fija y persiste `en` o `es`. |
 | `-n` | `--dry-run` | Imprime el plan. No lanza. |
 | `-b RUTA` | `--binary` | Sustituye el binario del motor en esta ejecución. |
@@ -210,9 +210,10 @@ Los flags cortos se agrupan (`-nr` == `-n -r`). `-p` junto con `-r` sale con có
 | Combinación | Para qué |
 |---|---|
 | `agydra -p grok-trabajo "prompt"` | Lanza Grok con ese perfil. |
-| `agydra -e grok -r "prompt"` | Rota entre perfiles elegibles de Grok según la cuota guardada. |
-| `agydra -e codex -r "prompt"` | Rota entre perfiles elegibles de Codex según la cuota guardada. |
-| `agydra -rf "prompt"` | Rota según la cuota guardada, omitiendo el límite opcional `max_sessions_per_profile`. |
+| `agydra -r "prompt"` | Rota entre perfiles autenticados de todos los motores; elige primero perfiles sin usar. |
+| `agydra -e grok -r "prompt"` | Rota entre perfiles elegibles de Grok; agota los nuevos antes de repetir según cuota. |
+| `agydra -e codex -r "prompt"` | Rota entre perfiles elegibles de Codex; agota los nuevos antes de repetir según cuota. |
+| `agydra -rf "prompt"` | Rota entre perfiles de todos los motores, omitiendo el límite opcional `max_sessions_per_profile`. |
 | `agydra -np trabajo` | Muestra el plan de lanzamiento de `trabajo`. |
 | `agydra -b /ruta/grok -p grok-trabajo` | Prueba un binario concreto con las credenciales de ese perfil. |
 

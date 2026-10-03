@@ -31,7 +31,7 @@ agydra -e grok -r   → next unused Grok profile, ranked by saved quota
 
 - Each profile authenticates through the official CLI. Tokens stay inside that profile.
 - Kernel advisory locks (`fcntl.flock` / `msvcrt.locking`) release when the process exits, including after `SIGKILL`.
-- `agydra -r` uses each eligible profile once per engine cycle, choosing the unused profile with the most remaining quota in a recent `agydra usage` snapshot. Unknown quota ranks after known quota; refresh it with `agydra usage`.
+- `agydra -r` uses each eligible profile once per selection-scope cycle. Without `-e`, the pool includes authenticated profiles across all engines; `-e` narrows it to one engine. Unused profiles come first, preferring a free session and then more saved quota. After the pool is exhausted, repeats prefer more saved quota. Unknown quota ranks after known quota; refresh it with `agydra usage`.
 - `agydra usage` shows live quotas for Antigravity, Codex, and Grok in one view.
 
 ---
@@ -95,7 +95,7 @@ agydra -e grok -r "Run a security review"
 agydra usage
 ```
 
-`agydra list` shows email, engine, and auth state. `-r` keeps a persistent cycle per engine and selects every eligible profile before repeating; when all have been selected, the next launch starts a new cycle. Within the unused profiles it prefers the highest remaining quota in a snapshot no older than 15 minutes; missing, stale, expired, or invalid readings rank last. Run `agydra usage` to refresh quota data. `.agydra` pins normal profile resolution, while explicit `-r` ignores that pin. Concurrent sessions are unlimited by default; set `settings.max_sessions_per_profile` in `agydra.json` to cap them. `-f` bypasses that cap without changing rotation order.
+`agydra list` shows email, engine, and auth state. `-r` keeps a persistent cycle for each selection scope: all engines when `-e` is omitted, or the selected engine when supplied. It selects every eligible profile before repeating; when all have been selected, the next launch starts a new cycle. Among unused profiles it prefers a free session, then the highest remaining quota in a snapshot no older than 15 minutes. Once repeating, quota ranks first, then session priority and least-recent use. Missing, stale, expired, or invalid readings rank last. Run `agydra usage` to refresh quota data. `.agydra` pins normal profile resolution, while explicit `-r` ignores that pin. Concurrent sessions are unlimited by default; set `settings.max_sessions_per_profile` in `agydra.json` to cap them. `-f` bypasses that cap without changing rotation order.
 
 ```text
 agydra usage                                     4 profiles · Sun Sep 27 · 23:18
@@ -148,9 +148,9 @@ Copy or merge the printed `statusLine` object **manually into `settings.json` at
 
 ## 🚀 Core Workflows
 
-**Pin a directory.** `agydra use client-acme` writes `.agydra`. Normal profile resolution in that tree uses the pinned profile; explicit `-r` ignores the marker and rotates through the engine's cycle.
+**Pin a directory.** `agydra use client-acme` writes `.agydra`. Normal profile resolution in that tree uses the pinned profile; explicit `-r` ignores the marker and rotates through its selection-scope cycle.
 
-**Rotate.** `agydra -r` stays on `agy`. `agydra -e codex -r`, `agydra -e grok -r`, and `agydra -e claude -r` rotate inside that engine, exhausting unused profiles before starting another cycle and ranking them by recent saved quota.
+**Rotate.** `agydra -r` considers authenticated profiles from all engines. Add `-e codex`, `-e grok`, `-e claude`, or `-e agy` to narrow the pool. Each scope exhausts unused profiles before repeating: unused candidates prefer a free session and then saved quota; repeats prefer saved quota, then session priority and least-recent use. On macOS, if a different `agy` profile owns the shared Keychain slot, `-e agy -r` reports the conflict instead of joining that account; close its sessions before switching profiles.
 
 **Share config, keep credentials.** `agydra share-config work personal staging` copies `settings.json`, `mcp.json`, and `config.toml`. `auth.json` stays in the source profile.
 
@@ -198,8 +198,8 @@ Launcher flags go **before** engine arguments.
 | Flag | Long form | Description |
 |:---:|---|---|
 | `-p NAME\|#` | `--profile` | Profile by name or index. |
-| `-r` | `--random` (`--rotate`) | Uses each eligible profile once per engine cycle, preferring the highest remaining recent saved quota; unknown quota ranks last. Ignores `.agydra`. `-e` limits the pool. |
-| `-e ENGINE` | `--engine` | `agy` (default), `codex`, `grok`, or `claude`. |
+| `-r` | `--random` (`--rotate`) | Uses each eligible profile once per selection-scope cycle before repeating. Without `-e`, the pool includes authenticated profiles from all engines; `-e` limits it to that engine. Unused profiles prefer a free session, then saved quota; repeats prefer highest saved quota. Ignores `.agydra`. |
+| `-e ENGINE` | `--engine` | `agy` (normal launch default), `codex`, `grok`, or `claude`. With `-r`, limits the rotation pool to that engine. |
 | `--lang CODE` | — | Set and persist `en` or `es`. |
 | `-n` | `--dry-run` | Print the plan. Do not launch. |
 | `-b PATH` | `--binary` | Override the engine binary for this run. |
@@ -210,9 +210,10 @@ Short flags bundle (`-nr` == `-n -r`). `-p` together with `-r` exits `2`.
 | Combination | Purpose |
 |---|---|
 | `agydra -p grok-work "prompt"` | Launch Grok on that profile. |
-| `agydra -e grok -r "prompt"` | Rotate across eligible Grok profiles by saved quota. |
-| `agydra -e codex -r "prompt"` | Rotate across eligible Codex profiles by saved quota. |
-| `agydra -rf "prompt"` | Rotate by saved quota, bypassing the optional `max_sessions_per_profile` cap. |
+| `agydra -r "prompt"` | Rotate across authenticated profiles from all engines; unused profiles come first. |
+| `agydra -e grok -r "prompt"` | Rotate across eligible Grok profiles, preferring new profiles before quota-ranked repeats. |
+| `agydra -e codex -r "prompt"` | Rotate across eligible Codex profiles, preferring new profiles before quota-ranked repeats. |
+| `agydra -rf "prompt"` | Rotate across all engine profiles, ignoring the optional `max_sessions_per_profile` cap. |
 | `agydra -np work` | Show the launch plan for `work`. |
 | `agydra -b /path/grok -p grok-work` | Try a specific binary with that profile's credentials. |
 

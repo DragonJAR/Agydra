@@ -49,6 +49,10 @@ $RECYCLE.BIN/
 # --- Agent tooling ---
 .atl/
 
+# --- agydra per-directory profile pin (`agydra use <profile>`) ---
+# A local pin is machine state, never source: it must not be committed.
+.agydra
+
 # --- Markdown files (do not upload any .md except READMEs and AGENTS.md) ---
 *.md
 !README.md

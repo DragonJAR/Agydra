@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,8 @@ dynamic = ["version"]
 description = "Multi-profile manager and workload dispatcher for AI developer CLIs (Google Antigravity, OpenAI Codex, xAI Grok, and Anthropic Claude Code) on macOS, Linux, and Windows"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Jaime Andrés Restrepo (DragonJAR)", email = "contacto@dragonjar.org" },
 ]
@@ -33,6 +34,13 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Utilities",
 ]
 
@@ -63,11 +71,14 @@ py-modules = [
     "models",
     "orphans",
     "platforms",
+    "profile_rotation",
     "resolver",
     "runner",
     "store",
     "ui",
     "usage",
+    "usage_agy",
+    "usage_snapshot",
     "vocab",
 ]
 
@@ -76,6 +87,3 @@ py-modules = [
 # static reader resolves py-modules from the project root, so a bare
 # ``attr = "VERSION"`` here would look in a module that does not exist.
 version = { attr = "agydra.VERSION" }
-
-[tool.pytest.ini_options]
-asyncio_default_fixture_loop_scope = "function"
