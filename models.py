@@ -15,6 +15,22 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+DEFAULT_ENGINE_NAME = "agy"
+CLAUDE_ENGINE = "claude"
+
+
+def normalize_engine(value: object) -> str:
+    """Canonical engine identity of profile metadata.
+
+    Mirrors ``engines.get_engine`` (missing or empty means the default
+    engine; surrounding whitespace and case are ignored) so a spelling such
+    as ``"Claude "`` is the Claude engine everywhere, including its strict
+    positive-sequence requirement. ``models`` cannot import ``engines``
+    (import cycle), so ``tests/test_models.py`` pins the two in lockstep.
+    """
+    return (str(value) if value else DEFAULT_ENGINE_NAME).strip().lower()
+
+
 @dataclass
 class Profile:
     """A named, isolated identity for agy.
@@ -55,11 +71,18 @@ class Profile:
             raise ValueError(f"profile name must be a string, got {type(name).__name__}")
         last_used = raw.get("last_used")
         email = raw.get("email")
-        engine = raw.get("engine")
-        try:
-            seq = int(raw.get("seq") or 0)
-        except OverflowError as exc:
-            raise ValueError(f"profile seq must be finite, got {raw.get('seq')!r}") from exc
+        engine_name = normalize_engine(raw.get("engine"))
+        if not engine_name:
+            raise ValueError("profile engine must not be blank")
+        seq = raw.get("seq")
+        if seq is None:
+            seq = 0
+        if type(seq) is not int:
+            raise ValueError(
+                f"profile seq must be a positive integer, got {type(seq).__name__}"
+            )
+        if seq < 0 or (engine_name == CLAUDE_ENGINE and seq < 1):
+            raise ValueError(f"profile seq must be positive, got {seq}")
         return cls(
             name=name,
             seq=seq,
@@ -67,19 +90,34 @@ class Profile:
             last_used=str(last_used) if last_used is not None else None,
             description=str(raw.get("description") or ""),
             email=str(email) if email is not None else None,
-            engine=str(engine) if engine else "agy",
+            engine=engine_name,
         )
+
+    def __post_init__(self) -> None:
+        self.engine = normalize_engine(self.engine)
 
     def touch(self) -> None:
         self.last_used = _utcnow_iso()
 
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
+    "max_sessions_per_profile": None,
     "use_linux_sandbox": False,
     "copy_settings_on_create": True,
     "windows_redirect_home": False,
     "lang": "auto",
 }
+
+_CONFIG_FIELDS = frozenset(
+    {
+        "default_profile",
+        "settings",
+        "agy_binary",
+        "codex_binary",
+        "grok_binary",
+        "claude_binary",
+    }
+)
 
 
 @dataclass
@@ -92,13 +130,31 @@ class Config:
     codex_binary: Optional[str] = None
     grok_binary: Optional[str] = None
     claude_binary: Optional[str] = None
+    _extra: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def session_limit(self) -> Optional[int]:
+        """Opt-in cap of live sessions per profile: THE single reader.
+
+        ``None`` (the default) means unlimited: the user decides how many
+        sessions to open. Only a positive integer enables the cap; any other
+        value (zero, negative, boolean, text) is ignored as unlimited.
+        """
+        value = self.settings.get("max_sessions_per_profile")
+        if type(value) is int and value >= 1:
+            return value
+        return None
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
+            key: value
+            for key, value in self._extra.items()
+            if key not in _CONFIG_FIELDS
+        }
+        d.update({
             "default_profile": self.default_profile,
             "settings": dict(self.settings),
             "agy_binary": self.agy_binary,
-        }
+        })
         if self.codex_binary is not None:
             d["codex_binary"] = self.codex_binary
         if self.grok_binary is not None:
@@ -149,4 +205,5 @@ class Config:
             codex_binary=codex_binary,
             grok_binary=grok_binary,
             claude_binary=claude_binary,
+            _extra={key: value for key, value in raw.items() if key not in _CONFIG_FIELDS},
         )

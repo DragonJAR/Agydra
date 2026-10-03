@@ -100,12 +100,14 @@ _LAUNCH_FLAGS: Dict[str, Tuple[str, str, bool, Optional[str], str]] = {
     ),
     "random": (
         "-r", "--random", False, None,
-        "rotate authenticated profiles without repeats per engine, ordered by saved "
-        "quota (unknown quota last); ignores the .agydra project pin",
+        "cycle through authenticated profiles in the selected pool: all "
+        "engines by default, or only -e; unused profiles first, saved quota ranks "
+        "repeats; ignores the .agydra project pin",
     ),
     "engine": (
         "-e", "--engine", True, "ENGINE",
-        f"target CLI engine: {', '.join(engines.SUPPORTED_ENGINES)} (default: agy); filters candidate profiles for -r",
+        f"target CLI engine: {', '.join(engines.SUPPORTED_ENGINES)} "
+        "(normal launch defaults to agy; filters -r candidates when supplied)",
     ),
     "dry-run": (
         "-n", "--dry-run", False, None,
@@ -681,9 +683,6 @@ def cmd_status(store: Store, args) -> int:
         if native.state == "unknown":
             _note(i18n.t("claude.binary_hint"))
     return 0
-
-
-_USAGE_MIN_COL_WIDTH = 9
 
 
 def _usage_progress_width(names: Sequence[str]) -> int:
@@ -1821,9 +1820,9 @@ _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
             ("agydra -p gk 'your prompt'", "launch grok with 'gk'"),
             ("agydra -p cc 'your prompt'", "launch Claude Code with 'cc'"),
             ("agydra 'your prompt'", "launch with the default profile"),
-            ("agydra -r 'your prompt'", "rotate agy profiles by saved quota without repeats"),
-            ("agydra -e codex -r 'your prompt'", "rotate codex profiles by saved quota without repeats"),
-            ("agydra -e grok -r 'your prompt'", "rotate grok profiles by saved quota without repeats"),
+            ("agydra -r 'your prompt'", "rotate all engines, choosing unused profiles first"),
+            ("agydra -e codex -r 'your prompt'", "rotate Codex, then rank repeats by saved quota"),
+            ("agydra -e grok -r 'your prompt'", "rotate Grok, then rank repeats by saved quota"),
         ],
     ),
     (

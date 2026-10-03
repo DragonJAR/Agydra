@@ -17,11 +17,13 @@ and replaces stale ancestor links with real mirrored directories.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import shutil
 import socket
 import stat
+import string
 import subprocess
 import tempfile
 from pathlib import Path
@@ -37,23 +39,28 @@ class IsolationError(Exception):
     pass
 
 
-def _is_link(path: Path) -> bool:
-    """True for symlinks AND Windows junctions/reparse points.
+def _safe_os_error_reason(error: BaseException) -> str:
+    if isinstance(error, OSError) and error.errno is not None:
+        return errno.errorcode.get(error.errno, type(error).__name__)
+    return type(error).__name__
 
-    ``Path.is_symlink()`` returns False for junctions created by ``mklink /J``,
-    so overlay checks must not rely on it alone: a junction we created would be
-    mistaken for a real directory and the next launch would abort.
+
+def _is_link(path: Path) -> bool:
+    """True for symlinks AND Windows junctions/reparse points (best effort).
+
+    Delegates to ``platforms.is_link`` so every module shares one probe;
+    safety guards use ``_reject_link`` (strict, fail closed) instead.
     """
-    if path.is_symlink():
-        return True
-    if not platforms.is_windows():
-        return False
+    return platforms.is_link(path)
+
+
+def _reject_link(path: Path, message: str) -> None:
     try:
-        st = os.stat(path, follow_symlinks=False)
-    except OSError:
-        return False
-    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    return bool(getattr(st, "st_file_attributes", 0) & reparse)
+        linked = platforms.is_link(path, strict=True)
+    except OSError as exc:
+        raise IsolationError(f"cannot inspect {path} ({exc}); refusing to continue") from exc
+    if linked:
+        raise IsolationError(message)
 
 
 def _link(target: Path, link: Path) -> None:
@@ -419,14 +426,17 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
             "re-run `agydra doctor --fix`"
         ) from exc
 
+    removal_error = ""
     try:
         store.rmtree(real_dir)
     except OSError as exc:
+        removal_error = f" ({exc})"
+    if os.path.lexists(real_dir):
         raise IsolationError(
             f"all overlay data was copied into {data_dir}, but source cleanup "
-            f"failed for {real_dir} ({exc}); fix the cause and re-run "
+            f"failed for {real_dir}{removal_error}; fix the cause and re-run "
             "`agydra doctor --fix`"
-        ) from exc
+        )
 
 
 CLAUDE_OWNED_STATE_FILES = (".claude.json", "settings.json", ".credentials.json")
@@ -442,11 +452,11 @@ def validate_claude_config_dir(config_dir: Path) -> Path:
     """
     config_dir = Path(config_dir)
     for candidate in (config_dir, config_dir.parent):
-        if _is_link(candidate):
-            raise IsolationError(
-                f"claude config path {candidate} must not be a symlink or junction; "
-                "refusing to risk aliasing the real ~/.claude"
-            )
+        _reject_link(
+            candidate,
+            f"claude config path {candidate} must not be a symlink or junction; "
+            "refusing to risk aliasing the real ~/.claude",
+        )
     real_claude = platforms.claude_data_dir()
     if os.path.lexists(real_claude) and os.path.lexists(config_dir):
         real_identity = _identity(real_claude)
@@ -465,11 +475,11 @@ def validate_claude_config_dir(config_dir: Path) -> Path:
         raise IsolationError(f"claude config path {config_dir} is not a directory")
     for filename in CLAUDE_OWNED_STATE_FILES:
         entry = config_dir / filename
-        if os.path.lexists(entry) and _is_link(entry):
-            raise IsolationError(
-                f"claude state file {entry} must be a regular file owned by the "
-                "profile, not a symlink or junction"
-            )
+        _reject_link(
+            entry,
+            f"claude state file {entry} must be a regular file owned by the "
+            "profile, not a symlink or junction",
+        )
     return config_dir
 
 
@@ -479,15 +489,67 @@ def prepare_claude_config_dir(data_dir: Path) -> Path:
     Claude profiles get no home overlay: ``CLAUDE_CONFIG_DIR`` alone redirects
     settings, credentials, global state and the background supervisor, while
     ``HOME`` stays real so the native binary and its resources keep resolving.
+    A failed chmod is tolerated only when an lstat confirms that group and
+    other permission bits are already clear.
     """
     data_dir = validate_claude_config_dir(Path(data_dir))
     platforms.ensure_dir(data_dir)
     if not platforms.is_windows():
         try:
             os.chmod(data_dir, 0o700)
-        except OSError:
-            pass
+        except OSError as exc:
+            try:
+                metadata = data_dir.lstat()
+                linked = platforms.is_link(data_dir, strict=True)
+            except (OSError, ValueError) as verify_exc:
+                chmod_reason = _safe_os_error_reason(exc)
+                verify_reason = _safe_os_error_reason(verify_exc)
+                raise IsolationError(
+                    f"cannot verify private permissions for Claude config directory "
+                    f"{data_dir} after chmod failed ({chmod_reason}; {verify_reason})"
+                ) from None
+            if linked or not stat.S_ISDIR(metadata.st_mode):
+                raise IsolationError(
+                    f"cannot verify private permissions for Claude config directory "
+                    f"{data_dir} after chmod failed ({_safe_os_error_reason(exc)})"
+                ) from None
+            if stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise IsolationError(
+                    f"Claude config directory {data_dir} still grants group or other "
+                    f"permissions after chmod failed ({_safe_os_error_reason(exc)})"
+                ) from None
     return validate_claude_config_dir(data_dir)
+
+
+def validate_overlay_roots(name: str, data_dir: Path, store_root: Path) -> Path:
+    """Central guard: overlay and profile data paths must be real directories.
+
+    A link at ``<store>/overlays``, ``<store>/overlays/<name>``, the profile
+    data directory or any profile directory above it would redirect overlay
+    writes (links, ``config.toml``) outside the store. Runs before any write
+    and returns the overlay path. The engine-data link inside the overlay is
+    the one valid link and is not checked here.
+    """
+    store_root = Path(store_root)
+    data_dir = Path(data_dir)
+    overlays_root = store_root / platforms.OVERLAYS_DIRNAME
+    overlay = overlays_root / name
+    for candidate in (overlays_root, overlay):
+        _reject_link(
+            candidate,
+            f"overlay path {candidate} must not be a symlink or junction; "
+            "refusing to write outside the profile store",
+        )
+    chain = [data_dir, data_dir.parent]
+    if store_root in data_dir.parents:
+        chain.extend(parent for parent in data_dir.parents if parent != store_root and store_root in parent.parents)
+    for candidate in chain:
+        _reject_link(
+            candidate,
+            f"profile data path {candidate} must not be a symlink or junction; "
+            "refusing to write outside the profile store",
+        )
+    return overlay
 
 
 def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "agy") -> Path:
@@ -510,7 +572,7 @@ def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "ag
     data_dir = Path(data_dir)
     store_root = Path(store_root)
     real_home = platforms.real_home()
-    overlay = platforms.ensure_dir(store_root / platforms.OVERLAYS_DIRNAME / name)
+    overlay = platforms.ensure_dir(validate_overlay_roots(name, data_dir, store_root))
     store_resolved = platforms.canonical_path(store_root)
     _, chain_identities = _ancestor_chain(real_home, store_root)
     real_codex = platforms.codex_data_dir(real_home)
@@ -653,79 +715,347 @@ def _reclaim_owned_socket(path: Path) -> None:
         pass
 
 
-def _disable_codex_daemon_auto_start(data_dir: Path) -> None:
-    """Ensure daemon_auto_start = false in Codex config.toml to avoid SUN_LEN socket limits."""
-    import re
+_BARE_KEY_CHARS = frozenset(string.ascii_letters + string.digits + "_-")
+_DAEMON_SETTING = "daemon_auto_start"
+_FEATURES_TABLE = "features"
 
+
+class _TomlStatement(NamedTuple):
+    kind: str
+    start: int
+    end: int
+    path: Tuple[str, ...]
+    value_start: int
+    value_end: int
+
+
+def _skip_toml_blanks(text: str, index: int, newlines: bool = False) -> int:
+    blanks = " \t\r\n" if newlines else " \t"
+    while index < len(text) and text[index] in blanks:
+        index += 1
+    return index
+
+
+def _scan_toml_quoted(text: str, index: int) -> int:
+    quote = text[index]
+    cursor = index + 1
+    while cursor < len(text):
+        character = text[cursor]
+        if character == "\n":
+            break
+        if quote == '"' and character == "\\":
+            cursor += 2
+            continue
+        if character == quote:
+            return cursor + 1
+        cursor += 1
+    raise ValueError("unterminated string")
+
+
+def _scan_toml_multiline(text: str, index: int) -> int:
+    delimiter = text[index : index + 3]
+    cursor = index + 3
+    while True:
+        found = text.find(delimiter, cursor)
+        if found < 0:
+            raise ValueError("unterminated multi-line string")
+        if delimiter == '"""':
+            backslashes = 0
+            while found - 1 - backslashes >= index + 3 and text[found - 1 - backslashes] == "\\":
+                backslashes += 1
+            if backslashes % 2:
+                cursor = found + 1
+                continue
+        end = found + 3
+        extra = 0
+        while end < len(text) and text[end] == delimiter[0] and extra < 2:
+            end += 1
+            extra += 1
+        return end
+
+
+_TOML_SIMPLE_ESCAPES = {
+    "b": "\b",
+    "t": "\t",
+    "n": "\n",
+    "f": "\f",
+    "r": "\r",
+    '"': '"',
+    "\\": "\\",
+}
+
+
+def _decode_toml_basic_string(raw: str) -> str:
+    decoded: List[str] = []
+    cursor = 0
+    while cursor < len(raw):
+        character = raw[cursor]
+        if character != "\\":
+            decoded.append(character)
+            cursor += 1
+            continue
+        cursor += 1
+        if cursor >= len(raw):
+            raise ValueError("invalid escape in quoted key")
+        marker = raw[cursor]
+        if marker in _TOML_SIMPLE_ESCAPES:
+            decoded.append(_TOML_SIMPLE_ESCAPES[marker])
+            cursor += 1
+            continue
+        width = {"u": 4, "U": 8}.get(marker)
+        digits = raw[cursor + 1 : cursor + 1 + (width or 0)]
+        if width is None or len(digits) != width or any(c not in string.hexdigits for c in digits):
+            raise ValueError(f"invalid escape \\{marker} in quoted key")
+        try:
+            decoded.append(chr(int(digits, 16)))
+        except (ValueError, OverflowError) as exc:
+            raise ValueError("invalid unicode escape in quoted key") from exc
+        cursor += 1 + width
+    return "".join(decoded)
+
+
+def _parse_toml_key(text: str, index: int) -> Tuple[Tuple[str, ...], int]:
+    parts: List[str] = []
+    while True:
+        index = _skip_toml_blanks(text, index)
+        if index >= len(text):
+            raise ValueError("unexpected end of key")
+        character = text[index]
+        if character in "\"'":
+            end = _scan_toml_quoted(text, index)
+            raw = text[index + 1 : end - 1]
+            parts.append(_decode_toml_basic_string(raw) if character == '"' else raw)
+            index = end
+        else:
+            end = index
+            while end < len(text) and text[end] in _BARE_KEY_CHARS:
+                end += 1
+            if end == index:
+                raise ValueError("invalid key")
+            parts.append(text[index:end])
+            index = end
+        index = _skip_toml_blanks(text, index)
+        if index < len(text) and text[index] == ".":
+            index += 1
+            continue
+        return tuple(parts), index
+
+
+def _scan_toml_value(text: str, index: int, inline: bool = False) -> Tuple[int, int]:
+    depth = 0
+    cursor = index
+    last = index
+    while cursor < len(text):
+        character = text[cursor]
+        if text.startswith('"""', cursor) or text.startswith("'''", cursor):
+            cursor = last = _scan_toml_multiline(text, cursor)
+            continue
+        if character in "\"'":
+            cursor = last = _scan_toml_quoted(text, cursor)
+            continue
+        if character == "#":
+            newline = text.find("\n", cursor)
+            cursor = len(text) if newline < 0 else newline
+            continue
+        if character in "[{":
+            depth += 1
+        elif character in "]}":
+            if depth == 0 and inline:
+                break
+            depth -= 1
+            if depth < 0:
+                raise ValueError("unbalanced brackets")
+        elif character == "\n" and depth == 0 and not inline:
+            break
+        elif character == "," and depth == 0 and inline:
+            break
+        if character not in " \t\r\n":
+            last = cursor + 1
+        cursor += 1
+    if depth != 0:
+        raise ValueError("unterminated array or inline table")
+    return last, cursor
+
+
+def _end_of_toml_line(text: str, index: int) -> int:
+    newline = text.find("\n", index)
+    return len(text) if newline < 0 else newline + 1
+
+
+def _toml_statements(text: str) -> List[_TomlStatement]:
+    statements: List[_TomlStatement] = []
+    cursor = 0
+    while cursor < len(text):
+        start = cursor
+        cursor = _skip_toml_blanks(text, cursor, newlines=True)
+        if cursor >= len(text):
+            break
+        start = text.rfind("\n", 0, cursor) + 1
+        if text[cursor] == "#":
+            cursor = _end_of_toml_line(text, cursor)
+            continue
+        if text[cursor] == "[":
+            array = text.startswith("[[", cursor)
+            closing = "]]" if array else "]"
+            path, cursor = _parse_toml_key(text, cursor + len(closing))
+            if not text.startswith(closing, cursor):
+                raise ValueError("unterminated table header")
+            cursor = _skip_toml_blanks(text, cursor + len(closing))
+            if cursor < len(text) and text[cursor] not in "#\r\n":
+                raise ValueError("unexpected text after table header")
+            end = _end_of_toml_line(text, cursor)
+            statements.append(
+                _TomlStatement("array-header" if array else "header", start, end, path, cursor, cursor)
+            )
+            cursor = end
+            continue
+        path, cursor = _parse_toml_key(text, cursor)
+        cursor = _skip_toml_blanks(text, cursor)
+        if cursor >= len(text) or text[cursor] != "=":
+            raise ValueError("expected '=' after key")
+        value_start = _skip_toml_blanks(text, cursor + 1)
+        value_end, cursor = _scan_toml_value(text, value_start)
+        if value_end == value_start:
+            raise ValueError("missing value")
+        end = _end_of_toml_line(text, cursor)
+        statements.append(_TomlStatement("key", start, end, path, value_start, value_end))
+        cursor = end
+    return statements
+
+
+def _inline_table_with_daemon_disabled(text: str, statement: _TomlStatement) -> str:
+    start, end = statement.value_start, statement.value_end
+    if text[start] != "{" or text[end - 1] != "}":
+        raise ValueError(f"{_FEATURES_TABLE} must be a table")
+    limit = end - 1
+    cursor = start + 1
+    entries: List[Tuple[Tuple[str, ...], int, int]] = []
+    while True:
+        cursor = _skip_toml_blanks(text, cursor, newlines=True)
+        while cursor < limit and text[cursor] == "#":
+            cursor = _skip_toml_blanks(text, _end_of_toml_line(text, cursor), newlines=True)
+        if cursor >= limit:
+            break
+        path, cursor = _parse_toml_key(text, cursor)
+        cursor = _skip_toml_blanks(text, cursor)
+        if cursor >= limit or text[cursor] != "=":
+            raise ValueError("expected '=' in inline table")
+        value_start = _skip_toml_blanks(text, cursor + 1)
+        value_end, cursor = _scan_toml_value(text, value_start, inline=True)
+        entries.append((path, value_start, value_end))
+        if cursor < limit and text[cursor] == ",":
+            cursor += 1
+    for path, value_start, value_end in entries:
+        if path == (_DAEMON_SETTING,):
+            if text[value_start:value_end] == "false":
+                return text
+            return text[:value_start] + "false" + text[value_end:]
+    if not text[start + 1 : limit].strip():
+        return text[:start] + "{ " + _DAEMON_SETTING + " = false }" + text[end:]
+    return text[: start + 1] + " " + _DAEMON_SETTING + " = false," + text[start + 1 :]
+
+
+def _with_daemon_auto_start_disabled(content: str) -> str:
+    bom = "\ufeff" if content.startswith("\ufeff") else ""
+    text = content[len(bom) :]
+    newline = "\r\n" if "\r\n" in text else "\n"
+    table: Tuple[str, ...] = ()
+    setting: Optional[_TomlStatement] = None
+    inline: Optional[_TomlStatement] = None
+    header: Optional[_TomlStatement] = None
+    dotted = False
+    for statement in _toml_statements(text):
+        if statement.kind == "array-header":
+            if statement.path == (_FEATURES_TABLE,):
+                raise ValueError(f"{_FEATURES_TABLE} must be a table")
+            table = statement.path + ("[]",)
+            continue
+        if statement.kind == "header":
+            table = statement.path
+            if statement.path == (_FEATURES_TABLE,) and header is None:
+                header = statement
+            continue
+        full = table + statement.path
+        if full == (_FEATURES_TABLE, _DAEMON_SETTING):
+            setting = setting or statement
+        elif full == (_FEATURES_TABLE,):
+            if text[statement.value_start] != "{":
+                raise ValueError(f"{_FEATURES_TABLE} must be a table")
+            inline = inline or statement
+        elif not table and statement.path[0] == _FEATURES_TABLE:
+            dotted = True
+    if setting is not None:
+        if text[setting.value_start : setting.value_end] == "false":
+            return content
+        return bom + text[: setting.value_start] + "false" + text[setting.value_end :]
+    if inline is not None:
+        return bom + _inline_table_with_daemon_disabled(text, inline)
+    line = f"{_DAEMON_SETTING} = false{newline}"
+    if header is not None:
+        prefix = "" if text[: header.end].endswith("\n") else newline
+        return bom + text[: header.end] + prefix + line + text[header.end :]
+    if dotted:
+        return bom + f"{_FEATURES_TABLE}.{line}" + text
+    body = text
+    if body and not body.endswith("\n"):
+        body += newline
+    if body.strip():
+        body += newline
+    return bom + body + f"[{_FEATURES_TABLE}]{newline}" + line
+
+
+def _disable_codex_daemon_auto_start(data_dir: Path) -> None:
+    """Ensure ``features.daemon_auto_start = false`` in Codex ``config.toml``.
+
+    The edit is a token-aware pass over standard TOML (tables, quoted keys,
+    dotted keys, inline tables, multi-line strings and arrays, CRLF and BOM)
+    that only touches the setting itself. A config that is not valid UTF-8 or
+    TOML, or where ``features`` is not a table, raises ``IsolationError``
+    instead of being rewritten, because Codex could not load it either. Read
+    and required write failures also raise so Codex cannot launch without the
+    daemon setting being established.
+    """
     cfg = data_dir / "config.toml"
-    if not cfg.exists():
+    try:
+        cfg.lstat()
+    except FileNotFoundError:
         try:
             store.atomic_write_text(cfg, "[features]\ndaemon_auto_start = false\n")
-        except OSError:
-            pass
+        except OSError as exc:
+            raise IsolationError(
+                f"cannot create Codex config {cfg} ({_safe_os_error_reason(exc)})"
+            ) from None
         return
+    except OSError as exc:
+        raise IsolationError(
+            f"cannot inspect Codex config {cfg} ({_safe_os_error_reason(exc)})"
+        ) from None
     try:
-        content = cfg.read_text(encoding="utf-8")
-        newline = "\r\n" if "\r\n" in content else "\n"
-        features = re.search(
-            r"(?m)^([ \t]*\[features\][ \t]*(?:\#[^\r\n]*)?)(\r?\n|$)",
-            content,
-        )
-        if features:
-            section_start = features.end()
-            next_section = re.search(
-                r"(?m)^[ \t]*\[[^\]\r\n]+\][ \t]*(?:\#[^\r\n]*)?(?:\r?\n|$)",
-                content[section_start:],
-            )
-            section_end = (
-                section_start + next_section.start()
-                if next_section
-                else len(content)
-            )
-            section = content[section_start:section_end]
-            setting = re.search(
-                r'(?m)^([ \t]*(?:daemon_auto_start|"daemon_auto_start")[ \t]*=[ \t]*)'
-                r"(true|false|1|0)([ \t]*(?:\#[^\r\n]*)?)(\r?)$",
-                section,
-            )
-            if setting:
-                if setting.group(2) in ("true", "1"):
-                    updated = (
-                        setting.group(1)
-                        + "false"
-                        + setting.group(3)
-                        + setting.group(4)
-                    )
-                    section = section[:setting.start()] + updated + section[setting.end():]
-                    new_content = content[:section_start] + section + content[section_end:]
-                else:
-                    new_content = content
-            else:
-                addition = "daemon_auto_start = false" + newline
-                if features.group(2):
-                    new_content = content[:section_start] + addition + content[section_start:]
-                else:
-                    new_content = (
-                        content[:section_start]
-                        + newline
-                        + addition
-                        + content[section_start:]
-                    )
-        else:
-            new_content = (
-                content.rstrip()
-                + newline
-                + newline
-                + "[features]"
-                + newline
-                + "daemon_auto_start = false"
-                + newline
-            )
+        raw = cfg.read_bytes()
+    except OSError as exc:
+        raise IsolationError(
+            f"cannot read Codex config {cfg} ({_safe_os_error_reason(exc)})"
+        ) from None
+    try:
+        content = raw.decode("utf-8")
+        updated = _with_daemon_auto_start_disabled(content)
+    except ValueError as exc:
+        raise IsolationError(
+            f"cannot disable the Codex daemon: {cfg} is not a usable TOML file "
+            f"({exc}); fix or remove it"
+        ) from exc
+    if updated != content:
+        try:
+            store.atomic_write_text(cfg, updated)
+        except OSError as exc:
+            raise IsolationError(
+                f"cannot write Codex config {cfg} ({_safe_os_error_reason(exc)})"
+            ) from None
 
-        if new_content != content:
-            store.atomic_write_text(cfg, new_content)
-    except OSError:
-        pass
+
+def _pin_store_root(env: dict, store_root: Optional[Path]) -> None:
+    if store_root is not None:
+        env[platforms.BASE_DIR_ENV] = str(platforms.absolute_path(store_root))
 
 
 def isolated_env(
@@ -733,8 +1063,14 @@ def isolated_env(
     extra: dict,
     engine: str = "agy",
     config_windows_redirect_home: bool = False,
+    store_root: Optional[Path] = None,
 ) -> dict:
     """Environment for the child process with the home redirected.
+
+    ``store_root`` (the caller's ``Store.root``) is pinned as an absolute
+    ``AGYDRA_HOME`` for every engine, after ``extra`` is merged, so nested
+    agydra calls resolve the same store whatever ``HOME``/``XDG_*`` redirection
+    the child sees. Without it an inherited ``AGYDRA_HOME`` is left untouched.
 
     For engines without an overlay (``claude``) ``overlay`` is the physical
     config directory: ``HOME``/``USERPROFILE``/XDG stay untouched, inherited
@@ -755,6 +1091,7 @@ def isolated_env(
         env["AGYDRA_REAL_HOME"] = str(platforms.real_home())
         env.update(driver.pinned_env)
         env[driver.env_home_var] = str(overlay)
+        _pin_store_root(env, store_root)
         return env
     env.update(extra)
     real_home = platforms.real_home()
@@ -778,6 +1115,7 @@ def isolated_env(
         if resolved == home_resolved or home_resolved in resolved.parents:
             relative = resolved.relative_to(home_resolved)
             env[xdg_var] = str(Path(overlay, relative))
+    _pin_store_root(env, store_root)
     return env
 
 
@@ -801,7 +1139,10 @@ def sandbox_wrap(argv: List[str]) -> List[str]:
     """Wrap argv in bubblewrap, masking DBus/keyring so OAuth stays on files.
 
     Only called on Linux when ``use_linux_sandbox`` is enabled and bwrap is
-    present. The same overlay-based HOME redirection applies inside.
+    present. The same overlay-based HOME redirection applies inside. A
+    socket or file (the DBus ``bus``) is masked with a ``/dev/null`` bind
+    because bwrap cannot mount a tmpfs over a non-directory; directories and
+    absent paths get a tmpfs.
     """
     uid = getattr(os, "getuid", lambda: 1000)()
     wrapped = ["bwrap", "--dev-bind", "/", "/"]

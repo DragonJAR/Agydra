@@ -14,10 +14,12 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import account
 import locks
+import profile_rotation
+from models import Profile
 from store import Store, StoreError
 from ui import warn
 
@@ -40,7 +42,9 @@ def _find_marker(start: Path) -> Optional[Path]:
     return None
 
 
-def _marker_resolution(store: Store, cwd: Path) -> Optional[Resolution]:
+def _marker_resolution(
+    store: Store, cwd: Path, read_only: bool = False
+) -> Optional[Resolution]:
     """Resolution pinned by a ``.agydra`` marker, or None when not pinned.
 
     A marker naming a dangling ref still raises (StoreError): a project pin
@@ -62,7 +66,8 @@ def _marker_resolution(store: Store, cwd: Path) -> Optional[Resolution]:
         raise StoreError(
             f"project marker {marker} is empty; write a profile name or delete the file"
         )
-    return Resolution(store.resolve_ref(ref), f"project marker {marker}")
+    resolve_ref = store.resolve_ref_readonly if read_only else store.resolve_ref
+    return Resolution(resolve_ref(ref), f"project marker {marker}")
 
 
 def resolve(
@@ -71,16 +76,20 @@ def resolve(
     cwd: Optional[Path] = None,
     env: Optional[dict] = None,
     engine: Optional[str] = None,
+    read_only: bool = False,
 ) -> Resolution:
     """Resolve which profile to use. Raises StoreError when none applies."""
     env = env if env is not None else os.environ
     cwd = Path(cwd) if cwd is not None else Path.cwd()
     target_engine = engine.strip().lower() if engine else None
+    get_profile = store.get_readonly if read_only else store.get
+    resolve_ref = store.resolve_ref_readonly if read_only else store.resolve_ref
+    list_profiles = store.list_readonly if read_only else store.list
 
     if flag_ref is not None:
-        name = store.resolve_ref(flag_ref)
+        name = resolve_ref(flag_ref)
         if target_engine is not None:
-            prof = store.get(name)
+            prof = get_profile(name)
             if prof.engine != target_engine:
                 raise StoreError(
                     f"profile {name!r} uses engine {prof.engine!r}, "
@@ -90,34 +99,44 @@ def resolve(
 
     env_ref = env.get(PROFILE_ENV)
     if env_ref:
-        name = store.resolve_ref(env_ref)
+        name = resolve_ref(env_ref)
         if target_engine is not None:
-            prof = store.get(name)
+            prof = get_profile(name)
             if prof.engine == target_engine:
                 return Resolution(name, f"environment {PROFILE_ENV}={env_ref}")
         else:
             return Resolution(name, f"environment {PROFILE_ENV}={env_ref}")
 
-    marker = _marker_resolution(store, cwd)
+    marker = _marker_resolution(store, cwd, read_only=read_only)
     if marker is not None:
         if target_engine is not None:
-            prof = store.get(marker.name)
+            prof = get_profile(marker.name)
             if prof.engine == target_engine:
                 return marker
         else:
             return marker
 
-    all_profiles = store.list()
+    all_profiles = list_profiles()
     if target_engine:
         eligible = [p for p in all_profiles if p.engine == target_engine]
     else:
         eligible = [p for p in all_profiles if p.engine == "agy"] or all_profiles
 
-    default = store.default_name()
-    if default and store.exists(default):
-        def_prof = store.get(default)
+    if read_only:
+        config = store.load_config()
+        default = config.default_profile
+        default_profile = next((p for p in all_profiles if p.name == default), None)
+        if default and default_profile is None:
+            _profiles, unreadable = store.scan_readonly()
+            if default in unreadable:
+                get_profile(default)
+    else:
+        default = store.default_name()
+        default_profile = store.get(default) if default and store.exists(default) else None
+    if default_profile is not None:
+        def_prof = default_profile
         if not target_engine or def_prof.engine == target_engine:
-            return Resolution(store.resolve_ref(default), "default profile")
+            return Resolution(resolve_ref(default), "default profile")
         if eligible:
             warn(
                 f"default profile {default!r} is for engine {def_prof.engine!r}; "
@@ -138,19 +157,13 @@ def resolve(
     )
 
 
-MIN_PROFILES = 2
-
 _NO_PROFILES = (
-    "no profiles exist yet; agydra only makes sense with at least "
-    f"{MIN_PROFILES} profiles — create them with: agydra create <name>"
+    "no profiles exist yet; create one with: agydra create <name>"
 )
-_TOO_FEW = (
-    f"only 1 profile exists; agydra only makes sense with at least "
-    f"{MIN_PROFILES} profiles — create another with: agydra create <name>"
-)
-_NO_FREE = (
-    "no free authenticated profile: every eligible one has a live session "
-    "(wait for one to finish, or bypass with -f/--force; see: agydra list)"
+_AT_LIMIT = (
+    "every authenticated profile already has {limit} live sessions (the limit "
+    "of {limit}); wait for one to finish, raise settings.max_sessions_per_profile "
+    "in agydra.json, or bypass with -f/--force"
 )
 _NOT_AUTHENTICATED = (
     "no authenticated profile available; authenticate one with: "
@@ -159,89 +172,92 @@ _NOT_AUTHENTICATED = (
 
 
 def pick_free_profile(
-    store,
+    store: Store,
     cwd: Optional[Path] = None,
     force: bool = False,
     engine: Optional[str] = None,
     exclude: Optional[set] = None,
+    read_only: bool = False,
+    rotation: Optional[profile_rotation.Rotation] = None,
 ) -> Resolution:
-    """Pick the free-est authenticated profile for ``-r``/``--random``.
+    """Preview or select an unused identity ordered by saved quota for ``-r``.
 
-    Deterministic and side-effect-free (the caller takes the lease later,
-    in ``runner.run``, which owns all filesystem mutation):
-
-    1. a store marker pinning this directory wins (``-r`` asks agydra to
-       CHOOSE, so an explicit project pin must win over the choice);
-    2. the 2-profile floor (a choice needs at least two candidates);
-    3. skip unauthenticated profiles;
-    4. first pass: prefer a profile with NO live session (free);
-    5. second pass: when every authenticated profile of the engine is in
-       use, JOIN the least-recently-used busy one — concurrent sessions
-       of the same profile are the supported mode now (the keychain slot
-       lease on macOS makes same-profile agy joins safe; codex/grok
-       share the on-disk auth.json with a re-login risk the runner
-       warns about);
-    6. break ties by seq (creation order).
-
-    ``force=True`` (launcher ``-f`` mode) is accepted for CLI
-    compatibility; the two passes subsume the busy filter it used to
-    skip, and the auth filter and marker precedence are preserved.
+    Random rotation ignores project pins. Unused identities precede repeats;
+    free sessions rank first among unused candidates, while saved quota ranks
+    first among repeats. Authentication is lazy and cached across retries
+    under the selection-scope lock.
+    A read-only preview skips authentication and session probes and writes
+    nothing. Failed retry exclusions never finish the persistent cycle.
     """
-    marker = _marker_resolution(store, Path(cwd) if cwd is not None else Path.cwd())
-    if marker is not None:
-        if engine is not None and getattr(store.get(marker.name), "engine", "agy") != engine.strip().lower():
-            pass
-        else:
-            return marker
-
-    profiles = store.list()
-    if engine is not None:
-        target_engine = engine.strip().lower()
-        profiles = [p for p in profiles if getattr(p, "engine", "agy") == target_engine]
-    else:
-        agy_profiles = [p for p in profiles if getattr(p, "engine", "agy") == "agy"]
-        if agy_profiles:
-            profiles = agy_profiles
-    if exclude:
-        profiles = [p for p in profiles if p.name not in exclude]
-
-    names = [p.name for p in profiles]
-    if not names:
-        if engine is not None:
+    profiles = store.list_readonly() if read_only else store.list()
+    target_engine = engine.strip().lower() if engine is not None else None
+    if target_engine is not None:
+        profiles = [p for p in profiles if p.engine == target_engine]
+    if not profiles:
+        if target_engine is not None:
             raise StoreError(
                 f"no profiles found for engine {target_engine!r}; "
                 f"create them with: agydra create <name> -e {target_engine}"
             )
         raise StoreError(_NO_PROFILES)
 
-    if not force and len(names) < MIN_PROFILES:
-        if engine is not None:
-            raise StoreError(
-                f"only 1 profile exists for engine {target_engine!r}; "
-                f"auto-rotation (-r) needs at least {MIN_PROFILES} profiles — "
-                f"create another with: agydra create <name> -e {target_engine}"
-            )
-        raise StoreError(_TOO_FEW)
+    limit = None if force or read_only else store.load_config().session_limit()
+    busy: Dict[str, bool] = {}
+    saturated = False
+    auth_states = rotation.auth_states if rotation is not None else {}
 
-    authenticated: list = []
-    for profile in sorted(profiles, key=lambda p: (p.last_used or "", p.seq)):
-        profile_engine = getattr(profile, "engine", "agy")
-        state = account.auth_state(
-            store.profile_data_dir(profile.name, engine=profile_engine),
-            store,
-            profile.name,
-            engine=profile_engine,
-        )
-        if state != "authenticated":
-            continue
-        if not locks.is_locked(store, profile.name):
-            return Resolution(
-                profile.name, "least-recently-used free profile (-r)"
+    def session_priority(profile: Profile) -> tuple:
+        if profile.name not in busy:
+            busy[profile.name] = locks.is_locked(store, profile.name)
+        return (busy[profile.name],)
+
+    def eligible(profile: Profile) -> bool:
+        nonlocal saturated
+        identity = (profile.engine, profile.seq, profile.name)
+        if identity not in auth_states:
+            auth_states[identity] = account.auth_state(
+                store.profile_data_dir(profile.name, engine=profile.engine),
+                store,
+                profile.name,
+                engine=profile.engine,
             )
-        authenticated.append(profile)
-    if authenticated:
-        return Resolution(
-            authenticated[0].name,
-            "joining busy profile (-r; free profiles exhausted)",
+        if auth_states[identity] != "authenticated":
+            return False
+        if limit is not None and session_priority(profile)[0]:
+            holders = locks.lease_holders(store, profile.name)
+            if holders is not None and len(holders) >= limit:
+                saturated = True
+                return False
+        return True
+
+    eligibility = None if read_only else eligible
+    priority = None if read_only else session_priority
+    try:
+        candidate = (
+            rotation.select(profiles, exclude, eligibility, priority)
+            if rotation is not None
+            else profile_rotation.preview(
+                store,
+                profiles,
+                exclude,
+                eligibility,
+                priority,
+                engine=target_engine,
+            )
         )
-    raise StoreError(_NOT_AUTHENTICATED)
+    except profile_rotation.NoEligibleProfileError as exc:
+        if saturated:
+            raise StoreError(_AT_LIMIT.format(limit=limit)) from exc
+        raise StoreError(_NOT_AUTHENTICATED) from exc
+    scope = target_engine or "all engines"
+    reason = f"profile selected from {scope} rotation; session state, saved quota, LRU and stable identity order (-r)"
+    if read_only:
+        reason = (
+            f"read-only random plan candidate (-r; {reason}; "
+            "auth and sessions not probed)"
+        )
+    elif session_priority(candidate)[0]:
+        reason = "joining busy profile (-r; " + reason + ")"
+    else:
+        reason = "free profile (-r; " + reason + ")"
+    return Resolution(candidate.name, reason)
