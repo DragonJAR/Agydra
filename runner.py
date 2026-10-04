@@ -335,6 +335,7 @@ def _run_prepared(
     while True:
         driver = engines.get_engine(plan.engine)
         keychain_needs_waited_child = driver.needs_keychain and keychain.supported()
+        leased: Optional[str] = None
         try:
             joined = locks.acquire_lease(
                 store, plan.profile, patience_s=locks.LEASE_PATIENCE_S, max_holders=limit
