@@ -6,8 +6,10 @@ Cascada de resolución de idioma (de mayor a menor prioridad):
   1. Argumento ``flag_lang`` (p.ej. ``--lang es`` en la CLI).
   2. Variable de entorno ``AGYDRA_LANG``.
   3. ``config.settings['lang']`` en ``agydra.json`` (persistido por :func:`set_language`).
-  4. Locale del sistema vía ``locale.getlocale()`` — si empieza por ``'es'`` → ``'es'``;
-     cualquier otro → ``'en'``.
+  4. Locale del sistema con precedencia POSIX: el primero no vacío de
+     ``LC_ALL``, ``LC_MESSAGES`` y ``LANG`` decide (``es*`` → ``'es'``;
+     cualquier otro valor, incluido ``C``/``POSIX`` → ``'en'``); solo cuando
+     ninguno está definido se consulta ``locale.getlocale()``.
 
 Uso::
 
@@ -483,8 +485,9 @@ interpolación devuelven la plantilla sin sustituir (fail-open).
 Ejemplo::
 
     t("cmd.create.ok", name="work")
-    # → "Profile 'work' created."  (en)
-    # → "Perfil 'work' creado."    (es)
+
+produce ``"Profile 'work' created."`` en ``en`` y
+``"Perfil 'work' creado."`` en ``es``.
 """
     lang = _get_active()
     template = (

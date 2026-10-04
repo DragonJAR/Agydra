@@ -100,10 +100,6 @@ def _quota_order(availability: object) -> tuple:
     return (not known, -availability if known else 0)
 
 
-class RotationExhaustedError(StoreError):
-    """Every unused eligible identity was already attempted by this launch."""
-
-
 class NoEligibleProfileError(StoreError):
     """No candidate passed lazy authentication and session eligibility."""
 
@@ -265,7 +261,7 @@ def _choose(
         for profile in unused
     )
     if blocked:
-        raise RotationExhaustedError(
+        raise StoreError(
             "no untried unused profile remains in the rotation scope"
         )
     for profile in repeated:

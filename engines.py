@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, ClassVar, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import ClassVar, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import account
 import platforms
@@ -116,12 +116,6 @@ class EngineDriver:
             env_var=self.env_bin_var,
             explicit=explicit,
         )
-
-    def auth_state(self, data_dir: Path, store: Any = None, profile_name: str = "") -> str:
-        return account.auth_state(data_dir, store=store, name=profile_name, engine=self.name)
-
-    def detect_email(self, data_dir: Path, store: Any = None, profile_name: str = "") -> Optional[str]:
-        return account.detect_email(data_dir, store=store, name=profile_name, engine=self.name)
 
     def prepare_args(self, args: Sequence[str]) -> List[str]:
         return self.translate_universal_flags(args)
@@ -338,7 +332,7 @@ def all_engines() -> List[EngineDriver]:
     return list(_REGISTRY.values())
 
 
-class EngineExportError(Exception):
+class EngineExportError(ValueError):
     """Raised when an engine refuses to be exported.
 
     Lives in ``engines.py`` (not in ``store.py``) to keep the engine module
@@ -347,4 +341,10 @@ class EngineExportError(Exception):
     spinning up a real profile. The export CLI command catches this
     exception by class and surfaces its message verbatim; everything else
     in the chain treats it as an ordinary user error.
+
+    Inherits from ``ValueError`` so it is caught by the same error path
+    that already handles invalid engine choices and bad profile names.
+    The single source of truth for "an export argument is invalid" lives
+    in ``ValueError``; we do not maintain a second per-type table in
+    ``cli._report_error``.
     """

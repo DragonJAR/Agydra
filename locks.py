@@ -5,17 +5,13 @@ The lock lives exactly as long as the session it protects:
 - POSIX: the lock fd is inheritable and ``platforms.launch_argv`` exec-replaces
   agydra with agy on the plain launch path, so the lock is held by the
   running agy process itself and the kernel releases it the moment agy
-  exits (crash, kill, logout — no stale locks). Best-effort, POSIX-only
-  PID recording rides along on that SAME plain-exec path only: since
-  ``execvpe`` keeps the PID, the value ``runner.run`` writes into the lock
-  file right before exec-ing is guaranteed to equal the process actually
-  running once exec completes. A launch that instead waits on a spawned
-  child (``launch_as_child``, a Linux sandbox launch) gets a NEW PID from
-  ``subprocess.run`` that never touches the lock file, so no PID is
-  recorded for those — ``lock_holder_pid`` returns ``None`` and callers
-  fall back to the generic busy message instead of naming a process that
-  is not the one actually running (killing it would only drop the flock
-  while the real ``agy`` process kept running unprotected).
+  exits (crash, kill, logout — no stale locks). PID attribution for
+  diagnostics comes from the refcounted holders registry written in place
+  under this same flock (``acquire_lease``/``release_lease``): each holder
+  records its PID and start token, so pid-reuse cannot impersonate a live
+  session. Parsing still accepts the legacy single-PID lock-file form and
+  the Windows NUL seed so a pre-registry lock file degrades to the generic
+  busy message instead of misattributing a process.
 - Windows: launch waits on the child, so the agydra parent holds the lock
   for the whole session and releases it at exit; no PID is recorded there
   either (msvcrt's byte-range locking makes concurrent reads of the same
