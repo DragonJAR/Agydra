@@ -135,10 +135,11 @@ class Rotation:
                         f"{scope} profile rotation is busy; retry in a moment"
                     )
                 self.handles.append(handle)
-        except BaseException as exc:
+        except StoreError:
             self.release()
-            if isinstance(exc, (KeyboardInterrupt, SystemExit, StoreError)):
-                raise
+            raise
+        except OSError as exc:
+            self.release()
             raise StoreError(
                 f"cannot lock {self.scope} profile rotation ({exc})"
             ) from exc
