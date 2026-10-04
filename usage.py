@@ -73,7 +73,6 @@ from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple
 
 import platforms
-import resolver
 import usage_agy
 from account import CHATGPT_PLAN_NAMES, auth_state, normalize_email, _has_credential
 from models import Profile

@@ -18,7 +18,7 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, TypeVar, Union
+from typing import AbstractSet, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
 
 import platforms
 import vocab
@@ -792,7 +792,6 @@ class Store:
             raise StoreError(f"profile {name!r} already exists")
         seq = self._reserve_next_sequence()
         stage_dir: Optional[Path] = None
-        config_stage: Optional[Path] = None
         config_dir: Optional[Path] = None
         try:
             platforms.ensure_dir(self.profiles_dir)
