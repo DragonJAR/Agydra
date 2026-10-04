@@ -731,7 +731,8 @@ class TestSandboxWrap(unittest.TestCase):
     def test_sandbox_wrap_creates_directories_before_tmpfs(self):
         """bwrap requires mount points to exist inside the sandbox before tmpfs
         mounts over them; --dir ensures /run/user/<uid>/bus and keyring exist."""
-        with mock.patch("os.getuid", return_value=1000, create=True):
+        with mock.patch("os.getuid", return_value=1000, create=True), \
+                mock.patch("isolation.os.path.lexists", return_value=False):
             wrapped = isolation.sandbox_wrap(["agy", "login"])
         self.assertIn("--dir", wrapped)
         self.assertIn("--tmpfs", wrapped)
@@ -747,6 +748,26 @@ class TestSandboxWrap(unittest.TestCase):
         keyring_tmpfs_idx = wrapped.index(keyring_dir, keyring_dir_idx + 1)
         self.assertEqual(wrapped[keyring_tmpfs_idx - 1], "--tmpfs")
         self.assertEqual(wrapped[-2:], ["agy", "login"])
+
+    def test_sandbox_wrap_binds_devnull_over_bus_socket(self):
+        """The systemd user bus is a socket, which bwrap cannot cover with a
+        tmpfs; it is masked by binding /dev/null while the keyring directory
+        keeps its tmpfs."""
+        bus = "/run/user/1000/bus"
+        keyring_dir = "/run/user/1000/keyring"
+        with mock.patch("os.getuid", return_value=1000, create=True), \
+                mock.patch("isolation.os.path.lexists", return_value=True), \
+                mock.patch("isolation.os.path.isdir", side_effect=lambda path: path == keyring_dir):
+            wrapped = isolation.sandbox_wrap(["agy", "login"])
+        self.assertEqual(
+            wrapped,
+            [
+                "bwrap", "--dev-bind", "/", "/",
+                "--ro-bind", os.devnull, bus,
+                "--dir", keyring_dir, "--tmpfs", keyring_dir,
+                "agy", "login",
+            ],
+        )
 
 
 if __name__ == "__main__":
