@@ -18,7 +18,7 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, TypeVar, Union
 
 import platforms
 import vocab
@@ -393,13 +393,19 @@ def _zip_add_file(zf: "zipfile.ZipFile", path: Path, arcname: str) -> None:
         shutil.copyfileobj(source, target)
 
 
-def _zip_tree_without_following(zf: "zipfile.ZipFile", root: Path, prefix: str) -> None:
+def _zip_tree_without_following(
+    zf: "zipfile.ZipFile",
+    root: Path,
+    prefix: str,
+    exclude: Optional[AbstractSet[str]] = None,
+) -> None:
     """Add ``root`` under ``prefix``: regular files by content, symlinks as links.
 
     A link is stored as a link (never dereferenced), so nothing outside the
     tree is read into the archive and nothing outside it is lost when the
     tree is deleted afterwards. Sockets and other special files carry no data
-    and are skipped.
+    and are skipped. ``exclude`` names POSIX arcnames (relative to ``root``)
+    that are omitted entirely.
     """
 
     def add_link(path: Path, arcname: str) -> None:
@@ -422,6 +428,8 @@ def _zip_tree_without_following(zf: "zipfile.ZipFile", root: Path, prefix: str) 
         for filename in filenames:
             child = base / filename
             arcname = str(Path(prefix) / relative / filename)
+            if exclude is not None and arcname in exclude:
+                continue
             if child.is_symlink():
                 add_link(child, arcname)
             elif child.is_file():
@@ -562,7 +570,8 @@ class Store:
     def update_config(self, mutator: Callable[[Config], None]) -> Config:
         """Load fresh config, mutate it in place, and atomically save under the
         nonblocking sequence lock. A mutator failure writes nothing and always
-        releases the lock; a busy lock fails immediately with ``StoreError``."""
+        releases the lock; a busy lock fails with ``StoreError`` once the
+        shared read patience (:data:`READ_LOCK_PATIENCE_S`) expires."""
         if not callable(mutator):
             raise StoreError("configuration mutator must be callable")
 
@@ -1997,13 +2006,9 @@ class Store:
 
         def payload(fh, tmp: Path) -> None:
             with zipfile.ZipFile(fh, "w", zipfile.ZIP_DEFLATED) as zf:
-                for file in profile_dir.rglob("*"):
-                    if not file.is_file():
-                        continue
-                    rel = file.relative_to(profile_dir).as_posix()
-                    if rel in excluded_set:
-                        continue
-                    _zip_add_file(zf, file, rel)
+                _zip_tree_without_following(
+                    zf, profile_dir, "", exclude=excluded_set
+                )
                 if claude_config is not None and "_claude-config" not in excluded_set:
                     _zip_tree_without_following(zf, claude_config, "_claude-config")
                 elif claude_config is None and "_keychain" not in excluded_set:

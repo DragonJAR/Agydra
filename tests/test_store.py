@@ -975,6 +975,37 @@ class TestStore(BaseCase):
         with zipfile.ZipFile(backup) as zf:
             self.assertNotIn("_keychain/nokc.secret", zf.namelist())
 
+    def test_backup_zip_stores_file_symlinks_without_dereferencing(self):
+        """A file symlink inside a profile's ``data/`` must reach the
+        archive as a link, never as the dereferenced content: the same
+        no-follow contract ``_claude-config`` archives already enforce.
+        Dereferencing would read outside-store bytes into delete backups
+        and exports (defeating R4's exclusion policy if the link points
+        at ``data/auth.json``)."""
+        import stat
+        import zipfile
+
+        store = Store()
+        store.create("links")
+        outside = store.root / "outside-secret.txt"
+        outside.write_text("outside-content", encoding="utf-8")
+        data_dir = store.profile_data_dir("links", engine="agy")
+        (data_dir / "plain.txt").write_text("plain-content", encoding="utf-8")
+        try:
+            (data_dir / "link.bin").symlink_to(outside)
+        except OSError:
+            self.skipTest("symlinks unavailable on this platform/account")
+        backup = store.delete("links")
+        self.assertIsNotNone(backup)
+        with zipfile.ZipFile(backup) as zf:
+            names = zf.namelist()
+            self.assertIn("data/plain.txt", names)
+            self.assertIn("data/link.bin", names)
+            self.assertTrue(stat.S_ISLNK(zf.getinfo("data/link.bin").external_attr >> 16))
+            self.assertEqual(zf.read("data/link.bin"), str(outside).encode())
+            self.assertNotIn("outside-secret.txt", names)
+            self.assertEqual(zf.read("data/plain.txt"), b"plain-content")
+
     def test_scan_detects_directory_missing_profile_json_as_unreadable(self):
         store = Store()
         store.profile_dir("broken").mkdir(parents=True)
