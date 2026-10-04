@@ -13,7 +13,6 @@ import os
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from conftest import isolated_store_env
 
@@ -644,9 +643,6 @@ class TestRunnerJoinSemantics(unittest.TestCase):
     tests."""
 
     def _session_plan(self, launch_as_child: bool = False):
-        import os
-        import sys
-
         store = Store()
         store.create("work")
         plan = runner.build_plan(
@@ -683,7 +679,6 @@ class TestRunnerJoinSemantics(unittest.TestCase):
         import sys
         from unittest import mock
 
-        import engines
         import platforms
 
         warnings: list = []
@@ -724,7 +719,6 @@ class TestRunnerPickRetryPreservesCwd(unittest.TestCase):
     context is not lost."""
 
     def test_retry_forwards_plan_cwd(self):
-        import contextlib
         import os
         import sys
         from unittest import mock

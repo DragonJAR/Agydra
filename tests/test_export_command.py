@@ -17,13 +17,11 @@ from __future__ import annotations
 import json
 import unittest
 import zipfile
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import cli
 import engines
-import keychain
 import locks
 from conftest import BaseCase
 from store import Store, StoreError

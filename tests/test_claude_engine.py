@@ -444,7 +444,7 @@ class TestInspectClaudeAuth(ClaudeBase):
         self.assertEqual(status.state, "authenticated")
 
     def test_symlinked_state_file_is_unknown_without_spawning(self):
-        profile = self.make_profile("work")
+        self.make_profile("work")
         cfg = self.store.claude_config_dir("work")
         target = self._tmp / "host.json"
         target.write_text("{}", encoding="utf-8")
@@ -1468,7 +1468,7 @@ class TestInheritedUsageState(ClaudeBase):
     def test_deleted_tombstone_never_falls_back_to_inherited_values(self):
         import claude_usage
 
-        profile = self.make_profile("work")
+        self.make_profile("work")
         claude_usage.invalidate_profile_usage(self.store, "work", deleted=True)
         self.assertEqual(self.child_usage_env("work"), {})
 

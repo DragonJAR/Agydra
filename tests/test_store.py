@@ -77,22 +77,6 @@ class TestStore(BaseCase):
         self.assertTrue(store.profiles_dir.is_dir())
         self.assertFalse(store.profiles_dir.is_symlink())
 
-    def test_store_root_symlink_is_allowed_when_profiles_directory_is_real(self):
-        physical_root = self._tmp / "physical-store"
-        alias_root = self._tmp / "store-alias"
-        physical_root.mkdir()
-        try:
-            alias_root.symlink_to(physical_root, target_is_directory=True)
-        except (OSError, NotImplementedError) as exc:
-            self.skipTest(f"directory symlink is unavailable: {exc}")
-
-        store = Store(root=alias_root)
-        profile = store.create("alpha")
-
-        self.assertEqual(profile.name, "alpha")
-        self.assertTrue(store.profiles_dir.is_dir())
-        self.assertFalse(store.profiles_dir.is_symlink())
-
     def test_profile_directory_symlink_is_unreadable_and_never_touched(self):
         store = Store()
         external = self._tmp / "outside-profile"
@@ -709,8 +693,6 @@ class TestStore(BaseCase):
         sequence_lock.release()
 
     def test_rename_and_create_interleaving_fails_cleanly_then_retries(self):
-        import locks
-
         store = Store()
         original = store.create("alpha")
         rename_reached_metadata = threading.Event()

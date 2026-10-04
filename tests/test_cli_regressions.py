@@ -223,7 +223,6 @@ class TestDeletePurgesUnderProfileLock(BaseCase):
 
     def test_purge_exception_reports_completed_delete_and_backup(self):
         import cli
-        import keychain
         from unittest import mock
 
         data_file = self.store.profile_data_dir("kc") / "session.json"

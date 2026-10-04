@@ -16,7 +16,6 @@ import os
 import stat
 import subprocess
 import sys
-import unittest
 from pathlib import Path
 from typing import Optional
 from unittest import mock

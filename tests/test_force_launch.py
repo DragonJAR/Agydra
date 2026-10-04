@@ -8,10 +8,7 @@ same profile via conftest's ``--hold`` gate without a real ``agy``.
 """
 from __future__ import annotations
 
-import os
-import subprocess
 import sys
-import time
 import unittest
 from pathlib import Path
 from unittest import mock

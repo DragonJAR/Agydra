@@ -274,7 +274,6 @@ class TestUsageCli(BaseCase):
         self.assertIn("usage unavailable: session expired (401)", stderr.getvalue())
 
     def test_grok_x_premium_reports_no_quota_on_plan_in_compact_and_detail(self):
-        from datetime import datetime, timedelta, timezone
         from types import SimpleNamespace
         from unittest import mock
         import cli
