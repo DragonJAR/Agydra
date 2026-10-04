@@ -1008,11 +1008,8 @@ def query_claude_usage_live(
 ) -> "UsageResult":
     """Prefer a fresh server-confirmed reading, falling back to the statusLine
     snapshots; a failure reason is surfaced only when nothing is known."""
-    try:
-        if profile is None:
-            profile = _read_profile_without_recovery(store, name)
-    except Exception:
-        return query_claude_usage(store, name, profile=profile, now=now, ttl_seconds=ttl_seconds)
+    if profile is None:
+        profile = _read_profile_without_recovery(store, name)
     reason = None
     if profile.engine == "claude" and not _usage_module()._has_pending_profile_rename(store):
         reason = refresh_live_usage(store, profile, now=now, runner=runner)
