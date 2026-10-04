@@ -505,7 +505,7 @@ def token_payload_for_slot(data: bytes) -> bytes:
     if payload is None:
         raise ValueError(
             f"token_payload_for_slot: expected envelope form, "
-            f"got {data[:60]!r}"
+            f"got {len(data)} bytes without the envelope prefix"
         )
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
@@ -1474,8 +1474,10 @@ def orphan_slots(store, known_names: List[str], keychain_path=_UNRESOLVED_KEYCHA
     ``[]`` when the keychain bridge is unsupported.
 
     ``keychain_path``, when omitted, is resolved here via
-    ``_ensure_target_keychain(store)`` -- never the ambient default
-    keychain, same rule as every other read/write/delete in this module.
+    ``_ensure_target_keychain(store)``. Resolution yields ``None`` only in
+    the degraded skip-marker mode, where the ambient default keychain is
+    the only remaining source of truth and the scan reads it as the
+    documented fail-open degradation for skipped setups.
     A caller that already resolved it for another step of the same
     operation (``doctor --fix``'s purge, which also needs it for the
     matching ``delete_slot`` calls) should pass it through explicitly
