@@ -2115,6 +2115,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args = parser.parse_args(rest)
         if sub == "doctor" and args.force and not args.fix:
             parser.error("-f/--force only applies together with --fix")
+        if sub == "setup" and args.dry_run and args.force:
+            parser.error("-f/--force has no effect with -n/--dry-run (nothing is written)")
         if sub == "usage" and args.claude_settings_apply and not args.claude_settings:
             parser.error("--apply requires --claude-settings PROFILE")
         try:
