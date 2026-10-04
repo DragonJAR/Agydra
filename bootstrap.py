@@ -427,6 +427,24 @@ def check_state(root: Path) -> dict:
     return state
 
 
+def report_state(root: Optional[Path] = None) -> None:
+    """Print the dry-run install report for ``root`` without touching anything.
+
+    Single implementation of the ``setup -n`` preview, shared by the
+    installed CLI subcommand and the repo-root launcher pre-install path
+    so both spellings can never render different facts.
+    """
+    from ui import console_print
+
+    state = check_state(project_root() if root is None else root)
+    console_print("agydra setup (dry run) — current install state:")
+    for key, present in (("venv", state["venv"]), ("console script", state["console"])):
+        console_print(f"  {'[ok]' if present else '[--]'} {key}")
+    console_print(f"  [{'ok' if state['shim_ok'] else '!!'}] shim: {state['shim_state']}")
+    console_print(f"  [{'ok' if state['on_path'] else '!!'}] shim dir on PATH: {state['on_path']}")
+    console_print("run `agydra setup` to create or repair anything marked [--]/[!!]")
+
+
 def run(
     out: Optional[Callable[[str], None]] = None,
     root: Optional[Path] = None,

@@ -99,6 +99,15 @@ def main() -> int:
             return _fail(f"cannot import bootstrap from {repo}: {exc}")
         return bootstrap.run(root=repo, force=force)
 
+    if setup_request and setup_dry_run and not os.path.isfile(script):
+        try:
+            import bootstrap
+        except ImportError as exc:
+            return _fail(f"cannot import bootstrap from {repo}: {exc}")
+        bootstrap.report_state(repo)
+        print("run `python3 agydra.py setup` to create the venv, console script and PATH shim")
+        return 0
+
     if not os.path.isfile(script):
         try:
             import bootstrap
