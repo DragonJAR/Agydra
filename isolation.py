@@ -785,6 +785,18 @@ def use_bwrap() -> bool:
     return platforms.is_linux() and shutil.which("bwrap") is not None
 
 
+def _sandbox_mask(path: str) -> List[str]:
+    """Return the bwrap arguments hiding ``path`` inside the sandbox.
+
+    A directory (or a missing path) is covered by an empty tmpfs. Any other
+    existing entry, such as the systemd user bus socket, cannot be a tmpfs
+    mount point, so ``/dev/null`` is bound over it instead.
+    """
+    if os.path.lexists(path) and not os.path.isdir(path):
+        return ["--ro-bind", os.devnull, path]
+    return ["--dir", path, "--tmpfs", path]
+
+
 def sandbox_wrap(argv: List[str]) -> List[str]:
     """Wrap argv in bubblewrap, masking DBus/keyring so OAuth stays on files.
 
@@ -792,14 +804,7 @@ def sandbox_wrap(argv: List[str]) -> List[str]:
     present. The same overlay-based HOME redirection applies inside.
     """
     uid = getattr(os, "getuid", lambda: 1000)()
-    bus_dir = f"/run/user/{uid}/bus"
-    keyring_dir = f"/run/user/{uid}/keyring"
-    wrapped = [
-        "bwrap",
-        "--dev-bind", "/", "/",
-        "--dir", bus_dir,
-        "--tmpfs", bus_dir,
-        "--dir", keyring_dir,
-        "--tmpfs", keyring_dir,
-    ]
+    wrapped = ["bwrap", "--dev-bind", "/", "/"]
+    for masked in (f"/run/user/{uid}/bus", f"/run/user/{uid}/keyring"):
+        wrapped += _sandbox_mask(masked)
     return wrapped + argv
