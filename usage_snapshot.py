@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import store as store_module
+import usage
 
 SNAPSHOT_FILENAME = "usage-latest.json"
 SCHEMA_VERSION = 1
@@ -348,13 +349,15 @@ def _aware_utc(value: Optional[datetime]) -> datetime:
 
 
 def _parse_instant(value: Any) -> Optional[datetime]:
-    """Parse a snapshot ISO-8601 stamp into aware UTC, or ``None``."""
-    if not isinstance(value, str) or not value:
-        return None
-    text = value[:-1] + "+00:00" if value.endswith("Z") else value
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
+    """Parse a snapshot ISO-8601 stamp into aware UTC, or ``None``.
+
+    Delegates to ``usage.parse_iso_utc``, the single timestamp parser every
+    Agydra reader shares, so snapshot stamps can never drift from the
+    quota reset and capture stamps the same document must stay comparable
+    with.
+    """
+    parsed = usage.parse_iso_utc(value)
+    if parsed is None:
         return None
     return _aware_utc(parsed)
 

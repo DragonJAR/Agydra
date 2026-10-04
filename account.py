@@ -55,6 +55,15 @@ def same_email(first: object, second: object) -> bool:
     return left is not None and right is not None and left.casefold() == right.casefold()
 
 
+CHATGPT_PLAN_NAMES = {
+    "plus": "ChatGPT Plus",
+    "team": "ChatGPT Team",
+    "pro": "ChatGPT Pro",
+    "enterprise": "ChatGPT Enterprise",
+    "free": "ChatGPT Free",
+}
+
+
 def _decode_jwt_payload(token: str) -> dict:
     parts = token.split(".")
     if len(parts) != 3:
@@ -253,14 +262,7 @@ def detect_codex_plan(data_dir: Path) -> Optional[str]:
             if isinstance(auth_claim, dict):
                 plan_type = auth_claim.get("chatgpt_plan_type")
                 if isinstance(plan_type, str) and plan_type:
-                    plan_map = {
-                        "plus": "ChatGPT Plus",
-                        "team": "ChatGPT Team",
-                        "pro": "ChatGPT Pro",
-                        "enterprise": "ChatGPT Enterprise",
-                        "free": "ChatGPT Free",
-                    }
-                    return plan_map.get(plan_type.lower(), f"ChatGPT {plan_type.capitalize()}")
+                    return CHATGPT_PLAN_NAMES.get(plan_type.lower(), f"ChatGPT {plan_type.capitalize()}")
     if _has_credential(raw.get("OPENAI_API_KEY")):
         return "OpenAI API Key"
     return None
@@ -268,6 +270,24 @@ def detect_codex_plan(data_dir: Path) -> Optional[str]:
 
 GROK_AUTH_FILE = "auth.json"
 GROK_CONFIG_FILE = "config.toml"
+
+
+def grok_config_api_key(data_dir: Path) -> Optional[str]:
+    """First credential-bearing ``api_key`` value in Grok's config.toml."""
+    cfg_path = Path(data_dir) / GROK_CONFIG_FILE
+    if not cfg_path.is_file():
+        return None
+    try:
+        content = cfg_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith("api_key") and "=" in line:
+            val = line.split("=", 1)[1].strip().strip('"\'').strip()
+            if _has_credential(val):
+                return val
+    return None
 
 
 def update_grok_tokens(
@@ -360,18 +380,9 @@ def inspect_grok_auth(data_dir: Path) -> Optional[dict]:
                 "auth_type": "api_key",
                 "api_key": api_key,
             }
-    cfg_path = Path(data_dir) / GROK_CONFIG_FILE
-    if cfg_path.is_file():
-        try:
-            content = cfg_path.read_text(encoding="utf-8", errors="replace")
-            for line in content.splitlines():
-                line = line.strip()
-                if line.startswith("api_key") and "=" in line:
-                    val = line.split("=", 1)[1].strip().strip('"\'').strip()
-                    if _has_credential(val):
-                        return {"auth_type": "api_key", "api_key": val}
-        except OSError:
-            pass
+    api_key = grok_config_api_key(data_dir)
+    if api_key is not None:
+        return {"auth_type": "api_key", "api_key": api_key}
     return None
 
 
@@ -421,18 +432,8 @@ def detect_grok_plan(data_dir: Path) -> Optional[str]:
         return "Grok (xAI)"
     if isinstance(raw, dict) and _has_credential(raw.get("XAI_API_KEY")):
         return "xAI API Key"
-    cfg_path = Path(data_dir) / GROK_CONFIG_FILE
-    if cfg_path.is_file():
-        try:
-            content = cfg_path.read_text(encoding="utf-8", errors="replace")
-            for line in content.splitlines():
-                line = line.strip()
-                if line.startswith("api_key") and "=" in line:
-                    val = line.split("=", 1)[1].strip().strip('"\'').strip()
-                    if _has_credential(val):
-                        return "xAI API Key"
-        except OSError:
-            pass
+    if grok_config_api_key(data_dir) is not None:
+        return "xAI API Key"
     return None
 
 
