@@ -473,6 +473,21 @@ def _assert_free(store: Store, name: str, action: str = "modifying the profile")
         )
 
 
+def _ensure_ref_unchanged(store: Store, ref: object, expected_name: str, action: str) -> None:
+    """Fail closed when a profile reference moved between resolution and lock.
+
+    The lock was taken on ``expected_name``; if a concurrent rename swapped
+    the ref to a different profile, the operation would otherwise silently
+    target the wrong file. The single source of truth for that error keeps
+    the wording consistent across every mutation command.
+    """
+    if store.resolve_ref(ref) != expected_name:
+        raise StoreError(
+            f"profile reference {ref!r} changed while acquiring its lock; "
+            f"retry {action}"
+        )
+
+
 def _acquire_profile_lock(
     store: Store, name: str, action: str
 ) -> locks.LockHandle:
@@ -1452,11 +1467,7 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
         for name in sorted({src, *resolved}):
             stack.enter_context(_acquire_profile_lock(store, name, "sharing config"))
         for reference, expected_name in references:
-            if store.resolve_ref(reference) != expected_name:
-                raise StoreError(
-                    f"profile reference {reference!r} changed while acquiring locks; "
-                    "retry sharing config"
-                )
+            _ensure_ref_unchanged(store, reference, expected_name, "sharing config")
         src_profile = store.get(src)
         if src_profile.name != src:
             raise StoreError(
@@ -1529,10 +1540,7 @@ def cmd_import(store: Store, args) -> int:
         )
     name = store.resolve_ref(ref)
     with _acquire_profile_lock(store, name, "importing into it"), ExitStack() as guards:
-        if store.resolve_ref(ref) != name:
-            raise StoreError(
-                f"profile reference {ref!r} changed while acquiring its lock; retry import"
-            )
+        _ensure_ref_unchanged(store, ref, name, "import")
         profile = store.get(name)
         if profile.name != name:
             raise StoreError(
@@ -1630,11 +1638,7 @@ def cmd_export(store: Store, args) -> int:
     excluded_relpaths: List[str] = [f"data/{p}" for p in engine_excluded]
     excluded_relpaths.append("_keychain/")
     with _acquire_profile_lock(store, name, "exporting it"):
-        if store.resolve_ref(args.ref) != name:
-            raise StoreError(
-                f"profile reference {args.ref!r} changed while acquiring its lock; "
-                "retry export"
-            )
+        _ensure_ref_unchanged(store, args.ref, name, "export")
         dest = args.output if args.output is not None else _default_export_path(name)
         manifest = {
             "format_version": 1,
