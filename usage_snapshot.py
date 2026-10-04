@@ -335,7 +335,7 @@ def write_snapshot(
     )
     try:
         store_module._atomic_write_json(snapshot_path(store), document)
-    except Exception:
+    except OSError:
         return None
     return document
 
