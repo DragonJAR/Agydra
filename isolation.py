@@ -1135,7 +1135,7 @@ def _sandbox_mask(path: str) -> List[str]:
     return ["--dir", path, "--tmpfs", path]
 
 
-def sandbox_wrap(argv: List[str]) -> List[str]:
+def sandbox_wrap(argv: List[str], runtime_dir: Optional[str] = None) -> List[str]:
     """Wrap argv in bubblewrap, masking DBus/keyring so OAuth stays on files.
 
     Only called on Linux when ``use_linux_sandbox`` is enabled and bwrap is
@@ -1145,7 +1145,8 @@ def sandbox_wrap(argv: List[str]) -> List[str]:
     absent paths get a tmpfs.
     """
     uid = getattr(os, "getuid", lambda: 1000)()
+    base = runtime_dir if runtime_dir is not None else f"/run/user/{uid}"
     wrapped = ["bwrap", "--dev-bind", "/", "/"]
-    for masked in (f"/run/user/{uid}/bus", f"/run/user/{uid}/keyring"):
-        wrapped += _sandbox_mask(masked)
+    for name in ("bus", "keyring"):
+        wrapped.extend(_sandbox_mask(os.path.join(base, name)))
     return wrapped + argv
