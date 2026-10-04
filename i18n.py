@@ -237,6 +237,25 @@ _STRINGS: dict[str, dict[str, str]] = {
         'usage.snapshot_ambiguous': 'ambiguous',
         'usage.snapshot_corrupt': 'unknown (invalid snapshot)',
         'usage.snapshot_window': '{name}: {cell} · reset: {reset}',
+        'usage.weekday.mon': 'Mon',
+        'usage.weekday.tue': 'Tue',
+        'usage.weekday.wed': 'Wed',
+        'usage.weekday.thu': 'Thu',
+        'usage.weekday.fri': 'Fri',
+        'usage.weekday.sat': 'Sat',
+        'usage.weekday.sun': 'Sun',
+        'usage.month.1': 'Jan',
+        'usage.month.2': 'Feb',
+        'usage.month.3': 'Mar',
+        'usage.month.4': 'Apr',
+        'usage.month.5': 'May',
+        'usage.month.6': 'Jun',
+        'usage.month.7': 'Jul',
+        'usage.month.8': 'Aug',
+        'usage.month.9': 'Sep',
+        'usage.month.10': 'Oct',
+        'usage.month.11': 'Nov',
+        'usage.month.12': 'Dec',
         'usage.snapshot_unavailable': 'Quota unknown; enable opt-in statusLine capture in this profile.',
         'usage.snapshot_reset_unknown': 'unknown',
         'claude.binary_hint': 'Set AGYDRA_CLAUDE_BIN or pass -b with the Claude Code executable path.',
@@ -444,6 +463,25 @@ _STRINGS: dict[str, dict[str, str]] = {
         'usage.snapshot_ambiguous': 'ambiguo',
         'usage.snapshot_corrupt': 'desconocido (snapshot inválido)',
         'usage.snapshot_window': '{name}: {cell} · reinicio: {reset}',
+        'usage.weekday.mon': 'lun',
+        'usage.weekday.tue': 'mar',
+        'usage.weekday.wed': 'mié',
+        'usage.weekday.thu': 'jue',
+        'usage.weekday.fri': 'vie',
+        'usage.weekday.sat': 'sáb',
+        'usage.weekday.sun': 'dom',
+        'usage.month.1': 'ene',
+        'usage.month.2': 'feb',
+        'usage.month.3': 'mar',
+        'usage.month.4': 'abr',
+        'usage.month.5': 'may',
+        'usage.month.6': 'jun',
+        'usage.month.7': 'jul',
+        'usage.month.8': 'ago',
+        'usage.month.9': 'sep',
+        'usage.month.10': 'oct',
+        'usage.month.11': 'nov',
+        'usage.month.12': 'dic',
         'usage.snapshot_unavailable': 'Cuota desconocida; habilita la captura statusLine opt-in en este perfil.',
         'usage.snapshot_reset_unknown': 'desconocido',
         'claude.binary_hint': 'Define AGYDRA_CLAUDE_BIN o pasa -b con la ruta del ejecutable Claude Code.',
@@ -605,21 +643,15 @@ necesidad de reiniciar.
     _set_active(normalized)
 
 
+_WEEKDAY_KEYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
 def format_usage_timestamp(dt: Optional[object] = None) -> str:
     """Format a localized, clean timestamp: e.g. 'dom 27 sep · 14:32' or 'Sun Sep 27 · 14:32'."""
     from datetime import datetime
     if dt is None:
         dt = datetime.now()
-    lang = _get_active()
-    if lang == 'es':
-        days = ['lun', 'mar', 'mié', 'jue', 'vie', 'sáb', 'dom']
-        months = ['', 'ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic']
-        day_str = days[dt.weekday()]
-        mo_str = months[dt.month]
-        return f"{day_str} {dt.day} {mo_str} · {dt.strftime('%H:%M')}"
-    else:
-        days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-        months = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-        day_str = days[dt.weekday()]
-        mo_str = months[dt.month]
-        return f"{day_str} {mo_str} {dt.day} · {dt.strftime('%H:%M')}"
+    weekday = _WEEKDAY_KEYS[dt.weekday()]
+    day_str = t(f"usage.weekday.{weekday}")
+    month_str = t(f"usage.month.{dt.month}")
+    return f"{day_str} {dt.day} {month_str} · {dt.strftime('%H:%M')}"
