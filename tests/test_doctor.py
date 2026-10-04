@@ -902,6 +902,19 @@ class TestIsolationRecovery(BaseCase):
         preview = doctor._preview_fixables(self.store, self._ctx())
         self.assertIn("remove orphan overlay directory overlays/ghost", preview)
 
+    def test_preview_omits_non_overlay_engines_apply_skips(self):
+        """The confirmed preview must never offer an action ``--fix``
+        would silently skip: overlay migration is overlay-engine-only, so
+        a claude profile's stale directory under ``overlays/`` stays out
+        of the preview exactly as ``_apply_fixes`` skips it."""
+        self.store.create("cc", engine="claude")
+        (self.store.overlays_dir / "cc" / ".claude").mkdir(parents=True)
+        preview = doctor._preview_fixables(self.store, self._ctx())
+        self.assertFalse(
+            any("migrate overlay data for 'cc'" in line for line in preview),
+            f"non-overlay engine offered an unfixable migration:\n{preview}",
+        )
+
 
 class TestUiPaintValidation(unittest.TestCase):
     def test_paint_invalid_style_raises_keyerror_with_color_disabled(self):

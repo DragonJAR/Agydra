@@ -15,7 +15,7 @@ import keychain
 import locks
 import platforms
 from store import Store, StoreError
-from ui import paint, warn
+from ui import console_print, paint, warn
 
 OK = "ok"
 WARN = "warn"
@@ -510,7 +510,7 @@ def _fix_orphans(store: Store, names: Sequence[str]) -> None:
         return
     removed = orphans.remove_orphans(store, scan)
     for line in removed:
-        print(paint("[fix]", "cyan", "bold") + f" removed: {line}")
+        console_print(paint("[fix]", "cyan", "bold") + f" removed: {line}")
 
 
 def _directory_identity(path: Path) -> Tuple[int, int]:
@@ -532,9 +532,16 @@ def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
     for name in ctx.names:
         if not store.exists(name):
             continue
-        p = profiles_by_name.get(name)
-        engine_name = (getattr(p, "engine", "agy") or "agy") if p else "agy"
-        driver = engines.get_engine(engine_name)
+        snapshot = profiles_by_name.get(name)
+        if snapshot is None or snapshot.name != name:
+            continue
+        engine_name = getattr(snapshot, "engine", "agy") or "agy"
+        try:
+            driver = engines.get_engine(engine_name)
+        except ValueError:
+            continue
+        if not driver.uses_overlay:
+            continue
         link = store.overlays_dir / name / driver.data_dir_name
         if link.exists() and not isolation._is_link(link):
             lines.append(
@@ -697,7 +704,7 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
             except (isolation.IsolationError, OSError) as exc:
                 warn(f"could not relink overlay for {name!r} ({exc})")
                 continue
-            print(
+            console_print(
                 paint("[fix]", "cyan", "bold")
                 + f" migrated overlay data for {name!r} and relinked {driver.data_dir_name}"
             )
@@ -712,7 +719,7 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
 
         try:
             store.update_config(clear_observed_default)
-            print(
+            console_print(
                 paint("[fix]", "cyan", "bold")
                 + f" cleared dangling default profile {default!r}"
             )
@@ -755,7 +762,7 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
             except (keychain.KeychainError, OSError, AttributeError) as exc:
                 warn(f"could not purge orphan keychain slot {orphan!r} ({exc})")
                 continue
-            print(
+            console_print(
                 paint("[fix]", "cyan", "bold")
                 + f" purged orphan keychain slot for {orphan!r}"
             )
@@ -791,7 +798,7 @@ def _print_check_pass(results: List[Tuple[str, str, str]]) -> None:
     for _label, status, message in results:
         symbol_color = {OK: "green", WARN: "yellow", FAIL: "red"}[status]
         symbol = paint({OK: "[ok]", WARN: "[!!]", FAIL: "[XX]"}[status], symbol_color, "bold")
-        print(f"{symbol} {message}")
+        console_print(f"{symbol} {message}")
 
 
 def _check_exit_code(results: List[Tuple[str, str, str]]) -> int:
@@ -822,11 +829,11 @@ def run_checks(store: Store, fix: bool = False, ctx: Optional["_DoctorContext"] 
     use ``cmd_doctor`` which calls ``_apply_fixes`` directly after user
     confirmation.
     """
-    print(
+    console_print(
         paint("agydra doctor", "cyan", "bold")
         + f" — agydra {__version__} on {sys.platform}"
     )
-    print(
+    console_print(
         paint("legend: ", "dim")
         + paint("[ok]", "green", "bold") + paint("=pass ", "dim")
         + paint("[!!]", "yellow", "bold") + paint("=warn ", "dim")
@@ -842,12 +849,12 @@ def run_checks(store: Store, fix: bool = False, ctx: Optional["_DoctorContext"] 
     else:
         exit_code = _check_exit_code(results)
     if exit_code:
-        print()
-        print(
+        console_print()
+        console_print(
             paint("result: ", "red", "bold")
             + paint("FAIL — fix the [XX] items above", "red")
         )
     else:
-        print()
-        print(paint("result: healthy", "green", "bold"))
+        console_print()
+        console_print(paint("result: healthy", "green", "bold"))
     return exit_code
