@@ -128,6 +128,18 @@ class UsageResponseError(ValueError):
     """An external usage endpoint returned data that could not be parsed."""
 
 
+def _is_ineligible_message(text: object) -> bool:
+    """True when ``text`` looks like an agy eligibility rejection.
+
+    Single source of truth so the ``is_ineligible`` flag stays consistent
+    across the subprocess-stderr path and the JSON-error path.
+    """
+    if not isinstance(text, str):
+        return False
+    lowered = text.lower()
+    return "eligibility" in lowered or "not eligible" in lowered
+
+
 def _is_finite_number(value: object) -> bool:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return False
@@ -1029,9 +1041,9 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
         detail_lines = (proc.stderr or "").strip().splitlines()
         suffix = f": {detail_lines[0]}" if detail_lines else ""
         err_msg = f"agy exited {proc.returncode}{suffix}"
-        ineligible = "eligibility check failed" in err_msg.lower() or "not eligible" in err_msg.lower()
         return UsageResult(
-            name=name, ok=False, engine=engine, email=profile.email, error=err_msg, is_ineligible=ineligible
+            name=name, ok=False, engine=engine, email=profile.email,
+            error=err_msg, is_ineligible=_is_ineligible_message(err_msg),
         )
 
     try:
@@ -1042,9 +1054,9 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     if not isinstance(payload, dict) or payload.get("status") != "SUCCESS":
         message = payload.get("error") if isinstance(payload, dict) else None
         err_msg = str(message) if message else "not eligible"
-        ineligible = "eligibility" in err_msg.lower() or "not eligible" in err_msg.lower()
         return UsageResult(
-            name=name, ok=False, engine=engine, email=profile.email, error=err_msg, is_ineligible=ineligible
+            name=name, ok=False, engine=engine, email=profile.email,
+            error=err_msg, is_ineligible=_is_ineligible_message(err_msg),
         )
 
     command = payload.get("command")
