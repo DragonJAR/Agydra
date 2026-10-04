@@ -76,11 +76,8 @@ def scoped_token_bytes(store, name: str, profile, data_dir: Path) -> Optional[by
     decoded = keychain.decode_go_keyring_secret(secret)
     if decoded is None:
         return None
-    profile_email = account.normalize_email(profile.email)
-    if profile_email is None:
-        return None
     identity = account.email_from_raw(decoded)
-    if identity is None or identity != profile_email:
+    if not account.same_email(identity, profile.email):
         return None
     try:
         return keychain.token_payload_for_slot(secret)

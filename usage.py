@@ -75,7 +75,7 @@ from typing import Callable, List, Literal, Optional, Tuple
 import platforms
 import resolver
 import usage_agy
-from account import auth_state, normalize_email, _has_credential
+from account import CHATGPT_PLAN_NAMES, auth_state, normalize_email, _has_credential
 from models import Profile
 
 DEFAULT_TIMEOUT_S = 20
@@ -370,14 +370,7 @@ def parse_codex_usage_payload(
     raw_plan = payload.get("plan_type")
     detected_plan = None
     if isinstance(raw_plan, str) and raw_plan:
-        plan_map = {
-            "plus": "ChatGPT Plus",
-            "team": "ChatGPT Team",
-            "pro": "ChatGPT Pro",
-            "enterprise": "ChatGPT Enterprise",
-            "free": "ChatGPT Free",
-        }
-        detected_plan = plan_map.get(raw_plan.lower(), f"ChatGPT {raw_plan.capitalize()}")
+        detected_plan = CHATGPT_PLAN_NAMES.get(raw_plan.lower(), f"ChatGPT {raw_plan.capitalize()}")
 
     credits_info = payload.get("credits")
     if isinstance(credits_info, dict) and detected_plan:
@@ -1043,7 +1036,7 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
 
     try:
         payload = json.loads(proc.stdout)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
         return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error="non-JSON response")
 
     if not isinstance(payload, dict) or payload.get("status") != "SUCCESS":
@@ -1101,9 +1094,14 @@ def gather_usage_report(
         try:
             results.append(query_profile_usage(store, name, timeout=timeout))
         except Exception as exc:
+            known: dict = {}
+            try:
+                known["engine"] = store.get(name).engine
+            except Exception:
+                pass
             results.append(
                 UsageResult(name=name, ok=False,
-                            error=f"unexpected error: {exc}")
+                            error=f"unexpected error: {exc}", **known)
             )
     return results
 

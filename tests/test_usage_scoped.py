@@ -193,6 +193,17 @@ class TestScopedTokenBytes(_ScopedBase):
         data_dir = self.store.profile_data_dir("alpha", engine="agy")
         self.assertIsNone(usage_agy.scoped_token_bytes(self.store, "alpha", profile, data_dir))
 
+    def test_secret_identity_matches_case_insensitively(self):
+        """The slot's identity and the profile's cached email naming the
+        same address with different casing are one account (the central
+        ``account.same_email`` rule); the profile's own backup must not
+        be refused over case alone."""
+        self._rm_disk_token("alpha")
+        self._write_secret("alpha", plain_json=_slot_payload_json("Alpha@Example.com"))
+        store, profile = self.store, self.store.get("alpha")
+        data_dir = self.store.profile_data_dir("alpha", engine="agy")
+        self.assertIsNotNone(usage_agy.scoped_token_bytes(store, "alpha", profile, data_dir))
+
     def test_none_when_no_sources(self):
         self._rm_disk_token("alpha")
         store, profile = self.store, self.store.get("alpha")

@@ -223,6 +223,20 @@ class TestQueryProfileUsageFailureModes(_UsageBase):
         self.assertFalse(result.ok)
         self.assertIn("could not run agy", result.error)
 
+    def test_pathological_json_nesting_degrades_without_raising(self):
+        """Over-nested JSON makes ``json.loads`` raise ``RecursionError``,
+        which is not a ``JSONDecodeError`` subclass: the parser must
+        contain it into the same clean ``non-JSON response`` degradation
+        instead of breaking ``query_profile_usage``'s never-raises
+        contract (R6 rejects pathological documents exactly like
+        ``account._decode_jwt_payload`` does)."""
+        path = self._tmp / "deep.json"
+        path.write_text('{"a":' * 300000 + "1" + "}" * 300000, encoding="utf-8")
+        os.environ["FAKE_AGY_USAGE_RESPONSE_FILE"] = str(path)
+        result = usage.query_profile_usage(self.store, "alpha")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "non-JSON response")
+
 
 class TestQueryProfileUsageCredentialUnavailable(_UsageBase):
     """When no credential is resolvable (disk token gone AND no keychain
