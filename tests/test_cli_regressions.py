@@ -643,24 +643,25 @@ class TestLateFlagWarningNoDuplicates(BaseCase):
         self.store.create("alpha")
 
     def test_repeated_flag_swallowing_value_flag_warns_exactly_once(self):
-        # -p alpha consumes profile; -p beta repeats, swallowing -b /opt/fake
+        # -p alpha consumes profile; -p beta repeats and is itself the
+        # first forwarded flag the note must name; -b /opt/fake follows it
         result = self._run_cli("-p", "alpha", "-p", "beta", "-b", "/opt/fake")
-        needle = "'-b /opt/fake' was passed to agy, not agydra"
+        needle = "'-p beta' was passed to agy, not agydra"
         self.assertIn(needle, result.stderr)
         self.assertEqual(
             result.stderr.count(needle), 1,
-            f"Expected exactly 1 warning for late -b, got:\n{result.stderr}",
+            f"Expected exactly 1 warning for the forwarded repeat, got:\n{result.stderr}",
         )
 
     def test_repeated_flag_swallowing_boolean_flag_warns_exactly_once(self):
         # -p alpha consumes profile; -p beta repeats, swallowing -n
         # (This was the original bug that launched without dry-run)
         result = self._run_cli("-p", "alpha", "-p", "beta", "-n")
-        needle = "'-n' was passed to agy, not agydra"
+        needle = "'-p beta' was passed to agy, not agydra"
         self.assertIn(needle, result.stderr)
         self.assertEqual(
             result.stderr.count(needle), 1,
-            f"Expected exactly 1 warning for late -n, got:\n{result.stderr}",
+            f"Expected exactly 1 warning for the forwarded repeat, got:\n{result.stderr}",
         )
 
     def test_late_flag_after_non_flag_still_warns_exactly_once(self):

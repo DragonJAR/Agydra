@@ -135,8 +135,8 @@ class TestConsumeBundles(unittest.TestCase):
         from that token onward, including the later ``-n``, is dumped into
         ``rest`` untouched. Without a diagnostic this is silent and
         order-dependent: the user asked for a dry run and got a real
-        launch instead. The extractor must warn on stderr that ``-n`` was
-        forwarded to agy instead of being consumed."""
+        launch instead. The note must name the first forwarded flag (the
+        repeated ``-p beta``) so the forwarded tail is never silent."""
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
             values, rest = _consume_launch_flags(
@@ -146,13 +146,14 @@ class TestConsumeBundles(unittest.TestCase):
         self.assertIsNone(values["dry-run"])
         self.assertEqual(rest, ["-p", "beta", "-n", "chat"])
         out = buf.getvalue()
-        self.assertIn("-n", out)
+        self.assertIn("'-p beta' was passed to agy", out)
         self.assertIn("must come first", out)
 
     def test_reverse_order_control_still_consumes_dry_run(self):
-        """Control case: same flags, ``-n`` placed BEFORE the repeat. This
-        already worked (order-independence was the bug) and must keep
-        working, with no spurious warning since nothing is swallowed."""
+        """Control case: same flags, ``-n`` placed BEFORE the repeat. The
+        dry-run flag is consumed before the swallow point (order
+        independence) and only the forwarded repeat ``-p beta`` is
+        diagnosed on stderr."""
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
             values, rest = _consume_launch_flags(
@@ -161,7 +162,7 @@ class TestConsumeBundles(unittest.TestCase):
         self.assertTrue(values["dry-run"])
         self.assertEqual(values["profile"], "alpha")
         self.assertEqual(rest, ["-p", "beta"])
-        self.assertEqual(buf.getvalue(), "")
+        self.assertIn("'-p beta' was passed to agy", buf.getvalue())
 
 
 class TestLateBundleWarning(unittest.TestCase):

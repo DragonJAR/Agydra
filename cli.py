@@ -378,7 +378,7 @@ def _consume_launch_flags(
         if any(values[key] is not None for key, _inline, _width in matched):
             swallowed = argv[i:]
             rest.extend(swallowed)
-            _warn_late_flags(values, swallowed, include_booleans=True)
+            _warn_late_flags(values, swallowed, include_booleans=True, ignore_consumed=True)
             return LaunchFlagsResult(values, rest, swallowed=True, swallowed_index=i)
         i += 1
         for key, inline, width in matched:
@@ -396,6 +396,7 @@ def _warn_late_flags(
     raw: Sequence[str],
     *,
     include_booleans: bool = False,
+    ignore_consumed: bool = False,
 ) -> None:
     """Detect value flags that slipped past the extractor into agy's argv.
 
@@ -416,6 +417,11 @@ def _warn_late_flags(
     too. The general "flag after a non-flag token" case intentionally
     leaves booleans unchecked — that ordering rule is already documented
     and a late boolean there is not silently discarded, it's just agy's.
+
+    ``ignore_consumed=True`` marks that tail-only scan: the head already
+    consumed its own occurrence of the repeated flag, so a taken value slot
+    must not suppress a tail repeat — the repeat is exactly the
+    order-dependence being surfaced.
     """
     for i, token in enumerate(raw):
         if token == "--":
@@ -425,7 +431,8 @@ def _warn_late_flags(
             continue
         for key, _inline, width in matched:
             short, long_, takes_value, _metavar, _help = _LAUNCH_FLAGS[key]
-            if (not takes_value and not include_booleans) or values[key] is not None:
+            consumed = values[key] is not None and not ignore_consumed
+            if (not takes_value and not include_booleans) or consumed:
                 continue
             if width == 2 and i + 1 < len(raw):
                 spelling = f"{token} {raw[i + 1]}"
@@ -871,12 +878,16 @@ def _usage_availability_cell(fraction: Optional[float], bar_width: int, width: i
     return pad(paint(f"{gauge} {round(fraction * 100):>2}", usage.usage_color(fraction)), width)
 
 
+def _windows_text(weekly: Optional[float], five_hour: Optional[float]) -> str:
+    if weekly is None or five_hour is None:
+        return paint("-", "dim")
+    return f"{round(weekly * 100):>3} · {round(five_hour * 100):>3}"
+
+
 def _usage_windows_cell(weekly: Optional[float], five_hour: Optional[float], shown: bool) -> str:
     if not shown:
         return ""
-    if weekly is None or five_hour is None:
-        return pad(paint("-", "dim"), 13)
-    return pad(f"{round(weekly * 100):>3} · {round(five_hour * 100):>3}", 13)
+    return pad(_windows_text(weekly, five_hour), 13)
 
 
 def _plan_separated(cell: str, width: int) -> str:
@@ -1126,10 +1137,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                 c_disp = _usage_availability_cell(c_avail, bar_w, disp_w)
 
                 if show_windows:
-                    if c_wk is not None and c_5h is not None:
-                        c_win = f"{round(c_wk * 100):>3} · {round(c_5h * 100):>3}"
-                    else:
-                        c_win = paint("-", "dim")
+                    c_win = _windows_text(c_wk, c_5h)
                 else:
                     c_win = ""
 
@@ -1713,13 +1721,7 @@ def cmd_setup(_store: Store, args) -> int:
     import bootstrap
 
     if getattr(args, "dry_run", False):
-        state = bootstrap.check_state(bootstrap.project_root())
-        print("agydra setup (dry run) — current install state:")
-        for key, present in (("venv", state["venv"]), ("console script", state["console"])):
-            print(f"  {'[ok]' if present else '[--]'} {key}")
-        print(f"  [{'ok' if state['shim_ok'] else '!!'}] shim: {state['shim_state']}")
-        print(f"  [{'ok' if state['on_path'] else '!!'}] shim dir on PATH: {state['on_path']}")
-        print("run `agydra setup` to create or repair anything marked [--]/[!!]")
+        bootstrap.report_state()
         return 0
     return bootstrap.run(force=getattr(args, "force", False))
 
@@ -1845,7 +1847,7 @@ _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
 
 def _report_error(exc: BaseException) -> int:
     """Single error-mapping table shared by both dispatch paths."""
-    if isinstance(exc, (StoreError, IsolationError, BootstrapError, keychain.KeychainError, ValueError)):
+    if isinstance(exc, _CLI_REPORTABLE_ERRORS):
         _error(str(exc))
         return 1
     if isinstance(exc, EOFError):
@@ -1858,6 +1860,17 @@ def _report_error(exc: BaseException) -> int:
         print("cancelled", file=sys.stderr)
         return 130
     raise exc
+
+
+_CLI_REPORTABLE_ERRORS: Tuple[type, ...] = (
+    StoreError,
+    IsolationError,
+    BootstrapError,
+    EOFError,
+    keychain.KeychainError,
+    OSError,
+    ValueError,
+)
 
 
 def _print_top_level_help() -> None:
@@ -2102,10 +2115,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             parser.error("--apply requires --claude-settings PROFILE")
         try:
             return args.func(store, args)
-        except (
-            StoreError, IsolationError, BootstrapError, EOFError, OSError,
-            KeyboardInterrupt, keychain.KeychainError, ValueError,
-        ) as exc:
+        except _CLI_REPORTABLE_ERRORS as exc:
             return _report_error(exc)
 
     try:
@@ -2135,7 +2145,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             plan_kwargs["read_only"] = True
         plan = runner.build_plan(store, agy_args, **plan_kwargs)
         return runner.run(plan, store=store, dry_run=bool(values["dry-run"]))
-    except (StoreError, IsolationError, keychain.KeychainError, OSError, KeyboardInterrupt, ValueError) as exc:
+    except _CLI_REPORTABLE_ERRORS as exc:
         return _report_error(exc)
 
 
