@@ -488,15 +488,54 @@ def _kill_process_group(proc: "subprocess.Popen") -> None:
             pass
 
 
+_CMD_METACHARACTERS = frozenset("&|<>^")
+"""cmd.exe parses these before any variable expansion.
+
+A child command line built from the caller must escape them so an
+argument that legitimately contains a metacharacter (a test fixture,
+a user-supplied path) is delivered as a single token to the child
+rather than as a second command. Double-quoting is the cmd.exe
+idiom and works without altering the child re-quoting rule
+(double the embedded quote for the child to see a literal quote);
+no production call site passes metacharacters today, but the
+escape is a defensive last layer for a corner case the test suite
+explicitly pins against (cmd.exe contract: test_windows_batch).
+"""
+
+
+def _escape_cmd_argument(value: str) -> str:
+    """Quote a single argument for ``cmd /c`` so cmd.exe delivers it as one token.
+
+    A bare argument whose first or last character is a double quote
+    would be misinterpreted by cmd's argument parser; wrap the whole
+    token in quotes and double any embedded quotes, the canonical
+    cmd.exe convention.
+    """
+    if not value:
+        return '""'
+    if value[0] == '"' or value[-1] == '"' or any(c in _CMD_METACHARACTERS for c in value):
+        return '"' + value.replace('"', '""') + '"'
+    return value
+
+
 def _normalize_windows_argv(argv: Sequence[str]) -> list[str]:
     """On Windows, batch files (.cmd / .bat) cannot be directly executed by
-    CreateProcessW with shell=False; cmd.exe /c must host them."""
+    CreateProcessW with shell=False; cmd.exe /c must host them.
+
+    Each argument after the batch file is run through
+    :func:`_escape_cmd_argument` so a metacharacter-bearing token
+    (``&``, ``|``, ``<``, ``>``, ``^``) is delivered to the batch file
+    as a single argument rather than a second command, and a token
+    whose first or last character is a double quote is not truncated
+    by cmd.exe's argument parser.
+    """
     cmd = [str(a) for a in argv]
     if is_windows() and cmd:
         target = cmd[0].lower()
         if target.endswith((".cmd", ".bat")):
-            return ["cmd", "/c", *cmd]
+            return ["cmd", "/c", cmd[0], *[_escape_cmd_argument(a) for a in cmd[1:]]]
     return cmd
+
 
 
 def run_with_group_kill(
