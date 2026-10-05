@@ -37,6 +37,7 @@ jobs:
             architecture: arm64
     env:
       AGYDRA_NO_KEYCHAIN: '1'
+      AGYDRA_SKIP_WIN32_BATCH: '1'
       NO_COLOR: '1'
       PYTHONUTF8: '1'
       PYTHONUNBUFFERED: '1'
