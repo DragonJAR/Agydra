@@ -1144,68 +1144,117 @@ def format_mini_bar(remaining_fraction: float, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+_SUMMARY_FAMILIES = ("gemini", "claude", "claude_code", "codex", "grok")
+"""Engine families the quota summary tabulates.
+
+``claude`` is the legacy agy Claude family (``gemini/agydra``-style billing
+shapes that used the ``claude`` model name); ``claude_code`` is the
+Anthropic Claude Code family surfaced by ``claude -p /usage``. They
+must remain distinct: a Claude Code reading must never be merged
+into the Antigravity Claude summary, even when the model name text
+overlaps.
+"""
+
+
+def _empty_summary() -> dict:
+    """One family's empty quota row, shared by every engine family."""
+    return {
+        "weekly": None,
+        "five_h": None,
+        "available": None,
+        "reset_time": None,
+    }
+
+
+def _bucket_destination(bucket, key: str) -> Optional[str]:
+    """Which slot of ``summary[key]`` a bucket fills, or ``None`` to skip.
+
+    A bucket is identified by either ``window`` (``"5h"`` / ``"weekly"``) or
+    ``id``; an unknown bucket falls into ``weekly`` if the weekly slot is
+    still empty (a defensive catch-all for buckets whose names do not
+    name a window directly).
+    """
+    win = bucket.window.lower()
+    bid = bucket.id.lower()
+    if "weekly" in win or "weekly" in bid:
+        return "weekly"
+    if "5h" in win or "5h" in bid:
+        return "five_h"
+    return "weekly"  # caller guards on summary[key]["weekly"] is None
+
+
+def _select_summary_key(lower_name: str, summary: dict) -> Optional[str]:
+    """Map a bucket's group name to a summary family, or ``None`` to skip.
+
+    The explicit-keyword branch handles every engine's own naming; the
+    fallback branch keeps an Antigravity Claude / Codex / Grok summary
+    populated when the bucket name is too generic to match. The result
+    is the first family that still has both windows empty.
+    """
+    if "gemini" in lower_name:
+        return "gemini"
+    if "claude code" in lower_name:
+        return "claude_code"
+    for keyword, key in (
+        (("claude", "gpt", "3p"), "claude"),
+        (("codex", "openai"), "codex"),
+        (("grok", "xai"), "grok"),
+    ):
+        if any(k in lower_name for k in keyword):
+            return key
+    for key in _SUMMARY_FAMILIES:
+        if summary[key]["weekly"] is None and summary[key]["five_h"] is None:
+            return key
+    return None
+
+
+def _apply_to_summary(summary: dict, key: str, bucket) -> None:
+    """Fill the right window of ``summary[key]`` from one bucket."""
+    destination = _bucket_destination(bucket, key)
+    summary[key][destination] = bucket.remaining_fraction
+    summary[key][f"{destination}_reset"] = bucket.reset_time
+    if destination == "five_h" and summary[key]["weekly"] is None:
+        summary[key]["weekly"] = bucket.remaining_fraction
+        summary[key]["weekly_reset"] = bucket.reset_time
+
+
+def _compute_available(entry: dict) -> None:
+    """Reduce ``weekly`` and ``five_h`` to ``available`` and ``reset_time``.
+
+    The bottleneck is whichever window is the most constraining. When
+    only one window is known, that window is the bottleneck. Mirrors
+    the algorithm documented for AGENTS.md R10 / ``usage_snapshot``.
+    """
+    weekly = entry["weekly"]
+    five_h = entry["five_h"]
+    weekly_reset = entry.get("weekly_reset")
+    five_h_reset = entry.get("five_h_reset")
+    if weekly is not None and five_h is not None:
+        if five_h <= weekly:
+            entry["available"] = five_h
+            entry["reset_time"] = five_h_reset
+        else:
+            entry["available"] = weekly
+            entry["reset_time"] = weekly_reset
+    elif weekly is not None:
+        entry["available"] = weekly
+        entry["reset_time"] = weekly_reset
+    elif five_h is not None:
+        entry["available"] = five_h
+        entry["reset_time"] = five_h_reset
+
+
 def extract_model_summary(groups: List[UsageGroup]) -> dict:
     """Extract quota availability for standard model families ('gemini', 'claude', 'codex', 'grok')."""
-    summary = {
-        "gemini": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
-        "claude": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
-        "claude_code": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
-        "codex": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
-        "grok": {"weekly": None, "five_h": None, "available": None, "reset_time": None},
-    }
+    summary = {family: _empty_summary() for family in _SUMMARY_FAMILIES}
     for group in groups:
-        lower_name = group.name.lower()
-        key = None
-        if "gemini" in lower_name:
-            key = "gemini"
-        elif "claude code" in lower_name:
-            key = "claude_code"
-        elif any(k in lower_name for k in ("claude", "gpt", "3p")):
-            key = "claude"
-        elif any(k in lower_name for k in ("codex", "openai")):
-            key = "codex"
-        elif any(k in lower_name for k in ("grok", "xai")):
-            key = "grok"
-        elif summary["gemini"]["weekly"] is None and summary["gemini"]["five_h"] is None:
-            key = "gemini"
-        elif summary["claude"]["weekly"] is None and summary["claude"]["five_h"] is None:
-            key = "claude"
-
+        key = _select_summary_key(group.name.lower(), summary)
         if key is None:
             continue
-
         for bucket in group.buckets:
-            win = bucket.window.lower()
-            bid = bucket.id.lower()
-            if "weekly" in win or "weekly" in bid:
-                summary[key]["weekly"] = bucket.remaining_fraction
-                summary[key]["weekly_reset"] = bucket.reset_time
-            elif "5h" in win or "5h" in bid:
-                summary[key]["five_h"] = bucket.remaining_fraction
-                summary[key]["five_h_reset"] = bucket.reset_time
-            elif summary[key]["weekly"] is None:
-                summary[key]["weekly"] = bucket.remaining_fraction
-                summary[key]["weekly_reset"] = bucket.reset_time
-
-    for key in ("gemini", "claude", "claude_code", "codex", "grok"):
-        w = summary[key]["weekly"]
-        f = summary[key]["five_h"]
-        w_reset = summary[key].get("weekly_reset")
-        f_reset = summary[key].get("five_h_reset")
-        if w is not None and f is not None:
-            if f <= w:
-                summary[key]["available"] = f
-                summary[key]["reset_time"] = f_reset
-            else:
-                summary[key]["available"] = w
-                summary[key]["reset_time"] = w_reset
-        elif w is not None:
-            summary[key]["available"] = w
-            summary[key]["reset_time"] = w_reset
-        elif f is not None:
-            summary[key]["available"] = f
-            summary[key]["reset_time"] = f_reset
-
+            _apply_to_summary(summary, key, bucket)
+    for entry in summary.values():
+        _compute_available(entry)
     return summary
 
 
