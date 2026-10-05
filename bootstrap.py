@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -394,7 +393,7 @@ def check_state(root: Path) -> dict:
             "console": True,
             "shim_ok": True,
             "shim_state": "pip-managed",
-            "on_path": shutil.which("agydra") is not None,
+            "on_path": platforms.resolve_binary("agydra") is not None,
             "installed": True,
         }
     vpy = venv_python(root)
