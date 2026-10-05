@@ -533,7 +533,12 @@ def _normalize_windows_argv(argv: Sequence[str]) -> list[str]:
     if is_windows() and cmd:
         target = cmd[0].lower()
         if target.endswith((".cmd", ".bat")):
-            return ["cmd", "/c", cmd[0], *[_escape_cmd_argument(a) for a in cmd[1:]]]
+            return [
+                "cmd",
+                "/c",
+                _escape_cmd_argument(cmd[0]),
+                *[_escape_cmd_argument(a) for a in cmd[1:]],
+            ]
     return cmd
 
 
