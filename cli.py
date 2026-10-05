@@ -1639,7 +1639,7 @@ def cmd_export(store: Store, args) -> int:
     excluded_relpaths.append("_keychain/")
     with _acquire_profile_lock(store, name, "exporting it"):
         _ensure_ref_unchanged(store, args.ref, name, "export")
-        dest = args.output if args.output is not None else _default_export_path(name)
+        dest = Path(args.output) if args.output is not None else _default_export_path(name)
         manifest = {
             "format_version": 1,
             "agydra_version": agydra.VERSION,
