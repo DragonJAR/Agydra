@@ -1292,18 +1292,18 @@ def _cmd_usage_detail(store: Store, args) -> int:
     profile = store.get_readonly(name)
     result = usage.query_profile_usage(store, name)
     _record_usage_snapshot(store, [profile], [result], scope=profile.name)
-    print(f"profile   : {profile.name}")
-    print(f"engine    : {profile.engine}")
+    print(i18n.t("cmd.status.profile", name=profile.name))
+    print(i18n.t("cmd.status.engine", engine=profile.engine))
     if profile.engine == "claude":
         print(paint(i18n.t("usage.section_claude_code"), "bold"))
         for line in _claude_usage_lines(result, 10):
             print(line)
         return 0 if result.ok else 1
     if profile.email or result.email:
-        print(f"email     : {profile.email or result.email}")
+        print(i18n.t("cmd.status.email", email=profile.email or result.email))
     if profile.engine in ("codex", "grok"):
         if result.plan:
-            print(f"plan      : {result.plan}")
+            print(i18n.t("cmd.status.plan", plan=result.plan))
         authenticated = (
             result.authentication_state == "authenticated"
             if result.authentication_state is not None else result.ok
