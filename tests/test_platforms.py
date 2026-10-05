@@ -595,11 +595,20 @@ class TestNormalizeWindowsArgv(unittest.TestCase):
         with mock.patch("platforms.is_windows", return_value=True):
             self.assertEqual(
                 platforms._normalize_windows_argv(["C:\\bin\\agy.cmd", "-p", "alpha"]),
-                ["cmd", "/c", "C:\\bin\\agy.cmd", "-p", "alpha"],
+                ["cmd", "/c", '""C:\\bin\\agy.cmd""', "-p", "alpha"],
             )
             self.assertEqual(
                 platforms._normalize_windows_argv(["agy.BAT", "login"]),
-                ["cmd", "/c", "agy.BAT", "login"],
+                ["cmd", "/c", '""agy.BAT""', "login"],
+            )
+
+    def test_quotes_batch_path_with_spaces(self):
+        with mock.patch("platforms.is_windows", return_value=True):
+            self.assertEqual(
+                platforms._normalize_windows_argv(
+                    ["C:\\Users\\Foo My Documents\\bar.cmd", "a&b"]
+                ),
+                ["cmd", "/c", '""C:\\Users\\Foo My Documents\\bar.cmd""', '"a&b"'],
             )
 
     def test_leaves_exe_unchanged_on_windows(self):
