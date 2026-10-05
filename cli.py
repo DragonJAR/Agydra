@@ -701,27 +701,29 @@ def cmd_status(store: Store, args) -> int:
     else:
         email = profile.email or account.detect_email(data_dir, store, name, engine=engine) or "-"
         state = account.auth_state(data_dir, store, name, engine=engine)
-    print(f"profile   : {name}")
-    print(f"engine    : {engine}")
-    print(f"reason    : {resolution.reason}")
-    print(f"binary    : {binary_text}")
-    print(f"email     : {email}")
-    print(f"auth      : {state}")
+    print(i18n.t("cmd.status.profile", name=name))
+    print(i18n.t("cmd.status.engine", engine=engine))
+    print(i18n.t("cmd.status.reason", reason=resolution.reason))
+    print(i18n.t("cmd.status.binary", path=binary_text))
+    print(i18n.t("cmd.status.email", email=email))
+    print(i18n.t("cmd.status.auth", state=state))
     holders = locks.lease_holders(store, name)
     limit = store.load_config().session_limit()
-    sessions = (
-        "busy (unverified)" if holders is None
-        else (
-            (f"{len(holders)}/{limit}" if limit is not None else str(len(holders)))
-            if holders else "none"
+    if holders is None:
+        sessions = i18n.t("cmd.status.busy_unverified")
+    elif not holders:
+        sessions = i18n.t("cmd.status.no_sessions")
+    else:
+        count = (
+            f"{len(holders)}/{limit}" if limit is not None else str(len(holders))
         )
-    )
-    print(f"sessions  : {sessions}")
-    print(f"store     : {data_dir}")
+        sessions = count
+    print(i18n.t("cmd.status.sessions", count=sessions))
+    print(i18n.t("cmd.status.store", path=data_dir))
     if native:
-        print(f"seq       : {profile.seq}")
+        print(i18n.t("cmd.status.seq", n=profile.seq))
         if native.reason:
-            print(f"reason    : {native.reason}")
+            print(i18n.t("cmd.status.reason", reason=native.reason))
         if native.state == "unknown":
             _note(i18n.t("claude.binary_hint"))
     return 0
