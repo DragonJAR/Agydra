@@ -64,4 +64,5 @@ jobs:
       - name: Full standard-library suite
         if: ${{ !cancelled() && steps.python.outcome == 'success' }}
         timeout-minutes: 10
+        shell: cmd
         run: python -m unittest discover -s tests -p "test_*.py" -v
