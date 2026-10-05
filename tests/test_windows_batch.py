@@ -17,7 +17,7 @@ import platforms
 @unittest.skipUnless(sys.platform == "win32", "requires native Windows cmd.exe, NTFS and WinAPI")
 class TestNativeWindows(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="agydra-audit-")
+        temporary = tempfile.TemporaryDirectory(prefix="agydra native audit ")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         home = self.root / "home"
