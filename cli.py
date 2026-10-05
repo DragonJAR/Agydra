@@ -518,11 +518,30 @@ def _default_export_path(name: str) -> Path:
     return platforms.real_home() / f"agydra-export-{name}-{stamp}.zip"
 
 
-_PROFILE_LABEL = "PROFILE"
+_PROFILE_LABEL = i18n.t("cmd.list.header_name", default="PROFILE")
 _EMAIL_COL_WIDTH = 34
 """Shared EMAIL column width: `cmd_list`'s profile table and the usage
 compact table's header/rows both render this column at the same width --
 one named constant instead of two hand-copied ``34`` literals."""
+
+
+def _table_headers() -> Dict[str, str]:
+    """One source of truth for the column titles shared by every table.
+
+    Each call resolves the i18n key at request time, so a profile table
+    rendered after the language cascade has settled honours the active
+    locale. The single dict replaces a scatter of literal column titles
+    across ``cmd_list``, the usage compact table, and the list header.
+    """
+    return {
+        "profile": _PROFILE_LABEL,
+        "email": i18n.t("cmd.list.header_email", default="EMAIL"),
+        "auth": i18n.t("cmd.list.header_auth", default="AUTH"),
+        "default": i18n.t("cmd.list.header_default", default="DEFAULT"),
+        "busy": i18n.t("cmd.list.header_busy", default="BUSY"),
+        "engine": i18n.t("cmd.list.header_engine", default="ENGINE"),
+        "last_used": i18n.t("cmd.list.header_last_used", default="LAST USED"),
+    }
 
 
 def cmd_list(store: Store, _args) -> int:
@@ -531,11 +550,12 @@ def cmd_list(store: Store, _args) -> int:
         print("no profiles; create one with: agydra create <name>")
         return 0
     default = store.default_name()
+    headers = _table_headers()
     width = max(len(p.name) for p in profiles)
-    width = max(width, len(_PROFILE_LABEL))
+    width = max(width, len(headers["profile"]))
     header = (
-        f"{'#':<3}{_PROFILE_LABEL:<{width + 2}}{'EMAIL':<{_EMAIL_COL_WIDTH}}{'AUTH':<20}"
-        f"{'DEFAULT':<9}{'BUSY':<6}{'ENGINE':<9}LAST USED"
+        f"{'#':<3}{headers['profile']:<{width + 2}}{headers['email']:<{_EMAIL_COL_WIDTH}}{headers['auth']:<20}"
+        f"{headers['default']:<9}{headers['busy']:<6}{headers['engine']:<9}{headers['last_used']}"
     )
     print(paint(header, "bold"))
     for idx, profile in enumerate(profiles, start=1):

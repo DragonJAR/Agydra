@@ -95,12 +95,16 @@ class TestListHeaderNeverFusesColumns(BaseCase):
         self.store = Store()
 
     def test_short_profile_name_keeps_header_separated(self):
+        import cli
+
         self.store.create("work")
         lines = self.capture_list()
         header = lines[0]
-        self.assertIn("PROFILE  EMAIL", header)
+        self.assertIn(f"{cli._PROFILE_LABEL}  EMAIL", header)
 
     def test_long_profile_name_still_aligned(self):
+        import cli
+
         self.store.create("a" * 30)
         lines = self.capture_list()
         header = lines[0]
