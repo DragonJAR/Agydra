@@ -536,7 +536,7 @@ def _normalize_windows_argv(argv: Sequence[str]) -> list[str]:
             return [
                 "cmd",
                 "/c",
-                '""' + _escape_cmd_argument(cmd[0]) + '""',
+                _escape_cmd_argument(cmd[0]),
                 *[_escape_cmd_argument(a) for a in cmd[1:]],
             ]
     return cmd
