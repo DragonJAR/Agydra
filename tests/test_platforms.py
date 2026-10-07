@@ -153,6 +153,12 @@ class TestHomeRedirectVar(unittest.TestCase):
 
 
 class TestResolveAgyBinary(unittest.TestCase):
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX-only: tests create scripts with a #!/bin/sh shebang; cmd.exe "
+        "cannot execute them in the GitHub Actions Windows-2022 runner. "
+        "Set AGYDRA_RUN_WIN32_RESOLVE=1 on a real Windows host to enable.",
+    )
     def setUp(self):
         self._tmp = Path(tempfile.mkdtemp(prefix="agydra-platforms-"))
         self._old = {
@@ -442,6 +448,13 @@ class TestDrainTtyInput(unittest.TestCase):
     (``^[[?1;2c``) after agydra's output. It must be a safe no-op everywhere
     the precondition does not hold: never raises, never touches non-TTYs."""
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX-only: imports termios, which is not available on Windows. "
+        "The Windows counterpart is TestLinkDetection.test_posix_flushes_input_queue "
+        "is already excluded on Windows; this class's tests need either a real "
+        "Windows host with termios available (POSIX layer) or a complete rewrite.",
+    )
     def _fake_stdin(self, isatty: bool, fileno=0):
         import types
 
