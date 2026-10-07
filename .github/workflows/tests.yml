@@ -63,7 +63,12 @@ jobs:
         env:
           AGYDRA_SKIP_WIN32_BATCH: '1'
         run: python -m unittest discover -s tests -p test_windows_batch.py -v
-      - name: Full standard-library suite
-        if: ${{ !cancelled() && steps.python.outcome == 'success' }}
+      - name: Full standard-library suite (Windows)
+        if: ${{ !cancelled() && steps.python.outcome == 'success' && runner.os == 'Windows' }}
+        timeout-minutes: 10
+        shell: cmd
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Full standard-library suite (POSIX)
+        if: ${{ !cancelled() && steps.python.outcome == 'success' && runner.os != 'Windows' }}
         timeout-minutes: 10
         run: python -m unittest discover -s tests -p "test_*.py" -v
