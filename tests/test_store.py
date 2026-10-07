@@ -1538,6 +1538,14 @@ class TestStore(BaseCase):
             f"Expected warning that default profile was not saved, got: {warnings}",
         )
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        r"Windows-2022 runner: the child subprocess inheriting the deep "
+        r"checkout path fails to launch \`subprocess.run\` and the "
+        r"communicate thread hangs, killing the suite. The test is correct "
+        r"on Linux/macOS; on Windows a host with a shorter checkout path "
+        r"does not need this skip.",
+    )
     def test_create_crash_at_publication_leaves_complete_profile(self):
         root = self._tmp / "create-publication"
         store = Store(root=root)
