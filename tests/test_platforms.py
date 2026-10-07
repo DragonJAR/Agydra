@@ -19,6 +19,13 @@ class TestBaseDir(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("AGYDRA_HOME", None)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX-only: \"/tmp/custom-root\" is interpreted as "
+        "\"C:\\\\tmp\\\\custom-root\" on Windows because os.path.abspath "
+        "anchors absolute paths to the drive root. Use a Windows-style "
+        "absolute path or tempfile.mkdtemp on a Windows host.",
+    )
     def test_env_override_wins(self):
         os.environ["AGYDRA_HOME"] = str(Path("/tmp/custom-root"))
         self.assertEqual(platforms.base_dir(), Path("/tmp/custom-root"))
