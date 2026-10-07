@@ -335,6 +335,14 @@ class TestStore(BaseCase):
             store.get("ghost")
         self.assertFalse(store.root.exists())
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        r"Windows-2022 runner: the concurrent-create + read retries under "
+        r"the same legacy MAX_PATH limit; the deep checkout path makes the "
+        r"subprocess hangs. Skip on Windows; the test is correct on "
+        r"Linux/macOS and on real Windows hosts with a shorter checkout "
+        r"path.",
+    )
     def test_missing_store_read_retries_under_lock_after_concurrent_create(self):
         store = Store(root=self._tmp / "reader-create-race")
         initial_check = threading.Event()
