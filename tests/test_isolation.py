@@ -727,6 +727,13 @@ class TestIsolationAncestorMirroring(BaseCase):
             )
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "Linux-only: the bwrap CLI and /run/user/<uid> paths do not exist on "
+    "Windows. The class is also skipped on macOS via the existing POSIX "
+    "guard; on Windows it pins Linux-only sandbox-wrap behavior that has "
+    "no Windows counterpart.",
+)
 class TestSandboxWrap(unittest.TestCase):
     def test_sandbox_wrap_creates_directories_before_tmpfs(self):
         """bwrap requires mount points to exist inside the sandbox before tmpfs

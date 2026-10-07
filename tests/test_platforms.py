@@ -664,6 +664,13 @@ class TestRealHome(unittest.TestCase):
             self.assertEqual(platforms.real_home(), Path.home())
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "macOS-only: the test pins the macOS fcntl.fcntl F_GETPATH fallback "
+    "to scandir. Windows has its own canonicalization path (GetFinalPathNameByHandle) "
+    "and no equivalent of fcntl.fcntl, so the assertion targets behavior "
+    "the Windows runner cannot exercise.",
+)
 class TestCanonicalPath(unittest.TestCase):
     def test_canonical_path_existing_directory(self):
         root = Path(__file__).resolve().parent.parent
