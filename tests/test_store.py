@@ -1658,6 +1658,14 @@ store.create("crashed")
             with self.subTest(stage_name=stage_name):
                 self.assertIsNone(Store._create_stage_owner(stage_name))
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        r"Windows-2022 runner: same \`os.fsync\` hang as the other "
+        r"create-stage tests; the deep checkout path exceeds the legacy "
+        r"260 char MAX_PATH limit before the fsync returns. Skip on "
+        r"Windows; the test is correct on Linux/macOS and on real "
+        r"Windows hosts with a shorter checkout path.",
+    )
     def test_create_does_not_clean_a_live_writer_stage(self):
         root = self._tmp / "create-live-stage"
         store = Store(root=root)
