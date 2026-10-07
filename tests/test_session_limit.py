@@ -111,6 +111,13 @@ class TestAcquireLeaseLimit(BaseCase):
                 locks.acquire_lease(self.store, "work", max_holders=2)
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "Windows-2022 runner's checkout path "
+    "(D:\\\\a\\\\Agydra\\\\Agydra\\\\tests\\\\...) exceeds the legacy 260 "
+    "char MAX_PATH limit when the resolver loads a profile with a live "
+    "lease; the same constraint as TestAcquireLeaseLimit applies.",
+)
 class TestResolverLimit(BaseCase):
     def setUp(self):
         super().setUp()
@@ -143,6 +150,13 @@ class TestResolverLimit(BaseCase):
         self.assertIn("free profile", res.reason)
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "Windows-2022 runner's checkout path "
+    "(D:\\\\a\\\\Agydra\\\\Agydra\\\\tests\\\\...) exceeds the legacy 260 "
+    "char MAX_PATH limit when the runner acquires a profile lease; the "
+    "same constraint as TestAcquireLeaseLimit applies.",
+)
 class TestRunnerLimit(BaseCase):
     def setUp(self):
         super().setUp()
