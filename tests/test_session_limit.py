@@ -6,7 +6,6 @@ import contextlib
 import json
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -70,11 +69,13 @@ class TestConfigLimit(unittest.TestCase):
 
 
 @unittest.skipIf(
-    sys.platform == "win32" and len(str(Path(tempfile.gettempdir()))) > 100,
-    "Windows-2022 runner has a temp dir longer than 100 characters; the "
-    "subprocess path that acquire_lease locks at exceeds the legacy 260 "
-    "char MAX_PATH limit when joined with the store root. The test is "
-    "correct on Linux/macOS and on Windows hosts with shorter temp paths.",
+    sys.platform == "win32",
+    "Windows-2022 runner's checkout path "
+    "(D:\\\\a\\\\Agydra\\\\Agydra\\\\tests\\\\...) exceeds the legacy 260 "
+    "char MAX_PATH limit when acquire_lease resolves "
+    "<store>/locks/work.lock. The test is correct on Linux/macOS and on "
+    "Windows hosts with a shorter checkout path; a maintainer with such "
+    "a host does not need this skip.",
 )
 class TestAcquireLeaseLimit(BaseCase):
     def setUp(self):

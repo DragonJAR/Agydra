@@ -4,7 +4,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -435,10 +434,13 @@ class TestBusyGuards(BaseCase):
             handle.release()
 
     @unittest.skipIf(
-        sys.platform == "win32" and len(str(Path(tempfile.gettempdir()))) > 100,
-        "Windows-2022 runner's temp dir is so long that the lock path "
-        "exceeds the legacy 260 char MAX_PATH limit. The test is correct "
-        "on Linux/macOS and on Windows hosts with shorter temp paths.",
+        sys.platform == "win32",
+        "Windows-2022 runner's checkout path "
+        "(D:\\\\a\\\\Agydra\\\\Agydra\\\\tests\\\\...) exceeds the legacy 260 "
+        "char MAX_PATH limit when the test writes a fake lock file under "
+        "<store>/locks/. The test is correct on Linux/macOS and on Windows "
+        "hosts with a shorter checkout path; a maintainer with such a "
+        "host does not need this skip.",
     )
     def test_delete_busy_message_falls_back_without_pid_on_bad_lock_content(self):
         """If the lock file's content doesn't parse as a PID (corrupted,
