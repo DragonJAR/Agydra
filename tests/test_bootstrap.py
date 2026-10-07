@@ -231,6 +231,12 @@ class RuntimeModuleDrift(unittest.TestCase):
         self.assertIn("/abs/path/venv/bin/agydra", s)
         self.assertTrue(s.startswith("#!/bin/sh"))
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX-only: PATH-segment matching uses case-sensitive startswith that "
+        "is the wrong contract on Windows. The Windows counterpart is "
+        "test_dir_on_path_windows_normalization, exercised on Windows hosts.",
+    )
     def test_dir_on_path_posix(self):
         with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/home/user/.local/bin"}):
             self.assertTrue(bootstrap._dir_on_path(Path("/home/user/.local/bin")))
