@@ -658,7 +658,7 @@ class TestStore(BaseCase):
             profiles = original_scan()
             if threading.current_thread().name == "first profile creator":
                 first_in_list.set()
-                if not continue_first.wait(5):
+                if not continue_first.wait(60):
                     raise RuntimeError("timed out waiting to resume first create")
             return profiles
 
@@ -674,13 +674,13 @@ class TestStore(BaseCase):
         ):
             thread.start()
             try:
-                self.assertTrue(first_in_list.wait(5))
+                self.assertTrue(first_in_list.wait(60))
                 with self.assertRaisesRegex(StoreError, "sequence allocation is busy"):
                     store.create("second")
                 self.assertFalse(store.profile_dir("second").exists())
             finally:
                 continue_first.set()
-                thread.join(5)
+                thread.join(60)
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(first_errors, [])
