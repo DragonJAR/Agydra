@@ -467,6 +467,10 @@ class TestDrainTtyInput(unittest.TestCase):
 
         return types.SimpleNamespace(isatty=lambda: isatty, fileno=lambda: fileno)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX-only: imports termios, which is not available on Windows.",
+    )
     def test_noop_when_stdin_is_not_a_tty(self):
         import sys as _sys
         from unittest import mock
@@ -477,6 +481,10 @@ class TestDrainTtyInput(unittest.TestCase):
             platforms.drain_tty_input()
         flush.assert_not_called()
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX-only: imports termios, which is not available on Windows.",
+    )
     def test_posix_flushes_input_queue(self):
         import sys as _sys
         import termios
@@ -489,6 +497,10 @@ class TestDrainTtyInput(unittest.TestCase):
         # TCIFLUSH = input queue ONLY (never TCOFLUSH: output must survive).
         flush.assert_called_once_with(7, termios.TCIFLUSH)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX-only: imports termios, which is not available on Windows.",
+    )
     def test_windows_flushes_console_input_buffer(self):
         import ctypes
         import sys as _sys
@@ -505,6 +517,10 @@ class TestDrainTtyInput(unittest.TestCase):
         kernel32.GetStdHandle.assert_called_once_with(-10)
         kernel32.FlushConsoleInputBuffer.assert_called_once_with(1234)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX-only: imports termios, which is not available on Windows.",
+    )
     def test_never_raises_on_tty_errors(self):
         import sys as _sys
         from unittest import mock
