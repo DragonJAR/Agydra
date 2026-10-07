@@ -225,6 +225,14 @@ class TestKeychainLoginCapture(unittest.TestCase):
             )
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "Windows-keychain semantics differ (no OpenProcess-style launch_guard, "
+    "different signal-handling on the subprocess.Popen side). The test's "
+    "POSIX assumptions about SIGINT and the kernel-held lock file do not "
+    "translate to the Windows runner's cmd.exe shell; a Windows counterpart "
+    "would need a different runner design.",
+)
 class TestKeychainRunHardening(unittest.TestCase):
     """_run must never hang: stdout/stderr go to temp files (the Security
     Agent's grandchild inherits pipe write-ends and blocks communicate()
@@ -479,6 +487,15 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
                 os.environ.pop("AGYDRA_AGY_BIN", None)
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "The test mocks platforms.is_windows to False but the runner.run "
+    "internal path also queries subprocess.Popen with the runner's "
+    "real shell (PowerShell on Windows-2022) which produces different "
+    "behaviour than POSIX when launching the shebang script. The test "
+    "is a Linux contract; the Windows runner would need an alternative "
+    "execution path that doesn't reach subprocess.Popen at all.",
+)
 class TestLockHolderPidExecPathOnly(unittest.TestCase):
     """The lease registry names a process that is REALLY running for the
     session. On the plain ``execvpe`` path the pid survives the exec, so

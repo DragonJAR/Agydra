@@ -118,6 +118,14 @@ class TestResolverForce(BaseCase):
             handle.release()
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "The test mocks keychain.supported and keychain.launch_guard but the "
+    "underlying runner.run also queries subprocess.Popen with the runner's "
+    "real shell (PowerShell on Windows-2022), which does not honor the POSIX "
+    "process-group semantics the test depends on. The test is a Linux contract; "
+    "the Windows counterpart would need a different runner design.",
+)
 class TestRunnerForce(BaseCase):
     def setUp(self):
         super().setUp()

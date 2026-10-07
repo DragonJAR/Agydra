@@ -228,6 +228,14 @@ class TestLockHolderPid(BaseCase):
         self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "Windows file-handle semantics are fundamentally different (e.g. "
+    "symlink metadata via FILE_ATTRIBUTE_REPARSE_POINT vs lstat's st_mode). "
+    "The test's POSIX assumptions (lstat st_mode, os.path.realpath "
+    "behavior) do not translate to the Windows runner's filesystem "
+    "layer; a Windows counterpart would need WinAPI mocks.",
+)
 class TestLockInodeConsistency(BaseCase):
     """The TOCTOU-at-acquire/probe-time guard (``locks._same_file``) and its
     documented boundary — see locks.py's module docstring for the exact

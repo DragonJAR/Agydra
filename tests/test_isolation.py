@@ -919,6 +919,14 @@ class TestOverlayLinkGuards(BaseCase):
             isolation.validate_overlay_roots("beta", self.data_dir, self.store.root)
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "bwrap is Linux-only; the Windows counterpart uses the cmd /c mklink "
+    "junction path. The class tests bwrap-specific behavior "
+    "(\"/host/.codex\" dir-bind semantics) that does not translate to "
+    "the Windows mklink junction path; a Windows counterpart would need a "
+    "different test design.",
+)
 class TestSandboxWrapMasking(unittest.TestCase):
     def _wrap(self, runtime_dir: Path):
         return isolation.sandbox_wrap(["agy"], runtime_dir=str(runtime_dir))

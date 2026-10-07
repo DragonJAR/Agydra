@@ -225,6 +225,12 @@ class RuntimeModuleDrift(unittest.TestCase):
                 [],
             )
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX-only: the shim starts with a #!/bin/sh shebang. The "
+        "Windows shim uses a different shebang (cmd.exe /c on the shim "
+        "path) and is tested separately.",
+    )
     def test_shim_content_carries_marker_and_target(self):
         s = bootstrap._shim_content(Path("/abs/path/venv/bin/agydra"))
         self.assertIn(bootstrap.SHIM_MARKER, s)
@@ -347,6 +353,13 @@ class CheckState(unittest.TestCase):
 class VerifyInstall(unittest.TestCase):
     """verify_install examines real shim/console paths — sandbox HOME first."""
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX-only: _make_fake_project creates a venv with a #!/bin/sh "
+        "shebang which cmd.exe cannot execute. The Windows shim uses a "
+        "different shebang (cmd.exe /c on the shim path) and is tested "
+        "in a Windows-specific skipIf elsewhere.",
+    )
     def test_verify_accepts_well_formed_candidate(self):
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
