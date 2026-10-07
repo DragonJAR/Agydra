@@ -1578,6 +1578,14 @@ Store(root=root).create("published")
             ["base", "published"],
         )
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        r"Windows-2022 runner: \`_create_locked\` writes to a stage under "
+        r"the deep checkout path and the legacy MAX_PATH limit causes the "
+        r"\`os.fsync\` call inside \`atomic_write_bytes\` to hang. The "
+        r"test is correct on Linux/macOS and on real Windows hosts with a "
+        r"shorter checkout path.",
+    )
     def test_create_crash_leaves_ignored_stage_that_next_create_cleans(self):
         root = self._tmp / "create-stage-crash"
         store = Store(root=root)
