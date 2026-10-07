@@ -142,6 +142,14 @@ class TestResolver(BaseCase):
         self.assertIn("not probed", plan.reason)
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    r"Windows-2022 runner's checkout path "
+    r"(D:\\\\a\\\\Agydra\\\\Agydra\\\\tests\\\\...) exceeds the legacy 260 "
+    r"char MAX_PATH limit when \`locks.is_locked\` opens "
+    r"\`<store>/locks/<profile>.lock\` via \`os.fstat\`; the same "
+    r"constraint as TestAcquireLeaseLimit applies.",
+)
 class TestPickFreeProfileAuthAndBusyOrder(BaseCase):
     """pick_free_profile filter order: authenticated profiles are verified
     first so that busy profiles are not misdiagnosed as unauthenticated."""
