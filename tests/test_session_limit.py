@@ -6,6 +6,7 @@ import contextlib
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -68,6 +69,13 @@ class TestConfigLimit(unittest.TestCase):
                 self.assertIsNone(config.session_limit())
 
 
+@unittest.skipIf(
+    sys.platform == "win32" and len(str(Path(tempfile.gettempdir()))) > 100,
+    "Windows-2022 runner has a temp dir longer than 100 characters; the "
+    "subprocess path that acquire_lease locks at exceeds the legacy 260 "
+    "char MAX_PATH limit when joined with the store root. The test is "
+    "correct on Linux/macOS and on Windows hosts with shorter temp paths.",
+)
 class TestAcquireLeaseLimit(BaseCase):
     def setUp(self):
         super().setUp()
