@@ -433,15 +433,6 @@ class TestBusyGuards(BaseCase):
         finally:
             handle.release()
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "Windows-2022 runner's checkout path "
-        "(D:\\\\a\\\\Agydra\\\\Agydra\\\\tests\\\\...) exceeds the legacy 260 "
-        "char MAX_PATH limit when the test writes a fake lock file under "
-        "<store>/locks/. The test is correct on Linux/macOS and on Windows "
-        "hosts with a shorter checkout path; a maintainer with such a "
-        "host does not need this skip.",
-    )
     def test_delete_busy_message_falls_back_without_pid_on_bad_lock_content(self):
         """If the lock file's content doesn't parse as a PID (corrupted,
         truncated, written by an older agydra version), the message must

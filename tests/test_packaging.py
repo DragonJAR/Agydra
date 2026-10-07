@@ -73,15 +73,6 @@ def _build_tools_problem():
     return None
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    "Windows subprocess with non-UTF-8 bytes: the runner's "
-    "codecs.StreamReader raises UnicodeDecodeError on the em-dash "
-    "byte 0x97 (CP-1252) that Python 3.9 emits on Windows. The test "
-    "is correct on Linux/macOS where the locale is UTF-8 by default; "
-    "on Windows it pins subprocess-stream behavior that requires a "
-    "locale-aware reader.",
-)
 class TestDistributionArtifacts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -184,8 +175,9 @@ class TestDistributionArtifacts(unittest.TestCase):
 
     def _run_installed(self, *argv):
         return subprocess.run(
-            [sys.executable, *argv], cwd=self.home, capture_output=True, text=True,
-            timeout=120, env=_clean_env(self.home, PYTHONPATH=str(self.site)),
+            [sys.executable, *argv], cwd=self.home, capture_output=True,
+            encoding="utf-8", errors="replace", timeout=120,
+            env=_clean_env(self.home, PYTHONPATH=str(self.site)),
         )
 
     def test_installed_module_entry_enters_the_cli_without_building_a_venv(self):

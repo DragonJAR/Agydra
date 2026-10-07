@@ -14,7 +14,6 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from pathlib import Path
-import unittest
 from unittest.mock import patch
 
 from conftest import BaseCase
@@ -422,14 +421,6 @@ class TestClaudeCaptureEnable(BaseCase):
             )
         return rc, out.getvalue()
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        r"Windows-claude-settings uses the \\\\?\ UNC-prefixed path that "
-        "the GitHub Actions Windows-2022 runner's temp dir resolves to, and "
-        "the test writes to a seq-keyed subdir that the runner cannot "
-        "create there. The Windows counterpart would need a path-independent "
-        "settings-path helper.",
-    )
     def test_apply_writes_statusline_when_settings_absent(self):
         self.store.create("cc", engine="claude")
         rc, out = self._run_apply()

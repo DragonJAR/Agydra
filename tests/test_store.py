@@ -335,14 +335,6 @@ class TestStore(BaseCase):
             store.get("ghost")
         self.assertFalse(store.root.exists())
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        r"Windows-2022 runner: the concurrent-create + read retries under "
-        r"the same legacy MAX_PATH limit; the deep checkout path makes the "
-        r"subprocess hangs. Skip on Windows; the test is correct on "
-        r"Linux/macOS and on real Windows hosts with a shorter checkout "
-        r"path.",
-    )
     def test_missing_store_read_retries_under_lock_after_concurrent_create(self):
         store = Store(root=self._tmp / "reader-create-race")
         initial_check = threading.Event()
@@ -652,15 +644,6 @@ class TestStore(BaseCase):
             create_lock.release()
         self.assertFalse(store.profile_dir("reserved").exists())
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        r"Windows-2022 runner: the \`continue_first.wait(5)\` join never "
-        r"fires before pytest cancels the test under the runner's 10-minute "
-        r"job timeout, leaving an orphan thread that kills the rest of the "
-        r"suite. The test is correct on Linux/macOS; on Windows the same "
-        r"race can be exercised with a shorter wait, but that is a "
-        r"Windows-host refactor.",
-    )
     def test_concurrent_creates_do_not_share_sequence_numbers(self):
         import locks
 
@@ -1546,14 +1529,6 @@ class TestStore(BaseCase):
             f"Expected warning that default profile was not saved, got: {warnings}",
         )
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        r"Windows-2022 runner: the child subprocess inheriting the deep "
-        r"checkout path fails to launch \`subprocess.run\` and the "
-        r"communicate thread hangs, killing the suite. The test is correct "
-        r"on Linux/macOS; on Windows a host with a shorter checkout path "
-        r"does not need this skip.",
-    )
     def test_create_crash_at_publication_leaves_complete_profile(self):
         root = self._tmp / "create-publication"
         store = Store(root=root)
@@ -1586,14 +1561,6 @@ Store(root=root).create("published")
             ["base", "published"],
         )
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        r"Windows-2022 runner: \`_create_locked\` writes to a stage under "
-        r"the deep checkout path and the legacy MAX_PATH limit causes the "
-        r"\`os.fsync\` call inside \`atomic_write_bytes\` to hang. The "
-        r"test is correct on Linux/macOS and on real Windows hosts with a "
-        r"shorter checkout path.",
-    )
     def test_create_crash_leaves_ignored_stage_that_next_create_cleans(self):
         root = self._tmp / "create-stage-crash"
         store = Store(root=root)
@@ -1666,14 +1633,6 @@ store.create("crashed")
             with self.subTest(stage_name=stage_name):
                 self.assertIsNone(Store._create_stage_owner(stage_name))
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        r"Windows-2022 runner: same \`os.fsync\` hang as the other "
-        r"create-stage tests; the deep checkout path exceeds the legacy "
-        r"260 char MAX_PATH limit before the fsync returns. Skip on "
-        r"Windows; the test is correct on Linux/macOS and on real "
-        r"Windows hosts with a shorter checkout path.",
-    )
     def test_create_does_not_clean_a_live_writer_stage(self):
         root = self._tmp / "create-live-stage"
         store = Store(root=root)

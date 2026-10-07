@@ -15,7 +15,6 @@ What this file asserts and why each test is worth its keep:
 from __future__ import annotations
 
 import json
-import sys
 import unittest
 import zipfile
 from types import SimpleNamespace
@@ -53,14 +52,6 @@ class TestExportCommandAGY(BaseCase):
         (data / "conversations" / "c1.json").write_text("hello", encoding="utf-8")
         return name
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        r"Windows export pipeline hits the same \\\\?\ UNC prefix that "
-        "the GitHub Actions Windows-2022 runner applies to its temp dir. "
-        "The test setup creates files under that temp prefix; cmd.exe or "
-        "Python's zipfile rejects the resulting paths. A Windows counterpart "
-        "would need to redirect to a non-UNC-prefixed location.",
-    )
     def test_export_writes_zip_at_user_path_and_includes_manifest(self):
         name = self._make_authenticated_agy_profile()
         out = self._tmp / "exp.zip"
@@ -144,14 +135,6 @@ class TestExportRefusals(BaseCase):
             with self.assertRaises(Exception):
                 cli.cmd_export(self.store, _args("ok", self._tmp / "out.zip"))
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        r"Windows export pipeline hits the same \\\\?\ UNC prefix that "
-        "the GitHub Actions Windows-2022 runner applies to its temp dir. "
-        "The test setup creates files under that temp prefix; cmd.exe or "
-        "Python's zipfile rejects the resulting paths. A Windows counterpart "
-        "would need to redirect to a non-UNC-prefixed location.",
-    )
     def test_export_keeps_engine_agnostic_by_assembling_exclusions_in_cli(self):
         """Sanity guard: the store's filter only sees paths, never engine
         names. A future engine that forgets to call ``export_credential_ignore``
