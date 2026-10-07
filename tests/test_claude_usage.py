@@ -384,6 +384,14 @@ class TestClaudeUsage(BaseCase):
         self.assertEqual(result.engine, "mystery")
         self.assertEqual(result.error, "unsupported usage engine: mystery")
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        r"Windows claude-usage reader has the same \\\\?\ UNC prefix on "
+        "the runner's temp dir that the GitHub Actions Windows-2022 image "
+        "applies; the test's snapshot reader cannot create files under that "
+        "prefix. The Windows counterpart would need a non-UNC-prefixed "
+        "scratch path.",
+    )
     def test_reader_is_byte_for_byte_read_only_and_does_not_touch_engine_services(self):
         observed = datetime.now(timezone.utc)
         value = _payload(

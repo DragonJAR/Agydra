@@ -1978,6 +1978,14 @@ class TestWriteSlotNeverExposesTheSecret(unittest.TestCase):
         self.assertNotIn("SYNTH-SECRET-TOKEN", message)
         self.assertNotIn(binascii.hexlify(self.SECRET).decode(), message.lower())
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        r"Windows keychain parser: odd\"dir\\x becomes invalid on a "
+        "NTFS volume that does not allow embedded backslash-double-quote, "
+        r"and \\\\?\ UNC prefix on the temp dir rejects that path. The "
+        "Windows counterpart uses a normal keychain path without quoting "
+        "and backslash interleaving.",
+    )
     def test_quotes_and_backslashes_survive_the_interactive_parser(self):
         odd = _FAKE_KEYCHAIN_DIR / 'odd"dir\\x'
         odd.mkdir(exist_ok=True)
