@@ -24,7 +24,8 @@ class TestStore(BaseCase):
             [sys.executable, "-c", source, *(str(arg) for arg in args)],
             cwd=str(Path(__file__).resolve().parents[1]),
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
 
