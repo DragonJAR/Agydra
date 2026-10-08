@@ -18,6 +18,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import keychain
+import locks
+import platforms
 from conftest import BaseCase, _make_jwt, isolated_store_env
 from store import Store
 
@@ -212,6 +214,50 @@ class _MemoryKeychain:
             self.shared = None
             return _rc(0)
         raise AssertionError(f"unexpected security call: {args}")
+
+
+class TestFileAuthenticationSlotMembership(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("alpha")
+
+    def test_only_file_holders_expire_a_stale_keychain_owner(self):
+        keychain._save_slot_lease(self.store, "alpha", b"original-baseline")
+        locks.acquire_lease(self.store, "alpha", keychain=False)
+        self.addCleanup(locks.release_lease, self.store, "alpha")
+        state = keychain._load_slot_lease(self.store)
+        self.assertIsNone(state.owner)
+        self.assertTrue(state.expired)
+        self.assertEqual(state.stale_owner, "alpha")
+        self.assertEqual(keychain._decode_shared(state.had_shared), b"original-baseline")
+        self.assertTrue(locks.is_locked(self.store, "alpha"))
+
+    def test_last_keychain_exit_restores_baseline_while_file_session_stays_live(self):
+        baseline = b"original-baseline"
+        credential = _slot_payload_json("alpha@example.com")
+        kc = _MemoryKeychain(baseline)
+        keychain.save_profile_slot(
+            self.store, "alpha", keychain.envelope_token_bytes(credential)
+        )
+        with mock.patch.object(keychain, "_run", kc.run), \
+                mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
+                ), mock.patch.object(platforms, "process_alive", return_value=True):
+            with keychain.launch_guard(self.store, "alpha"):
+                self.assertEqual(kc.shared, credential)
+                path = locks.lock_path(self.store, "alpha")
+                payload = json.loads(path.read_bytes())
+                payload["holders"].append({
+                    "pid": 424242, "start": None, "keychain": False
+                })
+                path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(kc.shared, baseline)
+            self.assertEqual(locks.lease_keychain_holders(self.store, "alpha"), [])
+            self.assertEqual([holder.pid for holder in locks.lease_holders(self.store, "alpha")], [424242])
+            self.assertTrue(locks.is_locked(self.store, "alpha"))
+            self.assertIsNone(keychain._load_slot_lease(self.store).owner)
 
 
 class TestLaunchGuardRestore(unittest.TestCase):

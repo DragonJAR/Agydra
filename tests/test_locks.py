@@ -1,4 +1,5 @@
 """locks: kernel-held session locks (flock/msvcrt) — acquire, probe, release."""
+import json
 import os
 import sys
 import unittest
@@ -527,6 +528,87 @@ class TestMutationLock(BaseCase):
             self.assertGreater(parsed[0].pid, 0)
             self.assertEqual(locks.lease_holders(self.store, "work"), [])
             self.assertFalse(locks.is_locked(self.store, "work"))
+
+
+class TestAuthenticationLeaseMembership(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("work")
+        self.path = locks.lock_path(self.store, "work")
+
+    def test_file_session_protects_mutations_but_does_not_own_keychain(self):
+        locks.acquire_lease(self.store, "work", keychain=False)
+        self.addCleanup(locks.release_lease, self.store, "work")
+        self.assertEqual(len(locks.lease_holders(self.store, "work")), 1)
+        self.assertFalse(locks.lease_holders(self.store, "work")[0].keychain)
+        self.assertEqual(locks.lease_keychain_holders(self.store, "work"), [])
+        self.assertTrue(locks.is_locked(self.store, "work"))
+        self.assertIsNone(locks.try_mutation_lock(self.store, "work"))
+        self.assertIs(json.loads(self.path.read_bytes())["holders"][0]["keychain"], False)
+
+    def test_default_lease_keeps_legacy_keychain_membership(self):
+        locks.acquire_lease(self.store, "work")
+        self.addCleanup(locks.release_lease, self.store, "work")
+        holders = locks.lease_keychain_holders(self.store, "work")
+        self.assertEqual(len(holders), 1)
+        self.assertTrue(holders[0].keychain)
+        for raw in (
+            str(os.getpid()).encode("ascii"),
+            json.dumps({"holders": [{"pid": os.getpid(), "start": None}]}).encode(),
+        ):
+            with self.subTest(raw=raw):
+                self.assertTrue(locks._parse_holders(raw)[0].keychain)
+
+    def test_same_pid_default_reacquisition_preserves_file_membership(self):
+        locks.acquire_lease(self.store, "work", keychain=False)
+        self.addCleanup(locks.release_lease, self.store, "work")
+        self.assertEqual(locks.acquire_lease(self.store, "work"), 1)
+        self.assertEqual(locks.lease_keychain_holders(self.store, "work"), [])
+        locks.acquire_lease(self.store, "work", keychain=True)
+        self.assertEqual(len(locks.lease_keychain_holders(self.store, "work")), 1)
+
+    def test_file_session_counts_toward_caps_for_every_authentication_mode(self):
+        raw = json.dumps({
+            "holders": [{"pid": 424242, "start": None, "keychain": False}]
+        }).encode()
+        self.path.write_bytes(raw)
+        with mock.patch.object(platforms, "process_alive", return_value=True):
+            for membership in (False, True):
+                with self.subTest(keychain=membership):
+                    with self.assertRaises(locks.LeaseLimitError):
+                        locks.acquire_lease(
+                            self.store, "work", max_holders=1, keychain=membership
+                        )
+                    self.assertEqual(self.path.read_bytes(), raw)
+
+    def test_invalid_membership_is_unknown_busy_and_cannot_be_overwritten(self):
+        for membership in (None, "file", "", 0, 1, [], {}):
+            with self.subTest(keychain=membership):
+                raw = json.dumps({
+                    "holders": [{"pid": os.getpid(), "start": None, "keychain": membership}]
+                }).encode()
+                self.path.write_bytes(raw)
+                self.assertIsNone(locks._parse_holders(raw))
+                self.assertIsNone(locks.lease_keychain_holders(self.store, "work"))
+                self.assertTrue(locks.is_locked(self.store, "work"))
+                self.assertIsNone(locks.try_mutation_lock(self.store, "work"))
+                with self.assertRaises(locks.LockError):
+                    locks.acquire_lease(self.store, "work", keychain=False)
+                self.assertEqual(self.path.read_bytes(), raw)
+                with self.assertRaises(locks.LockError):
+                    locks.release_lease(self.store, "work")
+                self.assertEqual(self.path.read_bytes(), raw)
+
+    def test_membership_filter_keeps_unknown_liveness_fail_closed(self):
+        with mock.patch.object(locks, "lease_holders", return_value=None):
+            self.assertIsNone(locks.lease_keychain_holders(self.store, "work"))
+
+    def test_invalid_acquisition_marker_does_not_create_a_registry(self):
+        self.path.unlink()
+        with self.assertRaises(locks.LockError):
+            locks.acquire_lease(self.store, "work", keychain="file")
+        self.assertFalse(self.path.exists())
 
 
 class TestInaccessibleProcessKeepsItsLease(BaseCase):

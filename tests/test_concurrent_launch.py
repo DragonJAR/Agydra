@@ -451,8 +451,9 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
     def test_the_guard_waits_out_lease_contention_like_the_runner(self):
         seen = {}
 
-        def record(store, name, patience_s=0.0, max_holders=None):
+        def record(store, name, patience_s=0.0, max_holders=None, *, keychain=None):
             seen["patience"] = patience_s
+            seen["keychain"] = keychain
             return 0
 
         with mock.patch.object(keychain, "supported", return_value=True), \
@@ -460,6 +461,7 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
                 mock.patch.object(keychain, "_ensure_target_keychain", return_value=None):
             keychain.launch_guard(self.store, "alpha").__enter__()
         self.assertEqual(seen["patience"], locks.LEASE_PATIENCE_S)
+        self.assertIs(seen["keychain"], True)
 
 
 class TestSlotOwnershipFailsClosed(BaseCase):

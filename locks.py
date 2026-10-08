@@ -18,7 +18,7 @@ The lock lives exactly as long as the session it protects:
   region unreliable enough to skip rather than guess).
 
 Beyond the flock, the SAME file now carries a holders registry: a JSON
-list of ``{"pid", "start"}`` entries describing every live session that
+list of ``{"pid", "start", "keychain"}`` entries describing every live session that
 joined the profile. ``lease_holders`` is the single parser for that
 content (legacy PID-only files parse as one token-less holder), sessions
 join via ``acquire_lease`` and leave via ``release_lease`` under a brief
@@ -222,11 +222,13 @@ class Holder(NamedTuple):
     ``start`` is the opaque ``platforms.process_start_token`` of ``pid``
     when it could be read, else None (legacy entries, or unreadable
     identity). A None start never prunes the holder on identity grounds —
-    only a dead pid does.
+    only a dead pid does. ``keychain`` is shared-slot participation; every
+    holder still protects mutations and counts toward session limits.
     """
 
     pid: int
     start: Optional[str]
+    keychain: bool = True
 
 
 _OWN_START_TOKEN: Optional[str] = None
@@ -247,10 +249,9 @@ def _parse_holders(raw: bytes) -> Optional[List[Holder]]:
 
     Three accepted shapes: empty → no holders; legacy PID-only (digits) →
     one token-less holder; JSON ``{"holders": [{"pid", "start"}]}``. Any
-    other content returns None = "undecodable": readers treat that as a
-    conservative busy signal, the exclusive writer of ``acquire_lease``
-    and ``release_lease`` (which holds the flock while parsing) treats it
-    as crash residue it may reset.
+    Missing authentication markers retain legacy Keychain membership.
+    Other content returns None = "undecodable": both readers and writers
+    fail closed without overwriting potentially live holders.
     """
     nul_stripped = raw.strip(b"\0")
     stripped = nul_stripped.strip()
@@ -275,11 +276,14 @@ def _parse_holders(raw: bytes) -> Optional[List[Holder]]:
             return None
         pid = entry.get("pid")
         start = entry.get("start")
+        keychain = entry.get("keychain", True)
         if not isinstance(pid, int) or isinstance(pid, bool):
             return None
         if start is not None and not isinstance(start, str):
             return None
-        holders.append(Holder(pid, start))
+        if not isinstance(keychain, bool):
+            return None
+        holders.append(Holder(pid, start, keychain))
     return holders
 
 
@@ -323,7 +327,7 @@ def _read_all(fd: int) -> bytes:
 
 def _write_holders(fd: int, holders: List[Holder]) -> None:
     payload = json.dumps(
-        {"holders": [{"pid": h.pid, "start": h.start} for h in holders]}
+        {"holders": [{"pid": h.pid, "start": h.start, "keychain": h.keychain} for h in holders]}
     ).encode("utf-8")
     os.ftruncate(fd, 0)
     os.lseek(fd, 0, os.SEEK_SET)
@@ -396,6 +400,12 @@ def lease_holders(store, name: str) -> Optional[List[Holder]]:
     return _prune_holders(parsed)
 
 
+def lease_keychain_holders(store, name: str) -> Optional[List[Holder]]:
+    """Read only shared-slot participants, preserving unknown registry state."""
+    holders = lease_holders(store, name)
+    return None if holders is None else [holder for holder in holders if holder.keychain]
+
+
 _LEASE_POLL_INTERVAL_S = 0.05
 POLL_INTERVAL_S = _LEASE_POLL_INTERVAL_S
 LEASE_PATIENCE_S = 2.0
@@ -415,7 +425,8 @@ def _open_lease_fd(store, name: str) -> int:
 
 
 def acquire_lease(
-    store, name: str, patience_s: float = 0.0, max_holders: Optional[int] = None
+    store, name: str, patience_s: float = 0.0, max_holders: Optional[int] = None,
+    *, keychain: Optional[bool] = None,
 ) -> int:
     """Join ``name``'s registry under a brief exclusive flock.
 
@@ -439,7 +450,13 @@ def acquire_lease(
     is refused with :class:`LeaseLimitError` and nothing is written. ``None``
     means unbounded (internal callers such as the keychain guard and usage
     queries, which never open a user session of their own).
+
+    ``keychain`` marks shared-slot participation, not session eligibility.
+    A missing argument preserves this PID's existing membership, or uses
+    the conservative legacy default for a new holder.
     """
+    if keychain is not None and not isinstance(keychain, bool):
+        raise LockError("invalid lease authentication membership")
     path = lock_path(store, name)
     deadline = time.monotonic() + patience_s
     while True:
@@ -450,8 +467,14 @@ def acquire_lease(
             if _lock_ex_brief(fd) and _same_file(fd, path):
                 try:
                     parsed = _parse_holders(_read_all(fd))
-                    holders = [] if parsed is None else _prune_holders(parsed)
-                    entry = Holder(os.getpid(), _own_start_token())
+                    if parsed is None:
+                        raise LockError(f"cannot decode live lease registry {path}")
+                    holders = _prune_holders(parsed)
+                    previous = next((h for h in holders if h.pid == os.getpid()), None)
+                    membership = keychain if keychain is not None else (
+                        previous.keychain if previous is not None else True
+                    )
+                    entry = Holder(os.getpid(), _own_start_token(), membership)
                     merged = [h for h in holders if h.pid != entry.pid]
                     if max_holders is not None and len(merged) >= max_holders:
                         raise LeaseLimitError(
@@ -494,7 +517,9 @@ def release_lease(store, name: str, patience_s: float = 0.0) -> None:
             if _lock_ex_brief(fd):
                 try:
                     parsed = _parse_holders(_read_all(fd))
-                    holders = [] if parsed is None else _prune_holders(parsed)
+                    if parsed is None:
+                        raise LockError(f"cannot decode live lease registry {path}")
+                    holders = _prune_holders(parsed)
                     remaining = [h for h in holders if h.pid != os.getpid()]
                     _write_holders(fd, remaining)
                     return

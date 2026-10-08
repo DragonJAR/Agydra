@@ -773,7 +773,8 @@ class SlotLeaseState(NamedTuple):
     (or None when the slot started empty) that the LAST live session of
     ``owner`` must restore on exit. Both fields are derived state: the
     holder registry in ``locks.py`` remains the single liveness oracle,
-    so a stored owner whose registry entries are all dead expires.
+    so an owner without live Keychain participants expires even if private
+    file-authentication sessions remain registered on that profile.
 
     An expired state (owner ``None``, ``stale_owner`` naming the crashed
     profile) keeps ``had_shared`` and ``owner_credential``. The baseline is
@@ -893,7 +894,7 @@ def _load_slot_lease(store) -> SlotLeaseState:
     if not isinstance(had_shared, str) or not had_shared:
         had_shared = None
     credential = _parse_owner_credential(data.get("owner_credential"))
-    holders = locks_module.lease_holders(store, owner)
+    holders = locks_module.lease_keychain_holders(store, owner)
     if holders is not None and not holders:
         return SlotLeaseState(
             owner=None,
@@ -1145,7 +1146,7 @@ def launch_guard(store, profile: str, capture: bool = False,
             import locks as locks_module
 
             locks_module.acquire_lease(
-                store, profile, patience_s=locks_module.LEASE_PATIENCE_S
+                store, profile, patience_s=locks_module.LEASE_PATIENCE_S, keychain=True
             )
             try:
                 with _launch_section(store):
@@ -1267,7 +1268,7 @@ def launch_guard(store, profile: str, capture: bool = False,
                     if state.owner == profile:
                         import locks as locks_module
 
-                        holders = locks_module.lease_holders(store, profile)
+                        holders = locks_module.lease_keychain_holders(store, profile)
                         if holders is not None:
                             others = [h for h in holders if h.pid != os.getpid()]
                             if not others:
