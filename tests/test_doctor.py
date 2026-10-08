@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import doctor
 import isolation
@@ -29,16 +30,17 @@ class TestDoctor(BaseCase):
         super().setUp()
         self.store = Store()
 
-    def test_cli_and_doctor_runtime_sources_have_no_comments(self):
+    def test_runtime_sources_have_no_comments(self):
         source_dir = Path(__file__).resolve().parents[1]
-        for filename in ("cli.py", "doctor.py"):
-            source = (source_dir / filename).read_text(encoding="utf-8")
+        for path in sorted(source_dir.glob("*.py")):
+            source = path.read_text(encoding="utf-8")
             comments = [
-                token.string
+                (token.start[0], token.string.strip())
                 for token in tokenize.generate_tokens(io.StringIO(source).readline)
-                if token.type == tokenize.COMMENT and not token.string.startswith("#!")
+                if token.type == tokenize.COMMENT
+                and not (token.start[0] == 1 and token.string.startswith("#!"))
             ]
-            with self.subTest(filename=filename):
+            with self.subTest(filename=path.name):
                 self.assertEqual(comments, [])
 
     def test_codex_schema_canary_accepts_daemonless_config_toml(self):

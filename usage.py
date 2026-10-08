@@ -1180,7 +1180,7 @@ def _bucket_destination(bucket, key: str) -> Optional[str]:
         return "weekly"
     if "5h" in win or "5h" in bid:
         return "five_h"
-    return "weekly"  # caller guards on summary[key]["weekly"] is None
+    return "weekly"
 
 
 def _select_summary_key(lower_name: str, summary: dict) -> Optional[str]:
