@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
@@ -13,6 +14,7 @@ from models import Profile
 from store import Store, StoreError, _atomic_write_json, read_json_object
 
 ALL_SCOPE = "all"
+LOCK_PATIENCE_S = 10.0
 ProfileIdentity = Union[int, str]
 IdentityKey = Tuple[str, int, str]
 
@@ -124,25 +126,31 @@ class Rotation:
         return [ALL_SCOPE, *sorted(engines.SUPPORTED_ENGINES)]
 
     def __enter__(self) -> "Rotation":
+        deadline = time.monotonic() + LOCK_PATIENCE_S
         try:
             for scope in self._lock_scopes():
                 path = lock_path(self.store, scope)
-                _require_real_path(path.parent)
-                _require_real_path(path)
-                handle = locks.try_lock_path(path, f"{scope} profile rotation lock")
-                if handle is None:
-                    raise StoreError(
-                        f"{scope} profile rotation is busy; retry in a moment"
-                    )
+                while True:
+                    _require_real_path(path.parent)
+                    _require_real_path(path)
+                    handle = locks.try_lock_path(path, f"{scope} profile rotation lock")
+                    if handle is not None:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise StoreError(
+                            f"{scope} profile rotation is busy; retry in a moment"
+                        )
+                    time.sleep(min(locks.POLL_INTERVAL_S, remaining))
                 self.handles.append(handle)
-        except StoreError:
-            self.release()
-            raise
         except OSError as exc:
             self.release()
             raise StoreError(
                 f"cannot lock {self.scope} profile rotation ({exc})"
             ) from exc
+        except BaseException:
+            self.release()
+            raise
         return self
 
     def __exit__(self, *args) -> None:

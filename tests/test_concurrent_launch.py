@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -17,7 +18,7 @@ import locks
 import platforms
 import profile_rotation
 import runner
-from conftest import BaseCase, LiveHolders
+from conftest import BaseCase, LiveHolders, held_cli_session
 from store import Store, StoreError
 
 
@@ -106,6 +107,141 @@ class TestStoreReadPatience(BaseCase):
             self.assertLess(time.monotonic() - started, 0.5)
         finally:
             holder.release()
+
+
+class TestRotationLockPatience(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+
+    def test_rotation_waits_out_brief_contention_in_each_scope(self):
+        scopes = ("agy", "claude", "codex", "grok")
+        scenarios = [
+            *[(scope, scope) for scope in scopes],
+            *[(None, scope) for scope in (None, *scopes)],
+        ]
+        for requested, held in scenarios:
+            with self.subTest(requested=requested, held=held):
+                holder = locks.try_lock_path(
+                    profile_rotation.lock_path(self.store, held), "test holder"
+                )
+                timer = _release_later(holder, 0.15)
+                started = time.monotonic()
+                try:
+                    with profile_rotation.Rotation(self.store, requested):
+                        self.assertGreaterEqual(time.monotonic() - started, 0.1)
+                finally:
+                    timer.join()
+                    holder.release()
+
+    def test_timeout_releases_partially_acquired_global_locks(self):
+        holder = locks.try_lock_path(
+            profile_rotation.lock_path(self.store, "grok"), "test holder"
+        )
+        rotation = profile_rotation.Rotation(self.store, None)
+        try:
+            with mock.patch.object(
+                profile_rotation, "LOCK_PATIENCE_S", 0.15
+            ):
+                started = time.monotonic()
+                with self.assertRaisesRegex(StoreError, "grok profile rotation is busy"):
+                    rotation.__enter__()
+                self.assertGreaterEqual(time.monotonic() - started, 0.1)
+                self.assertLess(time.monotonic() - started, 2.0)
+            self.assertEqual(rotation.handles, [])
+            for scope in (None, "agy", "claude", "codex"):
+                handle = locks.try_lock_path(
+                    profile_rotation.lock_path(self.store, scope), "released lock probe"
+                )
+                self.assertIsNotNone(handle)
+                handle.release()
+        finally:
+            rotation.release()
+            holder.release()
+
+    def test_interrupt_releases_partially_acquired_global_locks(self):
+        rotation = profile_rotation.Rotation(self.store, None)
+        real_try_lock = locks.try_lock_path
+
+        def interrupt(path, *args, **kwargs):
+            if path == profile_rotation.lock_path(self.store, "grok"):
+                raise KeyboardInterrupt
+            return real_try_lock(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(locks, "try_lock_path", side_effect=interrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    rotation.__enter__()
+            self.assertEqual(rotation.handles, [])
+        finally:
+            rotation.release()
+
+    def test_global_acquisition_uses_one_patience_budget_for_all_scopes(self):
+        elapsed = 0.0
+        real_try_lock = locks.try_lock_path
+        rotation = profile_rotation.Rotation(self.store, None)
+
+        def advance(seconds):
+            nonlocal elapsed
+            elapsed += seconds
+
+        def acquire(path, *args, **kwargs):
+            if path == profile_rotation.lock_path(self.store, "agy") and elapsed < 0.2:
+                return None
+            if path == profile_rotation.lock_path(self.store, "claude"):
+                return None
+            return real_try_lock(path, *args, **kwargs)
+
+        try:
+            with mock.patch.object(profile_rotation, "LOCK_PATIENCE_S", 0.3), \
+                    mock.patch.object(profile_rotation.time, "monotonic", side_effect=lambda: elapsed), \
+                    mock.patch.object(profile_rotation.time, "sleep", side_effect=advance), \
+                    mock.patch.object(locks, "try_lock_path", side_effect=acquire):
+                with self.assertRaisesRegex(StoreError, "claude profile rotation is busy"):
+                    rotation.__enter__()
+            self.assertAlmostEqual(elapsed, 0.3)
+            self.assertEqual(rotation.handles, [])
+        finally:
+            rotation.release()
+
+
+class TestConcurrentRandomCLI(BaseCase):
+    def test_parallel_cli_launches_keep_running_without_holding_rotation(self):
+        store = Store()
+        for name in ("alpha", "beta", "gamma"):
+            store.create(name)
+            _authenticate(store, name)
+        ready = threading.Barrier(5)
+        live_processes = []
+        scopes = ("agy", None, "agy", None)
+
+        def launch(scope):
+            args = ["--force", "-r", "--dangerously-skip-permissions"]
+            if scope is not None:
+                args[:0] = ["-e", scope]
+            with held_cli_session(*args, cwd=self._tmp, ready_timeout=30) as process:
+                live_processes.append(process)
+                ready.wait(timeout=20)
+                ready.wait(timeout=20)
+            return process.returncode
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(launch, scope) for scope in scopes]
+            try:
+                ready.wait(timeout=30)
+                self.assertEqual(len(live_processes), 4)
+                self.assertTrue(all(process.poll() is None for process in live_processes))
+                for scope in (None, "agy", "claude", "codex", "grok"):
+                    handle = locks.try_lock_path(
+                        profile_rotation.lock_path(store, scope), "concurrent rotation probe"
+                    )
+                    self.assertIsNotNone(handle)
+                    handle.release()
+                ready.wait(timeout=20)
+            except BaseException:
+                ready.abort()
+                raise
+            self.assertEqual([future.result(timeout=30) for future in futures], [0] * 4)
 
 
 class TestRandomPickExhaustion(BaseCase):
@@ -197,6 +333,54 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
         self.assertEqual(locks.lease_holders(self.store, "gamma"), [])
         self.assertEqual(locks.lease_holders(self.store, first), [])
         self.assertFalse(profile_rotation.state_path(self.store, "agy").exists())
+
+    def test_owner_join_releases_rotation_before_waiting_for_the_engine(self):
+        owner = self.store.get("gamma")
+        for engine_filter in ("agy", None):
+            with self.subTest(engine_filter=engine_filter):
+                scope = engine_filter or profile_rotation.ALL_SCOPE
+                state = {"version": 1, "engine": scope, "used": [owner.seq]}
+                path = profile_rotation.state_path(self.store, engine_filter)
+                profile_rotation._atomic_write_json(path, state)
+
+                @contextlib.contextmanager
+                def guard(store, profile, **_kwargs):
+                    if profile != owner.name:
+                        raise keychain.KeychainBusyError(
+                            "slot owned by gamma", owner=owner.name
+                        )
+                    yield
+
+                def launch(argv, env):
+                    self.assertEqual(argv[1:], ["--dangerously-skip-permissions"])
+                    self.assertEqual(env["AGYDRA_PROFILE"], owner.name)
+                    self.assertTrue(locks.lease_holders(self.store, owner.name))
+                    scopes = (
+                        ("agy",) if engine_filter else (None, "agy", "claude", "codex", "grok")
+                    )
+                    for locked_scope in scopes:
+                        handle = locks.try_lock_path(
+                            profile_rotation.lock_path(self.store, locked_scope),
+                            "live engine rotation probe",
+                        )
+                        self.assertIsNotNone(
+                            handle, "owner join retained a rotation lock during the session"
+                        )
+                        handle.release()
+                    self.assertEqual(profile_rotation.read_json_object(path), state)
+                    return 0
+
+                plan = runner.build_plan(
+                    self.store, ["--dangerously-skip-permissions"],
+                    random_pick=True, engine=engine_filter, force=True,
+                )
+                with mock.patch.object(keychain, "supported", return_value=True), \
+                        mock.patch.object(keychain, "launch_guard", side_effect=guard), \
+                        mock.patch.object(platforms, "run_wait", side_effect=launch), \
+                        mock.patch.object(platforms, "launch_argv", side_effect=launch):
+                    self.assertEqual(runner.run(plan, store=self.store), 0)
+                self.assertEqual(profile_rotation.read_json_object(path), state)
+                self.assertEqual(locks.lease_holders(self.store, owner.name), [])
 
     @unittest.skipIf(
         sys.platform == "win32",

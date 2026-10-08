@@ -298,7 +298,8 @@ class TestProfileRotation(BaseCase):
 
     def test_all_engine_rotation_lock_coordinates_with_engine_scopes(self):
         with profile_rotation.Rotation(self.store, None):
-            with self.assertRaisesRegex(StoreError, "codex profile rotation is busy"):
+            with mock.patch.object(profile_rotation, "LOCK_PATIENCE_S", 0.1), \
+                    self.assertRaisesRegex(StoreError, "codex profile rotation is busy"):
                 profile_rotation.Rotation(self.store, "codex").__enter__()
 
         with profile_rotation.Rotation(self.store, "codex") as codex_rotation, \

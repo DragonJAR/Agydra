@@ -373,7 +373,7 @@ def _run_prepared(
     plan: LaunchPlan, store: Store,
     rotation: Optional[profile_rotation.Rotation] = None,
 ) -> int:
-    """Prepare the leased candidate and commit rotation at the launch boundary."""
+    """Prepare the candidate and finish rotation before starting the engine."""
 
     import contextlib
     import engines
@@ -464,12 +464,11 @@ def _run_prepared(
             )
             try:
                 with guard:
-                    if (
-                        rotation is not None
-                        and plan.random_pick
-                        and not plan.skip_rotation_commit
-                    ):
-                        rotation.commit(profile)
+                    if rotation is not None:
+                        if plan.random_pick and not plan.skip_rotation_commit:
+                            rotation.commit(profile)
+                        else:
+                            rotation.release()
                     if platforms.is_windows():
                         rc = platforms.launch_argv(argv, env)
                         platforms.drain_tty_input()
