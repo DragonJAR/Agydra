@@ -170,6 +170,17 @@ def _make_jwt(claims: dict) -> str:
     return f"{seg({'alg': 'none', 'typ': 'JWT'})}.{seg(claims)}.sig"
 
 
+def authenticate_agy_profile(store, name: str) -> Path:
+    """Publish a private, modern synthetic token for launch tests."""
+    import account
+
+    path = store.profile_data_dir(name, engine="agy") / account.AGY_CLI_DIR / account.TOKEN_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"token":{"access_token":"mock-token"}}', encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
 _FAKE_AGY_HEARTBEAT_CHILD = (
     "import sys, time\n"
     "path = sys.argv[1]\n"

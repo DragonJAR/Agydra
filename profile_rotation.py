@@ -118,7 +118,6 @@ class Rotation:
         self.used: Set[ProfileIdentity] = set()
         self.auth_states: Dict[IdentityKey, str] = {}
         self.quota_availabilities: Dict[IdentityKey, Optional[float]] = {}
-        self.blocked_engines: Set[str] = set()
 
     def _lock_scopes(self) -> List[str]:
         if self.scope != ALL_SCOPE:
@@ -224,10 +223,7 @@ def _choose(
     eligible: Optional[Callable[[Profile], bool]],
     priority: Optional[Callable[[Profile], tuple]],
 ) -> Profile:
-    candidates = [
-        profile for profile in profiles
-        if profile.engine not in rotation.blocked_engines
-    ]
+    candidates = profiles
     if not candidates:
         raise NoEligibleProfileError("no profile remains in the rotation scope")
     used = _read_used(store, rotation.scope)

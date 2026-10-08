@@ -120,7 +120,7 @@ class _ScopedBase(BaseCase):
         clidir = data_dir / "antigravity-cli"
         clidir.mkdir(parents=True, exist_ok=True)
         (clidir / "antigravity-oauth-token").write_text(
-            json.dumps({"access_token": "on-disk-acc", "refresh_token": "on-disk-ref"}),
+            json.dumps({"token": {"access_token": "on-disk-acc", "refresh_token": "on-disk-ref"}}),
             encoding="utf-8",
         )
 
@@ -150,7 +150,7 @@ class TestScopedTokenBytes(_ScopedBase):
     def test_disk_token_returned_verbatim(self):
         store, profile = self.store, self.store.get("alpha")
         data_dir = self.store.profile_data_dir("alpha", engine="agy")
-        disk_bytes = b'{"access_token": "on-disk"}'
+        disk_bytes = b'{"token":{"access_token":"on-disk"}}'
         (data_dir / "antigravity-cli" / "antigravity-oauth-token").write_bytes(disk_bytes)
         self.assertEqual(
             usage_agy.scoped_token_bytes(store, "alpha", profile, data_dir), disk_bytes
@@ -320,6 +320,10 @@ class TestQueryProfileUsageScoped(_ScopedBase):
                 proc.stdin.close()
             proc.terminate()
             proc.wait(timeout=5)
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
 
     def test_does_not_touch_shared_keychain_under_macos(self):
         shared_before = _slot_payload_json("alpha@example.com")

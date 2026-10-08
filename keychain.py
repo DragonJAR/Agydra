@@ -106,21 +106,13 @@ class KeychainBusyError(KeychainError):
     """The shared keychain slot is unavailable to this launch.
 
     ``owner`` names the profile whose live sessions own the slot when that is
-    the reason (joining that profile is then always possible); it is ``None``
+    the reason (explicit joins still honor session caps); it is ``None``
     for plain swap-lock contention.
     """
 
     def __init__(self, message: str, owner: Optional[str] = None) -> None:
         super().__init__(message)
         self.owner = owner
-
-    @property
-    def retriable_with_another_profile(self) -> bool:
-        """True only when a live profile OWNS the slot (``owner`` set):
-        joining or re-picking profiles can then succeed. Owner-less
-        ``swap.lock`` contention is global to every agy profile, so
-        re-picking only burns another patience budget on the same lock."""
-        return self.owner is not None
 
 
 class SwapSectionError(KeychainError):

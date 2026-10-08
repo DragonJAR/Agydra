@@ -14,21 +14,14 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import account
 import keychain
 import locks
 import platforms
 import profile_rotation
 import runner
-from conftest import BaseCase, LiveHolders, held_cli_session
+from conftest import BaseCase, LiveHolders, authenticate_agy_profile as _authenticate, held_cli_session
 from store import Store, StoreError
-
-
-def _authenticate(store, name):
-    token_dir = store.profile_data_dir(name) / "antigravity-cli"
-    token_dir.mkdir(parents=True, exist_ok=True)
-    (token_dir / "antigravity-oauth-token").write_text(
-        '{"token": {"access_token": "mock-token"}}', encoding="utf-8"
-    )
 
 
 def _release_later(handle, delay):
@@ -254,46 +247,43 @@ class TestRandomPickExhaustion(BaseCase):
             _authenticate(self.store, name)
 
     def test_exhausted_candidates_report_the_real_cause_not_missing_profiles(self):
-        @contextlib.contextmanager
-        def busy_guard():
-            raise keychain.KeychainBusyError("slot owned elsewhere")
-            yield
-
         plan = runner.build_plan(self.store, ["chat"], random_pick=True, engine="agy")
-        with mock.patch.object(keychain, "supported", return_value=True), \
-                mock.patch.object(keychain, "launch_guard", side_effect=lambda *a, **k: busy_guard()), \
-                mock.patch.object(platforms, "run_wait", return_value=0):
+        with mock.patch.object(
+            locks, "acquire_lease", side_effect=locks.LockError("store mutation busy")
+        ) as acquire:
             with self.assertRaises(StoreError) as caught:
                 runner.run(plan, store=self.store)
         message = str(caught.exception)
-        self.assertIn("slot owned elsewhere", message)
+        self.assertIn("store mutation busy", message)
         self.assertNotIn("no profiles found", message)
+        self.assertEqual(acquire.call_count, 2)
+        self.assertFalse(profile_rotation.state_path(self.store, "agy").exists())
 
-    def test_ownerless_contention_repicks_once_then_fails_with_the_real_cause(self):
-        """Owner-less busy is swap.lock contention, global to every agy
-        profile: one re-pick absorbs a transient section that overran its
-        patience, then the launch fails fast with the keychain diagnostic
-        instead of cycling every remaining profile for nothing."""
+    def test_random_file_auth_never_waits_for_a_held_swap_lock(self):
         self.store.create("gamma")
         _authenticate(self.store, "gamma")
-        entered = []
-
-        @contextlib.contextmanager
-        def busy_guard(store, profile, capture=False, persist_on_exit=True):
-            entered.append(profile)
-            raise keychain.KeychainBusyError("swap lock held")
-            yield
-
+        path = keychain._slots_dir(self.store) / "swap.lock"
+        holder = locks.try_lock_path(path, "held Keychain section")
+        launched = []
         plan = runner.build_plan(self.store, ["chat"], random_pick=True, engine="agy")
-        with mock.patch.object(keychain, "supported", return_value=True), \
-                mock.patch.object(keychain, "launch_guard", side_effect=busy_guard), \
-                mock.patch.object(platforms, "run_wait", return_value=0):
-            with self.assertRaises(StoreError) as caught:
-                runner.run(plan, store=self.store)
-        message = str(caught.exception)
-        self.assertIn("swap lock held", message)
-        self.assertNotIn("already tried", message)
-        self.assertEqual(len(entered), 2)
+
+        def launch(_argv, env):
+            launched.append(env["AGYDRA_PROFILE"])
+            self.assertEqual(env[account.AGY_FILE_AUTH_ENV], account.AGY_FILE_AUTH_VALUE)
+            return 0
+
+        try:
+            with mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(keychain, "launch_guard") as guard, \
+                    mock.patch.object(platforms, "run_wait", side_effect=launch), \
+                    mock.patch.object(platforms, "launch_argv", side_effect=launch):
+                for _ in range(3):
+                    self.assertEqual(runner.run(plan, store=self.store), 0)
+                guard.assert_not_called()
+            self.assertEqual(launched, ["alpha", "beta", "gamma"])
+            self.assertIsNone(locks.try_lock_path(path, "still-held section probe"))
+        finally:
+            holder.release()
         for name in ("alpha", "beta", "gamma"):
             self.assertEqual(locks.lease_holders(self.store, name), [])
 
@@ -306,37 +296,34 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
             self.store.create(name)
             _authenticate(self.store, name)
 
-    def test_busy_slot_owned_by_another_profile_falls_back_to_joining_the_owner(self):
-        """Every non-owner candidate is blocked by the live owner, so the
-        rotation exhausts its scope; the launch then joins the owner's
-        live session through explicit-selection semantics — no rotation
-        commit — instead of failing with the keychain conflict."""
-        entered = []
-
-        @contextlib.contextmanager
-        def guard(store, profile, capture=False, persist_on_exit=True):
-            entered.append(profile)
-            if profile != "gamma":
-                raise keychain.KeychainBusyError(
-                    "slot owned by gamma", owner="gamma"
-                )
-            yield
-
+    def test_busy_slot_owner_does_not_change_the_selected_profile(self):
         plan = runner.build_plan(self.store, ["chat"], random_pick=True, engine="agy")
         first = plan.profile
-        self.assertNotEqual(first, "gamma")
-        with mock.patch.object(keychain, "supported", return_value=True), \
-                mock.patch.object(keychain, "launch_guard", side_effect=guard), \
-                mock.patch.object(platforms, "run_wait", return_value=0):
-            rc = runner.run(plan, store=self.store)
-        self.assertEqual(rc, 0)
-        self.assertEqual(entered, [first, "gamma"])
-        self.assertEqual(locks.lease_holders(self.store, "gamma"), [])
-        self.assertEqual(locks.lease_holders(self.store, first), [])
-        self.assertFalse(profile_rotation.state_path(self.store, "agy").exists())
+        locks.acquire_lease(self.store, "gamma")
+        keychain._save_slot_lease(self.store, "gamma", None)
 
-    def test_owner_join_releases_rotation_before_waiting_for_the_engine(self):
-        """An expected owner join is silent and releases only rotation locks."""
+        def launch(_argv, env):
+            self.assertEqual(env["AGYDRA_PROFILE"], first)
+            return 0
+
+        try:
+            with mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(keychain, "launch_guard") as guard, \
+                    mock.patch.object(platforms, "run_wait", side_effect=launch), \
+                    mock.patch.object(platforms, "launch_argv", side_effect=launch):
+                self.assertEqual(runner.run(plan, store=self.store), 0)
+            guard.assert_not_called()
+            self.assertEqual(keychain._load_slot_lease(self.store).owner, "gamma")
+            self.assertEqual(locks.lease_holders(self.store, first), [])
+            self.assertEqual(
+                profile_rotation.read_json_object(profile_rotation.state_path(self.store, "agy"))["used"],
+                [self.store.get(first).seq],
+            )
+        finally:
+            locks.release_lease(self.store, "gamma")
+
+    def test_random_file_launch_releases_rotation_before_waiting_for_the_engine(self):
+        """Quiet native file sessions commit selection and release rotation locks."""
         owner = self.store.get("gamma")
         for engine_filter in ("agy", None):
             with self.subTest(engine_filter=engine_filter):
@@ -345,18 +332,12 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
                 path = profile_rotation.state_path(self.store, engine_filter)
                 profile_rotation._atomic_write_json(path, state)
 
-                @contextlib.contextmanager
-                def guard(store, profile, **_kwargs):
-                    if profile != owner.name:
-                        raise keychain.KeychainBusyError(
-                            "slot owned by gamma", owner=owner.name
-                        )
-                    yield
-
                 def launch(argv, env):
                     self.assertEqual(argv[1:], ["--dangerously-skip-permissions"])
-                    self.assertEqual(env["AGYDRA_PROFILE"], owner.name)
-                    self.assertTrue(locks.lease_holders(self.store, owner.name))
+                    self.assertEqual(env["AGYDRA_PROFILE"], selected)
+                    self.assertEqual(env[account.AGY_FILE_AUTH_ENV], account.AGY_FILE_AUTH_VALUE)
+                    self.assertTrue(locks.lease_holders(self.store, selected))
+                    self.assertFalse(locks.lease_holders(self.store, selected)[0].keychain)
                     scopes = (
                         ("agy",) if engine_filter else (None, "agy", "claude", "codex", "grok")
                     )
@@ -366,82 +347,63 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
                             "live engine rotation probe",
                         )
                         self.assertIsNotNone(
-                            handle, "owner join retained a rotation lock during the session"
+                            handle, "random launch retained a rotation lock during the session"
                         )
                         handle.release()
-                    self.assertEqual(profile_rotation.read_json_object(path), state)
+                    self.assertEqual(
+                        profile_rotation.read_json_object(path)["used"],
+                        sorted([owner.seq, self.store.get(selected).seq], key=str),
+                    )
                     return 0
 
                 plan = runner.build_plan(
                     self.store, ["--dangerously-skip-permissions"],
                     random_pick=True, engine=engine_filter, force=True,
                 )
+                selected = plan.profile
                 stderr = io.StringIO()
                 with mock.patch.object(keychain, "supported", return_value=True), \
-                        mock.patch.object(keychain, "launch_guard", side_effect=guard), \
+                        mock.patch.object(keychain, "launch_guard") as guard, \
                         mock.patch.object(platforms, "run_wait", side_effect=launch), \
                         mock.patch.object(platforms, "launch_argv", side_effect=launch), \
                         contextlib.redirect_stderr(stderr):
                     self.assertEqual(runner.run(plan, store=self.store), 0)
                 self.assertEqual(stderr.getvalue(), "")
-                self.assertEqual(profile_rotation.read_json_object(path), state)
-                self.assertEqual(locks.lease_holders(self.store, owner.name), [])
+                guard.assert_not_called()
+                self.assertEqual(locks.lease_holders(self.store, selected), [])
 
     @unittest.skipIf(
         sys.platform == "win32",
         "spawns live lease-holder subprocesses; same constraint as the session-limit suite",
     )
-    def test_owner_join_fallback_still_respects_the_session_limit(self):
-        """The fallback join is explicit-selection semantics: without
-        ``--force`` the owner's session cap binds and the launch reports
-        the actionable lease-limit guidance instead of joining."""
+    def test_capped_keychain_owner_does_not_block_a_free_profile(self):
         self.store.update_config(
             lambda config: config.settings.update({"max_sessions_per_profile": 1})
         )
-        entered = []
         with LiveHolders(self.store, "gamma", 1):
-
-            @contextlib.contextmanager
-            def guard(store, profile, capture=False, persist_on_exit=True):
-                entered.append(profile)
-                if profile != "gamma":
-                    raise keychain.KeychainBusyError(
-                        "slot owned by gamma", owner="gamma"
-                    )
-                yield
-
+            keychain._save_slot_lease(self.store, "gamma", None)
             plan = runner.build_plan(self.store, ["chat"], random_pick=True, engine="agy")
             first = plan.profile
             with mock.patch.object(keychain, "supported", return_value=True), \
-                    mock.patch.object(keychain, "launch_guard", side_effect=guard), \
-                    mock.patch.object(platforms, "run_wait", return_value=0):
-                with self.assertRaises(StoreError) as caught:
-                    runner.run(plan, store=self.store)
-            message = str(caught.exception)
-            self.assertIn("max_sessions_per_profile", message)
-            self.assertIn("-f/--force", message)
-            self.assertEqual(entered, [first])
+                    mock.patch.object(keychain, "launch_guard") as guard, \
+                    mock.patch.object(platforms, "run_wait", return_value=0), \
+                    mock.patch.object(platforms, "launch_argv", return_value=0):
+                self.assertEqual(runner.run(plan, store=self.store), 0)
+            guard.assert_not_called()
+            self.assertNotEqual(first, "gamma")
+            self.assertEqual(locks.lease_holders(self.store, first), [])
 
-    def test_slot_owner_that_cannot_be_planned_is_excluded_and_another_profile_is_repicked(self):
-        entered = []
-
-        @contextlib.contextmanager
-        def guard(store, profile, capture=False, persist_on_exit=True):
-            entered.append(profile)
-            if len(entered) == 1:
-                raise keychain.KeychainBusyError(
-                    "slot owned by vanished", owner="vanished"
-                )
-            yield
-
+    def test_random_file_auth_ignores_an_unreadable_keychain_lease(self):
         plan = runner.build_plan(self.store, ["chat"], random_pick=True, engine="agy")
+        keychain._slot_lease_path(self.store).parent.mkdir(parents=True, exist_ok=True)
+        keychain._slot_lease_path(self.store).write_bytes(b"not-json")
         with mock.patch.object(keychain, "supported", return_value=True), \
-                mock.patch.object(keychain, "launch_guard", side_effect=guard), \
-                mock.patch.object(platforms, "run_wait", return_value=0):
+                mock.patch.object(keychain, "launch_guard") as guard, \
+                mock.patch.object(platforms, "run_wait", return_value=0), \
+                mock.patch.object(platforms, "launch_argv", return_value=0):
             self.assertEqual(runner.run(plan, store=self.store), 0)
-        self.assertEqual(len(entered), 2)
-        self.assertNotIn("vanished", entered)
-        self.assertNotEqual(entered[0], entered[1])
+        guard.assert_not_called()
+        self.assertEqual(keychain._slot_lease_path(self.store).read_bytes(), b"not-json")
 
     def test_owner_error_carries_the_owner_name(self):
         error = keychain.KeychainBusyError("busy", owner="gamma")

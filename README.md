@@ -150,7 +150,9 @@ Copy or merge the printed `statusLine` object **manually into `settings.json` at
 
 **Pin a directory.** `agydra use client-acme` writes `.agydra`. Normal profile resolution in that tree uses the pinned profile; explicit `-r` ignores the marker and rotates through its selection-scope cycle.
 
-**Rotate.** `agydra -r` considers authenticated profiles from all engines. Add `-e codex`, `-e grok`, `-e claude`, or `-e agy` to narrow the pool. Each scope exhausts unused profiles before repeating: unused candidates prefer a free session and then saved quota; repeats prefer saved quota, then session priority and least-recent use. On macOS, if a different `agy` profile owns the shared Keychain slot, `-e agy -r` reports the conflict instead of joining that account; close its sessions before switching profiles.
+**Rotate.** `agydra -r` considers authenticated profiles from all engines. Add `-e codex`, `-e grok`, `-e claude`, or `-e agy` to narrow the pool. Each scope exhausts unused profiles before repeating: unused candidates prefer a free session and then saved quota; repeats prefer saved quota, then session priority and least-recent use. Random `agy` sessions use each selected profile's native disk authentication, so different accounts can run concurrently without sharing the macOS Keychain slot or substituting its owner. Rotation is by profile, not email; intentionally same-account profiles remain separate entries.
+
+`agydra -e agy --force -r --dangerously-skip-permissions` preserves that ordering and bypasses only the session cap. Agydra sets `SSH_TTY=agydra-profile` to select native file authentication while keeping the terminal interactive. Native refreshes persist in the selected profile. A missing token is seeded atomically from an identity-verified private backup only while the profile is idle; malformed, foreign or unsafe files abort rather than inheriting another account. Authenticate an unprepared profile with `agydra login PROFILE`. Explicit `-p PROFILE` and login keep the existing Keychain bridge.
 
 **Share config, keep credentials.** `agydra share-config work personal staging` copies `settings.json`, `mcp.json`, and `config.toml`. `auth.json` stays in the source profile.
 
@@ -162,7 +164,7 @@ Copy or merge the printed `statusLine` object **manually into `settings.json` at
 
 | Engine | Isolation | Login | Notes |
 |---|---|---|---|
-| `agy` | `HOME` overlay, `~/.gemini` layout | Official Google OAuth | macOS keychain bridge (`agydra.<profile>`). Host `~/.gemini` stays as it was. |
+| `agy` | `HOME` overlay, `~/.gemini` layout | Official Google OAuth | Random sessions use private disk tokens; explicit selection/login retain the macOS Keychain bridge. Host `~/.gemini` stays as it was. |
 | `codex` | `CODEX_HOME` → overlay `~/.codex` | `codex login` | `--no-daemon` on every run, and `daemon_auto_start = false`, so the socket path stays under `SUN_LEN` and the lock releases on exit. Credentials live in `auth.json`. |
 | `grok` | `GROK_HOME` and `GROK_LEADER_SOCKET` (`<overlay>/.grok/leader.sock`) | `grok login` | Host `~/.grok` stays as it was. Plan names such as SuperGrok come from `auth.json`. `usage` reads the xAI billing API. No keychain swap. |
 | `claude` | `CLAUDE_CONFIG_DIR` → physical, stable `<store>/claude-config/<seq>`; real HOME | `claude auth login` | Authentication checked with `claude auth status`; no Antigravity Keychain swap. Rename preserves path and identity. Usage runs the profile's own `claude -p "/usage"` (cached 5 min), else opt-in statusLine snapshots. |
@@ -247,7 +249,7 @@ Host home (~/)                         left in place: ~/.gemini  ~/.codex  ~/.gr
 
 For overlay engines, `.ssh`, `.gitconfig`, and shell config are mirrored into the overlay. Ancestor directories of the store are real directories, so the store itself stays out of reach from inside the overlay. The child receives `AGYDRA_REAL_HOME`.
 
-`AgyEngine`, `CodexEngine`, `GrokEngine`, and `ClaudeEngine` own binary lookup, arguments, paths, and identity parsing. Codex always runs with `--no-daemon`. Grok's leader socket is per profile, so a host `grok` session and a profile session do not share it. The macOS keychain bridge applies to `agy` only.
+`AgyEngine`, `CodexEngine`, `GrokEngine`, and `ClaudeEngine` own binary lookup, arguments, paths, and identity parsing. Codex always runs with `--no-daemon`. Grok's leader socket is per profile, so a host `grok` session and a profile session do not share it. The macOS Keychain bridge applies only to explicit `agy` selection and login. File-authentication sessions still count toward session caps and protect their profile from mutations, but do not retain shared-slot ownership.
 
 Session locks use `<store>/locks/<profile>.lock`; the sentinel file persists, while the OS advisory lock is released when its holder exits. `create`, `rename`, and `delete` acquire the affected profile locks in sorted name order, then the persistent, non-inherited store-wide lock `<store>/locks/.profile-sequence.lock`; profile and sequence locks are acquired non-blockingly and profile locks are released in reverse order. The persistent `<store>/profile-sequence.json` stores `{"last_seq": N}`. If it is missing, the counter is initialized from the highest readable profile sequence while holding the sequence lock. `create` persists its next number before staging, so an interruption or later failure can leave a harmless gap; deleted sequence numbers are not reused.
 
@@ -257,11 +259,11 @@ Before moving a profile directory, `rename` atomically writes its intent to `<st
 
 When enabled (the default; `--no-backup` disables it), `delete` writes and verifies its ZIP backup before removing profile data: the backup is written and verified while holding the profile lock, then the commit phase re-acquires the sequence lock, re-checks the profile's identity and paths, and only then purges. At most the last 5 backup ZIPs per profile are kept. For Antigravity, the CLI keeps the profile lock through its post-delete keychain purge, after releasing the sequence lock; on macOS, that purge uses `swap.lock` to serialize cleanup of the profile's saved slot and system Keychain entry with keychain swaps. A purge failure is reported as a warning after deletion. `import` holds its target profile lock through the copy (plus `swap.lock` on macOS for Antigravity so the imported credential cannot race a live swap), and `share-config` holds the source and target profile locks until all copies finish. `doctor --fix` holds the profile lock while migrating and relinking overlay data.
 
-Store paths are hardened: a symlink or junction at the profiles root, a profile directory, `profile.json`, `data/`, the overlays root or the Claude config path fails closed instead of redirecting a write outside the store, and two profiles claiming the same sequence number are refused rather than aliasing one Claude configuration. On macOS, when another live Agydra operation holds the shared keychain swap lock, a launch reports a clean busy error instead of blocking or interleaving credential swaps.
+Store paths are hardened: a symlink or junction at the profiles root, a profile directory, `profile.json`, `data/`, the overlays root or the Claude config path fails closed instead of redirecting a write outside the store, and two profiles claiming the same sequence number are refused rather than aliasing one Claude configuration. On macOS, contention in the shared Keychain bridge reports a clean busy error for explicit selection/login; random `agy` sessions never take that swap lock.
 
 | Platform | Mechanism |
 |---|---|
-| **macOS** | Keychain bridge for `agy`. Codex, Grok and Claude skip it; Claude owns its native Keychain authentication. |
+| **macOS** | Private disk authentication for random `agy`; Keychain bridge for explicit `agy` selection/login. Other engines skip the bridge; Claude owns its native Keychain. |
 | **Linux** | Optional `bwrap` (`use_linux_sandbox`) masks DBus and keyring sockets. A missing `bwrap` warns and continues. |
 | **Windows** | NTFS junctions. No Administrator rights and no Developer Mode. |
 

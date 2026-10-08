@@ -17,16 +17,8 @@ import models
 import platforms
 import resolver
 import runner
-from conftest import BaseCase, LiveHolders as _LiveHolders
+from conftest import BaseCase, LiveHolders as _LiveHolders, authenticate_agy_profile as _authenticate
 from store import Store, StoreError
-
-
-def _authenticate(store, name):
-    token_dir = store.profile_data_dir(name) / "antigravity-cli"
-    token_dir.mkdir(parents=True, exist_ok=True)
-    (token_dir / "antigravity-oauth-token").write_text(
-        '{"token": {"access_token": "mock-token"}}', encoding="utf-8"
-    )
 
 
 @unittest.skipIf(
@@ -179,11 +171,13 @@ class TestRunnerLimit(BaseCase):
         real = locks.acquire_lease
         calls = []
 
-        def racing(store, name, patience_s=0.0, max_holders=None):
+        def racing(store, name, patience_s=0.0, max_holders=None, *, keychain=None):
             calls.append(name)
             if len(calls) == 1:
                 raise locks.LeaseLimitError(f"profile {name!r} reached its limit")
-            return real(store, name, patience_s=patience_s, max_holders=max_holders)
+            return real(
+                store, name, patience_s=patience_s, max_holders=max_holders, keychain=keychain
+            )
 
         with mock.patch.object(locks, "acquire_lease", side_effect=racing):
             self.assertEqual(self._run(plan), 0)
@@ -203,12 +197,12 @@ class TestRunnerLimit(BaseCase):
         real_acquire = locks.acquire_lease
         calls = []
 
-        def limit_alpha(store, name, patience_s=0.0, max_holders=None):
+        def limit_alpha(store, name, patience_s=0.0, max_holders=None, *, keychain=None):
             calls.append(name)
             if name == "alpha":
                 raise locks.LeaseLimitError("synthetic session limit for alpha")
             return real_acquire(
-                store, name, patience_s=patience_s, max_holders=max_holders
+                store, name, patience_s=patience_s, max_holders=max_holders, keychain=keychain
             )
 
         with mock.patch.object(locks, "acquire_lease", side_effect=limit_alpha):
@@ -226,7 +220,7 @@ class TestRunnerLimit(BaseCase):
         )
         calls = []
 
-        def at_limit(_store, name, patience_s=0.0, max_holders=None):
+        def at_limit(_store, name, patience_s=0.0, max_holders=None, *, keychain=None):
             calls.append(name)
             raise locks.LeaseLimitError(f"synthetic session limit for {name}")
 
@@ -244,28 +238,17 @@ class TestRunnerLimit(BaseCase):
                 self._run(plan)
         self.assertEqual(self.spawned, [])
 
-    def test_a_repick_after_keychain_busy_releases_the_abandoned_profile(self):
+    def test_random_file_launch_never_acquires_a_busy_keychain_guard(self):
         import keychain
 
         plan = runner.build_plan(self.store, ["chat"], random_pick=True)
         first = plan.profile
-        guard_calls = []
-
-        @contextlib.contextmanager
-        def busy_guard():
-            raise keychain.KeychainBusyError("busy")
-            yield
-
-        def busy_once(*args, **kwargs):
-            guard_calls.append(args[1])
-            if len(guard_calls) == 1:
-                return busy_guard()
-            return contextlib.nullcontext()
-
-        with mock.patch.object(keychain, "launch_guard", side_effect=busy_once), \
+        with mock.patch.object(
+            keychain, "launch_guard", side_effect=keychain.KeychainBusyError("busy")
+        ) as guard, \
                 mock.patch.object(keychain, "supported", return_value=True):
             self.assertEqual(self._run(plan), 0)
-        self.assertEqual(guard_calls[0], first)
+        guard.assert_not_called()
         self.assertEqual(locks.lease_holders(self.store, first), [])
 
 

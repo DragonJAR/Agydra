@@ -1,7 +1,6 @@
 """Persistent random profile rotation and quota ranking regressions."""
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import sys
@@ -20,7 +19,7 @@ import profile_rotation
 import resolver
 import runner
 import usage_snapshot
-from conftest import BaseCase
+from conftest import BaseCase, authenticate_agy_profile
 from store import Store, StoreError
 
 
@@ -41,7 +40,11 @@ class TestProfileRotation(BaseCase):
         self.now = datetime.now(timezone.utc)
 
     def _create(self, engine, *names):
-        return [self.store.create(name, engine=engine) for name in names]
+        profiles = [self.store.create(name, engine=engine) for name in names]
+        if engine == "agy":
+            for profile in profiles:
+                authenticate_agy_profile(self.store, profile.name)
+        return profiles
 
     def _auth_state(self, states=None):
         states = states or {}
@@ -177,7 +180,7 @@ class TestProfileRotation(BaseCase):
 
     def test_unfiltered_rotation_covers_all_authenticated_engines(self):
         profiles = [
-            self.store.create("agy-profile", engine="agy"),
+            self._create("agy", "agy-profile")[0],
             self.store.create("codex-profile", engine="codex"),
             self.store.create("grok-profile", engine="grok"),
             self.store.create("claude-profile", engine="claude"),
@@ -230,7 +233,7 @@ class TestProfileRotation(BaseCase):
         self.assertFalse(profile_rotation.state_path(self.store, None).exists())
 
     def test_unfiltered_retry_rebuilds_the_plan_for_the_new_engine(self):
-        agy = self.store.create("agy-profile", engine="agy")
+        agy = self._create("agy", "agy-profile")[0]
         codex = self.store.create("codex-profile", engine="codex")
         plan = self._random_plan(engine=None)
         self.assertEqual(plan.profile, agy.name)
@@ -238,12 +241,12 @@ class TestProfileRotation(BaseCase):
         acquired = []
         launched = []
 
-        def acquire(store, name, patience_s=0.0, max_holders=None):
+        def acquire(store, name, patience_s=0.0, max_holders=None, *, keychain=None):
             acquired.append(name)
             if name == agy.name:
                 raise locks.LeaseLimitError("synthetic session limit")
             return real_acquire(
-                store, name, patience_s=patience_s, max_holders=max_holders
+                store, name, patience_s=patience_s, max_holders=max_holders, keychain=keychain
             )
 
         def launch(argv, env):
@@ -262,6 +265,9 @@ class TestProfileRotation(BaseCase):
         self.assertEqual(acquired, [agy.name, codex.name])
         self.assertEqual(launched[0][0][0], str(self.executables["codex"]))
         self.assertIn("CODEX_HOME", launched[0][1])
+        self.assertNotEqual(
+            launched[0][1].get(account.AGY_FILE_AUTH_ENV), account.AGY_FILE_AUTH_VALUE
+        )
         state = json.loads(
             profile_rotation.state_path(self.store, None).read_text(encoding="utf-8")
         )
@@ -306,10 +312,9 @@ class TestProfileRotation(BaseCase):
                 profile_rotation.Rotation(self.store, "grok") as grok_rotation:
             self.assertNotEqual(codex_rotation.scope, grok_rotation.scope)
 
-    def test_keychain_owner_does_not_preempt_other_engine_candidates(self):
-        agy = self.store.create("agy-first", engine="agy")
-        owner = self.store.create("agy-owner", engine="agy")
-        codex = self.store.create("codex-profile", engine="codex")
+    def test_keychain_owner_does_not_change_global_priority_order(self):
+        agy, owner = self._create("agy", "agy-first", "agy-owner")
+        self.store.create("codex-profile", engine="codex")
         config = self.store.load_config()
         config.settings["max_sessions_per_profile"] = 2
         self.store.save_config(config)
@@ -317,17 +322,9 @@ class TestProfileRotation(BaseCase):
         self.assertEqual(plan.profile, agy.name)
         launched = []
 
-        @contextlib.contextmanager
-        def owned_slot(*_args, **_kwargs):
-            raise keychain.KeychainBusyError("owned slot", owner=owner.name)
-            yield
-
         def launch(argv, env):
             launched.append((list(argv), dict(env)))
             return 0
-
-        def guard(_store, name, **_kwargs):
-            return owned_slot() if name == agy.name else contextlib.nullcontext()
 
         with mock.patch.object(
             account, "auth_state", side_effect=self._auth_state()
@@ -336,25 +333,22 @@ class TestProfileRotation(BaseCase):
         ), mock.patch.object(
             locks,
             "lease_holders",
-            side_effect=lambda _store, name: [object()] if name == owner.name else None,
+            side_effect=lambda _store, name: [object()] if name == owner.name else [],
         ), mock.patch.object(
-            keychain, "launch_guard", side_effect=guard
-        ), mock.patch.object(
+            keychain, "launch_guard"
+        ) as guard, mock.patch.object(
             platforms, "launch_argv", side_effect=launch
         ):
             self.assertEqual(runner.run(plan, store=self.store), 0)
 
-        self.assertEqual(launched[0][0][0], str(self.executables["codex"]))
-        self.assertEqual(launched[0][1][resolver.PROFILE_ENV], codex.name)
+        guard.assert_not_called()
+        self.assertEqual(launched[0][1][resolver.PROFILE_ENV], agy.name)
+        self.assertEqual(
+            launched[0][1][account.AGY_FILE_AUTH_ENV], account.AGY_FILE_AUTH_VALUE
+        )
 
-    def test_agy_random_prefers_a_fresh_profile_then_joins_a_used_keychain_owner(self):
-        """Rotation order is untouched: the unused profile is tried first
-        and the used owner is never re-picked mid-cycle. When the owner's
-        live sessions block the fresh pick and the engine scope is
-        exhausted, the launch joins the owner through explicit-selection
-        semantics and the cycle state stays exactly as it was."""
-        fresh = self.store.create("agy-fresh", engine="agy")
-        owner = self.store.create("agy-owner", engine="agy")
+    def test_agy_random_launches_a_fresh_profile_without_joining_a_used_owner(self):
+        fresh, owner = self._create("agy", "agy-fresh", "agy-owner")
         profile_rotation._atomic_write_json(
             profile_rotation.state_path(self.store, "agy"),
             {"version": 1, "engine": "agy", "used": [owner.seq]},
@@ -362,20 +356,11 @@ class TestProfileRotation(BaseCase):
         plan = self._random_plan(engine="agy", force=True)
         self.assertEqual(plan.profile, fresh.name)
 
-        @contextlib.contextmanager
-        def keychain_guard(_store, name, **_kwargs):
-            if name == fresh.name:
-                raise keychain.KeychainBusyError(
-                    f"shared Antigravity keychain slot belongs to {owner.name!r}",
-                    owner=owner.name,
-                )
-            yield
-
         with mock.patch.object(
             account, "auth_state", side_effect=self._auth_state()
         ), mock.patch.object(
-            keychain, "launch_guard", side_effect=keychain_guard
-        ), mock.patch.object(
+            keychain, "launch_guard"
+        ) as guard, mock.patch.object(
             platforms, "launch_argv", side_effect=self._record_launch
         ), mock.patch.object(
             platforms, "run_wait", side_effect=self._record_launch
@@ -383,11 +368,12 @@ class TestProfileRotation(BaseCase):
             rc = runner.run(plan, store=self.store)
 
         self.assertEqual(rc, 0)
-        self.assertEqual(self.launched, [owner.name])
+        guard.assert_not_called()
+        self.assertEqual(self.launched, [fresh.name])
         rotation_state = json.loads(
             profile_rotation.state_path(self.store, "agy").read_text(encoding="utf-8")
         )
-        self.assertEqual(rotation_state["used"], [owner.seq])
+        self.assertEqual(rotation_state["used"], sorted([owner.seq, fresh.seq], key=str))
 
     def test_equal_quota_uses_lru_then_sequence_tie_break(self):
         earlier_sequence, less_recent = self._create("codex", "sequence-first", "lru-first")
@@ -717,18 +703,15 @@ class TestProfileRotation(BaseCase):
         )
 
 
-class TestBlockedRotationEngine(BaseCase):
-    def test_busy_keychain_owner_blocks_its_engine_for_random_retries(self):
+class TestEmptyRotationScope(BaseCase):
+    def test_empty_scope_has_a_finite_clean_error(self):
         store = Store(self.store_root)
-        alpha = store.create("alpha", engine="agy")
-        beta = store.create("beta", engine="agy")
         with profile_rotation.Rotation(store, "agy") as rotation:
-            rotation.blocked_engines.add("agy")
             with self.assertRaisesRegex(
-                profile_rotation.NoEligibleProfileError,
-                "no profile remains in the rotation scope",
+                StoreError,
+                "no eligible agy profile for rotation",
             ):
-                rotation.select([alpha, beta])
+                rotation.select([])
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from conftest import (
     BaseCase,
     _FAKE_AGY_SOURCE,
     _make_jwt,
+    authenticate_agy_profile,
     cli_environment,
     held_cli_session,
     run_cli,
@@ -334,11 +335,7 @@ class TestRandomProfileSelection(BaseCase):
         self.store.create("work")
         self.store.create("lab")
         for name in ("work", "lab"):
-            cli_dir = self.store.profile_data_dir(name) / "antigravity-cli"
-            cli_dir.mkdir(parents=True, exist_ok=True)
-            (cli_dir / "antigravity-oauth-token").write_text(
-                '{"access_token": "tok"}', encoding="utf-8"
-            )
+            authenticate_agy_profile(self.store, name)
 
     def test_r_picks_a_free_authenticated_profile(self):
         result = self._run_cli("-r")

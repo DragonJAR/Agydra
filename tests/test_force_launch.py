@@ -21,16 +21,7 @@ import resolver
 import runner
 from store import Store, StoreError
 
-from conftest import BaseCase, held_cli_session
-
-
-def _authenticate(store, name: str) -> None:
-    """Drop a parseable OAuth token into the profile's data dir."""
-    token_dir = store.profile_data_dir(name) / "antigravity-cli"
-    token_dir.mkdir(parents=True, exist_ok=True)
-    (token_dir / "antigravity-oauth-token").write_text(
-        '{"token": {"access_token": "mock-token"}}', encoding="utf-8"
-    )
+from conftest import BaseCase, authenticate_agy_profile as _authenticate, held_cli_session
 
 
 def _install_foreign_holder(store, name: str, pid: int = 424242) -> None:
@@ -151,8 +142,6 @@ class TestRunnerForce(BaseCase):
         self.assertEqual(rc, 0)
 
     def test_random_force_fallback_preserves_binary_and_launch_options(self):
-        import keychain
-
         self.store.create("beta")
         _authenticate(self.store, "beta")
         project = self._tmp / "forced-project"
@@ -177,7 +166,7 @@ class TestRunnerForce(BaseCase):
                 self.store,
                 plan,
                 set(),
-                keychain.KeychainBusyError("synthetic busy slot"),
+                locks.LockError("synthetic lease contention"),
             )
 
         self.assertEqual(retry.profile, "beta")

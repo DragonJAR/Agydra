@@ -204,9 +204,15 @@ def agy_token_path(data_dir: Path) -> Path:
 
 
 def _usable_agy_token(raw: object) -> bool:
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or not isinstance(raw.get("token"), dict):
         return False
     token = _token_payload(raw)
+    for fields, source in (
+        (("access_token", "refresh_token", "token_type"), token),
+        (("id_token", "auth_method"), raw),
+    ):
+        if any(source.get(field) is not None and not isinstance(source[field], str) for field in fields):
+            return False
     return _has_credential(token.get("access_token")) or _has_credential(token.get("refresh_token"))
 
 
