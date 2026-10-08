@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -72,6 +73,29 @@ def run_cli(*args, cwd, extra_env: dict = None, timeout: float = 60):
         timeout=timeout,
         cwd=str(cwd),
         env=cli_environment(extra_env),
+    )
+
+
+def run_python_child(source: str, *args, timeout: float = 10) -> subprocess.CompletedProcess:
+    """Run an inline Python snippet in a child process using temporary files for output to avoid pipe-reader threads on Windows."""
+    cmd = [sys.executable, "-c", source, *(str(arg) for arg in args)]
+    with tempfile.TemporaryFile() as out_fh, tempfile.TemporaryFile() as err_fh:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(REPO_ROOT),
+            stdout=out_fh,
+            stderr=err_fh,
+            timeout=timeout,
+        )
+        out_fh.seek(0)
+        err_fh.seek(0)
+        out = out_fh.read().decode("utf-8", "replace")
+        err = err_fh.read().decode("utf-8", "replace")
+    return subprocess.CompletedProcess(
+        proc.args,
+        proc.returncode,
+        out,
+        err,
     )
 
 
@@ -392,3 +416,16 @@ def isolated_store_env():
             else:
                 os.environ[key] = value
         td.cleanup()
+
+
+@contextlib.contextmanager
+def simulated_macos_keychain():
+    """Simulate a macOS environment with an available Keychain bridge."""
+    from unittest import mock
+
+    import keychain
+    import platforms
+
+    with mock.patch.object(platforms, "is_macos", return_value=True), \
+            mock.patch.object(keychain, "supported", return_value=True):
+        yield

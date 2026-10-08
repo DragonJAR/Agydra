@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import account
 import keychain
 import usage_agy
-from conftest import _make_jwt, isolated_store_env
+from conftest import _make_jwt, isolated_store_env, simulated_macos_keychain
 from store import Store
 
 
@@ -105,8 +105,7 @@ class TestDetectEmailKeychainFallback(unittest.TestCase):
             data_dir = store.profile_data_dir("kc")
             self.assertFalse((data_dir / account.AGY_CLI_DIR).exists())
 
-            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
-                    mock.patch.object(keychain, "supported", return_value=True):
+            with simulated_macos_keychain():
                 self.assertEqual(
                     account.detect_email(data_dir, store, "kc"), "kc@example.com"
                 )
@@ -118,8 +117,7 @@ class TestDetectEmailKeychainFallback(unittest.TestCase):
             self._write_secret(store, "kc", {"email": "kc@example.com"})
             data_dir = store.profile_data_dir("kc")
 
-            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
-                    mock.patch.object(keychain, "supported", return_value=True):
+            with simulated_macos_keychain():
                 self.assertIsNone(account.detect_email(data_dir))
 
     def test_off_macos_keychain_fallback_is_skipped(self):
@@ -139,8 +137,7 @@ class TestDetectEmailKeychainFallback(unittest.TestCase):
             keychain.save_profile_slot(store, "kc", b"not a real secret at all")
             data_dir = store.profile_data_dir("kc")
 
-            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
-                    mock.patch.object(keychain, "supported", return_value=True):
+            with simulated_macos_keychain():
                 self.assertIsNone(account.detect_email(data_dir, store, "kc"))
 
     def test_whitespace_only_backup_claim_and_profile_anchor_are_refused(self):
@@ -152,8 +149,7 @@ class TestDetectEmailKeychainFallback(unittest.TestCase):
             self._write_secret(store, "kc", {"email": " \t "})
             data_dir = store.profile_data_dir("kc")
 
-            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
-                    mock.patch.object(keychain, "supported", return_value=True):
+            with simulated_macos_keychain():
                 result = usage_agy.scoped_token_bytes(
                     store, "kc", store.get("kc"), data_dir
                 )
@@ -206,16 +202,14 @@ class TestSyncProfileEmailKeychainPoisoning(unittest.TestCase):
             self._write_stale_disk_token(store, "alice")
             self._write_secret(store, "alice", "bob@example.com")
 
-            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
-                    mock.patch.object(keychain, "supported", return_value=True):
+            with simulated_macos_keychain():
                 result = account.sync_profile_email(store, "alice")
 
             self.assertIsNone(result)
             refreshed = store.get("alice")
             self.assertEqual(refreshed.email, "alice@example.com")
 
-            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
-                    mock.patch.object(keychain, "supported", return_value=True):
+            with simulated_macos_keychain():
                 known = keychain._known_identity(store, "alice", include_secret=False)
                 secret = keychain.load_profile_slot(store, "alice")
                 candidate = keychain._secret_identity(secret)
@@ -230,8 +224,7 @@ class TestSyncProfileEmailKeychainPoisoning(unittest.TestCase):
             store.create("brandnew")
             self._write_secret(store, "brandnew", "new@example.com")
 
-            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
-                    mock.patch.object(keychain, "supported", return_value=True):
+            with simulated_macos_keychain():
                 result = account.sync_profile_email(store, "brandnew")
 
             self.assertEqual(result, "new@example.com")
@@ -443,8 +436,7 @@ class TestAuthStateKeychain(unittest.TestCase):
             store.create("kc")
             data_dir = store.profile_data_dir("kc")
 
-            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
-                    mock.patch.object(keychain, "supported", return_value=True):
+            with simulated_macos_keychain():
                 for access_token, refresh_token in (
                     (value, None) for value in invalid_values
                 ):
@@ -479,8 +471,7 @@ class TestAuthStateKeychain(unittest.TestCase):
             data_dir = store.profile_data_dir("kc")
             self.assertFalse((data_dir / account.AGY_CLI_DIR).exists())
 
-            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
-                    mock.patch.object(keychain, "supported", return_value=True):
+            with simulated_macos_keychain():
                 self.assertEqual(account.auth_state(data_dir, store, "kc"), "authenticated")
 
     def test_corrupt_keychain_secret_is_not_authenticated(self):
@@ -490,8 +481,7 @@ class TestAuthStateKeychain(unittest.TestCase):
             keychain.save_profile_slot(store, "kc", b"corrupted-not-an-envelope-or-valid-json")
             data_dir = store.profile_data_dir("kc")
 
-            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
-                    mock.patch.object(keychain, "supported", return_value=True):
+            with simulated_macos_keychain():
                 self.assertEqual(account.auth_state(data_dir, store, "kc"), "not-authenticated")
 
     def test_no_secret_or_token_is_not_authenticated(self):
@@ -500,8 +490,7 @@ class TestAuthStateKeychain(unittest.TestCase):
             store.create("empty")
             data_dir = store.profile_data_dir("empty")
 
-            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
-                    mock.patch.object(keychain, "supported", return_value=True):
+            with simulated_macos_keychain():
                 self.assertEqual(account.auth_state(data_dir, store, "empty"), "not-authenticated")
 
 
@@ -727,8 +716,7 @@ class TestSyncProfileEmailLeaseAndCasing(unittest.TestCase):
             store.save(profile)
             self._write_secret(store, "alice", "ALICE@Example.com")
 
-            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
-                    mock.patch.object(keychain, "supported", return_value=True):
+            with simulated_macos_keychain():
                 result = account.sync_profile_email(store, "alice")
 
             self.assertEqual(result, "ALICE@Example.com")
@@ -743,8 +731,7 @@ class TestSyncProfileEmailLeaseAndCasing(unittest.TestCase):
             store.save(profile)
             self._write_secret(store, "alice", "bob@example.com")
 
-            with mock.patch.object(account.platforms, "is_macos", return_value=True), \
-                    mock.patch.object(keychain, "supported", return_value=True):
+            with simulated_macos_keychain():
                 self.assertIsNone(account.sync_profile_email(store, "alice"))
             self.assertEqual(store.get("alice").email, "Alice@Example.com")
 

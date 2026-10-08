@@ -20,7 +20,13 @@ import locks
 import platforms
 import profile_rotation
 import runner
-from conftest import BaseCase, LiveHolders, authenticate_agy_profile as _authenticate, held_cli_session
+from conftest import (
+    BaseCase,
+    LiveHolders,
+    authenticate_agy_profile as _authenticate,
+    held_cli_session,
+    simulated_macos_keychain,
+)
 from store import Store, StoreError
 
 
@@ -273,7 +279,7 @@ class TestRandomPickExhaustion(BaseCase):
             return 0
 
         try:
-            with mock.patch.object(keychain, "supported", return_value=True), \
+            with simulated_macos_keychain(), \
                     mock.patch.object(keychain, "launch_guard") as guard, \
                     mock.patch.object(platforms, "run_wait", side_effect=launch), \
                     mock.patch.object(platforms, "launch_argv", side_effect=launch):
@@ -307,7 +313,7 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
             return 0
 
         try:
-            with mock.patch.object(keychain, "supported", return_value=True), \
+            with simulated_macos_keychain(), \
                     mock.patch.object(keychain, "launch_guard") as guard, \
                     mock.patch.object(platforms, "run_wait", side_effect=launch), \
                     mock.patch.object(platforms, "launch_argv", side_effect=launch):
@@ -362,7 +368,7 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
                 )
                 selected = plan.profile
                 stderr = io.StringIO()
-                with mock.patch.object(keychain, "supported", return_value=True), \
+                with simulated_macos_keychain(), \
                         mock.patch.object(keychain, "launch_guard") as guard, \
                         mock.patch.object(platforms, "run_wait", side_effect=launch), \
                         mock.patch.object(platforms, "launch_argv", side_effect=launch), \
@@ -384,7 +390,7 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
             keychain._save_slot_lease(self.store, "gamma", None)
             plan = runner.build_plan(self.store, ["chat"], random_pick=True, engine="agy")
             first = plan.profile
-            with mock.patch.object(keychain, "supported", return_value=True), \
+            with simulated_macos_keychain(), \
                     mock.patch.object(keychain, "launch_guard") as guard, \
                     mock.patch.object(platforms, "run_wait", return_value=0), \
                     mock.patch.object(platforms, "launch_argv", return_value=0):
@@ -397,7 +403,7 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
         plan = runner.build_plan(self.store, ["chat"], random_pick=True, engine="agy")
         keychain._slot_lease_path(self.store).parent.mkdir(parents=True, exist_ok=True)
         keychain._slot_lease_path(self.store).write_bytes(b"not-json")
-        with mock.patch.object(keychain, "supported", return_value=True), \
+        with simulated_macos_keychain(), \
                 mock.patch.object(keychain, "launch_guard") as guard, \
                 mock.patch.object(platforms, "run_wait", return_value=0), \
                 mock.patch.object(platforms, "launch_argv", return_value=0):
@@ -418,7 +424,7 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
             seen["keychain"] = keychain
             return 0
 
-        with mock.patch.object(keychain, "supported", return_value=True), \
+        with simulated_macos_keychain(), \
                 mock.patch.object(locks, "acquire_lease", side_effect=record), \
                 mock.patch.object(keychain, "_ensure_target_keychain", return_value=None):
             keychain.launch_guard(self.store, "alpha").__enter__()

@@ -29,7 +29,7 @@ import shutil as shutil_mod
 import ui
 from ui import strip_ansi
 
-from conftest import BaseCase
+from conftest import BaseCase, run_python_child
 
 
 class TestListColumnsAlignWithColor(BaseCase):
@@ -1171,13 +1171,7 @@ class Args:
 cli.cmd_rename(store, Args())
 os._exit(0)
 """
-        return subprocess.run(
-            [sys.executable, "-c", child, str(root), point, str(native_calls)],
-            cwd=str(Path(__file__).resolve().parents[1]),
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        return run_python_child(child, root, point, native_calls, timeout=10)
 
     def _recover_through_cli(self, root, swap_events):
         import cli

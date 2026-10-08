@@ -21,7 +21,7 @@ import platforms
 import profile_rotation
 import runner
 import usage_agy
-from conftest import BaseCase, _make_jwt
+from conftest import BaseCase, _make_jwt, simulated_macos_keychain
 from store import Store, StoreError
 
 
@@ -249,7 +249,7 @@ class TestRandomAgyFileLaunch(BaseCase):
         return 0
 
     def _run(self, plan, *, launch=None, guard=None):
-        with mock.patch.object(keychain, "supported", return_value=True), \
+        with simulated_macos_keychain(), \
                 mock.patch.object(
                     keychain, "launch_guard",
                     side_effect=guard or AssertionError("random file auth must bypass Keychain"),
@@ -343,7 +343,7 @@ class TestRandomAgyFileLaunch(BaseCase):
         keychain.save_profile_slot(
             self.store, "alpha", keychain.envelope_token_bytes(self.tokens["alpha"])
         )
-        with mock.patch.object(keychain, "supported", return_value=True):
+        with simulated_macos_keychain():
             plan = runner.build_plan(self.store, [], random_pick=True, engine="agy")
             self.assertEqual(self._run(plan), 0)
         self.assertEqual(self.launched, ["alpha"])
@@ -383,7 +383,7 @@ class TestRandomAgyFileLaunch(BaseCase):
                     self.store, [], flag_ref="alpha", launch_as_child=login
                 )
                 self.assertFalse(plan.agy_file_auth)
-                with mock.patch.object(keychain, "supported", return_value=True), \
+                with simulated_macos_keychain(), \
                         mock.patch.object(
                             keychain, "launch_guard", return_value=contextlib.nullcontext()
                         ) as guard, mock.patch.object(isolation, "prepare_agy_file_auth") as prepare, \
