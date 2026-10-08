@@ -13,6 +13,8 @@ import unittest
 from pathlib import Path
 
 os.environ["AGYDRA_NO_KEYCHAIN"] = "1"
+os.environ["LC_ALL"] = "en_US.UTF-8"
+os.environ.pop("LC_MESSAGES", None)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

@@ -7,6 +7,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import account
 import isolation
 import platforms
 from store import Store
@@ -1123,6 +1124,48 @@ class TestCentralLinkProbe(BaseCase):
             with self.assertRaises(isolation.IsolationError):
                 isolation.validate_claude_config_dir(config)
         self.assertEqual(isolation.validate_claude_config_dir(config), config)
+
+
+class TestIsolatedEnvFileAuthMarker(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.overlay = self.store.overlays_dir / "alpha"
+        self.overlay.mkdir(parents=True)
+        self.claude_config = self.store.claude_config_root / "1"
+        self.claude_config.mkdir(parents=True)
+
+    def _target(self, engine: str) -> Path:
+        return self.claude_config if engine == "claude" else self.overlay
+
+    def test_inherited_marker_is_dropped_for_non_agy_engines(self):
+        with mock.patch.dict(os.environ, {account.AGY_FILE_AUTH_ENV: account.AGY_FILE_AUTH_VALUE}):
+            for engine in ("codex", "claude", "grok"):
+                with self.subTest(engine=engine):
+                    env = isolation.isolated_env(self._target(engine), {}, engine=engine)
+                    self.assertNotIn(account.AGY_FILE_AUTH_ENV, env)
+
+    def test_inherited_marker_is_dropped_for_agy_without_extra(self):
+        with mock.patch.dict(os.environ, {account.AGY_FILE_AUTH_ENV: account.AGY_FILE_AUTH_VALUE}):
+            env = isolation.isolated_env(self.overlay, {}, engine="agy")
+            self.assertNotIn(account.AGY_FILE_AUTH_ENV, env)
+
+    def test_explicit_marker_in_extra_is_retained_for_agy(self):
+        with mock.patch.dict(os.environ, {account.AGY_FILE_AUTH_ENV: account.AGY_FILE_AUTH_VALUE}):
+            env = isolation.isolated_env(
+                self.overlay,
+                {account.AGY_FILE_AUTH_ENV: account.AGY_FILE_AUTH_VALUE},
+                engine="agy",
+            )
+            self.assertEqual(env.get(account.AGY_FILE_AUTH_ENV), account.AGY_FILE_AUTH_VALUE)
+
+    def test_genuine_ssh_tty_value_is_preserved_for_every_engine(self):
+        genuine_tty = "/dev/ttys003"
+        with mock.patch.dict(os.environ, {account.AGY_FILE_AUTH_ENV: genuine_tty}):
+            for engine in ("agy", "codex", "claude", "grok"):
+                with self.subTest(engine=engine):
+                    env = isolation.isolated_env(self._target(engine), {}, engine=engine)
+                    self.assertEqual(env.get(account.AGY_FILE_AUTH_ENV), genuine_tty)
 
 
 if __name__ == "__main__":
