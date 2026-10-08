@@ -21,7 +21,7 @@
 
 A Google One AI Premium / Google AI Pro family group can hold up to six accounts, and **each account has its own model quotas and 5-hour window**. The official `agy` CLI still reads a single `~/.gemini`, so switching accounts overwrites the session and parallel runs share one store and one keychain entry.
 
-**Agydra** turns those accounts — and separate Codex or Grok accounts — into one pool:
+**Agydra** turns those accounts — and separate Codex, Grok, or Claude Code accounts — into one pool:
 
 ```
 agy                 → generic session, real ~/.gemini
@@ -32,7 +32,7 @@ agydra -e grok -r   → next unused Grok profile, ranked by saved quota
 - Each profile authenticates through the official CLI. Tokens stay inside that profile.
 - Kernel advisory locks (`fcntl.flock` / `msvcrt.locking`) release when the process exits, including after `SIGKILL`.
 - `agydra -r` uses each eligible profile once per selection-scope cycle. Without `-e`, the pool includes authenticated profiles across all engines; `-e` narrows it to one engine. Unused profiles come first, preferring a free session and then more saved quota. After the pool is exhausted, repeats prefer more saved quota. Unknown quota ranks after known quota; refresh it with `agydra usage`.
-- `agydra usage` shows live quotas for Antigravity, Codex, and Grok in one view.
+- `agydra usage` shows live quotas and status across Antigravity, Codex, Grok, and Claude Code in one view.
 
 ---
 
@@ -43,7 +43,7 @@ agydra -e grok -r   → next unused Grok profile, ranked by saved quota
 | Requirement | Notes |
 |---|---|
 | **Python ≥ 3.9** | Standard library only. |
-| **`agy`** *(optional)* | On `PATH`, or `-b` / `agy_binary`, for `agy` profiles. |
+| **`agy`** *(optional)* | On `PATH`, or `-b` / `AGYDRA_AGY_BIN`, for `agy` profiles. |
 | **`codex`** *(optional)* | On `PATH`, or `-b` / `AGYDRA_CODEX_BIN`, for `codex` profiles. |
 | **`grok`** *(optional)* | On `PATH`, or `-b` / `AGYDRA_GROK_BIN`, for `grok` profiles. |
 | **`claude`** *(optional)* | On `PATH`, or `-b` / `AGYDRA_CLAUDE_BIN`, for Claude Code profiles. |
@@ -187,8 +187,8 @@ Management commands also accept `--NAME` or `-NAME` (`agydra --list` == `agydra 
 | `default [NAME\|#]` | `d` | Show or set the fallback profile. |
 | `use NAME\|#` | `u` | Pin the current directory with a `.agydra` marker. |
 | `status [NAME\|#] [-p NAME\|#] [-e ENGINE] [-n]` | `st` | Resolved profile, engine, binary (`not found` when the engine CLI is not installed), email, auth, live sessions. `-n` prints the launch plan and does need the binary. |
-| `usage [NAME\|#]` | `us` | Quotas for `agy`, `codex`, and `grok`; informational Claude snapshots. `--claude-settings PROFILE` prints opt-in capture settings; `--apply` (only with `--claude-settings`) writes the `statusLine` into the profile's `settings.json` (creating it, or atomically merging it while preserving other keys); no-op if already present; refuses and leaves the file untouched if a different `statusLine` or invalid JSON exists. |
-| `share-config SRC TARGET...` | `share` | Copies config files while holding the source and target profile locks through all copies. Leaves credentials in the source. |
+| `usage [NAME\|#]` | `us` | Quotas for `agy`, `codex`, `grok`, and Claude Code (live queries and informational snapshots). `--claude-settings PROFILE` prints opt-in capture settings; `--apply` (only with `--claude-settings`) writes the `statusLine` into the profile's `settings.json` (creating it, or atomically merging it while preserving other keys); no-op if already present; refuses and leaves the file untouched if a different `statusLine` or invalid JSON exists. |
+| `share-config SRC TARGET...` | `share` | Copies config files while holding the source and target profile locks through all copies. Leaves credentials in the source. Claude profiles are rejected. |
 | `doctor [--fix [-f]]` | `doc` | Ten health checks. `--fix` repairs overlay data links and dangling defaults, and purges only orphan artifacts; `-f` skips the `--fix` confirmation and is rejected without `--fix`. |
 | `setup [-n] [-f]` | `install` | Idempotent venv, console script, and PATH shim. `-n` previews; `-f` overwrites a foreign shim. |
 | `language [CODE]` | `lang`, `idioma`, `locale` | Display language: `en` or `es`. |
@@ -224,7 +224,7 @@ Without `-p`, the first match wins:
 ```
 1. --profile / -p
    └── 2. AGYDRA_PROFILE
-       └── 3. .agydra marker (nearest ancestor; overrides -r)
+       └── 3. .agydra marker (nearest ancestor; ignored by -r)
            └── 4. default_profile in agydra.json
                └── 5. First profile by number (creation order; `agy` profiles first)
 ```
@@ -251,7 +251,7 @@ For overlay engines, `.ssh`, `.gitconfig`, and shell config are mirrored into th
 
 `AgyEngine`, `CodexEngine`, `GrokEngine`, and `ClaudeEngine` own binary lookup, arguments, paths, and identity parsing. Codex always runs with `--no-daemon`. Grok's leader socket is per profile, so a host `grok` session and a profile session do not share it. The macOS Keychain bridge applies only to explicit `agy` selection and login. File-authentication sessions still count toward session caps and protect their profile from mutations, but do not retain shared-slot ownership.
 
-Session locks use `<store>/locks/<profile>.lock`; the sentinel file persists, while the OS advisory lock is released when its holder exits. `create`, `rename`, and `delete` acquire the affected profile locks in sorted name order, then the persistent, non-inherited store-wide lock `<store>/locks/.profile-sequence.lock`; profile and sequence locks are acquired non-blockingly and profile locks are released in reverse order. The persistent `<store>/profile-sequence.json` stores `{"last_seq": N}`. If it is missing, the counter is initialized from the highest readable profile sequence while holding the sequence lock. `create` persists its next number before staging, so an interruption or later failure can leave a harmless gap; deleted sequence numbers are not reused.
+Session locks use `<store>/locks/<profile>.lock`; the sentinel file persists, while the OS advisory lock is released when its holder exits. Concurrent sessions join by registering in the locked file's holders lease registry (`acquire_lease`/`release_lease`), which tracks PID and process start-token liveness while distinguishing Keychain participants from private-auth holders. `create`, `rename`, and `delete` acquire the affected profile locks in sorted name order, then the persistent, non-inherited store-wide lock `<store>/locks/.profile-sequence.lock`; profile and sequence locks are acquired non-blockingly and profile locks are released in reverse order. The persistent `<store>/profile-sequence.json` stores `{"last_seq": N}`. If it is missing, the counter is initialized from the highest readable profile sequence while holding the sequence lock. `create` persists its next number before staging, so an interruption or later failure can leave a harmless gap; deleted sequence numbers are not reused.
 
 `create` builds `data/` and `profile.json` in a same-filesystem temporary sibling directory under `<store>/profiles/`, named `.agydra-stage-<name>-<token>`, then publishes the complete profile with one directory rename. A stage left by an interruption is ignored by profile scans and removed by a later create for that exact name under both locks; the reserved sequence remains consumed.
 
@@ -300,7 +300,7 @@ Global config is `<store>/agydra.json`. Point the store elsewhere with `AGYDRA_H
 }
 ```
 
-`codex_binary`, `grok_binary`, and `claude_binary` are optional. Leave a key out and Agydra uses `PATH`.
+All binary keys (`agy_binary`, `codex_binary`, `grok_binary`, and `claude_binary`) are optional. Leave a key out and Agydra uses `PATH`.
 
 | Variable | Purpose |
 |---|---|
@@ -327,7 +327,7 @@ The suite uses temporary stores and leaves the host home alone. Native CI matrix
 ## ⚠️ Limitations
 
 - Agydra manages profiles and sessions. It does not install or update `agy`, `codex`, `grok`, or `claude`.
-- Isolation follows each CLI: `HOME` for `agy`, `CODEX_HOME` for `codex`, `GROK_HOME` plus `GROK_LEADER_SOCKET` for `grok`. Doctor's schema canary reports a layout the current drivers do not recognize.
+- Isolation follows each CLI: `HOME` for `agy`, `CODEX_HOME` for `codex`, `GROK_HOME` plus `GROK_LEADER_SOCKET` for `grok`, and `CLAUDE_CONFIG_DIR` for `claude`. Doctor's schema canary reports a layout the current drivers do not recognize.
 - Windows paths run on Windows. On Unix they are covered by the unit tests.
 
 ---

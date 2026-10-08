@@ -194,7 +194,7 @@ Every modification, addition, or refactor must strictly adhere to four foundatio
 ```
 agydra/
 ├── agydra.py            # Single-file bootstrap entrypoint (python3 agydra.py) + VERSION
-├── models.py            # Dataclasses (Profile, Config, Settings)
+├── models.py            # Dataclasses (Profile, Config) and default settings
 ├── engines.py           # Strategy Pattern multi-engine drivers (AgyEngine, CodexEngine, GrokEngine, ClaudeEngine)
 ├── platforms.py         # Cross-platform path resolution, real_home, binary probes
 ├── ui.py                # ANSI terminal styling and status formatters
@@ -215,15 +215,17 @@ agydra/
 ├── usage.py             # `agydra usage` quota inspector
 ├── usage_agy.py         # Keychain-free scoped staging for the Antigravity quota query
 ├── usage_snapshot.py    # Atomic `agydra usage` snapshot and selection quota reader
-├── claude_usage.py      # Opt-in Claude statusLine capture and read-only snapshot inspection
+├── claude_usage.py      # Live CLI usage queries, opt-in Claude statusLine capture, and cached snapshots
 ├── bootstrap.py         # Idempotent venv & PATH shim installer
 ├── tests/               # Automated unit and integration test suite
 ├── .github/workflows/tests.yml  # CI: native Windows/Linux/macOS unittest matrix
+├── .gitignore           # Git ignore patterns
 ├── README.md            # English documentation
 ├── README.es.md         # Spanish documentation
 ├── AGENTS.md            # This architecture and conventions guide
 ├── LICENSE              # MIT License
 ├── MANIFEST.in          # sdist extras (tests, docs, logo) for the wheel-only default
+├── logo.png             # Project logo (included in sdist via MANIFEST.in)
 └── pyproject.toml       # Package metadata (flat py-modules configuration)
 ```
 
@@ -243,7 +245,7 @@ agydra/
    - Keep pytest configuration limited to options supported by the installed test environment; remove stale plugin-specific keys that produce unknown-option warnings.
    - Test suites must strictly sandbox environment variables (`HOME`, `LOCALAPPDATA`, `XDG_DATA_HOME`) and temporary directories. Tests must never touch the host user's actual files or shims.
    - Linux container test scratch space must be writable and executable when tests create fake CLI binaries; a `noexec` temporary mount makes binary-resolution and launch tests fail for harness reasons. Keep the source mount read-only and disable network access while granting only the disposable test directory the permissions the suite needs.
-   - CI (`.github/workflows/tests.yml`) runs the full stdlib unittest suite natively on Windows 2022 (Python 3.9), Ubuntu 24.04 (Python 3.9) and macOS 15 (Python 3.14), with the Windows batch contracts (`tests/test_windows_batch.py`) exercised first on that runner; `AGYDRA_NO_KEYCHAIN=1` and `NO_COLOR=1` are set globally there.
+   - CI (`.github/workflows/tests.yml`) runs the full stdlib unittest suite natively on Windows 2022 (Python 3.9), Ubuntu 24.04 (Python 3.9) and macOS 15 (Python 3.14), with the Windows batch contracts (`tests/test_windows_batch.py`) exercised first on that runner; `AGYDRA_NO_KEYCHAIN=1`, `AGYDRA_SKIP_WIN32_BATCH=1`, `NO_COLOR=1`, `PYTHONUTF8=1`, and `PYTHONUNBUFFERED=1` are set globally there, and Windows runs under `cmd` with temporary directories pointed at `C:\tmp`.
    - `tests/test_packaging.py` builds the sdist and wheel from a temporary copy and asserts the distribution contract of R7 (wheel = runtime `py-modules` only; sdist adds tests and docs); it is safe to run offline.
    - In-process CLI tests should call the shared `conftest.run_cli` helper. Invoking `python -m agydra` from ordinary behavior tests can enter the source-checkout bootstrap, depend on a pre-existing `.venv`, or write into the checkout; reserve launcher invocations for tests specifically exercising bootstrap or installed-package entry points.
    - CI must install the declared build-tool minimum before packaging tests and fail visibly when it is missing; do not let artifact-contract tests silently skip in a CI environment.

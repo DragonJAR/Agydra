@@ -21,7 +21,7 @@
 
 Un grupo familiar de Google One AI Premium / Google AI Pro admite hasta seis cuentas, y **cada cuenta tiene sus propias cuotas de modelo y su ventana de 5 horas**. La CLI oficial `agy` sigue leyendo un único `~/.gemini`: cambiar de cuenta pisa la sesión, y las ejecuciones en paralelo comparten el mismo almacén y la misma entrada del llavero.
 
-**Agydra** convierte esas cuentas —y cuentas aparte de Codex o Grok— en un solo pool:
+**Agydra** convierte esas cuentas —y cuentas aparte de Codex, Grok o Claude Code— en un solo pool:
 
 ```
 agy                 → sesión genérica, ~/.gemini real
@@ -32,7 +32,7 @@ agydra -e grok -r   → el siguiente perfil de Grok sin usar, priorizado por cuo
 - Cada perfil se autentica con la CLI oficial. Los tokens quedan dentro de ese perfil.
 - Los locks del kernel (`fcntl.flock` / `msvcrt.locking`) se liberan al salir el proceso, también tras un `SIGKILL`.
 - `agydra -r` usa cada perfil elegible una vez por ciclo del ámbito de selección. Sin `-e`, el grupo incluye perfiles autenticados de todos los motores; `-e` lo limita a un motor. Primero elige perfiles sin usar, priorizando una sesión libre y luego más cuota guardada. Cuando se agota el grupo, las repeticiones priorizan la cuota guardada. La cuota desconocida queda detrás de la conocida; actualízala con `agydra usage`.
-- `agydra usage` muestra en una sola vista las cuotas en vivo de Antigravity, Codex y Grok.
+- `agydra usage` muestra en una sola vista las cuotas en vivo y el estado en Antigravity, Codex, Grok y Claude Code.
 
 ---
 
@@ -43,7 +43,7 @@ agydra -e grok -r   → el siguiente perfil de Grok sin usar, priorizado por cuo
 | Requisito | Detalle |
 |---|---|
 | **Python ≥ 3.9** | Solo librería estándar. |
-| **`agy`** *(opcional)* | En el `PATH`, o `-b` / `agy_binary`, para perfiles `agy`. |
+| **`agy`** *(opcional)* | En `PATH`, o `-b` / `AGYDRA_AGY_BIN`, para perfiles `agy`. |
 | **`codex`** *(opcional)* | En el `PATH`, o `-b` / `AGYDRA_CODEX_BIN`, para perfiles `codex`. |
 | **`grok`** *(opcional)* | En el `PATH`, o `-b` / `AGYDRA_GROK_BIN`, para perfiles `grok`. |
 | **`claude`** *(opcional)* | En `PATH`, o `-b` / `AGYDRA_CLAUDE_BIN`, para perfiles Claude Code. |
@@ -187,8 +187,8 @@ Los comandos de gestión también aceptan `--NOMBRE` o `-NOMBRE` (`agydra --list
 | `default [NOMBRE\|#]` | `d` | Muestra o fija el perfil de respaldo. |
 | `use NOMBRE\|#` | `u` | Fija el directorio actual con un marcador `.agydra`. |
 | `status [NOMBRE\|#] [-p NOMBRE\|#] [-e MOTOR] [-n]` | `st` | Perfil resuelto, motor, binario (`not found` si el CLI del motor no está instalado), correo, auth y sesiones activas. `-n` imprime el plan de lanzamiento y sí necesita el binario. |
-| `usage [NOMBRE\|#]` | `us` | Cuotas de `agy`, `codex` y `grok`; snapshots Claude informativos. `--claude-settings PERFIL` imprime ajustes opt-in; `--apply` (solo con `--claude-settings`) escribe el `statusLine` en el `settings.json` del perfil (lo crea o lo combina de forma atómica conservando las demás claves); no hace nada si ya está presente; se niega y deja el archivo intacto si hay un `statusLine` distinto o JSON inválido. |
-| `share-config ORIGEN DESTINO...` | `share` | Copia archivos de configuración mientras mantiene los locks de los perfiles de origen y destino hasta terminar todas las copias. Las credenciales se quedan en el origen. |
+| `usage [NOMBRE\|#]` | `us` | Cuotas de `agy`, `codex`, `grok` y Claude Code (consultas en vivo y snapshots informativos). `--claude-settings PERFIL` imprime ajustes opt-in; `--apply` (solo con `--claude-settings`) escribe el `statusLine` en el `settings.json` del perfil (lo crea o lo combina de forma atómica conservando las demás claves); no hace nada si ya está presente; se niega y deja el archivo intacto si hay un `statusLine` distinto o JSON inválido. |
+| `share-config ORIGEN DESTINO...` | `share` | Copia archivos de configuración mientras mantiene los locks de los perfiles de origen y destino hasta terminar todas las copias. Las credenciales se quedan en el origen. Los perfiles Claude se rechazan. |
 | `doctor [--fix [-f]]` | `doc` | Diez chequeos. `--fix` repara los enlaces de datos del overlay y los defaults colgantes, y purga solo artefactos huérfanos; `-f` omite la confirmación de `--fix` y se rechaza sin `--fix`. |
 | `setup [-n] [-f]` | `install` | Venv, script de consola y shim en el PATH, de forma idempotente. `-n` previsualiza; `-f` sobrescribe un shim ajeno. |
 | `language [CÓDIGO]` | `lang`, `idioma`, `locale` | Idioma de la interfaz: `en` o `es`. |
@@ -224,7 +224,7 @@ Sin `-p`, gana la primera coincidencia:
 ```
 1. --profile / -p
    └── 2. AGYDRA_PROFILE
-       └── 3. Marcador .agydra (ancestro más cercano; anula -r)
+       └── 3. Marcador .agydra (ancestro más cercano; ignorado por -r)
            └── 4. default_profile en agydra.json
                └── 5. Primer perfil por número (orden de creación; primero los de `agy`)
 ```
@@ -247,15 +247,15 @@ Home del host (~/)                     en su sitio: ~/.gemini  ~/.codex  ~/.grok
     claude CLAUDE_CONFIG_DIR → <store>/claude-config/<seq> (física; conserva HOME)
 ```
 
-`.ssh`, `.gitconfig` y la configuración del shell se reflejan en el overlay. Los directorios ancestros del almacén son directorios reales, así que el almacén queda fuera del alcance desde dentro del overlay. El hijo recibe `AGYDRA_REAL_HOME`.
+Para los motores con overlay, `.ssh`, `.gitconfig` y la configuración del shell se reflejan en el overlay. Los directorios ancestros del almacén son directorios reales, así que el almacén queda fuera del alcance desde dentro del overlay. El hijo recibe `AGYDRA_REAL_HOME`.
 
 `AgyEngine`, `CodexEngine`, `GrokEngine` y `ClaudeEngine` se encargan de encontrar el binario, los argumentos, las rutas y la identidad. Codex siempre corre con `--no-daemon`. El socket leader de Grok es por perfil, así que una sesión `grok` del host y una de perfil no lo comparten. El puente del llavero de macOS aplica solo a selección explícita/login de `agy`. Las sesiones con autenticación en archivo cuentan para los límites y protegen su perfil de mutaciones, pero no prolongan la propiedad del slot compartido.
 
-Los locks de sesión usan `<store>/locks/<perfil>.lock`; el archivo marcador persiste, mientras el lock advisory del sistema operativo se libera cuando termina el proceso que lo posee. `create`, `rename` y `delete` adquieren los locks de los perfiles afectados en orden ascendente por nombre y luego el lock persistente, compartido y no heredado `<store>/locks/.profile-sequence.lock`; los locks de perfil y de secuencia se adquieren sin espera, y los locks de perfil se liberan en orden inverso. El archivo persistente `<store>/profile-sequence.json` guarda `{"last_seq": N}`. Si falta, el contador se inicializa con la secuencia más alta de los perfiles con metadatos legibles mientras se mantiene el lock de secuencia. `create` guarda el número siguiente antes de preparar el perfil; una interrupción o un fallo posterior puede dejar un salto inocuo, y no se reutilizan secuencias de perfiles eliminados.
+Los locks de sesión usan `<store>/locks/<perfil>.lock`; el archivo marcador persiste, mientras el lock advisory del sistema operativo se libera cuando termina el proceso que lo posee. Las sesiones simultáneas se unen registrándose en el registro de leases de poseedores del archivo bloqueado (`acquire_lease`/`release_lease`), que rastrea el PID y la vigencia del token de inicio del proceso distinguiendo a los participantes del llavero de los poseedores con autenticación privada. `create`, `rename` y `delete` adquieren los locks de los perfiles afectados en orden ascendente por nombre y luego el lock persistente, compartido y no heredado `<store>/locks/.profile-sequence.lock`; los locks de perfil y de secuencia se adquieren sin espera, y los locks de perfil se liberan en orden inverso. El archivo persistente `<store>/profile-sequence.json` guarda `{"last_seq": N}`. Si falta, el contador se inicializa con la secuencia más alta de los perfiles con metadatos legibles mientras se mantiene el lock de secuencia. `create` guarda el número siguiente antes de preparar el perfil; una interrupción o un fallo posterior puede dejar un salto inocuo, y no se reutilizan secuencias de perfiles eliminados.
 
 `create` prepara `data/` y `profile.json` en un directorio temporal hermano, del mismo sistema de archivos, dentro de `<store>/profiles/`, con el nombre `.agydra-stage-<nombre>-<token>`, y publica el perfil completo con un único cambio de nombre de directorio. Los listados ignoran una etapa que quedó tras una interrupción; un `create` posterior para ese mismo nombre la elimina mientras mantiene ambos locks. El número de secuencia reservado sigue consumido.
 
-Antes de mover el directorio de un perfil, `rename` escribe atómicamente su intención en `<store>/profile-rename.json`, que incluye una acción de recuperación para migrar el slot de Keychain y la instantánea `source_present`. Una lectura pública o mutación posterior de perfiles recupera ese journal mientras mantiene, en orden ascendente por nombre, los locks de los perfiles anterior y nuevo, seguidos por el lock de secuencia. Si solo existe el directorio anterior, la recuperación restaura el default anterior cuando hace falta y elimina el journal; si solo existe el nuevo, completa el cambio: corrige los metadatos y el default cuando hace falta, elimina el overlay anterior y luego ejecuta la acción de Keychain registrada antes de borrar el journal. La recuperación forward ejecuta esa acción mientras mantiene los locks de perfil ordenados, el lock de secuencia y `swap.lock`; si falla, conserva el journal para reintentar en la siguiente operación del almacén. En el camino normal de rename, el callback se ejecuta con los locks de perfil mantenidos, después de liberar el lock de secuencia. Si existen ambos directorios o ninguno, el journal o los metadatos están dañados, o algún lock requerido está ocupado, la recuperación falla de forma segura y conserva el journal y los datos de perfil.
+Antes de mover el directorio de un perfil, `rename` escribe atómicamente su intención en `<store>/profile-rename.json`, que incluye una acción de recuperación para migrar el slot de Keychain y la instantánea `source_present` para Antigravity; el rename de Claude no añade esta acción. Una lectura pública o mutación posterior de perfiles recupera ese journal mientras mantiene, en orden ascendente por nombre, los locks de los perfiles anterior y nuevo, seguidos por el lock de secuencia. Si solo existe el directorio anterior, la recuperación restaura el default anterior cuando hace falta y elimina el journal; si solo existe el nuevo, completa el cambio: corrige los metadatos y el default cuando hace falta, elimina el overlay anterior y luego ejecuta la acción de Keychain registrada antes de borrar el journal. La recuperación forward ejecuta esa acción mientras mantiene los locks de perfil ordenados, el lock de secuencia y `swap.lock`; si falla, conserva el journal para reintentar en la siguiente operación del almacén. En el camino normal de rename, el callback se ejecuta con los locks de perfil mantenidos, después de liberar el lock de secuencia. Si existen ambos directorios o ninguno, el journal o los metadatos están dañados, o algún lock requerido está ocupado, la recuperación falla de forma segura y conserva el journal y los datos de perfil.
 
 Cuando está activado (por defecto; `--no-backup` lo desactiva), `delete` crea y verifica el ZIP de respaldo antes de borrar los datos del perfil: el respaldo se escribe y verifica manteniendo el lock de perfil, y la fase de confirmación vuelve a tomar el lock de secuencia, revalida la identidad y las rutas del perfil y solo entonces borra. Se conservan como máximo los últimos 5 ZIP por perfil. Para Antigravity, la CLI conserva el lock de perfil durante la purga de llavero posterior al borrado, después de liberar el lock de secuencia; en macOS, la purga usa `swap.lock` para serializar la limpieza del slot guardado y de la entrada del Llavero del sistema con los cambios de credenciales. Si falla la purga, se informa una advertencia después del borrado. `import` mantiene el lock del perfil de destino durante la copia (más `swap.lock` en macOS para Antigravity, para que la credencial importada no compita con un intercambio en curso) y `share-config` mantiene los locks de los perfiles de origen y destino hasta terminar todas las copias. `doctor --fix` mantiene el lock del perfil mientras migra y vuelve a enlazar los datos del overlay.
 
@@ -300,7 +300,7 @@ La configuración global está en `<store>/agydra.json`. Otro almacén se indica
 }
 ```
 
-`codex_binary`, `grok_binary` y `claude_binary` son opcionales. Si omites una clave, Agydra usa el `PATH`.
+Todas las claves de binarios (`agy_binary`, `codex_binary`, `grok_binary` y `claude_binary`) son opcionales. Si omites una clave, Agydra usa el `PATH`.
 
 | Variable | Para qué |
 |---|---|
@@ -327,7 +327,7 @@ La suite usa almacenes temporales y deja el home del host en paz. La matriz nati
 ## ⚠️ Limitaciones
 
 - Agydra gestiona perfiles y sesiones. No instala ni actualiza `agy`, `codex`, `grok` ni `claude`.
-- El aislamiento sigue a cada CLI: `HOME` para `agy`, `CODEX_HOME` para `codex`, `GROK_HOME` más `GROK_LEADER_SOCKET` para `grok`. El canario de esquema de Doctor avisa si el diseño no coincide con los drivers actuales.
+- El aislamiento sigue a cada CLI: `HOME` para `agy`, `CODEX_HOME` para `codex`, `GROK_HOME` más `GROK_LEADER_SOCKET` para `grok`, y `CLAUDE_CONFIG_DIR` para `claude`. El canario de esquema de Doctor avisa si el diseño no coincide con los drivers actuales.
 - Las rutas de Windows se ejercitan en Windows. En Unix las cubren las pruebas unitarias.
 
 ---
