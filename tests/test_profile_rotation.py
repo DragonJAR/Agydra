@@ -346,7 +346,12 @@ class TestProfileRotation(BaseCase):
         self.assertEqual(launched[0][0][0], str(self.executables["codex"]))
         self.assertEqual(launched[0][1][resolver.PROFILE_ENV], codex.name)
 
-    def test_agy_random_does_not_fall_back_to_a_used_keychain_owner(self):
+    def test_agy_random_prefers_a_fresh_profile_then_joins_a_used_keychain_owner(self):
+        """Rotation order is untouched: the unused profile is tried first
+        and the used owner is never re-picked mid-cycle. When the owner's
+        live sessions block the fresh pick and the engine scope is
+        exhausted, the launch joins the owner through explicit-selection
+        semantics and the cycle state stays exactly as it was."""
         fresh = self.store.create("agy-fresh", engine="agy")
         owner = self.store.create("agy-owner", engine="agy")
         profile_rotation._atomic_write_json(
@@ -355,7 +360,6 @@ class TestProfileRotation(BaseCase):
         )
         plan = self._random_plan(engine="agy", force=True)
         self.assertEqual(plan.profile, fresh.name)
-        launched = []
 
         @contextlib.contextmanager
         def keychain_guard(_store, name, **_kwargs):
@@ -372,11 +376,13 @@ class TestProfileRotation(BaseCase):
             keychain, "launch_guard", side_effect=keychain_guard
         ), mock.patch.object(
             platforms, "launch_argv", side_effect=self._record_launch
+        ), mock.patch.object(
+            platforms, "run_wait", side_effect=self._record_launch
         ):
-            with self.assertRaisesRegex(StoreError, "belongs to 'agy-owner'"):
-                runner.run(plan, store=self.store)
+            rc = runner.run(plan, store=self.store)
 
-        self.assertEqual(launched, [])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.launched, [owner.name])
         rotation_state = json.loads(
             profile_rotation.state_path(self.store, "agy").read_text(encoding="utf-8")
         )

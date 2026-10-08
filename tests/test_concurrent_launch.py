@@ -17,7 +17,7 @@ import locks
 import platforms
 import profile_rotation
 import runner
-from conftest import BaseCase
+from conftest import BaseCase, LiveHolders
 from store import Store, StoreError
 
 
@@ -169,7 +169,11 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
             self.store.create(name)
             _authenticate(self.store, name)
 
-    def test_busy_slot_owned_by_another_profile_aborts_random_agy_selection(self):
+    def test_busy_slot_owned_by_another_profile_falls_back_to_joining_the_owner(self):
+        """Every non-owner candidate is blocked by the live owner, so the
+        rotation exhausts its scope; the launch then joins the owner's
+        live session through explicit-selection semantics — no rotation
+        commit — instead of failing with the keychain conflict."""
         entered = []
 
         @contextlib.contextmanager
@@ -187,14 +191,47 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
         with mock.patch.object(keychain, "supported", return_value=True), \
                 mock.patch.object(keychain, "launch_guard", side_effect=guard), \
                 mock.patch.object(platforms, "run_wait", return_value=0):
-            with self.assertRaises(StoreError) as caught:
-                runner.run(plan, store=self.store)
-        self.assertIn("slot owned by gamma", str(caught.exception))
-        self.assertIn("no other agy engine profile could be joined", str(caught.exception))
-        self.assertEqual(entered, [first])
+            rc = runner.run(plan, store=self.store)
+        self.assertEqual(rc, 0)
+        self.assertEqual(entered, [first, "gamma"])
         self.assertEqual(locks.lease_holders(self.store, "gamma"), [])
         self.assertEqual(locks.lease_holders(self.store, first), [])
         self.assertFalse(profile_rotation.state_path(self.store, "agy").exists())
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "spawns live lease-holder subprocesses; same constraint as the session-limit suite",
+    )
+    def test_owner_join_fallback_still_respects_the_session_limit(self):
+        """The fallback join is explicit-selection semantics: without
+        ``--force`` the owner's session cap binds and the launch reports
+        the actionable lease-limit guidance instead of joining."""
+        self.store.update_config(
+            lambda config: config.settings.update({"max_sessions_per_profile": 1})
+        )
+        entered = []
+        with LiveHolders(self.store, "gamma", 1):
+
+            @contextlib.contextmanager
+            def guard(store, profile, capture=False, persist_on_exit=True):
+                entered.append(profile)
+                if profile != "gamma":
+                    raise keychain.KeychainBusyError(
+                        "slot owned by gamma", owner="gamma"
+                    )
+                yield
+
+            plan = runner.build_plan(self.store, ["chat"], random_pick=True, engine="agy")
+            first = plan.profile
+            with mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(keychain, "launch_guard", side_effect=guard), \
+                    mock.patch.object(platforms, "run_wait", return_value=0):
+                with self.assertRaises(StoreError) as caught:
+                    runner.run(plan, store=self.store)
+            message = str(caught.exception)
+            self.assertIn("max_sessions_per_profile", message)
+            self.assertIn("-f/--force", message)
+            self.assertEqual(entered, [first])
 
     def test_slot_owner_that_cannot_be_planned_is_excluded_and_another_profile_is_repicked(self):
         entered = []

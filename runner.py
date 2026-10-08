@@ -264,16 +264,54 @@ def _grok_socket_destination(overlay: Path, data_dir_name: str) -> str:
     return str(Path(f"/tmp/agydra-{os.getuid()}") / f"{digest}.sock")
 
 
+def _owner_join_plan(
+    store: Store, plan: LaunchPlan, cause: Exception, excluded: set
+) -> Optional[LaunchPlan]:
+    """Build the explicit join plan for a live keychain slot owner, or ``None``.
+
+    Reached only when random selection is exhausted because the owner's
+    live sessions blocked its whole engine: joining that profile is the
+    one launch the keychain contract guarantees to be possible
+    (``KeychainBusyError.owner``), so exhaustion ends in a useful session
+    instead of an error. Explicit-selection semantics: the rotation cycle
+    is not consulted or committed, and session limits still bind unless
+    ``--force`` — a fallback that cannot be planned leaves the original
+    cause for the caller to raise.
+    """
+    owner = getattr(cause, "owner", None)
+    if not owner or owner in excluded or plan.engine != "agy":
+        return None
+    try:
+        owner_profile = store.get_readonly(owner)
+    except StoreError:
+        return None
+    if owner_profile is None or owner_profile.engine != "agy":
+        return None
+    try:
+        return build_plan(
+            store, plan.raw_args,
+            binary_override=plan.binary_override,
+            launch_as_child=plan.launch_as_child,
+            cwd=plan.cwd,
+            force=plan.force,
+            flag_ref=owner,
+        )
+    except (StoreError, isolation.IsolationError, ValueError):
+        return None
+
+
 def _next_random_plan(
     store: Store, plan: LaunchPlan, excluded: set, cause: Exception,
     rotation: Optional[profile_rotation.Rotation] = None,
 ) -> LaunchPlan:
     """Re-pick after a random pick turned out unusable (slot busy or session
     limit reached): exclude it and plan again. A live Agy Keychain owner
-    blocks that engine for this launch rather than forcing a join; a global
-    scope can still select another engine. Each retry excludes one more
-    profile, so the loop ends; when none is left the original cause is what
-    the user sees, never the resolver's "no profiles" message."""
+    blocks that engine for this launch rather than re-picking it mid-cycle;
+    a global scope can still select another engine. Each retry excludes one
+    more profile, so the loop ends; when none is left the launch falls back
+    once to joining the owner's live session (``_owner_join_plan``) instead
+    of failing, and only a fallback that cannot be planned raises the
+    original cause — never the resolver's "no profiles" message."""
     excluded.add(plan.profile)
     owner = getattr(cause, "owner", None)
     if rotation is not None and plan.engine == "agy" and owner:
@@ -295,6 +333,13 @@ def _next_random_plan(
             rotation=rotation,
         )
     except StoreError as exhausted:
+        join_plan = _owner_join_plan(store, plan, cause, excluded)
+        if join_plan is not None:
+            warn(
+                f"every other agy profile is blocked by the live slot "
+                f"owner {owner!r}; joining its session"
+            )
+            return join_plan
         scope = f"{plan.engine_filter} engine" if plan.engine_filter else "any engine"
         raise StoreError(
             f"{cause}; no other {scope} profile could be joined "
@@ -415,7 +460,7 @@ def _run_prepared(
             )
             try:
                 with guard:
-                    if rotation is not None:
+                    if rotation is not None and plan.random_pick:
                         rotation.commit(profile)
                     if platforms.is_windows():
                         rc = platforms.launch_argv(argv, env)

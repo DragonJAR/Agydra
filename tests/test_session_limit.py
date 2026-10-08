@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import io
 import contextlib
-import json
-import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -19,7 +17,7 @@ import models
 import platforms
 import resolver
 import runner
-from conftest import BaseCase
+from conftest import BaseCase, LiveHolders as _LiveHolders
 from store import Store, StoreError
 
 
@@ -29,30 +27,6 @@ def _authenticate(store, name):
     (token_dir / "antigravity-oauth-token").write_text(
         '{"token": {"access_token": "mock-token"}}', encoding="utf-8"
     )
-
-
-class _LiveHolders:
-    """Registers N real, live foreign processes as lease holders."""
-
-    def __init__(self, store, name, count):
-        self.store = store
-        self.name = name
-        self.processes = [
-            subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
-            for _ in range(count)
-        ]
-
-    def __enter__(self):
-        holders = [{"pid": p.pid, "start": platforms.process_start_token(p.pid)} for p in self.processes]
-        path = locks.lock_path(self.store, self.name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"holders": holders}), encoding="utf-8")
-        return self
-
-    def __exit__(self, *exc):
-        for process in self.processes:
-            process.kill()
-            process.wait()
 
 
 @unittest.skipIf(

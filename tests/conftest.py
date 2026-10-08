@@ -130,6 +130,38 @@ def spawn_cli(*args, cwd, extra_env: dict = None, **popen_kwargs):
     )
 
 
+class LiveHolders:
+    """Registers N real, live foreign processes as lease holders."""
+
+    def __init__(self, store, name, count):
+        import subprocess
+
+        self.store = store
+        self.name = name
+        self.processes = [
+            subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+            for _ in range(count)
+        ]
+
+    def __enter__(self):
+        import locks
+        import platforms
+
+        holders = [
+            {"pid": process.pid, "start": platforms.process_start_token(process.pid)}
+            for process in self.processes
+        ]
+        path = locks.lock_path(self.store, self.name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"holders": holders}), encoding="utf-8")
+        return self
+
+    def __exit__(self, *exc):
+        for process in self.processes:
+            process.kill()
+            process.wait()
+
+
 def _make_jwt(claims: dict) -> str:
     """Minimal unsigned JWT: only the payload segment is ever decoded."""
     def seg(obj: dict) -> str:
