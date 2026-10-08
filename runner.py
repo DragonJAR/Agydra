@@ -80,6 +80,8 @@ class LaunchPlan:
     env: Dict[str, str] = field(default_factory=dict, repr=False)
     ignored_env: List[str] = field(default_factory=list)
     redirections: Dict[str, str] = field(default_factory=dict, repr=False)
+    owner_join: bool = False
+    skip_rotation_commit: bool = False
 
     def describe(self) -> str:
         if self.engine == "claude":
@@ -288,7 +290,7 @@ def _owner_join_plan(
     if owner_profile is None or owner_profile.engine != "agy":
         return None
     try:
-        return build_plan(
+        join_plan = build_plan(
             store, plan.raw_args,
             binary_override=plan.binary_override,
             launch_as_child=plan.launch_as_child,
@@ -298,6 +300,8 @@ def _owner_join_plan(
         )
     except (StoreError, isolation.IsolationError, ValueError):
         return None
+    join_plan.skip_rotation_commit = True
+    return join_plan
 
 
 def _next_random_plan(
@@ -460,7 +464,11 @@ def _run_prepared(
             )
             try:
                 with guard:
-                    if rotation is not None and plan.random_pick:
+                    if (
+                        rotation is not None
+                        and plan.random_pick
+                        and not plan.skip_rotation_commit
+                    ):
                         rotation.commit(profile)
                     if platforms.is_windows():
                         rc = platforms.launch_argv(argv, env)
