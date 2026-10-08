@@ -19,8 +19,10 @@ profile's own credential into a throwaway ``HOME`` therefore lets
   bypassed, so staging converges macOS onto the proven cross-platform
   path instead of inventing a new one.
 
-The staged credential comes from the profile's own on-disk token file
-when present, otherwise from its keychain ``.secret`` backup. A backup is
+The staged credential comes from the profile's own validated on-disk
+token file when present, otherwise from its keychain ``.secret`` backup.
+Malformed disk credentials and positively foreign identities are refused,
+not replaced with a backup. A backup is
 only staged when it decodes to a POSITIVE identity claim that matches the
 account the profile is known to belong to -- the same identity-guard
 philosophy as ``keychain._persist_if_trusted``, but stricter because a
@@ -46,43 +48,22 @@ from typing import Optional
 
 import account
 import isolation
-import keychain
 import platforms
 import resolver
 
-SCOPED_STORAGE_FLAG = "SSH_TTY"
-SCOPED_STORAGE_VALUE = "agydra-usage"
+SCOPED_STORAGE_FLAG = account.AGY_FILE_AUTH_ENV
+SCOPED_STORAGE_VALUE = account.AGY_FILE_AUTH_VALUE
 USAGE_ARGV = ("--print", "/usage", "--output-format", "json")
 
 
 def scoped_token_bytes(store, name: str, profile, data_dir: Path) -> Optional[bytes]:
     """Plain-JSON token bytes for staging, or ``None`` when unavailable.
 
-    The on-disk token file is the profile's own trusted artifact and is
-    preferred; the keychain ``.secret`` backup is only staged when it
-    decodes to the same account the profile is already known to belong
-    to. A corrupt backup (wrong shape, damaged envelope) degrades to
-    ``None`` so the caller reports a clean credential error.
+    Reuse the launch credential reader: reject malformed or foreign disk
+    state and require a positive identity match for a missing-file backup.
+    An unusable credential returns ``None`` for a clean caller error.
     """
-    try:
-        raw = (data_dir / account.AGY_CLI_DIR / account.TOKEN_FILE).read_bytes()
-    except OSError:
-        raw = b""
-    if raw.strip():
-        return raw
-    secret = keychain.load_profile_slot(store, name)
-    if secret is None:
-        return None
-    decoded = keychain.decode_go_keyring_secret(secret)
-    if decoded is None:
-        return None
-    identity = account.email_from_raw(decoded)
-    if not account.same_email(identity, profile.email):
-        return None
-    try:
-        return keychain.token_payload_for_slot(secret)
-    except ValueError:
-        return None
+    return account.scoped_agy_token_bytes(store, profile, data_dir)
 
 
 def run_scoped_usage_query(

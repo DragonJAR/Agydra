@@ -31,6 +31,7 @@ from typing import List, NamedTuple, Optional, Tuple
 
 import platforms
 import store
+from models import Profile
 
 _Identity = Optional[Tuple[int, int]]
 
@@ -610,6 +611,71 @@ def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "ag
 
     _mirror_dir(real_home, overlay, 0, ctx)
     return overlay
+
+
+def prepare_agy_file_auth(
+    profile_store: store.Store, profile: Profile, data_dir: Path
+) -> Path:
+    """Validate native file authentication, seeding only a missing idle token."""
+    import account
+    import locks
+
+    def ready(current: Profile) -> Tuple[Optional[Path], bytes]:
+        path = account.agy_token_path(data_dir)
+        raw = account.scoped_agy_token_bytes(profile_store, current, data_dir)
+        if raw is None:
+            raise IsolationError(
+                f"no trusted Antigravity credential for profile {current.name!r} "
+                f"at {path}; authenticate that profile with agydra login"
+            )
+        if path.exists():
+            metadata = path.lstat()
+            if platforms.is_windows() or not stat.S_IMODE(metadata.st_mode) & 0o077:
+                return path, raw
+        return None, raw
+
+    try:
+        path, _raw = ready(profile)
+        if path is not None:
+            return path
+        handle = locks.try_mutation_lock(profile_store, profile.name)
+        if handle is None:
+            raise IsolationError(
+                f"cannot prepare private Antigravity credentials for live profile "
+                f"{profile.name!r}; finish its sessions before retrying"
+            )
+        try:
+            current = profile_store.get(profile.name)
+            if (current.seq, current.engine, current.created) != (
+                profile.seq, profile.engine, profile.created
+            ):
+                raise IsolationError(f"profile {profile.name!r} changed during authentication preparation")
+            if profile_store.profile_data_dir(current.name, engine="agy") != Path(data_dir):
+                raise IsolationError(f"profile {profile.name!r} authentication path changed")
+            path, raw = ready(current)
+            if path is not None:
+                return path
+            path = account.agy_token_path(data_dir)
+            if path.exists():
+                metadata = path.lstat()
+                store._chmod_path_without_following(
+                    path, 0o600, metadata.st_dev, metadata.st_ino
+                )
+            else:
+                platforms.ensure_dir(path.parent)
+                account.agy_token_path(data_dir)
+                store.atomic_write_bytes(path, raw)
+            checked, _raw = ready(current)
+            if checked is None:
+                raise IsolationError(f"cannot verify private Antigravity credential permissions: {path}")
+            return checked
+        finally:
+            handle.release()
+    except OSError as exc:
+        raise IsolationError(
+            f"cannot prepare private Antigravity credentials at {data_dir} "
+            f"({_safe_os_error_reason(exc)})"
+        ) from None
 
 
 _AF_UNIX_PATH_MAX = 103

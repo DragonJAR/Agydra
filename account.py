@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,9 +22,12 @@ from typing import Iterator, Mapping, Optional, Tuple
 
 import platforms
 import store
+from models import Profile
 
 AGY_CLI_DIR = "antigravity-cli"
 TOKEN_FILE = "antigravity-oauth-token"
+AGY_FILE_AUTH_ENV = "SSH_TTY"
+AGY_FILE_AUTH_VALUE = "agydra-profile"
 
 
 def _normalize_nonblank_text(value: object) -> Optional[str]:
@@ -170,6 +174,84 @@ def email_from_raw(raw: dict) -> Optional[str]:
         return None
     claims = _decode_jwt_payload(id_token)
     return normalize_email(claims.get("email"))
+
+
+def _require_private_credential_path(path: Path, *, directory: bool = False) -> None:
+    try:
+        if platforms.is_link(path, strict=True):
+            raise store.StoreError(f"credential path must not be a link: {path}")
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise store.StoreError(
+            f"cannot inspect credential path {path} ({type(exc).__name__})"
+        ) from None
+    valid_type = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
+    if not valid_type or (not directory and metadata.st_nlink != 1):
+        raise store.StoreError(f"credential path must be a private real entry: {path}")
+
+
+def agy_token_path(data_dir: Path) -> Path:
+    """Validate the native credential path below an already-guarded profile root."""
+    data_dir = Path(data_dir)
+    _require_private_credential_path(data_dir, directory=True)
+    cli_dir = data_dir / AGY_CLI_DIR
+    _require_private_credential_path(cli_dir, directory=True)
+    path = cli_dir / TOKEN_FILE
+    _require_private_credential_path(path)
+    return path
+
+
+def _usable_agy_token(raw: object) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    token = _token_payload(raw)
+    return _has_credential(token.get("access_token")) or _has_credential(token.get("refresh_token"))
+
+
+def scoped_agy_token_bytes(
+    profile_store: store.Store, profile: Profile, data_dir: Path
+) -> Optional[bytes]:
+    """Validated private disk bytes, or a positively identity-verified backup.
+
+    Existing but unusable disk state is never masked by a backup. A disk
+    refresh without an id_token stays trusted as the profile's own artifact;
+    a positively foreign identity is refused. The reader never writes files
+    or accesses the native Keychain.
+    """
+    path = agy_token_path(data_dir)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        raw = None
+    except OSError:
+        return None
+    if raw is not None:
+        try:
+            decoded = json.loads(raw.decode("utf-8"))
+        except (RecursionError, ValueError, UnicodeDecodeError):
+            return None
+        if not _usable_agy_token(decoded):
+            return None
+        identity = email_from_raw(decoded)
+        anchor = normalize_email(profile.email)
+        if identity is not None and anchor is not None and not same_email(identity, anchor):
+            return None
+        return raw
+    import keychain
+
+    backup_path = keychain.slot_backup_path(profile_store, profile.name)
+    _require_private_credential_path(backup_path.parent, directory=True)
+    _require_private_credential_path(backup_path)
+    secret = keychain.load_profile_slot(profile_store, profile.name)
+    try:
+        decoded = keychain.decode_go_keyring_secret(secret)
+    except RecursionError:
+        return None
+    if not _usable_agy_token(decoded) or not same_email(email_from_raw(decoded), profile.email):
+        return None
+    return json.dumps(decoded, separators=(",", ":")).encode("utf-8")
 
 
 CODEX_AUTH_FILE = "auth.json"
