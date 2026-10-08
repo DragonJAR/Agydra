@@ -163,8 +163,8 @@ _NO_PROFILES = (
     "no profiles exist yet; create one with: agydra create <name>"
 )
 _AT_LIMIT = (
-    "every authenticated profile already has {limit} live sessions (the limit "
-    "of {limit}); wait for one to finish, raise settings.max_sessions_per_profile "
+    "every authenticated profile has reached the limit of {limit} live "
+    "session(s); wait for one to finish, raise settings.max_sessions_per_profile "
     "in agydra.json, or bypass with -f/--force"
 )
 _NOT_AUTHENTICATED = (
@@ -188,8 +188,11 @@ def pick_free_profile(
     free sessions rank first among unused candidates, while saved quota ranks
     first among repeats. Authentication is lazy and cached across retries
     under the selection-scope lock.
-    A read-only preview skips authentication and session probes and writes
-    nothing. Failed retry exclusions never finish the persistent cycle.
+    A read-only preview applies the same eligibility and session order from
+    side-effect-free evidence (stored credentials, lock and lease registry)
+    and writes nothing; a profile whose authentication needs a native CLI
+    probe (Claude Code) stays unprobed and eligible. Failed retry exclusions
+    never finish the persistent cycle.
     """
     profiles = store.list_readonly() if read_only else store.list()
     target_engine = engine.strip().lower() if engine is not None else None
@@ -203,10 +206,12 @@ def pick_free_profile(
             )
         raise StoreError(_NO_PROFILES)
 
-    limit = None if force or read_only else store.load_config().session_limit()
+    limit = None if force else store.load_config().session_limit()
     busy: Dict[str, bool] = {}
     saturated = False
     auth_states = rotation.auth_states if rotation is not None else {}
+    probe_auth = account.passive_auth_state if read_only else account.auth_state
+    unprobed: set = set()
 
     def session_priority(profile: Profile) -> tuple:
         if profile.name not in busy:
@@ -217,13 +222,15 @@ def pick_free_profile(
         nonlocal saturated
         identity = (profile.engine, profile.seq, profile.name)
         if identity not in auth_states:
-            auth_states[identity] = account.auth_state(
+            auth_states[identity] = probe_auth(
                 store.profile_data_dir(profile.name, engine=profile.engine),
                 store,
                 profile.name,
                 engine=profile.engine,
             )
-        if auth_states[identity] != "authenticated":
+        if auth_states[identity] is None:
+            unprobed.add(identity)
+        elif auth_states[identity] != "authenticated":
             return False
         if limit is not None and session_priority(profile)[0]:
             holders = locks.lease_holders(store, profile.name)
@@ -232,18 +239,16 @@ def pick_free_profile(
                 return False
         return True
 
-    eligibility = None if read_only else eligible
-    priority = None if read_only else session_priority
     try:
         candidate = (
-            rotation.select(profiles, exclude, eligibility, priority)
+            rotation.select(profiles, exclude, eligible, session_priority)
             if rotation is not None
             else profile_rotation.preview(
                 store,
                 profiles,
                 exclude,
-                eligibility,
-                priority,
+                eligible,
+                session_priority,
                 engine=target_engine,
             )
         )
@@ -253,13 +258,14 @@ def pick_free_profile(
         raise StoreError(_NOT_AUTHENTICATED) from exc
     scope = target_engine or "all engines"
     reason = f"profile selected from {scope} rotation; session state, saved quota, LRU and stable identity order (-r)"
+    session = "joining busy profile" if session_priority(candidate)[0] else "free profile"
     if read_only:
-        reason = (
-            f"read-only random plan candidate (-r; {reason}; "
-            "auth and sessions not probed)"
+        unprobed_note = (
+            "; auth needs a native CLI probe, not probed"
+            if (candidate.engine, candidate.seq, candidate.name) in unprobed
+            else ""
         )
-    elif session_priority(candidate)[0]:
-        reason = "joining busy profile (-r; " + reason + ")"
+        reason = f"read-only random plan candidate (-r; {reason}; {session}{unprobed_note})"
     else:
-        reason = "free profile (-r; " + reason + ")"
+        reason = f"{session} (-r; {reason})"
     return Resolution(candidate.name, reason)

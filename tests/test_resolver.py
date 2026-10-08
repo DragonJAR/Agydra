@@ -124,11 +124,16 @@ class TestResolver(BaseCase):
 
         self.assertEqual(journal.read_bytes(), journal_bytes)
 
-    def test_read_only_random_plan_skips_auth_and_recovery_probes(self):
+    def test_read_only_random_plan_uses_passive_auth_without_recovery_or_native_probes(self):
+        token_dir = self.store.profile_data_dir("lab") / "antigravity-cli"
+        token_dir.mkdir(parents=True, exist_ok=True)
+        (token_dir / "antigravity-oauth-token").write_text(
+            '{"token": {"access_token": "mock-token"}}', encoding="utf-8"
+        )
         with mock.patch.object(
             resolver.account,
-            "auth_state",
-            side_effect=AssertionError("read-only planning must not probe auth"),
+            "claude_auth_status",
+            side_effect=AssertionError("read-only planning must not spawn auth probes"),
         ), mock.patch.object(
             Store,
             "_recover_pending_rename",
@@ -138,8 +143,12 @@ class TestResolver(BaseCase):
                 self.store, [], random_pick=True, cwd=self.fake_home, read_only=True
             )
 
-        self.assertEqual(plan.profile, "personal")
-        self.assertIn("not probed", plan.reason)
+        self.assertEqual(plan.profile, "lab")
+        self.assertIn("read-only", plan.reason)
+        self.assertFalse(
+            any(self.store.root.glob("profile-rotation-*.json")),
+            "a read-only preview must not write rotation state",
+        )
 
 
 class TestPickFreeProfileAuthAndBusyOrder(BaseCase):
@@ -181,6 +190,46 @@ class TestPickFreeProfileAuthAndBusyOrder(BaseCase):
             self.assertIn("joining busy profile", res.reason)
         finally:
             handle.release()
+
+    def test_read_only_preview_skips_unauthenticated_profile(self):
+        self._authenticate("beta")
+        res = resolver.pick_free_profile(self.store, read_only=True)
+        self.assertEqual(res.name, "beta")
+
+    def test_read_only_preview_without_authenticated_profile_fails_like_launch(self):
+        with self.assertRaisesRegex(StoreError, "agydra login"):
+            resolver.pick_free_profile(self.store, read_only=True)
+
+    def test_read_only_preview_prefers_free_profile_over_busy(self):
+        import locks
+
+        self._authenticate("alpha")
+        self._authenticate("beta")
+        handle = locks.try_lock(self.store, "alpha")
+        self.assertIsNotNone(handle)
+        try:
+            res = resolver.pick_free_profile(self.store, read_only=True)
+        finally:
+            handle.release()
+        self.assertEqual(res.name, "beta")
+        self.assertIn("free profile", res.reason)
+
+    def test_read_only_preview_honors_session_limit(self):
+        import locks
+
+        self._authenticate("alpha")
+        config = self.store.load_config()
+        config.settings["max_sessions_per_profile"] = 1
+        self.store.save_config(config)
+        locks.acquire_lease(self.store, "alpha", patience_s=1.0, max_holders=1)
+        try:
+            with self.assertRaisesRegex(StoreError, "limit of 1 live session"):
+                resolver.pick_free_profile(self.store, read_only=True)
+            res = resolver.pick_free_profile(self.store, read_only=True, force=True)
+        finally:
+            locks.release_lease(self.store, "alpha", patience_s=1.0)
+        self.assertEqual(res.name, "alpha")
+        self.assertIn("joining busy profile", res.reason)
 
     def test_picks_authenticated_profile_when_unauthenticated_is_free(self):
         """When alpha is authenticated and free, and beta is unauthenticated,
@@ -353,6 +402,12 @@ class TestPickFreeProfileClaudeProbeCount(BaseCase):
         self.assertEqual(res.name, "c1")
         self.assertEqual(len(self.log.read_text(encoding="utf-8").splitlines()), 1)
 
+
+    def test_read_only_preview_never_spawns_claude_status_probe(self):
+        res = resolver.pick_free_profile(self.store, read_only=True)
+        self.assertEqual(res.name, "c1")
+        self.assertIn("native CLI probe, not probed", res.reason)
+        self.assertFalse(self.log.exists())
 
 if __name__ == "__main__":
     unittest.main()

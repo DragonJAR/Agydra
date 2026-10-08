@@ -693,6 +693,23 @@ def auth_state(
     return "not-authenticated"
 
 
+def passive_auth_state(
+    data_dir: Path,
+    store=None,
+    name: Optional[str] = None,
+    engine: str = "agy",
+) -> Optional[str]:
+    """:func:`auth_state` from stored credential files only, or ``None``.
+
+    ``None`` means only the engine's native CLI can answer (Claude Code's
+    ``claude auth status``), so a side-effect-free caller such as a dry-run
+    plan must leave that profile unprobed rather than spawn a process.
+    """
+    if engine == "claude":
+        return None
+    return auth_state(data_dir, store, name, engine=engine)
+
+
 def sync_profile_email(store, name: str) -> Optional[str]:
     """Refresh the cached email in profile metadata; returns the email.
 

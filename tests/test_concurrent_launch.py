@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import io
 import sys
 import threading
 import time
@@ -335,6 +336,7 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
         self.assertFalse(profile_rotation.state_path(self.store, "agy").exists())
 
     def test_owner_join_releases_rotation_before_waiting_for_the_engine(self):
+        """An expected owner join is silent and releases only rotation locks."""
         owner = self.store.get("gamma")
         for engine_filter in ("agy", None):
             with self.subTest(engine_filter=engine_filter):
@@ -374,11 +376,14 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
                     self.store, ["--dangerously-skip-permissions"],
                     random_pick=True, engine=engine_filter, force=True,
                 )
+                stderr = io.StringIO()
                 with mock.patch.object(keychain, "supported", return_value=True), \
                         mock.patch.object(keychain, "launch_guard", side_effect=guard), \
                         mock.patch.object(platforms, "run_wait", side_effect=launch), \
-                        mock.patch.object(platforms, "launch_argv", side_effect=launch):
+                        mock.patch.object(platforms, "launch_argv", side_effect=launch), \
+                        contextlib.redirect_stderr(stderr):
                     self.assertEqual(runner.run(plan, store=self.store), 0)
+                self.assertEqual(stderr.getvalue(), "")
                 self.assertEqual(profile_rotation.read_json_object(path), state)
                 self.assertEqual(locks.lease_holders(self.store, owner.name), [])
 

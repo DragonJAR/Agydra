@@ -339,10 +339,6 @@ def _next_random_plan(
     except StoreError as exhausted:
         join_plan = _owner_join_plan(store, plan, cause, excluded)
         if join_plan is not None:
-            warn(
-                f"every other agy profile is blocked by the live slot "
-                f"owner {owner!r}; joining its session"
-            )
             return join_plan
         scope = f"{plan.engine_filter} engine" if plan.engine_filter else "any engine"
         raise StoreError(
