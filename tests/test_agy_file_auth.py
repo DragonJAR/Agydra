@@ -450,17 +450,55 @@ class TestRandomAgyFileLaunch(BaseCase):
         self.assertEqual(self.paths["alpha"].read_bytes(), self.tokens["alpha"])
         self.assertEqual(locks.lease_holders(self.store, "alpha"), [])
 
-    def test_foreign_disk_identity_aborts_without_consuming_the_cycle(self):
+    def _make_alpha_foreign(self):
         foreign = json.loads(self.tokens["alpha"])
         foreign["id_token"] = _make_jwt({"email": "foreign@example.com"})
-        self.paths["alpha"].write_text(json.dumps(foreign), encoding="utf-8")
+        raw = json.dumps(foreign).encode("utf-8")
+        self.paths["alpha"].write_bytes(raw)
+        return raw
+
+    def test_random_launch_skips_a_foreign_disk_identity_without_consuming_its_cycle(self):
+        foreign = self._make_alpha_foreign()
         plan = runner.build_plan(self.store, [], random_pick=True, engine="agy")
-        with self.assertRaises(isolation.IsolationError):
+        self.assertEqual(plan.profile, "alpha")
+        self.assertEqual(self._run(plan), 0)
+        self.assertEqual(self.launched, ["beta"])
+        self.assertEqual(
+            profile_rotation.read_json_object(profile_rotation.state_path(self.store, "agy"))["used"],
+            [self.profiles["beta"].seq],
+        )
+        self.assertEqual(self.paths["alpha"].read_bytes(), foreign)
+        self.assertEqual(locks.lease_holders(self.store, "alpha"), [])
+        self.assertIsNone(self.store.get("alpha").last_used)
+        self.assertEqual(self.store.get("alpha").email, "alpha@example.com")
+
+    def test_random_launch_with_only_a_foreign_candidate_reports_the_cause(self):
+        self._make_alpha_foreign()
+        self.store.delete("beta", backup=False)
+        plan = runner.build_plan(self.store, [], random_pick=True, engine="agy")
+        with self.assertRaises(StoreError) as caught:
             self._run(plan)
+        message = str(caught.exception)
+        self.assertIn("no trusted Antigravity credential for profile 'alpha'", message)
+        self.assertIn("alpha already tried", message)
+        self.assertEqual(self.launched, [])
         self.assertFalse(profile_rotation.state_path(self.store, "agy").exists())
         self.assertEqual(locks.lease_holders(self.store, "alpha"), [])
         self.assertIsNone(self.store.get("alpha").last_used)
+
+    def test_non_random_file_auth_launch_still_refuses_a_foreign_identity(self):
+        import dataclasses
+
+        self._make_alpha_foreign()
+        plan = dataclasses.replace(
+            runner.build_plan(self.store, [], random_pick=True, engine="agy"), random_pick=False
+        )
+        self.assertEqual((plan.profile, plan.agy_file_auth), ("alpha", True))
+        with self.assertRaises(isolation.AgyCredentialUntrustedError) as caught:
+            self._run(plan)
+        self.assertIn("no trusted Antigravity credential", str(caught.exception))
         self.assertEqual(self.launched, [])
+        self.assertEqual(locks.lease_holders(self.store, "alpha"), [])
 
     def test_native_launch_failure_cleans_the_lease_and_rotation_lock(self):
         def launch(_argv, _env):

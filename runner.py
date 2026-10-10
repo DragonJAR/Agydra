@@ -261,7 +261,7 @@ def _next_random_plan(
     store: Store, plan: LaunchPlan, excluded: set, cause: Exception,
     rotation: Optional[profile_rotation.Rotation] = None,
 ) -> LaunchPlan:
-    """Exclude a busy candidate and replan with a finite scope.
+    """Exclude a busy or unusable candidate and replan with a finite scope.
 
     Never substitute a shared-slot owner or consume a failed cycle entry.
     Exhaustion preserves the actual preparation error.
@@ -330,7 +330,7 @@ def _run_prepared(
                 store, plan.profile, patience_s=locks.LEASE_PATIENCE_S, max_holders=limit,
                 **membership,
             )
-        except (locks.LockError, isolation.AgyCredentialBusyError) as exc:
+        except (locks.LockError, isolation.AgyCredentialUnavailableError) as exc:
             if plan.random_pick:
                 plan = _next_random_plan(store, plan, excluded, exc, rotation)
                 continue

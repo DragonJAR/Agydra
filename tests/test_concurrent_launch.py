@@ -378,10 +378,6 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
                 guard.assert_not_called()
                 self.assertEqual(locks.lease_holders(self.store, selected), [])
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "spawns live lease-holder subprocesses; same constraint as the session-limit suite",
-    )
     def test_capped_keychain_owner_does_not_block_a_free_profile(self):
         self.store.update_config(
             lambda config: config.settings.update({"max_sessions_per_profile": 1})

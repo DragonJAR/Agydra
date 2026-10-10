@@ -39,8 +39,20 @@ class IsolationError(Exception):
     pass
 
 
-class AgyCredentialBusyError(IsolationError):
+class AgyCredentialUnavailableError(IsolationError):
+    """This profile's private agy credential cannot be used for this launch.
+
+    A random pick skips the profile and tries another candidate; an explicit
+    selection reports the refusal.
+    """
+
+
+class AgyCredentialBusyError(AgyCredentialUnavailableError):
     """A missing private agy token cannot be seeded while the profile is live."""
+
+
+class AgyCredentialUntrustedError(AgyCredentialUnavailableError):
+    """The profile's private agy credential is missing, foreign, unusable or unsafe."""
 
 
 def _safe_os_error_reason(error: BaseException) -> str:
@@ -642,7 +654,7 @@ def _prepare_agy_file_auth(
         path = account.agy_token_path(data_dir)
         raw = account.scoped_agy_token_bytes(profile_store, current, data_dir)
         if raw is None:
-            raise IsolationError(
+            raise AgyCredentialUntrustedError(
                 f"no trusted Antigravity credential for profile {current.name!r} "
                 f"at {path}; authenticate that profile with agydra login"
             )
@@ -685,7 +697,9 @@ def _prepare_agy_file_auth(
                 store.atomic_write_bytes(path, raw)
             checked, _raw = ready(current)
             if checked is None:
-                raise IsolationError(f"cannot verify private Antigravity credential permissions: {path}")
+                raise AgyCredentialUntrustedError(
+                    f"cannot verify private Antigravity credential permissions: {path}"
+                )
             return checked
         finally:
             handle.release()
