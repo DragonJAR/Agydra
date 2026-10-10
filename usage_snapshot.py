@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
+from models import profile_identity
 import store as store_module
 import usage
 
@@ -219,6 +220,10 @@ def _carried_entries(previous: Optional[Mapping[str, Any]]) -> List[Dict[str, An
     return carried
 
 
+def _entry_identity(entry: Mapping[str, Any]) -> Any:
+    return profile_identity(entry.get("seq"), entry.get("engine"), entry.get("name"))
+
+
 def _merged_entries(
     profiles: Sequence[Any],
     results: Sequence[Any],
@@ -234,18 +239,19 @@ def _merged_entries(
     actually re-read this run, so a consumer always sees the whole store
     while being told which parts this particular run did not refresh.
     """
-    fresh = {entry.get("name"): entry for entry in _sorted_entries(
-        profiles, results, scope=scope
-    )}
+    fresh_entries = _sorted_entries(profiles, results, scope=scope)
+    fresh_by_id = {_entry_identity(entry): entry for entry in fresh_entries}
     merged: List[Dict[str, Any]] = []
+    is_scoped = scope is not None and scope != "all"
     for entry in carry or ():
-        name = entry.get("name")
-        if name in fresh:
-            merged.append(fresh.pop(name))
-        else:
+        ident = _entry_identity(entry)
+        if ident in fresh_by_id:
+            merged.append(fresh_by_id.pop(ident))
+        elif is_scoped:
             merged.append(dict(entry))
-    merged.extend(fresh[name] for name in fresh)
+    merged.extend(fresh_by_id.values())
     return merged
+
 
 
 def _stale_flags(entries: Iterable[Dict[str, Any]], refreshed: Iterable[str]) -> None:

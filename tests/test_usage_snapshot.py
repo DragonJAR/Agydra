@@ -332,6 +332,70 @@ class PartialRunMergeTests(unittest.TestCase):
         names = {entry.get("name") for entry in document["profiles"]}
         self.assertIn("a", names)
 
+    def test_rename_profile_replaces_old_entry_in_snapshot(self):
+        p_a = Profile(name="a", seq=3, engine="codex")
+        p_b = Profile(name="b", seq=3, engine="codex")
+        previous = usage_snapshot.build_snapshot(
+            self.store, profiles=[p_a],
+            results=[usage.UsageResult(
+                name="a", ok=True, engine="codex",
+                groups=[usage.UsageGroup(name="OpenAI Codex", buckets=[_bucket("codex-weekly", 0.01)])],
+            )],
+            scope="all", now=NOW,
+        )
+        document = usage_snapshot.build_snapshot(
+            self.store, profiles=[p_b],
+            results=[usage.UsageResult(
+                name="b", ok=True, engine="codex",
+                groups=[usage.UsageGroup(name="OpenAI Codex", buckets=[_bucket("codex-weekly", 0.01)])],
+            )],
+            scope="b", previous=previous, now=NOW + timedelta(minutes=1),
+        )
+        self.assertEqual(len(document["profiles"]), 1)
+        self.assertEqual(document["profiles"][0]["name"], "b")
+        matched = usage_snapshot._matching_entry(document, 3, "codex", "b")
+        self.assertIsNotNone(matched)
+
+    def test_deleted_profile_dropped_on_unscoped_run_and_carried_on_scoped_run(self):
+        p_survivor = Profile(name="survivor", seq=1, engine="codex")
+        p_deleted = Profile(name="deleted", seq=2, engine="codex")
+        res_survivor = usage.UsageResult(
+            name="survivor", ok=True, engine="codex",
+            groups=[usage.UsageGroup(name="OpenAI Codex", buckets=[_bucket("codex-weekly", 0.5)])],
+        )
+        res_deleted = usage.UsageResult(
+            name="deleted", ok=True, engine="codex",
+            groups=[usage.UsageGroup(name="OpenAI Codex", buckets=[_bucket("codex-weekly", 0.8)])],
+        )
+        previous = usage_snapshot.build_snapshot(
+            self.store, profiles=[p_survivor, p_deleted],
+            results=[res_survivor, res_deleted],
+            scope="all", now=NOW,
+        )
+        self.assertEqual(len(previous["profiles"]), 2)
+
+        scoped_doc = usage_snapshot.build_snapshot(
+            self.store, profiles=[p_survivor],
+            results=[res_survivor],
+            scope="survivor", previous=previous, now=NOW + timedelta(minutes=1),
+        )
+        scoped_names = [e["name"] for e in scoped_doc["profiles"]]
+        self.assertIn("survivor", scoped_names)
+        self.assertIn("deleted", scoped_names)
+        self.assertEqual(len(scoped_doc["profiles"]), 2)
+
+        unscoped_doc = usage_snapshot.build_snapshot(
+            self.store, profiles=[p_survivor],
+            results=[res_survivor],
+            scope=None, previous=previous, now=NOW + timedelta(minutes=2),
+        )
+        unscoped_names = [e["name"] for e in unscoped_doc["profiles"]]
+        self.assertIn("survivor", unscoped_names)
+        self.assertNotIn("deleted", unscoped_names)
+        self.assertEqual(len(unscoped_doc["profiles"]), 1)
+
+
+
 
 class SnapshotStoreIntegrationTests(BaseCase):
     """Real store: the file lands, is replaced, and is never orphaned."""

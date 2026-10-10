@@ -6,7 +6,7 @@ the single writer and the schema stays auditable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 
 def _utcnow_iso() -> str:
@@ -29,6 +29,19 @@ def normalize_engine(value: object) -> str:
     (import cycle), so ``tests/test_models.py`` pins the two in lockstep.
     """
     return (str(value) if value else DEFAULT_ENGINE_NAME).strip().lower()
+
+
+def profile_identity(seq: object, engine: object, name: object) -> Union[int, str]:
+    """Single source of truth for profile identity across rotation and snapshots.
+
+    Profiles with a positive monotonic sequence use that immutable integer.
+    Profiles without a sequence (seq <= 0 or missing) use legacy key:
+    ``legacy:<normalized_engine>:<lowercase_name>``.
+    """
+    if type(seq) is int and seq > 0:
+        return seq
+    normalized = normalize_engine(engine)
+    return f"legacy:{normalized}:{(name or '').lower()}"
 
 
 @dataclass

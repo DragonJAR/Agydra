@@ -10,7 +10,7 @@ import engines
 import locks
 import platforms
 import usage_snapshot
-from models import Profile
+from models import Profile, profile_identity
 from store import Store, StoreError, _atomic_write_json, read_json_object
 
 ALL_SCOPE = "all"
@@ -41,9 +41,7 @@ def _require_real_path(path: Path) -> None:
 
 
 def _identity(profile: Profile) -> ProfileIdentity:
-    if profile.seq > 0:
-        return profile.seq
-    return f"legacy:{profile.engine}:{profile.name.lower()}"
+    return profile_identity(profile.seq, profile.engine, profile.name)
 
 
 def _identity_key(profile: Profile) -> IdentityKey:

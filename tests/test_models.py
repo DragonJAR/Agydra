@@ -233,6 +233,53 @@ class TestModels(unittest.TestCase):
         with self.assertRaises(ValueError):
             Config.from_dict({"grok_binary": True})
 
+    def test_profile_identity(self):
+        import models
+
+        self.assertEqual(models.profile_identity(42, "codex", "Alpha"), 42)
+        self.assertEqual(models.profile_identity(0, "codex", "Alpha"), "legacy:codex:alpha")
+        self.assertEqual(models.profile_identity(5, "agy", "Beta"), 5)
+        self.assertEqual(models.profile_identity(None, "Grok", "Beta"), "legacy:grok:beta")
+        self.assertEqual(models.profile_identity(10, "claude", "foo"), 10)
+        self.assertEqual(models.profile_identity(0, "claude", "Foo"), "legacy:claude:foo")
+
+    def test_profile_identity_characterization(self):
+        import models
+
+        self.assertEqual(models.profile_identity(1, "codex", "alpha"), 1)
+        self.assertEqual(models.profile_identity(42, "agy", "work"), 42)
+        self.assertEqual(models.profile_identity(100, "grok", "Test"), 100)
+        self.assertEqual(models.profile_identity(5, "Claude", "MyProfile"), 5)
+
+        self.assertEqual(models.profile_identity(0, "codex", "alpha"), "legacy:codex:alpha")
+        self.assertEqual(models.profile_identity(0, "grok", "Test"), "legacy:grok:test")
+        self.assertEqual(models.profile_identity(0, "agy", "work"), "legacy:agy:work")
+
+        self.assertEqual(models.profile_identity(None, "grok", "beta"), "legacy:grok:beta")
+        self.assertEqual(models.profile_identity(None, "agy", "personal"), "legacy:agy:personal")
+
+        self.assertEqual(models.profile_identity(True, "claude", "dev"), "legacy:claude:dev")
+        self.assertEqual(models.profile_identity(False, "claude", "dev"), "legacy:claude:dev")
+
+        self.assertEqual(models.profile_identity(0, None, "profile"), "legacy:agy:profile")
+        self.assertEqual(models.profile_identity(None, "", "profile"), "legacy:agy:profile")
+        self.assertEqual(models.profile_identity(1, None, "profile"), 1)
+
+        self.assertEqual(models.profile_identity(0, "claude", "FooBar_Baz"), "legacy:claude:foobar_baz")
+        self.assertEqual(models.profile_identity(None, "Codex", "MixedCase"), "legacy:codex:mixedcase")
+        self.assertEqual(models.profile_identity(0, "GROK", "PROFILE_NAME"), "legacy:grok:profile_name")
+
+        entry1 = {"name": "Prod", "seq": 10, "engine": "codex"}
+        self.assertEqual(models.profile_identity(entry1.get("seq"), entry1.get("engine"), entry1.get("name")), 10)
+        entry2 = {"name": "Legacy", "seq": 0, "engine": "grok"}
+        self.assertEqual(models.profile_identity(entry2.get("seq"), entry2.get("engine"), entry2.get("name")), "legacy:grok:legacy")
+        entry3 = {"name": "NoSeq", "seq": None, "engine": "Claude"}
+        self.assertEqual(models.profile_identity(entry3.get("seq"), entry3.get("engine"), entry3.get("name")), "legacy:claude:noseq")
+        entry4 = {"name": "NoEngine", "seq": 0}
+        self.assertEqual(models.profile_identity(entry4.get("seq"), entry4.get("engine"), entry4.get("name")), "legacy:agy:noengine")
+        entry5 = {"name": "BoolSeq", "seq": True, "engine": "agy"}
+        self.assertEqual(models.profile_identity(entry5.get("seq"), entry5.get("engine"), entry5.get("name")), "legacy:agy:boolseq")
+
 
 if __name__ == "__main__":
     unittest.main()
