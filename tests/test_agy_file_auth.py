@@ -544,6 +544,22 @@ class TestRandomAgyFileLaunch(BaseCase):
         self.assertFalse(self.paths["alpha"].exists())
         self.assertEqual(len(locks.lease_holders(self.store, "alpha")), 1)
 
+    def test_forced_random_launch_repeats_when_the_only_unused_profile_is_live(self):
+        path = profile_rotation.state_path(self.store, "agy")
+        profile_rotation._atomic_write_json(
+            path, {"version": 1, "engine": "agy", "used": [self.profiles["beta"].seq]},
+        )
+        self._block_with_a_live_session("alpha")
+        self.assertEqual(self._forced_random_plan().profile, "alpha")
+
+        self.assertEqual(self._run(self._forced_random_plan()), 0)
+        self.assertEqual(self.launched, ["beta"])
+        self.assertFalse(self.paths["alpha"].exists())
+        self.assertEqual(
+            profile_rotation.read_json_object(path)["used"], [self.profiles["beta"].seq]
+        )
+        self.assertEqual(self._forced_random_plan().profile, "alpha")
+
     def test_random_launch_with_every_candidate_busy_reports_the_cause(self):
         for name in ("alpha", "beta"):
             self._block_with_a_live_session(name)

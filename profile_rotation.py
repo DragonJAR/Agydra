@@ -265,15 +265,15 @@ def _choose(
         and accepts(profile)
         for profile in unused
     )
-    if blocked:
-        raise StoreError(
-            "no untried unused profile remains in the rotation scope"
-        )
     for profile in repeated:
         if exclude and profile.name in exclude:
             continue
         if accepts(profile):
-            return selected(profile, reset=True)
+            return selected(profile, reset=not blocked)
+    if blocked:
+        raise StoreError(
+            "no untried unused profile remains in the rotation scope"
+        )
     raise NoEligibleProfileError("no eligible profile remains in the rotation scope")
 
 

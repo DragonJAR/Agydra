@@ -163,6 +163,31 @@ class TestProfileRotation(BaseCase):
 
         self.assertEqual(self._launch_random(), "newcomer")
 
+    def test_tried_unused_profile_keeps_its_turn_while_a_repeat_launches(self):
+        first, second, skipped = self._create("agy", "first", "second", "skipped")
+        path = profile_rotation.state_path(self.store, "agy")
+        profile_rotation._atomic_write_json(
+            path, {"version": 1, "engine": "agy", "used": [first.seq, second.seq]},
+        )
+
+        with profile_rotation.Rotation(self.store, "agy") as rotation:
+            repeat = rotation.select(
+                [first, second, skipped], exclude={skipped.name}
+            )
+            self.assertIn(repeat.name, {first.name, second.name})
+            rotation.commit(repeat)
+
+        self.assertEqual(
+            profile_rotation.read_json_object(path)["used"],
+            sorted([first.seq, second.seq], key=str),
+        )
+        self.assertEqual(
+            profile_rotation.preview(
+                self.store, [first, second, skipped], engine="agy"
+            ).name,
+            skipped.name,
+        )
+
     def test_unused_profile_precedes_a_used_profile_with_more_quota(self):
         used, unused = self._create("codex", "used-high", "unused-low")
         profile_rotation._atomic_write_json(
