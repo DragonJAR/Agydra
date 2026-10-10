@@ -1735,3 +1735,171 @@ class TestListBusyProfileShowsDetectableEmail(BaseCase):
             output = buf.getvalue()
 
         self.assertIn("andrea@example.com", output)
+
+
+class TestP5CliRegressions(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+
+    def test_list_headers_resolve_localized_labels_at_request_time(self):
+        import cli
+        import i18n
+
+        self.store.create("work")
+        orig_lang = i18n._get_active()
+        try:
+            i18n.resolve_language(self.store, flag_lang="es")
+            headers = cli._table_headers()
+            self.assertEqual(headers["profile"], "NOMBRE")
+            self.assertEqual(headers["auth"], "AUTENT.")
+            self.assertEqual(headers["default"], "PREDET.")
+            self.assertEqual(headers["busy"], "OCUPADO")
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli.cmd_list(self.store, None)
+            self.assertEqual(rc, 0)
+            header = buf.getvalue().splitlines()[0]
+            self.assertIn("NOMBRE", header)
+            self.assertIn("AUTENT.", header)
+            self.assertIn("PREDET.", header)
+            self.assertIn("OCUPADO", header)
+        finally:
+            i18n.resolve_language(self.store, flag_lang=orig_lang)
+
+    def test_eof_error_reports_friendly_force_hint(self):
+        import cli
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = cli._report_error(EOFError("EOF when reading a line"))
+        self.assertEqual(rc, 1)
+        self.assertIn("no input available to confirm; re-run with --force", buf.getvalue())
+
+    def test_confirm_accepts_spanish_affirmative_answers(self):
+        import cli
+
+        for ans in ("s", "si", "sí", "S", "SI", "Sí", "y", "yes", "Y", "YES"):
+            with self.subTest(ans=ans):
+                with mock.patch("builtins.input", return_value=ans):
+                    self.assertTrue(cli._confirm("delete profile?", False))
+
+    def test_claude_capture_hint_command_syntax(self):
+        import cli
+
+        self.store.create("cc", engine="claude")
+        profile = self.store.get("cc")
+        summary = cli._enable_claude_capture(self.store, profile)
+        self.assertIn("agydra -p cc", summary)
+        self.assertNotIn("agydra claude", summary)
+
+    def test_confirm_flows_show_fully_spanish_prompts_and_cancellation_under_es(self):
+        import cli
+        import i18n
+        import argparse
+
+        self.store.create("work", engine="agy")
+        orig_lang = i18n._get_active()
+        try:
+            i18n.resolve_language(self.store, flag_lang="es")
+
+            captured = {}
+
+            def fake_input(prompt):
+                captured["prompt"] = prompt
+                return "n"
+
+            with mock.patch("builtins.input", side_effect=fake_input), \
+                 mock.patch.object(cli.account, "auth_state", return_value="authenticated"), \
+                 mock.patch.object(cli.account, "detect_email", return_value="test@example.com"):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_login(self.store, argparse.Namespace(ref="work", dry_run=False, force=False))
+                self.assertEqual(rc, 1)
+                self.assertIn("[s/N]", captured["prompt"])
+                self.assertNotIn("already authenticated", captured["prompt"])
+                self.assertNotIn("re-login", captured["prompt"])
+                self.assertNotIn("cancelled", buf.getvalue())
+                self.assertIn(i18n.t("confirm.cancelled"), buf.getvalue())
+
+            with mock.patch("builtins.input", side_effect=fake_input):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_delete(self.store, argparse.Namespace(ref="work", force=False, no_backup=False))
+                self.assertEqual(rc, 1)
+                self.assertIn("[s/N]", captured["prompt"])
+                self.assertNotIn("delete profile", captured["prompt"])
+                self.assertNotIn("cancelled", buf.getvalue())
+                self.assertIn(i18n.t("confirm.cancelled"), buf.getvalue())
+
+            (self.store.profiles_dir / "bad" / "data").mkdir(parents=True, exist_ok=True)
+            (self.store.profiles_dir / "bad" / "profile.json").write_text("{corrupt", encoding="utf-8")
+            with mock.patch("builtins.input", side_effect=fake_input):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_delete(self.store, argparse.Namespace(ref="bad", force=False, no_backup=False))
+                self.assertEqual(rc, 1)
+                self.assertIn("[s/N]", captured["prompt"])
+                self.assertNotIn("delete unreadable profile", captured["prompt"])
+                self.assertNotIn("corrupt or incomplete", captured["prompt"])
+                self.assertNotIn("cancelled", buf.getvalue())
+                self.assertIn(i18n.t("confirm.cancelled"), buf.getvalue())
+
+            with mock.patch("builtins.input", side_effect=fake_input), \
+                 mock.patch("doctor.run_checks", return_value=0), \
+                 mock.patch("doctor._preview_fixables", return_value=["orphan overlay"]):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_doctor(self.store, argparse.Namespace(fix=True, force=False))
+                self.assertEqual(rc, 1)
+                self.assertIn("[s/N]", captured["prompt"])
+                self.assertNotIn("apply these repairs", captured["prompt"])
+                self.assertNotIn("cancelled", buf.getvalue())
+                self.assertIn(i18n.t("confirm.cancelled"), buf.getvalue())
+
+            i18n.resolve_language(self.store, flag_lang="en")
+
+            with mock.patch("builtins.input", side_effect=fake_input), \
+                 mock.patch.object(cli.account, "auth_state", return_value="authenticated"), \
+                 mock.patch.object(cli.account, "detect_email", return_value="test@example.com"):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_login(self.store, argparse.Namespace(ref="work", dry_run=False, force=False))
+                self.assertEqual(rc, 1)
+                self.assertIn("[y/N]", captured["prompt"])
+                self.assertIn("already authenticated", captured["prompt"])
+                self.assertIn("cancelled", buf.getvalue())
+
+            with mock.patch("builtins.input", side_effect=fake_input):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_delete(self.store, argparse.Namespace(ref="work", force=False, no_backup=False))
+                self.assertEqual(rc, 1)
+                self.assertIn("[y/N]", captured["prompt"])
+                self.assertIn("delete profile", captured["prompt"])
+                self.assertIn("cancelled", buf.getvalue())
+
+            with mock.patch("builtins.input", side_effect=fake_input):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_delete(self.store, argparse.Namespace(ref="bad", force=False, no_backup=False))
+                self.assertEqual(rc, 1)
+                self.assertIn("[y/N]", captured["prompt"])
+                self.assertIn("delete unreadable profile", captured["prompt"])
+                self.assertIn("cancelled", buf.getvalue())
+
+            with mock.patch("builtins.input", side_effect=fake_input), \
+                 mock.patch("doctor.run_checks", return_value=0), \
+                 mock.patch("doctor._preview_fixables", return_value=["orphan overlay"]):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = cli.cmd_doctor(self.store, argparse.Namespace(fix=True, force=False))
+                self.assertEqual(rc, 1)
+                self.assertIn("[y/N]", captured["prompt"])
+                self.assertIn("apply these repairs?", captured["prompt"])
+                self.assertIn("cancelled", buf.getvalue())
+
+        finally:
+            i18n.resolve_language(self.store, flag_lang=orig_lang)
+

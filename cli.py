@@ -518,11 +518,17 @@ def _default_export_path(name: str) -> Path:
     return platforms.real_home() / f"agydra-export-{name}-{stamp}.zip"
 
 
-_PROFILE_LABEL = i18n.t("cmd.list.header_name", default="PROFILE")
 _EMAIL_COL_WIDTH = 34
 """Shared EMAIL column width: `cmd_list`'s profile table and the usage
 compact table's header/rows both render this column at the same width --
 one named constant instead of two hand-copied ``34`` literals."""
+
+
+def __getattr__(name: str) -> object:
+    """Dynamic fallback for backward-compatible module attributes."""
+    if name == "_PROFILE_LABEL":
+        return i18n.t("cmd.list.header_name", default="PROFILE")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _table_headers() -> Dict[str, str]:
@@ -534,7 +540,7 @@ def _table_headers() -> Dict[str, str]:
     across ``cmd_list``, the usage compact table, and the list header.
     """
     return {
-        "profile": _PROFILE_LABEL,
+        "profile": i18n.t("cmd.list.header_name", default="PROFILE"),
         "email": i18n.t("cmd.list.header_email", default="EMAIL"),
         "auth": i18n.t("cmd.list.header_auth", default="AUTH"),
         "default": i18n.t("cmd.list.header_default", default="DEFAULT"),
@@ -635,11 +641,14 @@ def cmd_login(store: Store, args) -> int:
         )
     if state == "authenticated" and not dry_run and not getattr(args, "force", False):
         email = native.email if native else account.detect_email(data_dir, store, name, engine=engine)
-        if not _confirm(
-            f"profile {name!r} already authenticated as {email or '?'} — re-login?",
-            False,
-        ):
-            print("cancelled")
+        prompt = i18n.t(
+            "cmd.login.confirm_relogin",
+            name=name,
+            email=email or "?",
+            default=f"profile {name!r} already authenticated as {email or '?'} — re-login?",
+        )
+        if not _confirm(prompt, False):
+            _print_cancelled()
             return 1
     driver = engines.get_engine(engine)
     login_args = list(driver.login_args) if hasattr(driver, "login_args") else []
@@ -859,7 +868,7 @@ def _enable_claude_capture(store: Store, profile) -> str:
             ) from exc
         return (
             f"wrote {settings_path}: statusLine capture enabled for profile "
-            f"{profile.name!r}. Run `agydra claude {profile.name}` (or plain "
+            f"{profile.name!r}. Run `agydra -p {profile.name}` (or plain "
             "Claude Code) once so the statusLine fires and the cache populates; "
             "`agydra usage " + profile.name + "` will then show quota windows."
         )
@@ -1403,7 +1412,13 @@ def cmd_rename(store: Store, args) -> int:
 def _confirm(prompt: str, assume_yes: bool) -> bool:
     if assume_yes:
         return True
-    return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+    suffix = i18n.t("confirm.yes_no", default="[y/N] ")
+    return i18n.is_affirmative(input(f"{prompt} {suffix}"))
+
+
+def _print_cancelled(*, file: Any = None) -> None:
+    kwargs = {"file": file} if file is not None else {}
+    print(i18n.t("confirm.cancelled", default="cancelled"), **kwargs)
 
 
 def _finish_delete(store: Store, name: str, no_backup: bool) -> int:
@@ -1451,19 +1466,29 @@ def cmd_delete(store: Store, args) -> int:
         if args.ref not in store.unreadable_profiles():
             raise
         _assert_free(store, args.ref, "deleting the profile")
-        if not _confirm(
-            f"delete unreadable profile {args.ref!r} (corrupt or incomplete "
-            "metadata)?",
-            args.force,
-        ):
-            print("cancelled")
+        prompt = i18n.t(
+            "cmd.delete.confirm_unreadable",
+            name=args.ref,
+            default=(
+                f"delete unreadable profile {args.ref!r} (corrupt or incomplete "
+                "metadata)?"
+            ),
+        )
+        if not _confirm(prompt, args.force):
+            _print_cancelled()
             return 1
         return _finish_delete(store, args.ref, args.no_backup)
     _assert_free(store, name, "deleting the profile")
     profile = store.get(name)
     email = account.display_email(store, profile) or "?"
-    if not _confirm(f"delete profile {name!r} ({email})?", args.force):
-        print("cancelled")
+    prompt = i18n.t(
+        "cmd.delete.confirm",
+        name=name,
+        email=email,
+        default=f"delete profile {name!r} ({email})?",
+    )
+    if not _confirm(prompt, args.force):
+        _print_cancelled()
         return 1
     return _finish_delete(store, name, args.no_backup)
 
@@ -1731,8 +1756,9 @@ def cmd_doctor(store: Store, args) -> int:
     print("fixable items:")
     for line in preview:
         print(f"  - {line}")
-    if not _confirm("apply these repairs?", getattr(args, "force", False)):
-        print("cancelled")
+    prompt = i18n.t("cmd.doctor.fix_confirm", default="apply these repairs?")
+    if not _confirm(prompt, getattr(args, "force", False)):
+        _print_cancelled()
         return 1
     print()
     doctor._apply_fixes(store, ctx)
@@ -1875,18 +1901,18 @@ _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
 
 def _report_error(exc: BaseException) -> int:
     """Single error-mapping table shared by both dispatch paths."""
-    if isinstance(exc, _CLI_REPORTABLE_ERRORS):
-        _error(str(exc))
-        return 1
     if isinstance(exc, EOFError):
         _error("no input available to confirm; re-run with --force")
+        return 1
+    if isinstance(exc, KeyboardInterrupt):
+        _print_cancelled(file=sys.stderr)
+        return 130
+    if isinstance(exc, _CLI_REPORTABLE_ERRORS):
+        _error(str(exc))
         return 1
     if isinstance(exc, OSError):
         _error(str(exc))
         return 1
-    if isinstance(exc, KeyboardInterrupt):
-        print("cancelled", file=sys.stderr)
-        return 130
     raise exc
 
 

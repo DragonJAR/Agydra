@@ -32,6 +32,7 @@ from typing import Optional
 
 SUPPORTED_LANGS = ('en', 'es')
 DEFAULT_LANG = 'en'
+AFFIRMATIVE_ANSWERS = frozenset({"y", "yes", "s", "si", "sí"})
 
 _LANG_ENV = "AGYDRA_LANG"
 _SETTINGS_KEY = "lang"
@@ -58,7 +59,9 @@ _STRINGS: dict[str, dict[str, str]] = {
         'cmd.login.help': 'Log in with a profile (launch the CLI for authentication).',
         'cmd.login.launching': 'Launching {engine} login for profile {name!r}…',
         'cmd.login.ok': 'Login flow completed for profile {name!r}.',
+        'cmd.login.confirm_relogin': 'profile {name!r} already authenticated as {email} — re-login?',
         'cmd.import.help': 'Import an existing agy/codex data directory into a new profile.',
+
         'cmd.import.ok': 'Profile {name!r} imported from {path}.',
         'cmd.import.not_found': 'Source path not found: {path}',
         'cmd.import.already_exists': 'Profile {name!r} already exists. Use a different name.',
@@ -68,6 +71,9 @@ _STRINGS: dict[str, dict[str, str]] = {
         'cmd.list.header_engine': 'ENGINE',
         'cmd.list.header_state': 'STATE',
         'cmd.list.header_email': 'EMAIL',
+        'cmd.list.header_auth': 'AUTH',
+        'cmd.list.header_default': 'DEFAULT',
+        'cmd.list.header_busy': 'BUSY',
         'cmd.list.header_last_used': 'LAST USED',
         'cmd.list.state_authenticated': 'authenticated',
         'cmd.list.state_not_authenticated': 'not authenticated',
@@ -100,7 +106,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         'cmd.rename.new_exists': 'A profile named {name!r} already exists.',
         'cmd.rename.same_name': 'Old and new name are the same ({name!r}).',
         'cmd.delete.help': 'Delete a profile (backs up data first).',
-        'cmd.delete.confirm': 'Delete profile {name!r}? This cannot be undone. [y/N] ',
+        'cmd.delete.confirm': 'delete profile {name!r} ({email})?',
+        'cmd.delete.confirm_unreadable': 'delete unreadable profile {name!r} (corrupt or incomplete metadata)?',
         'cmd.delete.aborted': 'Aborted.',
         'cmd.delete.ok': 'Profile {name!r} deleted. Backup saved to {path}',
         'cmd.delete.not_found': 'Profile {name!r} not found.',
@@ -111,7 +118,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         'cmd.share_config.not_found': 'Profile {name!r} not found.',
         'cmd.doctor.help': 'Run diagnostics and optionally repair the store.',
         'cmd.doctor.fix_preview_header': 'The following issues can be repaired:',
-        'cmd.doctor.fix_confirm': 'Apply fixes? [y/N] ',
+        'cmd.doctor.fix_confirm': 'apply these repairs?',
+
         'cmd.doctor.fix_aborted': 'No changes made.',
         'cmd.doctor.fix_done': 'Fixes applied.',
         'cmd.doctor.result_ok': 'result: healthy',
@@ -194,6 +202,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'error.config_corrupt': 'Ignoring corrupt config ({error}); using defaults until it is fixed or deleted.',
         'confirm.yes_no': '[y/N] ',
         'confirm.aborted': 'Aborted.',
+        'confirm.cancelled': 'cancelled',
         'confirm.proceed': 'Proceed? [y/N] ',
         'banner.tagline': 'profile manager for agy, codex, and grok',
         'banner.version': 'version {version}',
@@ -288,6 +297,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'cmd.login.help': 'Iniciar sesión con un perfil (lanza la CLI para autenticarse).',
         'cmd.login.launching': 'Iniciando sesión de {engine} para el perfil {name!r}…',
         'cmd.login.ok': 'Flujo de inicio de sesión completado para el perfil {name!r}.',
+        'cmd.login.confirm_relogin': '¿el perfil {name!r} ya está autenticado como {email} — volver a iniciar sesión?',
         'cmd.import.help': 'Importar un directorio de datos de agy/codex a un perfil nuevo.',
         'cmd.import.ok': 'Perfil {name!r} importado desde {path}.',
         'cmd.import.not_found': 'Ruta de origen no encontrada: {path}',
@@ -298,6 +308,9 @@ _STRINGS: dict[str, dict[str, str]] = {
         'cmd.list.header_engine': 'MOTOR',
         'cmd.list.header_state': 'ESTADO',
         'cmd.list.header_email': 'CORREO',
+        'cmd.list.header_auth': 'AUTENT.',
+        'cmd.list.header_default': 'PREDET.',
+        'cmd.list.header_busy': 'OCUPADO',
         'cmd.list.header_last_used': 'ÚLTIMO USO',
         'cmd.list.state_authenticated': 'autenticado',
         'cmd.list.state_not_authenticated': 'no autenticado',
@@ -330,7 +343,8 @@ _STRINGS: dict[str, dict[str, str]] = {
         'cmd.rename.new_exists': 'Ya existe un perfil llamado {name!r}.',
         'cmd.rename.same_name': 'El nombre antiguo y el nuevo son iguales ({name!r}).',
         'cmd.delete.help': 'Eliminar un perfil (hace una copia de seguridad primero).',
-        'cmd.delete.confirm': '¿Eliminar el perfil {name!r}? Esta acción no se puede deshacer. [s/N] ',
+        'cmd.delete.confirm': '¿eliminar el perfil {name!r} ({email})?',
+        'cmd.delete.confirm_unreadable': '¿eliminar el perfil ilegible {name!r} (metadatos corruptos o incompletos)?',
         'cmd.delete.aborted': 'Cancelado.',
         'cmd.delete.ok': 'Perfil {name!r} eliminado. Copia guardada en {path}',
         'cmd.delete.not_found': 'Perfil {name!r} no encontrado.',
@@ -341,7 +355,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'cmd.share_config.not_found': 'Perfil {name!r} no encontrado.',
         'cmd.doctor.help': 'Ejecutar diagnósticos y opcionalmente reparar el almacén.',
         'cmd.doctor.fix_preview_header': 'Los siguientes problemas pueden repararse:',
-        'cmd.doctor.fix_confirm': '¿Aplicar reparaciones? [s/N] ',
+        'cmd.doctor.fix_confirm': '¿aplicar estas reparaciones?',
         'cmd.doctor.fix_aborted': 'Sin cambios.',
         'cmd.doctor.fix_done': 'Reparaciones aplicadas.',
         'cmd.doctor.result_ok': 'resultado: saludable',
@@ -424,6 +438,7 @@ _STRINGS: dict[str, dict[str, str]] = {
         'error.config_corrupt': 'Ignorando configuración corrupta ({error}); usando valores predeterminados hasta que se corrija o elimine.',
         'confirm.yes_no': '[s/N] ',
         'confirm.aborted': 'Cancelado.',
+        'confirm.cancelled': 'cancelado',
         'confirm.proceed': '¿Continuar? [s/N] ',
         'banner.tagline': 'gestor de perfiles para agy, codex, grok y claude',
         'banner.version': 'versión {version}',
@@ -548,6 +563,11 @@ produce ``"Profile 'work' created."`` en ``en`` y
         return template.format_map(kwargs)
     except (KeyError, ValueError, IndexError):
         return template
+
+
+def is_affirmative(answer: str) -> bool:
+    """True when answer is an affirmative token in any supported language."""
+    return answer.strip().lower() in AFFIRMATIVE_ANSWERS
 
 
 def _normalize(lang: str) -> Optional[str]:

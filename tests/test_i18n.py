@@ -59,6 +59,14 @@ class TestI18nModule(unittest.TestCase):
         # Clave inexistente en todos lados devuelve la clave
         self.assertEqual(i18n.t("non.existent.key"), "non.existent.key")
 
+    def test_affirmative_answers(self):
+        for ans in ("y", "yes", "s", "si", "sí", "Y", "YES", "S", "SI", "Sí", " yes ", "  s  "):
+            with self.subTest(ans=ans):
+                self.assertTrue(i18n.is_affirmative(ans))
+        for ans in ("n", "no", "N", "NO", "", "  ", "maybe", "cancel", "0", "1"):
+            with self.subTest(ans=ans):
+                self.assertFalse(i18n.is_affirmative(ans))
+
     def test_resolve_language_cascade(self):
         # 1. flag_lang
         self.assertEqual(i18n.resolve_language(flag_lang="es"), "es")
