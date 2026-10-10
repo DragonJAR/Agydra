@@ -427,7 +427,10 @@ class TestClaudeCaptureEnable(BaseCase):
         self.assertEqual(rc, 0)
         settings = json.loads(self._settings_path().read_text(encoding="utf-8"))
         self.assertEqual(settings["statusLine"]["type"], "command")
-        self.assertIn("claude_usage", settings["statusLine"]["command"])
+        command = settings["statusLine"]["command"]
+        if command.startswith("powershell.exe -NoProfile -NonInteractive -EncodedCommand "):
+            command = base64.b64decode(command.split()[-1]).decode("utf-16-le")
+        self.assertIn("claude_usage", command)
         self.assertIn("capture enabled", out)
 
     def test_apply_merges_preserving_existing_keys(self):

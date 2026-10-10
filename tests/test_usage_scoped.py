@@ -216,7 +216,7 @@ class TestRunScopedUsageQuery(_ScopedBase):
 
         def fake_run(argv, *, env, **kwargs):
             captured["argv"] = tuple(argv)
-            home = env.get("HOME") or env.get("USERPROFILE")
+            home = env.get(platforms.home_redirect_var())
             captured["home"] = home
             captured["env"] = env
             token_path = Path(home) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
@@ -245,7 +245,7 @@ class TestRunScopedUsageQuery(_ScopedBase):
         captured = {}
 
         def fake_run(argv, *, env, **kwargs):
-            home = env.get("HOME") or env.get("USERPROFILE")
+            home = env.get(platforms.home_redirect_var())
             captured["staging_path"] = Path(home)
             raise OSError("simulated launch failure")
 
@@ -342,7 +342,7 @@ class TestQueryProfileUsageScoped(_ScopedBase):
         seen = {}
 
         def fake_run(argv, *, env, **kwargs):
-            home = env.get("HOME") or env.get("USERPROFILE")
+            home = env.get(platforms.home_redirect_var())
             token_path = Path(home) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
             seen["staged"] = token_path.read_bytes()
             return self._success_proc()

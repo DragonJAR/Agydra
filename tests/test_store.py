@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import store as store_mod
 from store import Config, Store, StoreError, backup_owner, read_json_object
 
-from conftest import BaseCase, run_python_child
+from conftest import BaseCase, run_python_child, expected_file_mode
 
 
 class TestStore(BaseCase):
@@ -1112,12 +1112,12 @@ class TestStore(BaseCase):
         os.chmod(path, 0o755)
 
         def fail_without_mode_change(target):
-            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), expected_file_mode(0o755))
             raise PermissionError("still busy")
 
         with self.assertRaisesRegex(PermissionError, "still busy"):
             store_mod._rmtree_readonly_ok(fail_without_mode_change, str(path), None)
-        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), expected_file_mode(0o755))
 
     def test_readonly_removal_restores_readonly_mode_after_failed_retry(self):
         path = self._tmp / "readonly-file"
@@ -1125,7 +1125,7 @@ class TestStore(BaseCase):
         os.chmod(path, 0o444)
 
         def fail_after_retry(target):
-            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o644)
+            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), expected_file_mode(0o644))
             raise PermissionError("still busy")
 
         with self.assertRaisesRegex(PermissionError, "still busy"):
@@ -1203,6 +1203,7 @@ class TestStore(BaseCase):
             stat.S_IMODE(target_info.st_mode),
             target.read_bytes(),
         )
+        os.chmod(path, stat.S_IWRITE)
         path.unlink()
         try:
             path.symlink_to(target)

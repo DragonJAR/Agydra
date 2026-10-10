@@ -461,3 +461,21 @@ def simulated_macos_keychain():
     with mock.patch.object(platforms, "is_macos", return_value=True), \
             mock.patch.object(keychain, "supported", return_value=True):
         yield
+
+
+def expected_file_mode(posix_mode: int) -> int:
+    """Return the stat mode bits expected on the current OS for a file.
+
+    Windows CRT stat() maps FILE_ATTRIBUTE_READONLY to 0o444 and any writable
+    file to 0o666, ignoring execute and group/other permission bits.
+    """
+    if sys.platform == "win32":
+        return 0o444 if (posix_mode & stat.S_IWRITE) == 0 else 0o666
+    return posix_mode
+
+
+def normalize_newlines(text_or_bytes: str | bytes) -> str | bytes:
+    """Normalize CRLF line endings to LF across string or byte payloads."""
+    if isinstance(text_or_bytes, bytes):
+        return text_or_bytes.replace(b"\r\n", b"\n")
+    return text_or_bytes.replace("\r\n", "\n")

@@ -436,8 +436,10 @@ class TestBusyGuards(BaseCase):
         fall back to the generic wording instead of printing garbage."""
         handle = locks.try_lock(self.store, "work")
         try:
-            with open(locks.lock_path(self.store, "work"), "wb") as fh:
-                fh.write(b"not-a-pid")
+            os.lseek(handle._fd, 0, os.SEEK_SET)
+            os.ftruncate(handle._fd, 0)
+            os.write(handle._fd, b"not-a-pid")
+            os.fsync(handle._fd)
             result = self._run_cli("delete", "work", "-f")
             self.assertEqual(result.returncode, 1)
             self.assertIn("holder state could not be verified", result.stderr)

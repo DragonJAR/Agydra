@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from conftest import BaseCase
+from conftest import BaseCase, normalize_newlines
 import cli
 import platforms
 import ui
@@ -34,12 +34,12 @@ class TestLegacyConsoleOutput(BaseCase):
 
     def test_unencodable_glyphs_use_ascii_and_keep_cell_width(self):
         raw = io.BytesIO()
-        stream = io.TextIOWrapper(raw, encoding="ascii", errors="strict")
+        stream = io.TextIOWrapper(raw, encoding="ascii", errors="strict", newline="\n")
         with mock.patch.object(sys, "stdout", stream), mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
             cell = ui.pad(ui.paint("█░ →", "green"), 12)
             ui.console_print(cell)
         stream.flush()
-        rendered = raw.getvalue().decode("ascii").rstrip("\n")
+        rendered = normalize_newlines(raw.getvalue().decode("ascii")).rstrip("\n")
         self.assertIn("#- ->", rendered)
         self.assertEqual(len(rendered), 12)
 
@@ -55,11 +55,11 @@ class TestLegacyConsoleOutput(BaseCase):
 
     def test_utf8_console_output_stays_unchanged(self):
         raw = io.BytesIO()
-        stream = io.TextIOWrapper(raw, encoding="utf-8", errors="strict")
+        stream = io.TextIOWrapper(raw, encoding="utf-8", errors="strict", newline="\n")
         text = "█░ → 用户"
         ui.console_print(text, file=stream)
         stream.flush()
-        self.assertEqual(raw.getvalue(), (text + "\n").encode("utf-8"))
+        self.assertEqual(normalize_newlines(raw.getvalue()), (text + "\n").encode("utf-8"))
 
 
 class TestPublicEngineHelp(BaseCase):
