@@ -1107,10 +1107,11 @@ def gather_usage_report(
         except Exception as exc:
             known: dict = {}
             try:
-                known["engine"] = store.get(name).engine
+                known["engine"] = _get_profile_readonly(store, name).engine
             except Exception:
                 pass
             results.append(
+
                 UsageResult(name=name, ok=False,
                             error=f"unexpected error: {exc}", **known)
             )
@@ -1166,7 +1167,7 @@ def _empty_summary() -> dict:
     }
 
 
-def _bucket_destination(bucket, key: str) -> Optional[str]:
+def _bucket_destination(bucket, key: str, summary: dict) -> Optional[str]:
     """Which slot of ``summary[key]`` a bucket fills, or ``None`` to skip.
 
     A bucket is identified by either ``window`` (``"5h"`` / ``"weekly"``) or
@@ -1180,7 +1181,9 @@ def _bucket_destination(bucket, key: str) -> Optional[str]:
         return "weekly"
     if "5h" in win or "5h" in bid:
         return "five_h"
-    return "weekly"
+    if summary[key]["weekly"] is None:
+        return "weekly"
+    return None
 
 
 def _select_summary_key(lower_name: str, summary: dict) -> Optional[str]:
@@ -1210,12 +1213,24 @@ def _select_summary_key(lower_name: str, summary: dict) -> Optional[str]:
 
 def _apply_to_summary(summary: dict, key: str, bucket) -> None:
     """Fill the right window of ``summary[key]`` from one bucket."""
-    destination = _bucket_destination(bucket, key)
-    summary[key][destination] = bucket.remaining_fraction
-    summary[key][f"{destination}_reset"] = bucket.reset_time
-    if destination == "five_h" and summary[key]["weekly"] is None:
+    destination = _bucket_destination(bucket, key, summary)
+    if destination is None:
+        return
+    already_explicit = summary[key].get(f"{destination}_explicit", False)
+    if destination == "weekly" and not already_explicit and summary[key].get("weekly_seeded", False):
         summary[key]["weekly"] = bucket.remaining_fraction
         summary[key]["weekly_reset"] = bucket.reset_time
+        summary[key]["weekly_explicit"] = True
+        return
+    if not already_explicit:
+        summary[key][destination] = bucket.remaining_fraction
+        summary[key][f"{destination}_reset"] = bucket.reset_time
+        summary[key][f"{destination}_explicit"] = True
+        if destination == "five_h" and summary[key]["weekly"] is None:
+            summary[key]["weekly"] = bucket.remaining_fraction
+            summary[key]["weekly_reset"] = bucket.reset_time
+            summary[key]["weekly_seeded"] = True
+
 
 
 def _compute_available(entry: dict) -> None:

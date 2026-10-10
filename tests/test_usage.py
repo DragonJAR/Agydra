@@ -430,6 +430,16 @@ class TestGatherUsageReportSequential(_UsageBase):
         )
         self.assertEqual(seen, [(1, 2, "alpha"), (2, 2, "beta")])
 
+    def test_gather_usage_report_error_fallback_does_not_call_store_get(self):
+        with mock.patch.object(usage, "query_profile_usage", side_effect=RuntimeError("boom")), \
+                mock.patch.object(self.store, "get", side_effect=AssertionError("store.get must not be called on read-only usage fallback")) as mock_get:
+            results = usage.gather_usage_report(self.store, ["alpha"])
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].ok)
+        self.assertEqual(results[0].engine, "agy")
+        mock_get.assert_not_called()
+
+
 
 class TestUsageRenderingHelpers(unittest.TestCase):
     def test_usage_color_thresholds(self):
@@ -510,6 +520,34 @@ class TestUsageRenderingHelpers(unittest.TestCase):
         self.assertEqual(summary["codex"]["weekly"], 0.80)
         self.assertEqual(summary["codex"]["available"], 0.80)
         self.assertEqual(summary["codex"]["reset_time"], t2)
+
+    def test_extract_model_summary_preserves_main_windows_over_additional_and_spend_buckets(self):
+        groups = [
+            usage.UsageGroup(
+                name="OpenAI Codex",
+                buckets=[
+                    usage.UsageBucket("codex-5h", "5 Hours", "5h", 0.10, None),
+                    usage.UsageBucket("codex-weekly", "Weekly", "weekly", 0.05, None),
+                    usage.UsageBucket("codex-gpt-5.3-codex-spark-5h", "Spark 5h", "5h", 1.0, None),
+                    usage.UsageBucket("codex-gpt-5.3-codex-spark-weekly", "Spark Weekly", "weekly", 1.0, None),
+                    usage.UsageBucket("codex-spend", "Spend", "monthly", 0.99, None),
+                ],
+            ),
+            usage.UsageGroup(
+                name="xAI Grok",
+                buckets=[
+                    usage.UsageBucket("grok-weekly", "Weekly", "weekly", 0.0, None),
+                    usage.UsageBucket("grok-grok-code", "Grok Code", "weekly", 1.0, None),
+                ],
+            ),
+        ]
+        summary = usage.extract_model_summary(groups)
+        self.assertEqual(summary["codex"]["five_h"], 0.10)
+        self.assertEqual(summary["codex"]["weekly"], 0.05)
+        self.assertEqual(summary["codex"]["available"], 0.05)
+        self.assertEqual(summary["grok"]["weekly"], 0.0)
+        self.assertEqual(summary["grok"]["available"], 0.0)
+
 
     def test_parse_codex_usage_payload_success(self):
         payload = {
