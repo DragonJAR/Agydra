@@ -325,13 +325,32 @@ def _read_all(fd: int) -> bytes:
     return b"".join(chunks)
 
 
+def _write_in_place(fd: int, payload: bytes) -> None:
+    """Write arbitrary bytes to an open lock or registry descriptor.
+
+    Seeks to the beginning, writes all bytes in a loop, then truncates to the
+    exact payload length. By writing before truncating, a failed write leaves
+    previous content in place (fail-closed) rather than an empty file that
+    would unlock a busy profile. Raises LockError on any OS or short write error.
+    """
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise LockError("short write on lock descriptor")
+            view = view[written:]
+        os.ftruncate(fd, len(payload))
+    except OSError as exc:
+        raise LockError(f"cannot update lock descriptor ({exc})") from exc
+
+
 def _write_holders(fd: int, holders: List[Holder]) -> None:
     payload = json.dumps(
         {"holders": [{"pid": h.pid, "start": h.start, "keychain": h.keychain} for h in holders]}
     ).encode("utf-8")
-    os.ftruncate(fd, 0)
-    os.lseek(fd, 0, os.SEEK_SET)
-    os.write(fd, payload)
+    _write_in_place(fd, payload)
 
 
 def _lock_ex_brief(fd: int) -> bool:
@@ -707,10 +726,8 @@ def _write_holder_pid(fd: int) -> None:
     here must never turn a successful lock acquisition into a launch
     failure (fail-open, mirrors the keychain bridge)."""
     try:
-        os.ftruncate(fd, 0)
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.write(fd, str(os.getpid()).encode("ascii"))
-    except OSError:
+        _write_in_place(fd, str(os.getpid()).encode("ascii"))
+    except (LockError, OSError):
         pass
 
 

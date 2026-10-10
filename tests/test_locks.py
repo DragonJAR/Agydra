@@ -610,6 +610,32 @@ class TestAuthenticationLeaseMembership(BaseCase):
             locks.acquire_lease(self.store, "work", keychain="file")
         self.assertFalse(self.path.exists())
 
+    def test_write_holders_failure_converts_to_lock_error_and_does_not_empty_file(self):
+        initial = json.dumps({"holders": [{"pid": os.getpid(), "start": None}]}).encode("utf-8")
+        self.path.write_bytes(initial)
+        with mock.patch("os.write", side_effect=OSError(28, "No space left on device")):
+            with self.assertRaises(locks.LockError):
+                locks.acquire_lease(self.store, "work")
+        self.assertNotEqual(self.path.read_bytes(), b"")
+        self.assertEqual(self.path.read_bytes(), initial)
+
+    def test_write_holders_retries_short_writes(self):
+        real_write = os.write
+        calls = []
+
+        def short_write(fd, data):
+            calls.append(len(data))
+            if len(calls) == 1 and len(data) > 5:
+                return real_write(fd, data[:5])
+            return real_write(fd, data)
+
+        with mock.patch("os.write", side_effect=short_write):
+            locks.acquire_lease(self.store, "work")
+        self.assertGreater(len(calls), 1)
+        parsed = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertIn("holders", parsed)
+        self.assertEqual(parsed["holders"][0]["pid"], os.getpid())
+
 
 class TestInaccessibleProcessKeepsItsLease(BaseCase):
     """A live process Windows refuses to open must not lose its lease."""
