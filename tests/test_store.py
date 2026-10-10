@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import store as store_mod
 from store import Config, Store, StoreError, backup_owner, read_json_object
 
-from conftest import BaseCase, run_python_child, skip_windows_crash_child
+from conftest import BaseCase, run_python_child
 
 
 class TestStore(BaseCase):
@@ -1546,7 +1546,6 @@ class TestStore(BaseCase):
             f"Expected warning that default profile was not saved, got: {warnings}",
         )
 
-    @skip_windows_crash_child
     def test_create_crash_at_publication_leaves_complete_profile(self):
         root = self._tmp / "create-publication"
         store = Store(root=root)
@@ -1579,7 +1578,6 @@ Store(root=root).create("published")
             ["base", "published"],
         )
 
-    @skip_windows_crash_child
     def test_create_crash_leaves_ignored_stage_that_next_create_cleans(self):
         root = self._tmp / "create-stage-crash"
         store = Store(root=root)
@@ -1710,7 +1708,6 @@ store.create("live")
         self.assertTrue(store.profile_meta_path("live").is_file())
         self.assertEqual(store.get("live").seq, 2)
 
-    @skip_windows_crash_child
     def test_rename_crash_boundaries_recover_complete_profiles(self):
         child = """import os, sys
 from pathlib import Path

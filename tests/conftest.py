@@ -76,14 +76,6 @@ def run_cli(*args, cwd, extra_env: dict = None, timeout: float = 60):
     )
 
 
-skip_windows_crash_child = unittest.skipIf(
-    sys.platform == "win32",
-    "Windows CI (Python 3.9): a child that crashes mid store operation never "
-    "exits, so the parent waits until the job is cancelled; reproduced with "
-    "pipes and with run_python_child's temporary files, root cause still open.",
-)
-
-
 def run_python_child(source: str, *args, timeout: float = 10) -> subprocess.CompletedProcess:
     """Run an inline Python snippet in a child process using temporary files for output to avoid pipe-reader threads on Windows."""
     cmd = [sys.executable, "-c", source, *(str(arg) for arg in args)]
