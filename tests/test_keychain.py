@@ -58,6 +58,12 @@ class TestKeychainNames(unittest.TestCase):
         self.assertIn("supported", report)
         self.assertIsInstance(report["supported"], bool)
 
+    def test_describe_with_names_and_none_store(self):
+        with mock.patch.object(keychain, "supported", return_value=True):
+            report = keychain.describe(None, names=["alpha", "beta"])
+        self.assertTrue(report["supported"])
+        self.assertEqual(report["profile_slots"], {"alpha": False, "beta": False})
+
 
 class TestDecodeGoKeyringSecret(unittest.TestCase):
     """The private keychain slot backup is go-keyring-encoded; this decode
@@ -1538,6 +1544,25 @@ class TestLaunchGuardFailOpenOnForeignSecret(unittest.TestCase):
                 state = guard.__enter__()
             self.assertFalse(state._swapped, "undecodable slot must not be swapped")
 
+    def test_swap_failure_retains_lease_with_downgraded_membership(self):
+        import locks
+
+        with isolated_store_env():
+            store = Store()
+            store.create("alpha")
+            with mock.patch.object(keychain, "supported", return_value=True), \
+                    mock.patch.object(
+                        keychain, "_ensure_target_keychain", return_value=Path("/tmp/nonexistent.keychain")
+                    ):
+                guard = keychain.launch_guard(store, "alpha")
+                with guard:
+                    self.assertTrue(locks.is_locked(store, "alpha"))
+                    holders = locks.lease_holders(store, "alpha")
+                    self.assertEqual(len(holders), 1)
+                    self.assertEqual(holders[0].pid, os.getpid())
+                    self.assertEqual(locks.lease_keychain_holders(store, "alpha"), [])
+                self.assertFalse(locks.is_locked(store, "alpha"))
+
 
 class TestKeychainCheckFlagsStaleSharedFormat(unittest.TestCase):
     """``doctor --fix`` cannot blindly rewrite the shared slot (the user's
@@ -2340,6 +2365,21 @@ class TestRenameProfileSlotSerialization(BaseCase):
         self.assertFalse(old_slot.exists())
         self.assertEqual(new_slot.read_bytes(), b"credential")
 
+    def test_rename_succeeds_when_keychain_target_is_none_due_to_skip_marker(self):
+        old_slot = keychain.slot_backup_path(self.store, "old")
+        new_slot = keychain.slot_backup_path(self.store, "new")
+        old_slot.parent.mkdir(parents=True, exist_ok=True)
+        old_slot.write_bytes(b"credential")
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(keychain, "_ensure_target_keychain", return_value=None), \
+                mock.patch.object(keychain, "delete_slot") as mock_delete:
+            keychain.rename_profile_slot(self.store, "old", "new", strict=True)
+            mock_delete.assert_not_called()
+
+        self.assertFalse(old_slot.exists())
+        self.assertEqual(new_slot.read_bytes(), b"credential")
+
 
 class TestSwapLockFailClosed(BaseCase):
     def setUp(self):
@@ -2815,6 +2855,38 @@ class TestKnownIdentityWhitespaceEmail(unittest.TestCase):
         store.save(profile)
 
         self.assertEqual(keychain._known_identity(store, "a"), "a@example.com")
+
+
+class TestKeychainRunPipeCleanup(unittest.TestCase):
+    def test_feeder_start_failure_does_not_leak_write_fd(self):
+        import errno
+
+        created_fds = []
+        real_pipe = os.pipe
+
+        def tracking_pipe():
+            r, w = real_pipe()
+            created_fds.extend([r, w])
+            return r, w
+
+        with mock.patch("os.pipe", side_effect=tracking_pipe), \
+                mock.patch("threading.Thread.start", side_effect=RuntimeError("thread start failure")):
+            with self.assertRaises(RuntimeError):
+                keychain._run(["dummy"], input_bytes=b"hello")
+
+        self.assertEqual(len(created_fds), 2)
+        r, w = created_fds
+        try:
+            for fd in (r, w):
+                with self.assertRaises(OSError) as ctx:
+                    os.fstat(fd)
+                self.assertEqual(ctx.exception.errno, errno.EBADF)
+        finally:
+            for fd in (r, w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

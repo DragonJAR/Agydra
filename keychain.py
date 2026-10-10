@@ -180,8 +180,8 @@ def _run(
             feeder = threading.Thread(
                 target=_feed_pipe, args=(write_fd, input_bytes), daemon=True
             )
-            write_fd = None
             feeder.start()
+            write_fd = None
         try:
             result = platforms.run_with_group_kill(
                 ["security", *args],
@@ -203,6 +203,11 @@ def _run(
         if read_fd is not None:
             try:
                 os.close(read_fd)
+            except OSError:
+                pass
+        if write_fd is not None:
+            try:
+                os.close(write_fd)
             except OSError:
                 pass
         if feeder is not None:
@@ -1165,7 +1170,10 @@ def launch_guard(store, profile: str, capture: bool = False,
                 self._abandon_membership()
                 raise
             except (KeychainError, OSError, ValueError) as exc:
-                self._abandon_membership()
+                try:
+                    locks_module.acquire_lease(store, profile, keychain=False)
+                except (locks_module.LockError, OSError):
+                    pass
                 warn(
                     f"keychain swap skipped ({exc}); continuing without "
                     "per-profile credential swap"
@@ -1427,10 +1435,9 @@ def _rename_profile_slot_unlocked(
         new.unlink(missing_ok=True)
     if keychain_supported:
         target = _ensure_target_keychain(store)
-        if target is None:
-            raise KeychainError("could not resolve the keychain for slot migration")
-        delete_slot(profile_slot(old_name), target)
-        delete_slot(profile_slot(new_name), target)
+        if target is not None:
+            delete_slot(profile_slot(old_name), target)
+            delete_slot(profile_slot(new_name), target)
 
 
 def purge_profile_slot(store, name: str) -> None:
@@ -1579,7 +1586,11 @@ def describe(store, names: Optional[List[str]] = None) -> Dict[str, object]:
     slots = {}
     for name in names:
         try:
-            slots[name] = load_profile_slot(store, name) is not None
+            slots[name] = (
+                load_profile_slot(store, name) is not None
+                if store is not None
+                else False
+            )
         except OSError:
             slots[name] = False
     try:
