@@ -14,9 +14,10 @@ is built inside ``run`` exclusively.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -28,7 +29,7 @@ import platforms
 import profile_rotation
 import resolver
 from store import Store, StoreError
-from ui import warn
+from ui import note, warn
 
 
 _PLAN_ENV_DISPLAY = (
@@ -304,27 +305,65 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
         return _run_prepared(selected, store, rotation)
 
 
+def _prepare_file_auth(
+    store: Store, plan: LaunchPlan,
+    slot_busy: Optional[keychain.KeychainBusyError] = None,
+) -> None:
+    """Validate the private agy credential a file-auth launch will use.
+
+    A login creates that credential instead of consuming it, so it is not
+    validated. When file auth replaced a shared Keychain slot owned by
+    another profile, a refusal names both causes.
+    """
+    if not plan.agy_file_auth or plan.launch_as_child:
+        return
+    profile = store.get(plan.profile)
+    data_dir = store.profile_data_dir(plan.profile, engine=plan.engine)
+    try:
+        isolation.prepare_agy_file_auth(store, profile, data_dir)
+    except isolation.AgyCredentialUnavailableError as exc:
+        if slot_busy is None:
+            raise
+        raise StoreError(
+            f"{slot_busy}; its private file credential cannot be used either ({exc})"
+        ) from exc
+
+
+@contextlib.contextmanager
+def _keep_file_login(store: Store, name: str, data_dir: Path):
+    """Back up a credential written by a file-auth login for Keychain launches."""
+    yield
+    try:
+        if account.agy_token_path(data_dir).is_file():
+            raw = account.scoped_agy_token_bytes(store, store.get(name), data_dir)
+            if raw is not None:
+                keychain.save_file_credential(store, name, raw)
+    except (keychain.KeychainError, OSError, StoreError) as exc:
+        warn(
+            f"could not back up the new Antigravity credential of profile "
+            f"{name!r} for explicit launches ({exc}); random launches still use it"
+        )
+
+
 def _run_prepared(
     plan: LaunchPlan, store: Store,
     rotation: Optional[profile_rotation.Rotation] = None,
 ) -> int:
     """Prepare the candidate and finish rotation before starting the engine."""
 
-    import contextlib
     import engines
 
     excluded: set = set()
+    slot_busy: Optional[keychain.KeychainBusyError] = None
     limit = None if plan.force else store.load_config().session_limit()
     while True:
         driver = engines.get_engine(plan.engine)
         needs_keychain = driver.needs_keychain and not plan.agy_file_auth
         keychain_needs_waited_child = needs_keychain and keychain.supported()
         leased: Optional[str] = None
+        started = False
         try:
-            if plan.agy_file_auth:
-                profile = store.get(plan.profile)
-                data_dir = store.profile_data_dir(plan.profile, engine=plan.engine)
-                isolation.prepare_agy_file_auth(store, profile, data_dir)
+            _prepare_file_auth(store, plan, slot_busy)
             membership = {"keychain": False} if plan.agy_file_auth else {}
             joined = locks.acquire_lease(
                 store, plan.profile, patience_s=locks.LEASE_PATIENCE_S, max_holders=limit,
@@ -361,8 +400,7 @@ def _run_prepared(
         try:
             profile = store.get(plan.profile)
             data_dir = store.profile_data_dir(plan.profile, engine=plan.engine)
-            if plan.agy_file_auth:
-                isolation.prepare_agy_file_auth(store, profile, data_dir)
+            _prepare_file_auth(store, plan, slot_busy)
             profile.touch()
             store.save(profile)
 
@@ -402,13 +440,15 @@ def _run_prepared(
             if plan.use_sandbox:
                 argv = isolation.sandbox_wrap(argv)
 
-            guard = (
-                keychain.launch_guard(store, plan.profile, capture=plan.launch_as_child)
-                if needs_keychain
-                else contextlib.nullcontext()
-            )
+            if needs_keychain:
+                guard = keychain.launch_guard(store, plan.profile, capture=plan.launch_as_child)
+            elif plan.agy_file_auth and plan.launch_as_child:
+                guard = _keep_file_login(store, plan.profile, data_dir)
+            else:
+                guard = contextlib.nullcontext()
             try:
                 with guard:
+                    started = True
                     if rotation is not None:
                         if plan.random_pick:
                             rotation.commit(profile)
@@ -424,7 +464,15 @@ def _run_prepared(
                         return rc
                     return platforms.launch_argv(argv, env)
             except keychain.KeychainBusyError as exc:
-                raise StoreError(str(exc)) from exc
+                if exc.owner is None or plan.agy_file_auth:
+                    raise StoreError(str(exc)) from exc
+                note(
+                    f"profile {exc.owner!r} owns the shared Antigravity Keychain "
+                    f"slot; profile {plan.profile!r} uses its private file "
+                    "credential instead"
+                )
+                slot_busy = exc
+                plan = replace(plan, agy_file_auth=True)
         finally:
             try:
                 locks.release_lease(store, leased, patience_s=1.0)
@@ -434,7 +482,7 @@ def _run_prepared(
                     f"{leased!r} ({exc}); it self-heals on the next "
                     "launch"
                 )
-            if leased:
+            if leased and started:
                 try:
                     account.record_profile_email(store, plan.profile)
                 except Exception:

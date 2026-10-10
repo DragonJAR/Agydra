@@ -717,6 +717,18 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
     )
 
 
+def save_file_credential(store, name: str, data: bytes) -> None:
+    """Back up a private file credential as ``name``'s slot.
+
+    A login that ran with file authentication (because another profile
+    owned the shared slot) leaves its token only on disk; this makes it
+    available to later Keychain launches through the same identity guard
+    as a Keychain login capture.
+    """
+    with serialized_access(store):
+        _persist_if_trusted(store, name, data)
+
+
 def _serialize_lock(store):
     """Cross-process non-blocking mutex for shared-slot swaps (macOS only)."""
     import locks

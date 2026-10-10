@@ -530,6 +530,67 @@ class TestRandomAgyFileLaunch(BaseCase):
                 guard.assert_called_once_with(self.store, "alpha", capture=login)
                 prepare.assert_not_called()
 
+    @staticmethod
+    def _slot_owned_by(owner):
+        @contextlib.contextmanager
+        def guard(*_args, **_kwargs):
+            raise keychain.KeychainBusyError(
+                f"shared slot owned by {owner!r}", owner=owner
+            )
+            yield
+
+        return guard
+
+    def test_explicit_launch_uses_its_file_credential_while_another_profile_owns_the_slot(self):
+        plan = runner.build_plan(self.store, [], flag_ref="alpha")
+        self.assertFalse(plan.agy_file_auth)
+        self.assertEqual(self._run(plan, guard=self._slot_owned_by("andrea")), 0)
+        self.assertEqual(self.launched, ["alpha"])
+        self.assertEqual(locks.lease_holders(self.store, "alpha"), [])
+
+    def test_login_of_a_new_profile_proceeds_while_another_profile_owns_the_slot(self):
+        gamma = self.store.create("gamma")
+        token = self.store.profile_data_dir("gamma") / account.AGY_CLI_DIR / account.TOKEN_FILE
+        raw = json.dumps({
+            "token": {"access_token": "synthetic-gamma", "refresh_token": "renew-gamma"},
+            "auth_method": "consumer",
+            "id_token": _make_jwt({"email": "gamma@example.com"}),
+        }).encode("utf-8")
+
+        def native_login(_argv, env):
+            self.assertEqual(env["AGYDRA_PROFILE"], "gamma")
+            self.assertEqual(env[account.AGY_FILE_AUTH_ENV], account.AGY_FILE_AUTH_VALUE)
+            self.assertFalse(locks.lease_holders(self.store, "gamma")[0].keychain)
+            token.parent.mkdir(parents=True, exist_ok=True)
+            token.write_bytes(raw)
+            token.chmod(0o600)
+            return 0
+
+        plan = runner.build_plan(self.store, [], flag_ref=gamma.name, launch_as_child=True)
+        self.assertEqual(
+            self._run(plan, launch=native_login, guard=self._slot_owned_by("andrea")), 0
+        )
+        backup = keychain.load_profile_slot(self.store, "gamma")
+        self.assertEqual(keychain.decode_go_keyring_secret(backup), json.loads(raw))
+        self.assertEqual(self.store.get("gamma").email, "gamma@example.com")
+        self.assertEqual(locks.lease_holders(self.store, "gamma"), [])
+
+    def test_explicit_launch_without_a_usable_file_credential_reports_the_slot_owner(self):
+        self._make_alpha_foreign()
+        plan = runner.build_plan(self.store, [], flag_ref="alpha")
+        with self.assertRaises(StoreError) as caught:
+            self._run(plan, guard=self._slot_owned_by("andrea"))
+        self.assertIn("andrea", str(caught.exception))
+        self.assertIn("no trusted Antigravity credential", str(caught.exception))
+        self.assertEqual(self.launched, [])
+        self.assertEqual(locks.lease_holders(self.store, "alpha"), [])
+
+    def test_plain_swap_lock_contention_does_not_switch_to_file_auth(self):
+        plan = runner.build_plan(self.store, [], flag_ref="alpha")
+        with self.assertRaises(StoreError):
+            self._run(plan, guard=self._slot_owned_by(None))
+        self.assertEqual(self.launched, [])
+
     def test_forced_random_launch_of_a_fresh_logged_in_profile_needs_no_extra_step(self):
         alpha = self.store.get("alpha")
         alpha.email = None
