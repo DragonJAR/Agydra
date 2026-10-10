@@ -343,7 +343,7 @@ def _rmtree_readonly_ok(
 
 def _tree_has_entries(root: Path) -> bool:
     """True when ``root`` is a link or holds any file/link, never following links."""
-    if root.is_symlink():
+    if platforms.is_link(root):
         return True
     if not root.is_dir():
         return False
@@ -440,7 +440,7 @@ def _zip_tree_without_following(
         info.external_attr = (stat.S_IFLNK | 0o777) << 16
         zf.writestr(info, os.readlink(path))
 
-    if root.is_symlink():
+    if platforms.is_link(root):
         add_link(root, prefix)
         return
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -448,7 +448,7 @@ def _zip_tree_without_following(
         relative_parts = base.relative_to(root).parts
         for dirname in list(dirnames):
             child = base / dirname
-            if child.is_symlink():
+            if platforms.is_link(child):
                 dirnames.remove(dirname)
                 arcname = _zip_arcname(prefix, relative_parts, dirname)
                 if not _arcname_excluded(arcname, exclude):
@@ -458,7 +458,7 @@ def _zip_tree_without_following(
             arcname = _zip_arcname(prefix, relative_parts, filename)
             if _arcname_excluded(arcname, exclude):
                 continue
-            if child.is_symlink():
+            if platforms.is_link(child):
                 add_link(child, arcname)
             elif child.is_file():
                 _zip_add_file(zf, child, arcname)
@@ -511,26 +511,53 @@ def rmtree(path: Path) -> None:
     not a store-private helper.
     """
     path = Path(path)
-    changed_paths: List[Tuple[Path, int, int, int]] = []
-    cleanup_error = None
-
-    def retry_readonly(function, target, error) -> None:
-        _rmtree_readonly_ok(function, target, error, changed_paths)
-
     try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if platforms.is_link(path):
         try:
-            if sys.version_info >= (3, 12):
-                shutil.rmtree(path, onexc=retry_readonly)
+            path.unlink()
+        except OSError:
+            if platforms.is_windows() and path.is_dir():
+                os.rmdir(path)
             else:
-                shutil.rmtree(path, onerror=retry_readonly)
-        except FileNotFoundError:
-            pass
-        except BaseException as exc:
-            cleanup_error = exc
-    finally:
-        restore_errors = _restore_rmtree_modes(changed_paths)
-    if cleanup_error is not None or restore_errors:
-        _raise_rmtree_failure(path, cleanup_error, restore_errors)
+                raise
+    elif not stat.S_ISDIR(metadata.st_mode):
+        try:
+            path.unlink()
+        except PermissionError:
+            try:
+                os.chmod(path, stat.S_IWRITE)
+                path.unlink()
+            except OSError:
+                raise
+    else:
+        changed_paths: List[Tuple[Path, int, int, int]] = []
+        cleanup_error = None
+
+        def retry_readonly(function, target, error) -> None:
+            _rmtree_readonly_ok(function, target, error, changed_paths)
+
+        try:
+            try:
+                if sys.version_info >= (3, 12):
+                    shutil.rmtree(path, onexc=retry_readonly)
+                else:
+                    shutil.rmtree(path, onerror=retry_readonly)
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = exc
+        finally:
+            restore_errors = _restore_rmtree_modes(changed_paths)
+        if cleanup_error is not None or restore_errors:
+            _raise_rmtree_failure(path, cleanup_error, restore_errors)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise OSError(f"could not fully remove {path}")
 
 
 class Store:
@@ -757,7 +784,9 @@ class Store:
         return sorted(
             entry.name
             for entry in self.claude_config_root.iterdir()
-            if entry.name not in owned
+            if (entry.is_dir() or platforms.is_link(entry))
+            and not entry.name.startswith(".")
+            and entry.name not in owned
         )
 
     @staticmethod
@@ -895,19 +924,25 @@ class Store:
         if not self.claude_config_root.is_dir():
             return
         for entry in sorted(self.claude_config_root.iterdir()):
-            if entry.name.startswith(_CREATE_STAGE_PREFIX) and entry.is_dir() and not entry.is_symlink():
-                rmtree(entry)
+            if entry.name.startswith(_CREATE_STAGE_PREFIX):
+                try:
+                    rmtree(entry)
+                except OSError:
+                    pass
 
     def _abort_create(self, stage_dir: Optional[Path], config_dir: Optional[Path]) -> None:
         try:
             if stage_dir is not None:
                 self._remove_create_stage(stage_dir)
         finally:
-            if config_dir is not None and config_dir.is_dir() and not config_dir.is_symlink():
-                rmtree(config_dir)
+            if config_dir is not None:
+                try:
+                    rmtree(config_dir)
+                except OSError:
+                    pass
 
     def _remove_create_stage(self, stage_dir: Path) -> None:
-        if stage_dir.is_symlink() or not stage_dir.is_dir():
+        if platforms.is_link(stage_dir) or not stage_dir.is_dir():
             raise StoreError(f"refusing to remove unexpected create stage {stage_dir}")
         rmtree(stage_dir)
         if stage_dir.exists():
@@ -1456,6 +1491,8 @@ class Store:
             for pdir in sorted(self.profiles_dir.iterdir()):
                 if pdir.name.startswith(_CREATE_STAGE_PREFIX):
                     continue
+                if not (pdir.is_dir() or platforms.is_link(pdir)):
+                    continue
                 try:
                     profile_dir = self._require_profile_entry_paths_are_real(pdir.name)
                 except StoreError:
@@ -1522,21 +1559,6 @@ class Store:
             else:
                 message = "could not fully remove overlay during profile deletion"
             raise StoreError(f"{message}: {overlay} ({exc})") from exc
-        try:
-            overlay.lstat()
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            raise StoreError(
-                f"cannot verify removal of overlay {overlay} ({exc})"
-            ) from exc
-        if require_removed:
-            raise StoreError(
-                f"could not fully remove overlay {overlay}; rename recovery will retry"
-            )
-        raise StoreError(
-            f"could not fully remove overlay {overlay}; profile deletion is incomplete"
-        )
 
     def _with_profile_locks(
         self, names: Sequence[str], action: str, operation: Callable[[], _Result]
@@ -1947,7 +1969,7 @@ class Store:
 
     def _require_plain_claude_roots(self) -> None:
         for root in (self.claude_config_root, self.usage_cache_root):
-            if os.path.lexists(root) and (root.is_symlink() or not root.is_dir()):
+            if os.path.lexists(root) and (platforms.is_link(root) or not root.is_dir()):
                 raise StoreError(
                     f"{root} must be a real directory, not a link or file; "
                     "refusing to touch claude profile data through it"
@@ -1959,21 +1981,12 @@ class Store:
         targets = (config_dir, self.usage_cache_dir(seq))
         for target in targets:
             try:
-                target.lstat()
-            except FileNotFoundError:
-                continue
-            if target.is_symlink():
-                target.unlink()
-            else:
                 rmtree(target)
-            try:
-                target.lstat()
-            except FileNotFoundError:
-                continue
-            raise StoreError(
-                f"profile {name!r} could not be fully removed: {target} survived; "
-                "remove it manually and retry"
-            )
+            except OSError as exc:
+                raise StoreError(
+                    f"profile {name!r} could not be fully removed: {target} survived ({exc}); "
+                    "remove it manually and retry"
+                ) from exc
 
     BACKUP_RETENTION = 5
 

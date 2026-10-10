@@ -479,7 +479,7 @@ class TestOrphanLinkSafety(BaseCase):
         scan = orphans.OrphanScan(overlays=["ghost"])
         with mock.patch.object(orphans.platforms, "is_link", side_effect=probe), \
                 mock.patch.object(
-                    orphans.store_mod, "rmtree", side_effect=AssertionError("must not recurse")
+                    orphans.store_mod.shutil, "rmtree", side_effect=AssertionError("must not recurse")
                 ):
             orphans.remove_orphans(self.store, scan)
         self.assertEqual((entry / "target-data.txt").read_bytes(), b"linked content")
@@ -513,6 +513,32 @@ class TestOrphanKeychainBusy(BaseCase):
             removed = orphans.remove_orphans(store, scan)
         self.assertEqual(removed, [])
         self.assertEqual(keychain.load_profile_slot(store, "ghost"), b"ghost-secret")
+
+
+class TestOrphansResilience(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+
+    def test_remove_orphans_continues_when_one_overlay_rmtree_fails(self):
+        self.store.overlays_dir.mkdir(parents=True, exist_ok=True)
+        o1 = self.store.overlays_dir / "orphan1"
+        o1.mkdir()
+        o2 = self.store.overlays_dir / "orphan2"
+        o2.mkdir()
+        scan = orphans.OrphanScan(overlays=["orphan1", "orphan2"])
+        original_rmtree = orphans.store_mod.rmtree
+
+        def failing_rmtree(path):
+            if Path(path).name == "orphan1":
+                raise OSError("simulated permission failure")
+            return original_rmtree(path)
+
+        with mock.patch.object(orphans.store_mod, "rmtree", side_effect=failing_rmtree):
+            removed = orphans.remove_orphans(self.store, scan)
+        self.assertEqual(removed, ["overlay: orphan2"])
+        self.assertTrue(o1.exists())
+        self.assertFalse(o2.exists())
 
 
 if __name__ == "__main__":

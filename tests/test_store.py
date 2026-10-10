@@ -2408,5 +2408,63 @@ class TestRoutineSaveSkipsTheWholeStoreScan(BaseCase):
         self.assertEqual(beta_path.read_bytes(), before)
 
 
+class TestStoreRmtreeAndScan(BaseCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.store = Store(self.store_root)
+
+    def test_rmtree_unlinks_symlink_without_touching_target(self):
+        target = self._tmp / "target"
+        target.mkdir()
+        (target / "data.txt").write_bytes(b"payload")
+        link = self._tmp / "link"
+        link.symlink_to(target, target_is_directory=True)
+        store_mod.rmtree(link)
+        self.assertFalse(link.exists() or link.is_symlink())
+        self.assertTrue(target.exists())
+        self.assertEqual((target / "data.txt").read_bytes(), b"payload")
+
+    def test_rmtree_unlinks_regular_file(self):
+        file_path = self._tmp / "plain.txt"
+        file_path.write_bytes(b"content")
+        store_mod.rmtree(file_path)
+        self.assertFalse(file_path.exists())
+
+    def test_rmtree_raises_oserror_if_path_survives(self):
+        survivor = self._tmp / "survivor"
+        survivor.mkdir()
+        with unittest.mock.patch.object(store_mod.shutil, "rmtree"):
+            with self.assertRaises(OSError):
+                store_mod.rmtree(survivor)
+
+    def test_delete_and_rename_succeed_with_symlinked_overlay(self):
+        self.store.create("symprof")
+        overlay = self.store.overlays_dir / "symprof"
+        self.store.overlays_dir.mkdir(parents=True, exist_ok=True)
+        target = self._tmp / "outside-overlay"
+        target.mkdir()
+        overlay.symlink_to(target, target_is_directory=True)
+        self.store.delete("symprof")
+        self.assertFalse(overlay.exists() or overlay.is_symlink())
+        self.assertTrue(target.exists())
+
+    def test_scan_ignores_stray_non_directory_files_like_ds_store(self):
+        self.store.create("validprof")
+        self.store.profiles_dir.mkdir(parents=True, exist_ok=True)
+        (self.store.profiles_dir / ".DS_Store").write_bytes(b"finder metadata")
+        (self.store.profiles_dir / "notes.txt").write_bytes(b"stray file")
+        profiles, unreadable = self.store.scan()
+        self.assertEqual([p.name for p in profiles], ["validprof"])
+        self.assertEqual(unreadable, [])
+
+    def test_claude_config_orphans_ignores_non_directories_and_dotfiles(self):
+        self.store.claude_config_root.mkdir(parents=True, exist_ok=True)
+        (self.store.claude_config_root / ".DS_Store").write_bytes(b"stray")
+        (self.store.claude_config_root / "README.txt").write_bytes(b"stray")
+        (self.store.claude_config_root / "99").mkdir()
+        orphans = self.store.claude_config_orphans([])
+        self.assertEqual(orphans, ["99"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -199,11 +199,16 @@ def remove_orphans(store, scan: OrphanScan) -> List[str]:
 
             if name in scan.overlays:
                 path = store.overlays_dir / name
-                if platforms.is_link(path):
-                    _unlink_if_present(path, f"overlay: {name}", removed)
-                elif path.is_dir():
-                    store_mod.rmtree(path)
-                    if not path.exists():
+                try:
+                    metadata = path.lstat()
+                except FileNotFoundError:
+                    metadata = None
+                if metadata is not None:
+                    try:
+                        store_mod.rmtree(path)
+                    except OSError:
+                        pass
+                    if not (path.exists() or platforms.is_link(path)):
                         removed.append(f"overlay: {name}")
 
             quarantine_names = [
