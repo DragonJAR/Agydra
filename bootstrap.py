@@ -23,6 +23,7 @@ Design invariants (see AGENTS.md):
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -169,7 +170,11 @@ def _dir_on_path(d: Path) -> bool:
             if part and ntpath.normcase(ntpath.normpath(part)) == target:
                 return True
         return False
-    return str(d) in os.environ.get("PATH", "").split(os.pathsep)
+    target = os.path.normpath(str(d))
+    for part in os.environ.get("PATH", "").split(os.pathsep):
+        if part and os.path.normpath(os.path.expanduser(part)) == target:
+            return True
+    return False
 
 
 def _shim_entry_exists(path: Path) -> bool:
@@ -218,11 +223,15 @@ def ensure_venv(root: Path, out: Callable[[str], None]) -> Path:
     if vpy.exists():
         out(f"venv already present: {venv_dir(root)}")
         return vpy
-    if venv_dir(root).exists():
-        out(f"removing broken venv (no interpreter): {venv_dir(root)}")
+    target = venv_dir(root)
+    if os.path.lexists(target):
+        out(f"removing broken venv (no interpreter): {target}")
         import store as _store
 
-        _store.rmtree(venv_dir(root))
+        try:
+            _store.rmtree(target)
+        except OSError as exc:
+            raise BootstrapError(f"cannot remove broken venv {target}: {exc}") from exc
     out(f"creating venv: {venv_dir(root)}")
     proc = _run([sys.executable, "-m", "venv", str(venv_dir(root))])
     if proc.returncode != 0:
@@ -243,9 +252,10 @@ def _pip_version(vpy: Path) -> Optional[tuple]:
         if tok and tok[0].isdigit() and "." in tok:
             parts = []
             for piece in tok.split(".")[:2]:
-                if not piece.isdigit():
+                match = re.match(r"\d+", piece)
+                if not match:
                     return None
-                parts.append(int(piece))
+                parts.append(int(match.group(0)))
             return tuple(parts)
     return None
 

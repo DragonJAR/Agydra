@@ -1079,5 +1079,46 @@ class RunHelperOSError(unittest.TestCase):
                 bootstrap._run(["some", "argv"])
 
 
+class TestBootstrapFixes(unittest.TestCase):
+    def test_ensure_venv_removes_broken_venv_file_or_symlink(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            venv = bootstrap.venv_dir(root)
+            venv.parent.mkdir(parents=True, exist_ok=True)
+            venv.write_text("not a venv dir")
+            with mock.patch.object(bootstrap, "_run", return_value=mock.Mock(returncode=0)), \
+                    mock.patch.object(bootstrap, "venv_python") as mock_vpy:
+                mock_vpy.return_value.exists.side_effect = [False, True]
+                res = bootstrap.ensure_venv(root, lambda _l: None)
+                self.assertEqual(res, mock_vpy.return_value)
+                self.assertFalse(venv.is_file())
+
+    def test_ensure_venv_converts_oserror_to_bootstrap_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            venv = bootstrap.venv_dir(root)
+            venv.parent.mkdir(parents=True, exist_ok=True)
+            venv.mkdir()
+            with mock.patch("store.rmtree", side_effect=OSError("permission denied")):
+                with self.assertRaises(bootstrap.BootstrapError):
+                    bootstrap.ensure_venv(root, lambda _l: None)
+
+    def test_dir_on_path_handles_trailing_slash_and_tilde_on_posix(self):
+        with mock.patch.dict(os.environ, {"PATH": "/custom/bin/:~/other/bin"}, clear=True):
+            with mock.patch.object(bootstrap.platforms, "is_windows", return_value=False):
+                self.assertTrue(bootstrap._dir_on_path(Path("/custom/bin")))
+                self.assertTrue(bootstrap._dir_on_path(Path("~/other/bin").expanduser()))
+                self.assertFalse(bootstrap._dir_on_path(Path("/not/on/path")))
+
+    def test_pip_version_parses_prerelease_and_local_versions(self):
+        vpy = Path("/fake/python")
+        with mock.patch.object(bootstrap, "_run") as mock_run:
+            mock_run.return_value = mock.Mock(returncode=0, stdout="pip 24.1b1 from /path (python 3.12)\n")
+            self.assertEqual(bootstrap._pip_version(vpy), (24, 1))
+
+            mock_run.return_value = mock.Mock(returncode=0, stdout="pip 23.3.dev0 from /path (python 3.12)\n")
+            self.assertEqual(bootstrap._pip_version(vpy), (23, 3))
+
+
 if __name__ == "__main__":
     unittest.main()
