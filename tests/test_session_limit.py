@@ -21,13 +21,6 @@ from conftest import BaseCase, LiveHolders as _LiveHolders, authenticate_agy_pro
 from store import Store, StoreError
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    r"Windows-2022 runner's checkout path "
-    r"(D:\\\\a\\\\Agydra\\\\Agydra\\\\tests\\\\...) exceeds the legacy 260 "
-    r"char MAX_PATH limit when \`_LiveHolders\` spawns subprocess.Popen "
-    r"with sleep(120); the same constraint as TestAcquireLeaseLimit.",
-)
 class TestConfigLimit(unittest.TestCase):
     def test_unlimited_by_default_and_capped_only_when_the_user_opts_in(self):
         self.assertIsNone(models.Config().session_limit())
@@ -41,15 +34,6 @@ class TestConfigLimit(unittest.TestCase):
                 self.assertIsNone(config.session_limit())
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    "Windows-2022 runner's checkout path "
-    "(D:\\\\a\\\\Agydra\\\\Agydra\\\\tests\\\\...) exceeds the legacy 260 "
-    "char MAX_PATH limit when acquire_lease resolves "
-    "<store>/locks/work.lock. The test is correct on Linux/macOS and on "
-    "Windows hosts with a shorter checkout path; a maintainer with such "
-    "a host does not need this skip.",
-)
 class TestAcquireLeaseLimit(BaseCase):
     def setUp(self):
         super().setUp()
@@ -84,13 +68,6 @@ class TestAcquireLeaseLimit(BaseCase):
                 locks.acquire_lease(self.store, "work", max_holders=2)
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    "Windows-2022 runner's checkout path "
-    "(D:\\\\a\\\\Agydra\\\\Agydra\\\\tests\\\\...) exceeds the legacy 260 "
-    "char MAX_PATH limit when the resolver loads a profile with a live "
-    "lease; the same constraint as TestAcquireLeaseLimit applies.",
-)
 class TestResolverLimit(BaseCase):
     def setUp(self):
         super().setUp()
@@ -123,13 +100,6 @@ class TestResolverLimit(BaseCase):
         self.assertIn("free profile", res.reason)
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    "Windows-2022 runner's checkout path "
-    "(D:\\\\a\\\\Agydra\\\\Agydra\\\\tests\\\\...) exceeds the legacy 260 "
-    "char MAX_PATH limit when the runner acquires a profile lease; the "
-    "same constraint as TestAcquireLeaseLimit applies.",
-)
 class TestRunnerLimit(BaseCase):
     def setUp(self):
         super().setUp()
@@ -252,13 +222,6 @@ class TestRunnerLimit(BaseCase):
         self.assertEqual(locks.lease_holders(self.store, first), [])
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    r"Windows-2022 runner's checkout path "
-    r"(D:\\\\a\\\\Agydra\\\\Agydra\\\\tests\\\\...) exceeds the legacy 260 "
-    r"char MAX_PATH limit when \`_LiveHolders\` spawns subprocess.Popen "
-    r"with sleep(120); the same constraint as TestAcquireLeaseLimit.",
-)
 class TestDefaultIsUnlimited(BaseCase):
     def setUp(self):
         super().setUp()
@@ -287,13 +250,6 @@ class TestDefaultIsUnlimited(BaseCase):
         self.assertIn("sessions  : 4\n", out.getvalue())
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    r"Windows-2022 runner's checkout path "
-    r"(D:\\\\a\\\\Agydra\\\\Agydra\\\\tests\\\\...) exceeds the legacy 260 "
-    r"char MAX_PATH limit when \`_LiveHolders\` spawns subprocess.Popen "
-    r"with sleep(120); the same constraint as TestAcquireLeaseLimit.",
-)
 class TestStatusShowsTheLimit(BaseCase):
     def test_status_reports_sessions_against_an_enabled_limit(self):
         store = Store()

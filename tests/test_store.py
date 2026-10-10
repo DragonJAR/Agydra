@@ -638,16 +638,6 @@ class TestStore(BaseCase):
             create_lock.release()
         self.assertFalse(store.profile_dir("reserved").exists())
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "Python 3.9 on Windows has a known thread-startup race: the parent "
-        "thread blocks in `thread.start()` waiting for the child to call "
-        "`Thread._started.set()` and the child never reaches that call before "
-        "the test gets a KeyboardInterrupt. The race is fixed in CPython 3.11+ "
-        "but the GitHub Actions Windows-2022 runner ships 3.9. The product "
-        "code is correct on every platform; the test is correct on Linux, "
-        "macOS, and on Windows hosts running Python 3.11 or later.",
-    )
     def test_concurrent_creates_do_not_share_sequence_numbers(self):
         import locks
 
@@ -2191,13 +2181,6 @@ Store(root=root).rename("old", "new")
         self.assertEqual(len(remaining), 1)
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    r"Windows-2022 runner: same \`os.fsync\` hang as the other create-stage "
-    r"tests; the deep checkout path exceeds the legacy 260 char MAX_PATH "
-    r"limit before the fsync returns. Skip on Windows; the test is correct "
-    r"on Linux/macOS and on real Windows hosts with a shorter checkout path.",
-)
 class TestLeasedSessionBlocksMutations(BaseCase):
     """A session registered in the lease registry blocks delete/rename even
     though its flock is free (sessions only hold it briefly)."""
@@ -2263,13 +2246,6 @@ def _write_profile_metadata(store, name, **fields):
     return meta_path
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    r"Windows-2022 runner: same \`os.fsync\` hang as the other create-stage "
-    r"tests; the deep checkout path exceeds the legacy 260 char MAX_PATH "
-    r"limit before the fsync returns. Skip on Windows; the test is correct "
-    r"on Linux/macOS and on real Windows hosts with a shorter checkout path.",
-)
 class TestProfileSequenceIdentity(BaseCase):
     def test_duplicate_positive_sequence_fails_closed_across_different_engines(self):
         store = Store()
@@ -2335,13 +2311,6 @@ class TestProfileSequenceIdentity(BaseCase):
             store.save(profile)
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    r"Windows-2022 runner: same \`os.fsync\` hang as the other create-stage "
-    r"tests; the deep checkout path exceeds the legacy 260 char MAX_PATH "
-    r"limit before the fsync returns. Skip on Windows; the test is correct "
-    r"on Linux/macOS and on real Windows hosts with a shorter checkout path.",
-)
 class TestRoutineSaveSkipsTheWholeStoreScan(BaseCase):
     def setUp(self):
         super().setUp()
