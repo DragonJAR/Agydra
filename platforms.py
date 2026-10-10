@@ -305,7 +305,8 @@ def canonical_path(path: Path) -> Path:
         try:
             import fcntl
 
-            fd = os.open(str(p), os.O_RDONLY)
+            open_flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
+            fd = os.open(str(p), open_flags)
             try:
                 f_getpath = getattr(fcntl, "F_GETPATH", 50)
                 buf = b"\x00" * 1024
@@ -488,14 +489,65 @@ def _kill_process_group(proc: "subprocess.Popen") -> None:
             pass
 
 
-def _normalize_windows_argv(argv: Sequence[str]) -> list[str]:
+_BATCH_SAFE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#$*+-./:?@\\_")
+
+
+def _escape_windows_batch_arg(arg: str) -> str:
+    """Escape a single argument for cmd.exe /c batch file invocation.
+
+    Characters outside the safe alphanumeric and punctuation whitelist are quoted.
+    Embedded double-quotes are doubled to prevent breaking out of quotation.
+    Percent signs are transformed to prevent cmd.exe environment variable expansion.
+    Trailing backslashes before closing quotes are doubled to prevent escaping.
+    Arguments with NUL or newline characters are rejected because cmd.exe treats
+    newlines as statement separators that cannot be quoted safely.
+    """
+    if "\x00" in arg:
+        raise ValueError("batch file arguments cannot contain NUL characters")
+    if "\r" in arg or "\n" in arg:
+        raise ValueError("batch file arguments cannot contain newline characters")
+    needs_quotes = (
+        not arg
+        or arg.endswith("\\")
+        or any(ch not in _BATCH_SAFE_CHARS for ch in arg)
+    )
+    if not needs_quotes:
+        return arg
+    buf = ['"']
+    backslashes = 0
+    for ch in arg:
+        if ch == "\\":
+            backslashes += 1
+        else:
+            if ch == '"':
+                buf.append("\\" * backslashes)
+                buf.append('"')
+            elif ch == "%":
+                buf.append("%%cd:~,")
+            backslashes = 0
+        buf.append(ch)
+    buf.append("\\" * backslashes)
+    buf.append('"')
+    return "".join(buf)
+
+
+def _normalize_windows_argv(argv: Sequence[str]) -> Union[list[str], str]:
     """On Windows, batch files (.cmd / .bat) cannot be directly executed by
-    CreateProcessW with shell=False; cmd.exe /c must host them."""
+    CreateProcessW with shell=False; cmd.exe /c must host them.
+
+    To prevent CVE-2024-24576 (BatBadBut) command injection, arguments passed
+    to batch scripts are strictly escaped against cmd.exe metacharacters
+    (&, |, ^, <, >, %, quotes, newlines) and built into an explicit cmd.exe
+    command line string with Command Extensions enabled (/e:ON), delayed
+    variable expansion disabled (/v:OFF), and AutoRun disabled (/d).
+    """
     cmd = [str(a) for a in argv]
     if is_windows() and cmd:
-        target = cmd[0].lower()
-        if target.endswith((".cmd", ".bat")):
-            return ["cmd", "/c", *cmd]
+        target = cmd[0]
+        if target.lower().endswith((".cmd", ".bat")):
+            escaped_args = [_escape_windows_batch_arg(a) for a in cmd[1:]]
+            args_part = (" " + " ".join(escaped_args)) if escaped_args else ""
+            return f'cmd.exe /e:ON /v:OFF /d /c ""{target}"{args_part}"'
     return cmd
 
 

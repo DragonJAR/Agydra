@@ -137,3 +137,104 @@ class TestWindowsTreeCleanup(BaseCase):
         self.assertEqual(status, 127)
         self.assertIn(b"\\u7528\\u6237", raw.getvalue())
         self.assertIn(b"not found", raw.getvalue())
+
+
+class TestWindowsJunctionCreation(BaseCase):
+    def test_junction_uses_winapi_without_cmd_subprocess(self):
+        """Directory linking on Windows must call _winapi.CreateJunction directly
+        without invoking cmd.exe /c mklink, preserving metacharacters like & | ^ %VAR%.
+        """
+        import isolation
+
+        target = self._tmp / "target & special ^ %VAR%"
+        link = self._tmp / "link & special ^ %VAR%"
+        target.mkdir()
+
+        fake_winapi = SimpleNamespace(CreateJunction=mock.Mock())
+
+        with mock.patch.object(platforms, "is_windows", return_value=True), \
+                mock.patch.object(os, "symlink", side_effect=PermissionError("no unprivileged symlinks")), \
+                mock.patch.dict(sys.modules, {"_winapi": fake_winapi}), \
+                mock.patch("subprocess.run") as mock_subproc:
+            isolation._link(target, link)
+
+        fake_winapi.CreateJunction.assert_called_once_with(str(target), str(link))
+        mock_subproc.assert_not_called()
+
+    def test_junction_propagates_oserror_from_winapi(self):
+        """_winapi.CreateJunction OSError must propagate under the _link contract."""
+        import isolation
+
+        target = self._tmp / "target"
+        link = self._tmp / "link"
+        target.mkdir()
+
+        fake_winapi = SimpleNamespace(
+            CreateJunction=mock.Mock(side_effect=OSError("junction creation failed"))
+        )
+
+        with mock.patch.object(platforms, "is_windows", return_value=True), \
+                mock.patch.object(os, "symlink", side_effect=PermissionError("no unprivileged symlinks")), \
+                mock.patch.dict(sys.modules, {"_winapi": fake_winapi}):
+            with self.assertRaises(OSError):
+                isolation._link(target, link)
+
+
+class TestWindowsBatchArgvNormalization(BaseCase):
+    def test_cmd_metacharacters_are_escaped_in_batch_command_line(self):
+        """Batch scripts on Windows (.cmd / .bat) must have command line built with
+        escaping for cmd.exe shell metacharacters (&, |, ^, %, quotes), preventing BatBadBut injection.
+        """
+        with mock.patch.object(platforms, "is_windows", return_value=True):
+            cmdline = platforms._normalize_windows_argv(["echo.cmd", "a&b", "%PATH%", "a|b", "a^b"])
+        self.assertIsInstance(cmdline, str)
+        self.assertIn('"a&b"', cmdline)
+        self.assertIn('"a|b"', cmdline)
+        self.assertIn('"a^b"', cmdline)
+        self.assertIn("%%cd:~,%PATH%%cd:~,%", cmdline)
+
+    def test_batch_command_line_preserves_expected_patterns(self):
+        """Verify plain args, spaces, &, |, ^, %VAR%, embedded quotes, and trailing backslashes."""
+        cases = [
+            (["echo.cmd", "plain"], 'plain'),
+            (["echo.cmd", "two words"], '"two words"'),
+            (["echo.cmd", ""], '""'),
+            (["echo.cmd", "用户"], '"用户"'),
+            (["echo.cmd", 'a"b'], '"a""b"'),
+            (["echo.cmd", "trailing\\"], '"trailing\\\\"'),
+            (["echo.cmd", "a&b"], '"a&b"'),
+            (["echo.cmd", "a|b"], '"a|b"'),
+            (["echo.cmd", "a^b"], '"a^b"'),
+            (["echo.cmd", "%PATH%"], '"%%cd:~,%PATH%%cd:~,%"'),
+        ]
+        with mock.patch.object(platforms, "is_windows", return_value=True):
+            for argv, expected_sub in cases:
+                with self.subTest(argv=argv):
+                    cmdline = platforms._normalize_windows_argv(argv)
+                    self.assertIsInstance(cmdline, str)
+                    self.assertTrue(cmdline.startswith('cmd.exe /e:ON /v:OFF /d /c ""'))
+                    self.assertTrue(cmdline.endswith('"'))
+                    self.assertIn(expected_sub, cmdline)
+
+    def test_non_batch_executables_remain_unchanged(self):
+        """Non-batch executables (.exe, no ext) must remain untouched as a list on Windows."""
+        for argv in (["python.exe", "a&b", "%PATH%"], ["node", "app.js", "a|b"]):
+            with self.subTest(argv=argv):
+                with mock.patch.object(platforms, "is_windows", return_value=True):
+                    res = platforms._normalize_windows_argv(argv)
+                self.assertEqual(res, argv)
+
+    def test_batch_rejects_newlines_and_nul_characters(self):
+        """Arguments with newlines or NUL characters must be rejected with ValueError."""
+        with mock.patch.object(platforms, "is_windows", return_value=True):
+            for bad_arg in ("line1\nline2", "line1\rline2", "line1\x00line2"):
+                with self.subTest(bad_arg=bad_arg):
+                    with self.assertRaises(ValueError):
+                        platforms._normalize_windows_argv(["echo.cmd", bad_arg])
+
+    def test_non_windows_host_returns_list_unchanged(self):
+        """When not on Windows, argv must remain untouched as a list."""
+        argv = ["echo.cmd", "a&b", "%PATH%"]
+        with mock.patch.object(platforms, "is_windows", return_value=False):
+            res = platforms._normalize_windows_argv(argv)
+        self.assertEqual(res, argv)

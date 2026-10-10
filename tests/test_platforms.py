@@ -631,11 +631,11 @@ class TestNormalizeWindowsArgv(unittest.TestCase):
         with mock.patch("platforms.is_windows", return_value=True):
             self.assertEqual(
                 platforms._normalize_windows_argv(["C:\\bin\\agy.cmd", "-p", "alpha"]),
-                ["cmd", "/c", "C:\\bin\\agy.cmd", "-p", "alpha"],
+                'cmd.exe /e:ON /v:OFF /d /c ""C:\\bin\\agy.cmd" -p alpha"',
             )
             self.assertEqual(
                 platforms._normalize_windows_argv(["agy.BAT", "login"]),
-                ["cmd", "/c", "agy.BAT", "login"],
+                'cmd.exe /e:ON /v:OFF /d /c ""agy.BAT" login"',
             )
 
     def test_leaves_exe_unchanged_on_windows(self):
@@ -798,6 +798,27 @@ class TestCanonicalPath(unittest.TestCase):
             link.symlink_to(target_file)
 
             self.assertEqual(platforms.canonical_path(link), target_file)
+
+    def test_canonical_path_fifo_does_not_hang(self):
+        """canonical_path must not block indefinitely on a named pipe (FIFO)."""
+        if not platforms.is_macos() or not hasattr(os, "mkfifo"):
+            self.skipTest("macOS mkfifo test")
+        with tempfile.TemporaryDirectory() as td:
+            fifo = Path(td) / "test_pipe"
+            os.mkfifo(fifo)
+            code = (
+                "import sys, pathlib, platforms\n"
+                "p = platforms.canonical_path(pathlib.Path(sys.argv[1]))\n"
+                "print(p)\n"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-c", code, str(fifo)],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(Path(proc.stdout.strip()).resolve(), fifo.resolve())
 
 
 if __name__ == "__main__":
