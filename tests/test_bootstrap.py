@@ -1103,6 +1103,12 @@ class TestBootstrapFixes(unittest.TestCase):
                 with self.assertRaises(bootstrap.BootstrapError):
                     bootstrap.ensure_venv(root, lambda _l: None)
 
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX-only: the PATH fixture uses ':' separators and POSIX paths, "
+        "which os.pathsep/os.path cannot parse on Windows; the Windows branch "
+        "is covered by test_dir_on_path_windows_normalization.",
+    )
     def test_dir_on_path_handles_trailing_slash_and_tilde_on_posix(self):
         with mock.patch.dict(os.environ, {"PATH": "/custom/bin/:~/other/bin"}, clear=True):
             with mock.patch.object(bootstrap.platforms, "is_windows", return_value=False):
