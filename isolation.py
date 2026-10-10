@@ -40,6 +40,10 @@ class IsolationError(Exception):
     pass
 
 
+class AgyCredentialBusyError(IsolationError):
+    """A missing private agy token cannot be seeded while the profile is live."""
+
+
 def _safe_os_error_reason(error: BaseException) -> str:
     if isinstance(error, OSError) and error.errno is not None:
         return errno.errorcode.get(error.errno, type(error).__name__)
@@ -619,7 +623,7 @@ def prepare_agy_file_auth(
     """Validate native file authentication, seeding only a missing idle token.
 
     A profile with no recorded email gets the trusted identity recorded
-    through :func:`account.sync_profile_email` once its credential is ready,
+    through :func:`account.record_profile_email` once its credential is ready,
     so later checks have an anchor; a busy profile simply keeps running
     unanchored until a later idle launch records it.
     """
@@ -627,10 +631,7 @@ def prepare_agy_file_auth(
 
     path = _prepare_agy_file_auth(profile_store, profile, data_dir)
     if account.normalize_email(profile.email) is None:
-        try:
-            account.sync_profile_email(profile_store, profile.name)
-        except (store.StoreError, OSError):
-            pass
+        account.record_profile_email(profile_store, profile.name)
     return path
 
 
@@ -661,7 +662,7 @@ def _prepare_agy_file_auth(
             return path
         handle = locks.try_mutation_lock(profile_store, profile.name)
         if handle is None:
-            raise IsolationError(
+            raise AgyCredentialBusyError(
                 f"cannot prepare private Antigravity credentials for live profile "
                 f"{profile.name!r}; finish its sessions before retrying"
             )

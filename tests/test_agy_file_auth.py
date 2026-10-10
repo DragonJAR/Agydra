@@ -281,6 +281,21 @@ class TestAgyFileCredentials(BaseCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.store.get("alpha").email, "alpha@example.com")
 
+    def test_metadata_failure_after_a_successful_login_keeps_it_successful(self):
+        import cli
+        from types import SimpleNamespace
+
+        self._unanchor()
+        for failure in (StoreError("synthetic"), OSError("synthetic")):
+            with self.subTest(failure=type(failure).__name__), \
+                    mock.patch.object(cli.runner, "run", return_value=0), \
+                    mock.patch.object(account, "sync_profile_email", side_effect=failure), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                code = cli.cmd_login(
+                    self.store, SimpleNamespace(ref="alpha", dry_run=False, force=True)
+                )
+            self.assertEqual(code, 0)
+
     def test_failed_login_records_nothing(self):
         import cli
         from types import SimpleNamespace
@@ -494,3 +509,61 @@ class TestRandomAgyFileLaunch(BaseCase):
         self.assertEqual(self.paths["alpha"].read_bytes(), self.tokens["alpha"])
         self.assertEqual(self.store.get("alpha").email, "alpha@example.com")
         self.assertEqual(locks.lease_holders(self.store, "alpha"), [])
+
+    def _block_with_a_live_session(self, name):
+        profile = self.store.get(name)
+        profile.email = None
+        self.store.save(profile)
+        self.paths[name].unlink()
+        keychain.save_profile_slot(
+            self.store, name, keychain.envelope_token_bytes(self.tokens[name])
+        )
+        locks.acquire_lease(self.store, name)
+        self.addCleanup(locks.release_lease, self.store, name)
+
+    def _forced_random_plan(self):
+        with simulated_macos_keychain():
+            return runner.build_plan(
+                self.store, ["--dangerously-skip-permissions"],
+                random_pick=True, engine="agy", force=True,
+            )
+
+    def test_forced_random_launch_skips_a_live_profile_it_cannot_prepare(self):
+        self._block_with_a_live_session("alpha")
+        locks.acquire_lease(self.store, "beta", keychain=False)
+        self.addCleanup(locks.release_lease, self.store, "beta")
+        self.assertEqual(self._forced_random_plan().profile, "alpha")
+
+        def launch(_argv, env):
+            self.launched.append(env["AGYDRA_PROFILE"])
+            self.assertEqual(self.paths["beta"].read_bytes(), self.tokens["beta"])
+            return 0
+
+        self.assertEqual(self._run(self._forced_random_plan(), launch=launch), 0)
+        self.assertEqual(self.launched, ["beta"])
+        self.assertFalse(self.paths["alpha"].exists())
+        self.assertEqual(len(locks.lease_holders(self.store, "alpha")), 1)
+
+    def test_random_launch_with_every_candidate_busy_reports_the_cause(self):
+        for name in ("alpha", "beta"):
+            self._block_with_a_live_session(name)
+        with self.assertRaises(StoreError) as caught:
+            self._run(self._forced_random_plan())
+        message = str(caught.exception)
+        self.assertIn("finish its sessions", message)
+        self.assertIn("alpha, beta already tried", message)
+        self.assertEqual(self.launched, [])
+        self.assertFalse(profile_rotation.state_path(self.store, "agy").exists())
+
+    def test_non_random_file_auth_launch_still_refuses_a_live_profile(self):
+        import dataclasses
+
+        self._block_with_a_live_session("alpha")
+        locks.acquire_lease(self.store, "beta", keychain=False)
+        self.addCleanup(locks.release_lease, self.store, "beta")
+        plan = dataclasses.replace(self._forced_random_plan(), random_pick=False)
+        self.assertEqual((plan.profile, plan.agy_file_auth), ("alpha", True))
+        with self.assertRaises(isolation.IsolationError) as caught:
+            self._run(plan)
+        self.assertIn("finish its sessions", str(caught.exception))
+        self.assertEqual(self.launched, [])

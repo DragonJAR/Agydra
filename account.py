@@ -862,3 +862,11 @@ def sync_profile_email(store, name: str) -> Optional[str]:
     finally:
         handle.release()
     return email
+
+
+def record_profile_email(profile_store, name: str) -> Optional[str]:
+    """Best-effort :func:`sync_profile_email`: a metadata failure never fails the caller."""
+    try:
+        return sync_profile_email(profile_store, name)
+    except (store.StoreError, OSError):
+        return None

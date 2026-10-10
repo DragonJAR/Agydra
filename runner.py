@@ -261,7 +261,7 @@ def _next_random_plan(
     store: Store, plan: LaunchPlan, excluded: set, cause: Exception,
     rotation: Optional[profile_rotation.Rotation] = None,
 ) -> LaunchPlan:
-    """Exclude a lease-contended candidate and replan with a finite scope.
+    """Exclude a busy candidate and replan with a finite scope.
 
     Never substitute a shared-slot owner or consume a failed cycle entry.
     Exhaustion preserves the actual preparation error.
@@ -319,34 +319,33 @@ def _run_prepared(
         driver = engines.get_engine(plan.engine)
         needs_keychain = driver.needs_keychain and not plan.agy_file_auth
         keychain_needs_waited_child = needs_keychain and keychain.supported()
-        if plan.agy_file_auth:
-            profile = store.get(plan.profile)
-            data_dir = store.profile_data_dir(plan.profile, engine=plan.engine)
-            isolation.prepare_agy_file_auth(store, profile, data_dir)
         leased: Optional[str] = None
         try:
+            if plan.agy_file_auth:
+                profile = store.get(plan.profile)
+                data_dir = store.profile_data_dir(plan.profile, engine=plan.engine)
+                isolation.prepare_agy_file_auth(store, profile, data_dir)
             membership = {"keychain": False} if plan.agy_file_auth else {}
             joined = locks.acquire_lease(
                 store, plan.profile, patience_s=locks.LEASE_PATIENCE_S, max_holders=limit,
                 **membership,
             )
-        except locks.LeaseLimitError as exc:
-            if not plan.random_pick:
+        except (locks.LockError, isolation.AgyCredentialBusyError) as exc:
+            if plan.random_pick:
+                plan = _next_random_plan(store, plan, excluded, exc, rotation)
+                continue
+            if isinstance(exc, locks.LeaseLimitError):
                 raise StoreError(
                     f"{exc}; wait for one to finish, raise "
                     "settings.max_sessions_per_profile in agydra.json, or "
                     "bypass with -f/--force"
                 ) from exc
-            plan = _next_random_plan(store, plan, excluded, exc, rotation)
-            continue
-        except locks.LockError as exc:
-            if plan.random_pick:
-                plan = _next_random_plan(store, plan, excluded, exc, rotation)
-                continue
-            raise StoreError(
-                f"profile {plan.profile!r} is locked by a store operation "
-                f"({exc}); retry in a moment"
-            ) from exc
+            if isinstance(exc, locks.LockError):
+                raise StoreError(
+                    f"profile {plan.profile!r} is locked by a store operation "
+                    f"({exc}); retry in a moment"
+                ) from exc
+            raise
         leased = plan.profile
         if joined and driver.name in ("codex", "grok"):
             warn(

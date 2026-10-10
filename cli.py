@@ -658,7 +658,7 @@ def cmd_login(store: Store, args) -> int:
             print("complete the OAuth flow in the browser; tokens land in the profile store")
     code = runner.run(plan, store=store, dry_run=dry_run)
     if code == 0 and not dry_run and engine == "agy":
-        account.sync_profile_email(store, plan.profile)
+        account.record_profile_email(store, plan.profile)
     return code
 
 
