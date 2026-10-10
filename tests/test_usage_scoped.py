@@ -23,12 +23,15 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import account
 import keychain
 import platforms
 import usage
 import usage_agy
 from conftest import BaseCase, _make_jwt
-from store import Store
+from store import Store, StoreError
+
+
 
 _FAKE_KEYCHAIN = Path("/fake/login.keychain-db")
 
@@ -208,6 +211,14 @@ class TestScopedTokenBytes(_ScopedBase):
         store, profile = self.store, self.store.get("alpha")
         data_dir = self.store.profile_data_dir("alpha", engine="agy")
         self.assertIsNone(usage_agy.scoped_token_bytes(store, "alpha", profile, data_dir))
+
+    def test_returns_none_when_store_error_raised_from_private_path_check(self):
+        store, profile = self.store, self.store.get("alpha")
+        data_dir = self.store.profile_data_dir("alpha", engine="agy")
+        with mock.patch.object(account, "scoped_agy_token_bytes", side_effect=StoreError("credential path must not be a link")):
+            self.assertIsNone(usage_agy.scoped_token_bytes(store, "alpha", profile, data_dir))
+
+
 
 
 class TestRunScopedUsageQuery(_ScopedBase):

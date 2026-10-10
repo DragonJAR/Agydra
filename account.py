@@ -511,33 +511,33 @@ def detect_grok_email(data_dir: Path) -> Optional[str]:
 def detect_grok_plan(data_dir: Path) -> Optional[str]:
     """Extract Grok subscription plan or tier."""
     path = Path(data_dir) / GROK_AUTH_FILE
-    if not path.is_file():
-        return None
-    raw = store.read_json_object(path, tolerant=True)
-    cred = _first_grok_credential(raw)
-    if cred is not None:
-        sub_tier = cred.get("subscription_tier")
-        if _has_credential(sub_tier):
-            return sub_tier.capitalize() if not sub_tier.lower().startswith("super") else "SuperGrok"
-        key = cred.get("key")
-        if _has_credential(key):
-            claims = _decode_jwt_payload(key)
-            tier = claims.get("tier")
-            if tier is not None:
-                tier_str = str(tier)
-                tier_map = {
-                    "4": "SuperGrok",
-                    "3": "Grok Pro",
-                    "2": "Grok Basic",
-                    "1": "Grok Free",
-                }
-                return tier_map.get(tier_str, f"Grok Tier {tier_str}")
-        return "Grok (xAI)"
-    if isinstance(raw, dict) and _has_credential(raw.get("XAI_API_KEY")):
-        return "xAI API Key"
+    if path.is_file():
+        raw = store.read_json_object(path, tolerant=True)
+        cred = _first_grok_credential(raw)
+        if cred is not None:
+            sub_tier = cred.get("subscription_tier")
+            if _has_credential(sub_tier):
+                return sub_tier.capitalize() if not sub_tier.lower().startswith("super") else "SuperGrok"
+            key = cred.get("key")
+            if _has_credential(key):
+                claims = _decode_jwt_payload(key)
+                tier = claims.get("tier")
+                if tier is not None:
+                    tier_str = str(tier)
+                    tier_map = {
+                        "4": "SuperGrok",
+                        "3": "Grok Pro",
+                        "2": "Grok Basic",
+                        "1": "Grok Free",
+                    }
+                    return tier_map.get(tier_str, f"Grok Tier {tier_str}")
+            return "Grok (xAI)"
+        if isinstance(raw, dict) and _has_credential(raw.get("XAI_API_KEY")):
+            return "xAI API Key"
     if grok_config_api_key(data_dir) is not None:
         return "xAI API Key"
     return None
+
 
 
 CLAUDE_STATUS_TIMEOUT = 15.0

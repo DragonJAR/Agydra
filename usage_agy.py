@@ -50,6 +50,7 @@ import account
 import isolation
 import platforms
 import resolver
+from store import StoreError as StoreException
 
 SCOPED_STORAGE_FLAG = account.AGY_FILE_AUTH_ENV
 SCOPED_STORAGE_VALUE = account.AGY_FILE_AUTH_VALUE
@@ -63,7 +64,11 @@ def scoped_token_bytes(store, name: str, profile, data_dir: Path) -> Optional[by
     state and require a positive identity match for a missing-file backup.
     An unusable credential returns ``None`` for a clean caller error.
     """
-    return account.scoped_agy_token_bytes(store, profile, data_dir)
+    try:
+        return account.scoped_agy_token_bytes(store, profile, data_dir)
+    except StoreException:
+        return None
+
 
 
 def run_scoped_usage_query(

@@ -97,6 +97,14 @@ class TestGrokEngine(unittest.TestCase):
         self.assertEqual(account.detect_grok_plan(data_dir), "xAI API Key")
         self.assertEqual(account.auth_state(data_dir, self.store, "grok-api", engine="grok"), "authenticated")
 
+    def test_detect_grok_plan_config_toml_api_key_without_auth_json(self):
+        self.store.create("grok-cfg-key", engine="grok")
+        data_dir = self.store.profile_data_dir("grok-cfg-key", engine="grok")
+        (data_dir / "config.toml").write_text('api_key = "xai-cfg-secret-key"\n', encoding="utf-8")
+        self.assertFalse((data_dir / "auth.json").exists())
+        self.assertEqual(account.detect_grok_plan(data_dir), "xAI API Key")
+
+
     def test_auth_state_not_authenticated(self):
         self.store.create("grok-empty", engine="grok")
         data_dir = self.store.profile_data_dir("grok-empty", engine="grok")
