@@ -642,6 +642,10 @@ class TestRunnerReleasesLockOnExecFailure(unittest.TestCase):
             plan = runner.build_plan(store, [], flag_ref="work")
             with mock.patch.object(platforms, "is_windows", return_value=False), \
                     mock.patch.object(
+                        platforms, "process_alive",
+                        side_effect=lambda pid: pid == os.getpid(),
+                    ), \
+                    mock.patch.object(
                         platforms, "launch_argv", return_value=126
                     ) as launch_argv:
                 rc = runner.run(plan, store=store)

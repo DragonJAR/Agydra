@@ -23,6 +23,32 @@ if _HANG_DUMP_SECONDS.isdigit() and int(_HANG_DUMP_SECONDS) > 0:
 os.environ["LC_ALL"] = "C.UTF-8"
 os.environ.pop("LC_MESSAGES", None)
 
+
+def _refuse_console_control_kill(real_kill):
+    """Fail loudly instead of letting os.kill broadcast a Windows console event.
+
+    On Windows ``signal.CTRL_C_EVENT == 0``, so a POSIX liveness probe such as
+    ``os.kill(pid, 0)`` reached by a test that patches ``is_windows`` to False
+    sends a real Ctrl+C to every process on the console and interrupts an
+    unrelated later test.
+    """
+    import signal
+
+    blocked = (signal.CTRL_C_EVENT, signal.CTRL_BREAK_EVENT)
+
+    def guarded_kill(pid, sig):
+        if sig in blocked:
+            raise AssertionError(
+                f"os.kill({pid}, {sig}) would broadcast a console control event on Windows"
+            )
+        return real_kill(pid, sig)
+
+    return guarded_kill
+
+
+if sys.platform == "win32":
+    os.kill = _refuse_console_control_kill(os.kill)
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 HOST_ENGINE_VARIABLES = (
