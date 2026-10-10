@@ -783,6 +783,17 @@ def display_email(store: Optional[store.Store], profile: Profile) -> Optional[st
     return detect_email(data_dir, store, profile.name, engine=engine)
 
 
+def row_email(
+    store: Optional[store.Store], profile: Profile, observed: Optional[str] = None
+) -> Optional[str]:
+    """Account label for a profile row: ``display_email`` first, then an
+    identity observed elsewhere (such as a usage probe's confirmed email).
+
+    Read-only like ``display_email``; callers keep their own fallback glyph.
+    """
+    return display_email(store, profile) or normalize_email(observed)
+
+
 def auth_state(
     data_dir: Path,
     store=None,

@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from conftest import BaseCase, run_cli
+from conftest import BaseCase, _make_jwt, run_cli
 from store import Store
 
 REAL_USAGE_JSON = {
@@ -138,6 +138,28 @@ class TestUsageCli(BaseCase):
 
         # Recommendations footer includes alpha
         self.assertIn("alpha", out)
+
+    def _write_unrecorded_identity(self, name: str, email: str) -> None:
+        token_path = self.store.profile_data_dir(name) / "antigravity-cli" / "antigravity-oauth-token"
+        token_path.write_text(json.dumps({
+            "token": {"access_token": "tok"},
+            "id_token": _make_jwt({"email": email}),
+        }), encoding="utf-8")
+
+    def test_compact_and_detail_show_detected_email_when_none_is_recorded(self):
+        self._write_json("alpha", REAL_USAGE_JSON)
+        self._write_unrecorded_identity("alpha", "andrea@example.com")
+        self.assertIsNone(self.store.get_readonly("alpha").email)
+
+        compact = self._run_cli("usage")
+        self.assertEqual(compact.returncode, 0, compact.stderr)
+        alpha_line = next(line for line in compact.stdout.splitlines() if " alpha " in line)
+        self.assertIn("andrea@", alpha_line)
+
+        detail = self._run_cli("usage", "alpha")
+        self.assertEqual(detail.returncode, 0, detail.stderr)
+        self.assertIn("email     : andrea@example.com", detail.stdout)
+        self.assertIsNone(self.store.get_readonly("alpha").email)
 
     def test_alias_us_renders_same_compact_table(self):
         self._write_json("alpha", REAL_USAGE_JSON)

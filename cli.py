@@ -943,8 +943,7 @@ def _usage_error_cell(error: Optional[str]) -> str:
     return paint(f"({error})", "dim")
 
 
-def _usage_account_cell(profile, result, mode: str, width: int) -> str:
-    email = profile.email or result.email or "-"
+def _usage_account_cell(email: str, mode: str, width: int) -> str:
     if mode == "truncated":
         email = _truncate_account(email, max_len=12)
     return pad(email, width)
@@ -1047,8 +1046,10 @@ def _cmd_usage_compact(store: Store, _args) -> int:
     idx_w = max(3, len(str(len(profiles))) + 1)
     name_w = max(max(len(p.name) for p in profiles), len(lbl_profile)) + 2
 
-    all_emails = [p.email or r.email or "-" for p, r in zip(profiles, results)]
-    natural_account_w = max(max(len(e) for e in all_emails), len(lbl_account)) + 2
+    account_labels = {
+        p.name: account.row_email(store, p, r.email) or "-" for p, r in zip(profiles, results)
+    }
+    natural_account_w = max(max(len(e) for e in account_labels.values()), len(lbl_account)) + 2
 
     is_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
     term_width = None
@@ -1137,11 +1138,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
         for idx, (profile, result) in enumerate(agy_entries, start=1):
             row_pfx = f" {idx:<{idx_w}} {profile.name:<{name_w}}"
             if show_account:
-                email_raw = profile.email or result.email or "-"
-                if account_mode == "truncated":
-                    row_pfx += pad(_truncate_account(email_raw, max_len=12), account_w)
-                else:
-                    row_pfx += pad(email_raw, account_w)
+                row_pfx += _usage_account_cell(account_labels[profile.name], account_mode, account_w)
 
             if result.is_ineligible:
                 ineligible_profiles.append(profile.name)
@@ -1206,7 +1203,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
         for offset, (profile, result) in enumerate(entries):
             row = f" {start_idx + offset:<{idx_w}} {profile.name:<{name_w}}"
             if show_account:
-                row += _usage_account_cell(profile, result, account_mode, account_w)
+                row += _usage_account_cell(account_labels[profile.name], account_mode, account_w)
             plan = tail(result)
             if not result.ok:
                 print(row + _plan_separated(_usage_error_cell(result.error), quota_width) + plan)
@@ -1303,8 +1300,9 @@ def _cmd_usage_detail(store: Store, args) -> int:
         for line in _claude_usage_lines(result, 10):
             print(line)
         return 0 if result.ok else 1
-    if profile.email or result.email:
-        print(i18n.t("cmd.status.email", email=profile.email or result.email))
+    email = account.row_email(store, profile, result.email)
+    if email:
+        print(i18n.t("cmd.status.email", email=email))
     if profile.engine in ("codex", "grok"):
         if result.plan:
             print(i18n.t("cmd.status.plan", plan=result.plan))
