@@ -723,9 +723,9 @@ def save_file_credential(store, name: str, data: bytes) -> None:
     A login that ran with file authentication (because another profile
     owned the shared slot) leaves its token only on disk; this makes it
     available to later Keychain launches through the same identity guard
-    as a Keychain login capture.
+    as a Keychain login capture, inside the same waiting swap section.
     """
-    with serialized_access(store):
+    with _launch_section(store):
         _persist_if_trusted(store, name, data)
 
 
