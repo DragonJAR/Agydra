@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import faulthandler
 import json
 import os
 import shutil
@@ -14,6 +15,11 @@ import unittest
 from pathlib import Path
 
 os.environ["AGYDRA_NO_KEYCHAIN"] = "1"
+
+_HANG_DUMP_SECONDS = os.environ.get("AGYDRA_TEST_HANG_DUMP_SECONDS", "")
+if _HANG_DUMP_SECONDS.isdigit() and int(_HANG_DUMP_SECONDS) > 0:
+    faulthandler.dump_traceback_later(int(_HANG_DUMP_SECONDS), exit=True)
+
 os.environ["LC_ALL"] = "C.UTF-8"
 os.environ.pop("LC_MESSAGES", None)
 

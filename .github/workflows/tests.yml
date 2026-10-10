@@ -71,6 +71,7 @@ jobs:
           TMP: C:\\tmp
           TEMP: C:\\tmp
           TMPDIR: C:\\tmp
+          AGYDRA_TEST_HANG_DUMP_SECONDS: '420'
         run: mkdir C:\tmp & python -m unittest discover -s tests -p "test_*.py" -v
       - name: Full standard-library suite (POSIX)
         if: ${{ !cancelled() && steps.python.outcome == 'success' && runner.os != 'Windows' }}
