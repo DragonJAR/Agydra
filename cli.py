@@ -656,7 +656,10 @@ def cmd_login(store: Store, args) -> int:
             print(i18n.t("claude.login_native"))
         else:
             print("complete the OAuth flow in the browser; tokens land in the profile store")
-    return runner.run(plan, store=store, dry_run=dry_run)
+    code = runner.run(plan, store=store, dry_run=dry_run)
+    if code == 0 and not dry_run and engine == "agy":
+        account.sync_profile_email(store, plan.profile)
+    return code
 
 
 def _status_target(store: Store, ref: Optional[str], engine: Optional[str]):

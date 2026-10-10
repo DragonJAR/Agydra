@@ -183,14 +183,14 @@ class TestScopedTokenBytes(_ScopedBase):
         data_dir = self.store.profile_data_dir("alpha", engine="agy")
         self.assertIsNone(usage_agy.scoped_token_bytes(store, "alpha", profile, data_dir))
 
-    def test_secret_without_profile_anchor_refused(self):
+    def test_secret_without_profile_anchor_trusted_as_first_identity(self):
         self._rm_disk_token("alpha")
         self._write_secret("alpha")
         profile = self.store.get("alpha")
         profile.email = ""
         self.store.save(profile)
         data_dir = self.store.profile_data_dir("alpha", engine="agy")
-        self.assertIsNone(usage_agy.scoped_token_bytes(self.store, "alpha", profile, data_dir))
+        self.assertIsNotNone(usage_agy.scoped_token_bytes(self.store, "alpha", profile, data_dir))
 
     def test_secret_identity_matches_case_insensitively(self):
         """The slot's identity and the profile's cached email naming the

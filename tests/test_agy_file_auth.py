@@ -210,6 +210,91 @@ class TestAgyFileCredentials(BaseCase):
         with self.assertRaises((StoreError, isolation.IsolationError)):
             self._prepare()
 
+    def _unanchor(self):
+        self.profile.email = None
+        self.store.save(self.profile)
+
+    def test_unanchored_profile_trusts_and_records_its_first_backup_identity(self):
+        self._unanchor()
+        raw = self._write_backup()
+        self.assertEqual(json.loads(self._read()), json.loads(raw))
+        self.assertEqual(self._prepare(), self.token_path)
+        self.assertEqual(json.loads(self.token_path.read_bytes()), json.loads(raw))
+        self.assertEqual(self.store.get("alpha").email, "alpha@example.com")
+        handle = locks.try_mutation_lock(self.store, "alpha")
+        self.assertIsNotNone(handle)
+        handle.release()
+
+    def test_unanchored_profile_backup_is_trusted_under_a_live_session(self):
+        self._unanchor()
+        raw = self._write_backup()
+        locks.acquire_lease(self.store, "alpha")
+        try:
+            self.assertEqual(json.loads(self._read()), json.loads(raw))
+            with self.assertRaises(isolation.IsolationError) as caught:
+                self._prepare()
+            self.assertNotIn("no trusted Antigravity credential", str(caught.exception))
+            self.assertIn("finish its sessions", str(caught.exception))
+            self.assertFalse(self.token_path.exists())
+            self.assertIsNone(self.store.get("alpha").email)
+        finally:
+            locks.release_lease(self.store, "alpha")
+
+    def test_unanchored_profile_records_its_existing_disk_identity(self):
+        self._unanchor()
+        self._write_disk()
+        self.assertEqual(self._prepare(), self.token_path)
+        self.assertEqual(self.store.get("alpha").email, "alpha@example.com")
+
+    def test_backup_conflicting_with_the_recorded_identity_is_still_refused(self):
+        self._write_backup(self._payload("foreign@example.com"))
+        with self.assertRaises(isolation.IsolationError) as caught:
+            self._prepare()
+        self.assertIn("no trusted Antigravity credential", str(caught.exception))
+        self.assertFalse(self.token_path.exists())
+        with simulated_macos_keychain():
+            self.assertIsNone(account.sync_profile_email(self.store, "alpha"))
+        self.assertEqual(self.store.get("alpha").email, "alpha@example.com")
+
+    def test_trusted_identity_is_one_rule_for_launch_and_metadata(self):
+        self.assertTrue(account.trusted_identity(None, "first@example.com"))
+        self.assertTrue(account.trusted_identity("Alice@X.com", "alice@x.com"))
+        self.assertFalse(account.trusted_identity("alice@x.com", "bob@x.com"))
+        self.assertFalse(account.trusted_identity(None, None))
+        self.assertFalse(account.trusted_identity("alice@x.com", " "))
+
+    def test_login_records_the_authenticated_identity(self):
+        import cli
+        from types import SimpleNamespace
+
+        self._unanchor()
+
+        def native_login(plan, store=None, dry_run=False):
+            self._write_disk()
+            return 0
+
+        with mock.patch.object(cli.runner, "run", side_effect=native_login), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = cli.cmd_login(
+                self.store, SimpleNamespace(ref="alpha", dry_run=False, force=True)
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.store.get("alpha").email, "alpha@example.com")
+
+    def test_failed_login_records_nothing(self):
+        import cli
+        from types import SimpleNamespace
+
+        self._unanchor()
+        self._write_disk()
+        with mock.patch.object(cli.runner, "run", return_value=1), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = cli.cmd_login(
+                self.store, SimpleNamespace(ref="alpha", dry_run=False, force=True)
+            )
+        self.assertEqual(code, 1)
+        self.assertIsNone(self.store.get("alpha").email)
+
 
 class TestRandomAgyFileLaunch(BaseCase):
     def setUp(self):
@@ -391,3 +476,21 @@ class TestRandomAgyFileLaunch(BaseCase):
                     self.assertEqual(runner.run(plan, store=self.store), 0)
                 guard.assert_called_once_with(self.store, "alpha", capture=login)
                 prepare.assert_not_called()
+
+    def test_forced_random_launch_of_a_fresh_logged_in_profile_needs_no_extra_step(self):
+        alpha = self.store.get("alpha")
+        alpha.email = None
+        self.store.save(alpha)
+        self.paths["alpha"].unlink()
+        keychain.save_profile_slot(
+            self.store, "alpha", keychain.envelope_token_bytes(self.tokens["alpha"])
+        )
+        plan = runner.build_plan(
+            self.store, ["--dangerously-skip-permissions"],
+            random_pick=True, engine="agy", force=True,
+        )
+        self.assertEqual(self._run(plan), 0)
+        self.assertEqual(self.launched, ["alpha"])
+        self.assertEqual(self.paths["alpha"].read_bytes(), self.tokens["alpha"])
+        self.assertEqual(self.store.get("alpha").email, "alpha@example.com")
+        self.assertEqual(locks.lease_holders(self.store, "alpha"), [])

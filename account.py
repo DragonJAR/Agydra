@@ -59,6 +59,20 @@ def same_email(first: object, second: object) -> bool:
     return left is not None and right is not None and left.casefold() == right.casefold()
 
 
+def trusted_identity(anchor: object, identity: object) -> bool:
+    """Whether a detected credential identity may act for a profile.
+
+    The single trust rule shared by launch preparation and metadata sync:
+    a profile with a recorded email (``anchor``) only trusts a credential
+    naming that same account, while a profile with no recorded email yet
+    trusts the first identity detected for it (the bootstrap case of a
+    freshly logged-in profile). A blank identity is never trusted.
+    """
+    if normalize_email(identity) is None:
+        return False
+    return normalize_email(anchor) is None or same_email(anchor, identity)
+
+
 CHATGPT_PLAN_NAMES = {
     "plus": "ChatGPT Plus",
     "team": "ChatGPT Team",
@@ -219,12 +233,14 @@ def _usable_agy_token(raw: object) -> bool:
 def scoped_agy_token_bytes(
     profile_store: store.Store, profile: Profile, data_dir: Path
 ) -> Optional[bytes]:
-    """Validated private disk bytes, or a positively identity-verified backup.
+    """Validated private disk bytes, or an identity-trusted backup.
 
     Existing but unusable disk state is never masked by a backup. A disk
     refresh without an id_token stays trusted as the profile's own artifact;
-    a positively foreign identity is refused. The reader never writes files
-    or accesses the native Keychain.
+    a positively foreign identity is refused. A backup must carry an
+    identity that :func:`trusted_identity` accepts: the recorded email, or
+    the first identity of a profile with none recorded yet. The reader
+    never writes files or accesses the native Keychain.
     """
     path = agy_token_path(data_dir)
     try:
@@ -241,8 +257,7 @@ def scoped_agy_token_bytes(
         if not _usable_agy_token(decoded):
             return None
         identity = email_from_raw(decoded)
-        anchor = normalize_email(profile.email)
-        if identity is not None and anchor is not None and not same_email(identity, anchor):
+        if identity is not None and not trusted_identity(profile.email, identity):
             return None
         return raw
     import keychain
@@ -255,7 +270,7 @@ def scoped_agy_token_bytes(
         decoded = keychain.decode_go_keyring_secret(secret)
     except RecursionError:
         return None
-    if not _usable_agy_token(decoded) or not same_email(email_from_raw(decoded), profile.email):
+    if not _usable_agy_token(decoded) or not trusted_identity(profile.email, email_from_raw(decoded)):
         return None
     return json.dumps(decoded, separators=(",", ":")).encode("utf-8")
 
@@ -827,8 +842,7 @@ def sync_profile_email(store, name: str) -> Optional[str]:
     email = normalize_email(email)
     if email is None:
         return None
-    cached_email = normalize_email(profile.email)
-    if cached_email is not None and not same_email(cached_email, email) and source == _SOURCE_KEYCHAIN:
+    if source == _SOURCE_KEYCHAIN and not trusted_identity(profile.email, email):
         return None
     if same_email(profile.email, email):
         return email
@@ -840,8 +854,7 @@ def sync_profile_email(store, name: str) -> Optional[str]:
         return email
     try:
         profile = store.get(name)
-        cached_email = normalize_email(profile.email)
-        if cached_email is not None and not same_email(cached_email, email) and source == _SOURCE_KEYCHAIN:
+        if source == _SOURCE_KEYCHAIN and not trusted_identity(profile.email, email):
             return None
         if not same_email(profile.email, email):
             profile.email = email

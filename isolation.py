@@ -616,7 +616,28 @@ def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "ag
 def prepare_agy_file_auth(
     profile_store: store.Store, profile: Profile, data_dir: Path
 ) -> Path:
-    """Validate native file authentication, seeding only a missing idle token."""
+    """Validate native file authentication, seeding only a missing idle token.
+
+    A profile with no recorded email gets the trusted identity recorded
+    through :func:`account.sync_profile_email` once its credential is ready,
+    so later checks have an anchor; a busy profile simply keeps running
+    unanchored until a later idle launch records it.
+    """
+    import account
+
+    path = _prepare_agy_file_auth(profile_store, profile, data_dir)
+    if account.normalize_email(profile.email) is None:
+        try:
+            account.sync_profile_email(profile_store, profile.name)
+        except (store.StoreError, OSError):
+            pass
+    return path
+
+
+def _prepare_agy_file_auth(
+    profile_store: store.Store, profile: Profile, data_dir: Path
+) -> Path:
+    """Validated private token path, seeding a missing one while idle."""
     import account
     import locks
 

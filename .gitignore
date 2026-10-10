@@ -48,6 +48,7 @@ $RECYCLE.BIN/
 
 # --- Agent tooling ---
 .atl/
+.local/
 
 # --- agydra per-directory profile pin (`agydra use <profile>`) ---
 # A local pin is machine state, never source: it must not be committed.
