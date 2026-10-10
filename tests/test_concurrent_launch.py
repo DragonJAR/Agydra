@@ -450,5 +450,65 @@ class TestSlotOwnershipFailsClosed(BaseCase):
         self.assertIsNone(state.owner)
 
 
+class TestSessionEndRecordsEmail(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+
+    def test_unanchored_profile_records_email_when_session_ends(self):
+        import json
+        from conftest import _make_jwt
+
+        self.store.create("andrea")
+        token_path = (
+            self.store.profile_data_dir("andrea", engine="agy")
+            / account.AGY_CLI_DIR
+            / account.TOKEN_FILE
+        )
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        jwt = _make_jwt({"email": "andrea@example.com"})
+        token_path.write_text(
+            json.dumps({"token": {"access_token": "mock"}, "id_token": jwt}),
+            encoding="utf-8",
+        )
+        token_path.chmod(0o600)
+        self.assertIsNone(self.store.get("andrea").email)
+
+        plan = runner.build_plan(self.store, ["chat"], flag_ref="andrea", launch_as_child=True)
+        with simulated_macos_keychain(), \
+                mock.patch.object(platforms, "run_wait", return_value=0), \
+                mock.patch.object(platforms, "launch_argv", return_value=0):
+            rc = runner.run(plan, store=self.store)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.store.get("andrea").email, "andrea@example.com")
+
+    def test_concurrent_session_prevents_metadata_mutation_on_exit(self):
+        import json
+        from conftest import _make_jwt
+
+        self.store.create("andrea")
+        token_path = (
+            self.store.profile_data_dir("andrea", engine="agy")
+            / account.AGY_CLI_DIR
+            / account.TOKEN_FILE
+        )
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        jwt = _make_jwt({"email": "andrea@example.com"})
+        token_path.write_text(
+            json.dumps({"token": {"access_token": "mock"}, "id_token": jwt}),
+            encoding="utf-8",
+        )
+        token_path.chmod(0o600)
+
+        plan = runner.build_plan(self.store, ["chat"], flag_ref="andrea", launch_as_child=True)
+        with simulated_macos_keychain(), \
+                mock.patch.object(platforms, "run_wait", return_value=0), \
+                mock.patch.object(platforms, "launch_argv", return_value=0), \
+                mock.patch.object(locks, "try_mutation_lock", return_value=None):
+            rc = runner.run(plan, store=self.store)
+        self.assertEqual(rc, 0)
+        self.assertIsNone(self.store.get("andrea").email)
+
+
 if __name__ == "__main__":
     unittest.main()

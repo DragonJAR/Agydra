@@ -768,6 +768,21 @@ def detect_email(
     return email
 
 
+def display_email(store: Optional[store.Store], profile: Profile) -> Optional[str]:
+    """Read-only email for UI display: recorded email, else detected via detect_email.
+
+    Never persists metadata and never takes locks.
+    """
+    recorded = normalize_email(profile.email)
+    if recorded is not None:
+        return recorded
+    if store is None:
+        return None
+    engine = getattr(profile, "engine", "agy") or "agy"
+    data_dir = store.profile_data_dir(profile.name, engine=engine)
+    return detect_email(data_dir, store, profile.name, engine=engine)
+
+
 def auth_state(
     data_dir: Path,
     store=None,

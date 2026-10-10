@@ -752,5 +752,45 @@ class TestSyncProfileEmailLeaseAndCasing(unittest.TestCase):
             self.assertEqual(store.profile_meta_path("alice").read_bytes(), before)
 
 
+class TestDisplayEmail(unittest.TestCase):
+    def test_recorded_email_is_preferred_without_reading_store(self):
+        from models import Profile
+
+        profile = Profile(name="alice", email="  Alice@Example.com  ")
+        self.assertEqual(account.display_email(None, profile), "Alice@Example.com")
+
+    def test_unrecorded_email_detects_from_store_data_dir(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("bob")
+            token_path = (
+                store.profile_data_dir("bob", engine="agy")
+                / account.AGY_CLI_DIR
+                / account.TOKEN_FILE
+            )
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+            jwt = _make_jwt({"email": "bob@example.com"})
+            token_path.write_text(
+                json.dumps({"token": {"access_token": "mock"}, "id_token": jwt}),
+                encoding="utf-8",
+            )
+            profile = store.get("bob")
+            self.assertIsNone(profile.email)
+            self.assertEqual(account.display_email(store, profile), "bob@example.com")
+
+    def test_unrecorded_email_returns_none_when_store_is_none(self):
+        from models import Profile
+
+        profile = Profile(name="bob")
+        self.assertIsNone(account.display_email(None, profile))
+
+    def test_unrecorded_email_returns_none_when_no_token_present(self):
+        with isolated_store_env():
+            store = Store()
+            store.create("charlie")
+            profile = store.get("charlie")
+            self.assertIsNone(account.display_email(store, profile))
+
+
 if __name__ == "__main__":
     unittest.main()

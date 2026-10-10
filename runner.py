@@ -434,3 +434,8 @@ def _run_prepared(
                     f"{leased!r} ({exc}); it self-heals on the next "
                     "launch"
                 )
+            if leased:
+                try:
+                    account.record_profile_email(store, plan.profile)
+                except Exception:
+                    pass

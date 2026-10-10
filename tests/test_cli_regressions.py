@@ -1486,10 +1486,11 @@ class TestSummarizeImportFailure(BaseCase):
     def test_non_list_or_empty_args_are_summarized_without_crashing(self):
         import cli
 
+        source = Path("/src")
         for error in (shutil_mod.Error(), shutil_mod.Error("plain reason"), shutil_mod.Error([])):
             with self.subTest(args=error.args):
-                message = cli._summarize_import_failure(error, Path("/src"))
-                self.assertIn("0 entries could not be copied from /src", message)
+                message = cli._summarize_import_failure(error, source)
+                self.assertIn(f"0 entries could not be copied from {source}", message)
 
 
 
@@ -1698,3 +1699,39 @@ class TestLeaseAwareProfileLocks(BaseCase):
             handle = cli._acquire_profile_lock(self.store, "work", "importing into it")
         mutation.assert_called_once_with(self.store, "work")
         self.assertIsNotNone(handle)
+
+
+class TestListBusyProfileShowsDetectableEmail(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+
+    def test_busy_profile_without_recorded_email_displays_detected_email(self):
+        import json
+        import account
+        import cli
+        from conftest import _make_jwt
+
+        self.store.create("andrea")
+        token_path = (
+            self.store.profile_data_dir("andrea", engine="agy")
+            / account.AGY_CLI_DIR
+            / account.TOKEN_FILE
+        )
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        jwt = _make_jwt({"email": "andrea@example.com"})
+        token_path.write_text(
+            json.dumps({"token": {"access_token": "mock"}, "id_token": jwt}),
+            encoding="utf-8",
+        )
+        token_path.chmod(0o600)
+        self.assertIsNone(self.store.get("andrea").email)
+
+        with mock.patch.object(cli.locks, "is_locked", return_value=True):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli.cmd_list(self.store, None)
+            self.assertEqual(rc, 0)
+            output = buf.getvalue()
+
+        self.assertIn("andrea@example.com", output)

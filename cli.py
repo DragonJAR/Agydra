@@ -566,10 +566,11 @@ def cmd_list(store: Store, _args) -> int:
             email = native.email or "-"
             state = native.auth_state_label
         else:
-            if busy:
-                email = profile.email or "-"
-            else:
-                email = account.sync_profile_email(store, profile.name) or profile.email or "-"
+            if not busy:
+                synced = account.sync_profile_email(store, profile.name)
+                if synced and not profile.email:
+                    profile.email = synced
+            email = account.display_email(store, profile) or "-"
             state = account.auth_state(
                 store.profile_data_dir(profile.name, engine=engine), store, profile.name, engine=engine,
             )
@@ -702,7 +703,7 @@ def cmd_status(store: Store, args) -> int:
         email = native.email or "-"
         state = native.auth_state_label
     else:
-        email = profile.email or account.detect_email(data_dir, store, name, engine=engine) or "-"
+        email = account.display_email(store, profile) or "-"
         state = account.auth_state(data_dir, store, name, engine=engine)
     print(i18n.t("cmd.status.profile", name=name))
     print(i18n.t("cmd.status.engine", engine=engine))
@@ -1462,7 +1463,7 @@ def cmd_delete(store: Store, args) -> int:
         return _finish_delete(store, args.ref, args.no_backup)
     _assert_free(store, name, "deleting the profile")
     profile = store.get(name)
-    email = profile.email or account.detect_email(store.profile_data_dir(name, engine=profile.engine), store, name, engine=profile.engine) or "?"
+    email = account.display_email(store, profile) or "?"
     if not _confirm(f"delete profile {name!r} ({email})?", args.force):
         print("cancelled")
         return 1
