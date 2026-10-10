@@ -24,7 +24,6 @@ import shutil
 import socket
 import stat
 import string
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import List, NamedTuple, Optional, Tuple
@@ -96,16 +95,9 @@ def _link(target: Path, link: Path) -> None:
     except OSError:
         pass
     if target.is_dir():
-        result = subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).decode("oem", "replace").strip()
-            raise OSError(
-                f"mklink /J failed for {link} "
-                f"(rc={result.returncode}): {detail}"
-            )
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
         return
     try:
         os.link(target, link)
@@ -264,7 +256,11 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
             resolved = platforms.canonical_path(entry)
         except OSError:
             continue
-        if resolved.is_relative_to(ctx.store_resolved):
+        if (
+            resolved == ctx.store_resolved
+            or resolved.is_relative_to(ctx.store_resolved)
+            or ctx.store_resolved.is_relative_to(resolved)
+        ):
             continue
         if _is_link(link):
             if link.exists():
@@ -579,13 +575,13 @@ def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "ag
     real_home = platforms.real_home()
     overlay = platforms.ensure_dir(validate_overlay_roots(name, data_dir, store_root))
     store_resolved = platforms.canonical_path(store_root)
-    _, chain_identities = _ancestor_chain(real_home, store_root)
+    _, chain_identities = _ancestor_chain(real_home, store_resolved)
     real_codex = platforms.codex_data_dir(real_home)
     real_grok = platforms.grok_data_dir(real_home)
     ctx = _MirrorContext(
         chain_identities=chain_identities,
         store_resolved=store_resolved,
-        store_identity=chain_identities[-1] if chain_identities else _identity(store_root),
+        store_identity=chain_identities[-1] if chain_identities else _identity(store_resolved),
         agy_data_identity=_identity(platforms.agy_data_dir(real_home)),
         codex_data_identity=_identity(real_codex) if real_codex.exists() else None,
         grok_data_identity=_identity(real_grok) if real_grok.exists() else None,

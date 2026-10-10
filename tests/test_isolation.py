@@ -698,7 +698,8 @@ class TestIsolationAncestorMirroring(BaseCase):
         (self.fake_home / "Library" / "Keychains").mkdir(parents=True)
         data_dir = self._make_store("alpha")
 
-        ancestor_paths, _ = isolation._ancestor_chain(self.fake_home, store_root)
+        canonical_store = platforms.canonical_path(store_root)
+        ancestor_paths, _ = isolation._ancestor_chain(self.fake_home, canonical_store)
         self.assertTrue(ancestor_paths, "expected a non-empty ancestor chain for this layout")
 
         real_identity = isolation._identity
@@ -1166,6 +1167,59 @@ class TestIsolatedEnvFileAuthMarker(BaseCase):
                 with self.subTest(engine=engine):
                     env = isolation.isolated_env(self._target(engine), {}, engine=engine)
                     self.assertEqual(env.get(account.AGY_FILE_AUTH_ENV), genuine_tty)
+
+
+class TestOverlayStoreSymlinkIsolation(BaseCase):
+    def test_store_addressed_via_symlink_does_not_leak_profiles_through_overlay(self):
+        """Case (a): store addressed via symlink (~/agydra -> ~/Dropbox/agydra).
+        The overlay must not link the directory containing the real store,
+        preventing access to other profiles.
+        """
+        if platforms.is_windows():
+            self.skipTest("POSIX symlink test")
+        dropbox = self.fake_home / "Dropbox"
+        dropbox.mkdir()
+        real_store_dir = dropbox / "agydra"
+        real_store = Store(real_store_dir)
+        real_store.create("victim")
+        real_store.create("work")
+        victim_token = real_store.profile_data_dir("victim") / "token.txt"
+        victim_token.write_text("secret-data", encoding="utf-8")
+
+        symlink_store = self.fake_home / "agydra"
+        symlink_store.symlink_to(real_store_dir)
+
+        work_data = real_store.profile_data_dir("work")
+        overlay = isolation.build_overlay("work", work_data, symlink_store, engine="agy")
+
+        leaked = overlay / "Dropbox" / "agydra" / "profiles" / "victim" / "data" / "token.txt"
+        self.assertFalse(leaked.exists())
+        self.assertFalse((overlay / "agydra").exists())
+
+    def test_home_link_to_ancestor_of_external_store_does_not_leak_profiles(self):
+        """Case (b): home link to ancestor of external store (~/data -> /external).
+        The overlay must not link ~/data into the overlay, protecting external store profiles.
+        """
+        if platforms.is_windows():
+            self.skipTest("POSIX symlink test")
+        external = self._tmp / "external"
+        external.mkdir()
+        ext_store_dir = external / "agydra"
+        ext_store = Store(ext_store_dir)
+        ext_store.create("victim")
+        ext_store.create("work")
+        victim_token = ext_store.profile_data_dir("victim") / "token.txt"
+        victim_token.write_text("secret-data", encoding="utf-8")
+
+        home_link = self.fake_home / "data"
+        home_link.symlink_to(external)
+
+        work_data = ext_store.profile_data_dir("work")
+        overlay = isolation.build_overlay("work", work_data, ext_store_dir, engine="agy")
+
+        leaked = overlay / "data" / "agydra" / "profiles" / "victim" / "data" / "token.txt"
+        self.assertFalse(leaked.exists())
+        self.assertFalse((overlay / "data").exists())
 
 
 if __name__ == "__main__":
