@@ -196,16 +196,24 @@ class TestCodexRunner(BaseCase):
         self.assertEqual(email, "codex-user@dragonjar.org")
         self.assertEqual(self.store.get("cx-sync").email, "codex-user@dragonjar.org")
 
-    def test_resolver_resolve_env_var_engine_mismatch_raises(self):
+    def test_resolver_env_var_of_another_engine_yields_to_the_requested_engine(self):
         self.store.create("agy-main", engine="agy")
         self.store.create("cx-main", engine="codex")
+        res = resolver.resolve(
+            self.store,
+            env={"AGYDRA_PROFILE": "agy-main"},
+            engine="codex",
+        )
+        self.assertEqual(res.name, "cx-main")
+
+    def test_resolver_env_var_of_another_engine_without_candidates_names_the_engine(self):
+        self.store.create("agy-main", engine="agy")
         with self.assertRaises(StoreError) as ctx:
             resolver.resolve(
                 self.store,
                 env={"AGYDRA_PROFILE": "agy-main"},
                 engine="codex",
             )
-        self.assertIn("agy-main", str(ctx.exception))
         self.assertIn("codex", str(ctx.exception))
 
     def test_cli_status_with_engine_and_ref(self):

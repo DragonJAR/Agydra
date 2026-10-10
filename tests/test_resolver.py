@@ -43,6 +43,46 @@ class TestResolver(BaseCase):
         res = self._resolve(flag="lab", env={resolver.PROFILE_ENV: "personal"})
         self.assertEqual(res.name, "lab")
 
+    def _resolve_engine(self, engine, flag=None, env=None, cwd=None):
+        return resolver.resolve(
+            self.store, flag_ref=flag, cwd=cwd or self.fake_home, env=env or {}, engine=engine
+        )
+
+    def test_inherited_env_profile_of_another_engine_yields_to_requested_engine(self):
+        self.store.create("openai", engine="codex")
+        res = self._resolve_engine("codex", env={resolver.PROFILE_ENV: "personal"})
+        self.assertEqual(res.name, "openai")
+
+    def test_inherited_env_profile_of_the_requested_engine_still_wins(self):
+        self.store.create("openai", engine="codex")
+        self.store.create("openai-2", engine="codex")
+        res = self._resolve_engine("codex", env={resolver.PROFILE_ENV: "openai-2"})
+        self.assertEqual(res.name, "openai-2")
+        self.assertIn("environment", res.reason)
+
+    def test_env_profile_of_another_engine_falls_through_to_a_matching_marker(self):
+        self.store.create("openai", engine="codex")
+        self.store.create("openai-2", engine="codex")
+        project = self._tmp / "project"
+        project.mkdir()
+        (project / ".agydra").write_text("openai-2", encoding="utf-8")
+        res = self._resolve_engine(
+            "codex", env={resolver.PROFILE_ENV: "personal"}, cwd=project
+        )
+        self.assertEqual(res.name, "openai-2")
+        self.assertIn("marker", res.reason)
+
+    def test_explicit_flag_of_another_engine_still_refuses(self):
+        self.store.create("openai", engine="codex")
+        with self.assertRaises(StoreError) as ctx:
+            self._resolve_engine("codex", flag="personal")
+        self.assertIn("was requested", str(ctx.exception))
+
+    def test_dangling_env_profile_still_raises_with_an_engine(self):
+        self.store.create("openai", engine="codex")
+        with self.assertRaises(StoreError):
+            self._resolve_engine("codex", env={resolver.PROFILE_ENV: "ghost"})
+
     def test_marker_file_wins_over_default(self):
         project = self._tmp / "project" / "sub"
         project.mkdir(parents=True)

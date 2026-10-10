@@ -6,6 +6,11 @@ readable ``reason`` so ``status`` can explain why a profile was picked:
 1. explicit flag (``--profile``/``-p``) handled by the caller and passed here
 2. ``AGYDRA_PROFILE`` environment variable
 3. ``.agydra`` marker file searched upwards from the CWD
+
+Only the explicit flag is binding against a requested engine. The
+environment variable (inherited from an enclosing agydra session) and the
+marker are ambient pins: a pin naming a profile of another engine yields to
+the next step, while a pin naming no profile still raises.
 4. configured default profile
 5. first profile by number
 """
@@ -86,37 +91,27 @@ def resolve(
     resolve_ref = store.resolve_ref_readonly if read_only else store.resolve_ref
     list_profiles = store.list_readonly if read_only else store.list
 
+    def serves_engine(name: str) -> bool:
+        return target_engine is None or get_profile(name).engine == target_engine
+
     if flag_ref is not None:
         name = resolve_ref(flag_ref)
-        if target_engine is not None:
-            prof = get_profile(name)
-            if prof.engine != target_engine:
-                raise StoreError(
-                    f"profile {name!r} uses engine {prof.engine!r}, "
-                    f"but engine {target_engine!r} was requested"
-                )
+        if not serves_engine(name):
+            raise StoreError(
+                f"profile {name!r} uses engine {get_profile(name).engine!r}, "
+                f"but engine {target_engine!r} was requested"
+            )
         return Resolution(name, f"flag --profile={flag_ref}")
 
     env_ref = env.get(PROFILE_ENV)
     if env_ref:
         name = resolve_ref(env_ref)
-        if target_engine is not None:
-            prof = get_profile(name)
-            if prof.engine != target_engine:
-                raise StoreError(
-                    f"profile {name!r} uses engine {prof.engine!r}, "
-                    f"but engine {target_engine!r} was requested"
-                )
-        return Resolution(name, f"environment {PROFILE_ENV}={env_ref}")
+        if serves_engine(name):
+            return Resolution(name, f"environment {PROFILE_ENV}={env_ref}")
 
     marker = _marker_resolution(store, cwd, read_only=read_only)
-    if marker is not None:
-        if target_engine is not None:
-            prof = get_profile(marker.name)
-            if prof.engine == target_engine:
-                return marker
-        else:
-            return marker
+    if marker is not None and serves_engine(marker.name):
+        return marker
 
     all_profiles = list_profiles()
     if target_engine:

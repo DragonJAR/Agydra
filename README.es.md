@@ -223,7 +223,7 @@ Sin `-p`, gana la primera coincidencia:
 
 ```
 1. --profile / -p
-   └── 2. AGYDRA_PROFILE
+   └── 2. AGYDRA_PROFILE (se omite si -e pide otro motor)
        └── 3. Marcador .agydra (ancestro más cercano; ignorado por -r)
            └── 4. default_profile en agydra.json
                └── 5. Primer perfil por número (orden de creación; primero los de `agy`)
@@ -304,7 +304,7 @@ Todas las claves de binarios (`agy_binary`, `codex_binary`, `grok_binary` y `cla
 
 | Variable | Para qué |
 |---|---|
-| `AGYDRA_PROFILE` | Perfil de respaldo. Ganan `-p` y `.agydra`. |
+| `AGYDRA_PROFILE` | Perfil de respaldo, definido dentro de las sesiones de agydra. Gana `-p`; se omite cuando `-e` pide otro motor. |
 | `AGYDRA_LANG` | `en` o `es` para un proceso. |
 | `AGYDRA_HOME` | Almacén y overlays. |
 | `AGYDRA_AGY_BIN` / `AGYDRA_CODEX_BIN` / `AGYDRA_GROK_BIN` / `AGYDRA_CLAUDE_BIN` | Binario alternativo. |

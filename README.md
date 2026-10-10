@@ -223,7 +223,7 @@ Without `-p`, the first match wins:
 
 ```
 1. --profile / -p
-   └── 2. AGYDRA_PROFILE
+   └── 2. AGYDRA_PROFILE (skipped when -e asks for another engine)
        └── 3. .agydra marker (nearest ancestor; ignored by -r)
            └── 4. default_profile in agydra.json
                └── 5. First profile by number (creation order; `agy` profiles first)
@@ -304,7 +304,7 @@ All binary keys (`agy_binary`, `codex_binary`, `grok_binary`, and `claude_binary
 
 | Variable | Purpose |
 |---|---|
-| `AGYDRA_PROFILE` | Fallback profile. `-p` and `.agydra` win. |
+| `AGYDRA_PROFILE` | Fallback profile, set inside agydra sessions. `-p` wins; it is skipped when `-e` asks for another engine. |
 | `AGYDRA_LANG` | `en` or `es` for one process. |
 | `AGYDRA_HOME` | Store and overlays. |
 | `AGYDRA_AGY_BIN` / `AGYDRA_CODEX_BIN` / `AGYDRA_GROK_BIN` / `AGYDRA_CLAUDE_BIN` | Binary override. |
