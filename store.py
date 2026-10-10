@@ -7,6 +7,7 @@ so a crash can never leave a half-written config.
 from __future__ import annotations
 
 import errno
+import fnmatch
 import json
 import os
 import re
@@ -17,7 +18,7 @@ import sys
 import tempfile
 import time
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import AbstractSet, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
 
 import platforms
@@ -393,6 +394,31 @@ def _zip_add_file(zf: "zipfile.ZipFile", path: Path, arcname: str) -> None:
         shutil.copyfileobj(source, target)
 
 
+def _zip_arcname(prefix: str, relative_parts: Sequence[str], name: str) -> str:
+    """POSIX arcname for ``name`` under ``prefix``, whatever the host separator."""
+    return PurePosixPath(prefix, *relative_parts, name).as_posix()
+
+
+def _arcname_excluded(arcname: str, exclude: Optional[AbstractSet[str]]) -> bool:
+    """True iff ``arcname`` is named by an ``exclude`` entry.
+
+    An entry matches its exact path, every path beneath it as a directory
+    (with or without a trailing ``/``), and, as an ``fnmatch`` glob, any
+    path it matches case-sensitively on every OS.
+    """
+    for entry in exclude or ():
+        pattern = entry.rstrip("/")
+        if not pattern:
+            continue
+        if (
+            arcname == pattern
+            or arcname.startswith(pattern + "/")
+            or fnmatch.fnmatchcase(arcname, pattern)
+        ):
+            return True
+    return False
+
+
 def _zip_tree_without_following(
     zf: "zipfile.ZipFile",
     root: Path,
@@ -404,8 +430,8 @@ def _zip_tree_without_following(
     A link is stored as a link (never dereferenced), so nothing outside the
     tree is read into the archive and nothing outside it is lost when the
     tree is deleted afterwards. Sockets and other special files carry no data
-    and are skipped. ``exclude`` names POSIX arcnames (relative to ``root``)
-    that are omitted entirely.
+    and are skipped. ``exclude`` names POSIX arcnames (relative to ``root``),
+    directory prefixes or globs that are omitted entirely.
     """
 
     def add_link(path: Path, arcname: str) -> None:
@@ -419,16 +445,18 @@ def _zip_tree_without_following(
         return
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         base = Path(dirpath)
-        relative = base.relative_to(root)
+        relative_parts = base.relative_to(root).parts
         for dirname in list(dirnames):
             child = base / dirname
             if child.is_symlink():
-                add_link(child, str(Path(prefix) / relative / dirname))
                 dirnames.remove(dirname)
+                arcname = _zip_arcname(prefix, relative_parts, dirname)
+                if not _arcname_excluded(arcname, exclude):
+                    add_link(child, arcname)
         for filename in filenames:
             child = base / filename
-            arcname = str(Path(prefix) / relative / filename)
-            if exclude is not None and arcname in exclude:
+            arcname = _zip_arcname(prefix, relative_parts, filename)
+            if _arcname_excluded(arcname, exclude):
                 continue
             if child.is_symlink():
                 add_link(child, arcname)

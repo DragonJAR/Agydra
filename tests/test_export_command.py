@@ -17,12 +17,14 @@ from __future__ import annotations
 import json
 import unittest
 import zipfile
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from unittest import mock
 
 import cli
 import engines
 import locks
+import store as store_module
 from conftest import BaseCase
 from store import Store, StoreError
 
@@ -177,6 +179,96 @@ class TestExportRefusesBusy(BaseCase):
                 cli.cmd_export(
                     self.store, _args("busy", self._tmp / "out.zip")
                 )
+
+
+class TestExportExclusionMatching(BaseCase):
+    """The exclusion filter compares POSIX arcnames on every OS and honours
+    exact paths, directory prefixes and the ``*`` globs engines declare."""
+
+    def test_glob_entry_matches_every_quarantined_secret(self):
+        self.assertTrue(store_module._arcname_excluded(
+            "data/antigravity-cli/.secret.corrupt-9",
+            {"data/antigravity-cli/.secret.corrupt-*"},
+        ))
+
+    def test_exact_entry_does_not_match_a_sibling_with_a_longer_name(self):
+        self.assertFalse(store_module._arcname_excluded(
+            "data/antigravity-cli/.secret.corrupt-9",
+            {"data/antigravity-cli/.secret"},
+        ))
+
+    def test_directory_entry_matches_nested_paths(self):
+        for entry in ("_keychain/", "_keychain"):
+            self.assertTrue(store_module._arcname_excluded(
+                "_keychain/nested/blob.json", {entry},
+            ))
+        self.assertFalse(store_module._arcname_excluded(
+            "_keychain-notes.txt", {"_keychain/"},
+        ))
+
+    def test_windows_rendered_parts_match_the_posix_entry(self):
+        arcname = store_module._zip_arcname(
+            "", PureWindowsPath(r"data\auth.json").parts[:-1], "auth.json"
+        )
+        self.assertEqual(arcname, "data/auth.json")
+        self.assertTrue(store_module._arcname_excluded(arcname, {"data/auth.json"}))
+
+    def test_zip_tree_drops_excluded_files_when_paths_render_with_backslashes(self):
+        """Reproduces Windows, where ``str(Path(...))`` joins with ``\\``."""
+        root = self._tmp / "tree"
+        (root / "data").mkdir(parents=True)
+        (root / "data" / "auth.json").write_text("{}", encoding="utf-8")
+        (root / "data" / "config.toml").write_text("", encoding="utf-8")
+        out = self._tmp / "tree.zip"
+
+        def windows_rendering(*parts):
+            if parts == ("",):
+                return PureWindowsPath(*parts)
+            return Path(*parts)
+
+        with mock.patch.object(store_module, "Path", side_effect=windows_rendering):
+            with zipfile.ZipFile(out, "w") as zf:
+                store_module._zip_tree_without_following(
+                    zf, root, "", exclude={"data/auth.json"}
+                )
+        with zipfile.ZipFile(out) as zf:
+            self.assertEqual(sorted(zf.namelist()), ["data/config.toml"])
+
+    def test_zip_tree_skips_an_excluded_directory_symlink(self):
+        root = self._tmp / "tree"
+        target = self._tmp / "elsewhere"
+        target.mkdir()
+        (root / "data").mkdir(parents=True)
+        (root / "data" / "kept.txt").write_text("", encoding="utf-8")
+        try:
+            (root / "data" / "linked").symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        out = self._tmp / "tree.zip"
+        with zipfile.ZipFile(out, "w") as zf:
+            store_module._zip_tree_without_following(
+                zf, root, "", exclude={"data/linked"}
+            )
+        with zipfile.ZipFile(out) as zf:
+            self.assertEqual(zf.namelist(), ["data/kept.txt"])
+
+    def test_export_of_agy_profile_carries_no_credential_file(self):
+        store = Store()
+        name = "agy_secrets"
+        store.create(name, engine="agy")
+        data = store.profile_data_dir(name, engine="agy")
+        agy_dir = data / "antigravity-cli"
+        agy_dir.mkdir(parents=True, exist_ok=True)
+        for credential in (
+            "antigravity-oauth-token", ".secret", ".secret.corrupt-123",
+        ):
+            (agy_dir / credential).write_text("secret", encoding="utf-8")
+        (agy_dir / "settings.json").write_text("{}", encoding="utf-8")
+        out = self._tmp / "agy.zip"
+        self.assertEqual(cli.cmd_export(store, _args(name, out)), 0)
+        with zipfile.ZipFile(out) as zf:
+            exported = {n for n in zf.namelist() if n.startswith("data/")}
+        self.assertEqual(exported, {"data/antigravity-cli/settings.json"})
 
 
 if __name__ == "__main__":
