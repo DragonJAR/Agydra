@@ -992,6 +992,24 @@ class TestOrphanScanCaching(BaseCase):
             f"refresh), got {orphan_slots_spy.call_count}",
         )
 
+    def test_unreadable_default_profile_is_not_treated_as_dangling(self):
+        self.store.create("work", engine="codex")
+        self.store.set_default("work")
+        (self.store.profiles_dir / "work" / "profile.json").write_text("{corrupt json", encoding="utf-8")
+
+        ctx = doctor._build_ctx(self.store)
+        status, output = doctor._check_profiles(self.store, ctx)
+        self.assertEqual(status, doctor.WARN)
+        self.assertNotIn("MISSING (dangling)", output)
+        self.assertNotIn("does not exist", output)
+        self.assertIn("unreadable profile metadata: work", output)
+
+        preview = doctor._preview_fixables(self.store, ctx)
+        self.assertNotIn("clear dangling default profile 'work'", preview)
+
+        doctor._apply_fixes(self.store, ctx)
+        self.assertEqual(self.store.default_name(), "work")
+
 
 if __name__ == "__main__":
     unittest.main()

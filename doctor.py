@@ -129,12 +129,17 @@ def _check_profiles(store: Store, ctx: "_DoctorContext"):
         )
         lines.append(f"  - {p.name}: {state}")
     default = store.default_name()
-    if default and default not in ctx.names:
+    if default and default not in ctx.names and default not in unreadable:
         problems.append(
             f"default profile {default!r} does not exist "
             "(fix with: agydra default <name>)"
         )
         lines.append(f"  - default: {default!r} MISSING (dangling)")
+    if unreadable:
+        lines.append(
+            f"unreadable profile metadata: {', '.join(unreadable)} "
+            "(remove with: agydra delete <name>)"
+        )
     if problems:
         lines.insert(0, "; ".join(problems))
         return WARN, "\n".join(lines)
@@ -142,15 +147,11 @@ def _check_profiles(store: Store, ctx: "_DoctorContext"):
         message = "no profiles yet (create one with: agydra create <name>)"
         if unreadable:
             return WARN, (
-                f"{message}; unreadable metadata: {', '.join(unreadable)} "
+                f"{message}; unreadable profile metadata: {', '.join(unreadable)} "
                 "(remove with: agydra delete <name>)"
             )
         return WARN, message
     if unreadable:
-        lines.append(
-            f"unreadable profile metadata: {', '.join(unreadable)} "
-            "(remove with: agydra delete <name>)"
-        )
         return WARN, "\n".join(lines)
     return OK, "\n".join(lines)
 
@@ -548,7 +549,8 @@ def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
                 f"migrate overlay data for {name!r} into the profile store and relink {driver.data_dir_name}"
             )
     default = store.default_name()
-    if default and default not in ctx.names:
+    unreadable = ctx.scan[1]
+    if default and default not in ctx.names and default not in unreadable:
         lines.append(f"clear dangling default profile {default!r}")
     keychain_orphans = ctx.keychain_orphans
     if keychain_orphans is None:
@@ -711,8 +713,9 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
         finally:
             handle.release()
     current_names = store.names()
+    unreadable_names = store.unreadable_profiles()
     default = store.default_name()
-    if default and default not in current_names:
+    if default and default not in current_names and default not in unreadable_names:
         def clear_observed_default(config) -> None:
             if config.default_profile == default:
                 config.default_profile = None
