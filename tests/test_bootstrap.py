@@ -340,9 +340,11 @@ class CheckState(unittest.TestCase):
             with _sandbox_home(Path(td)):
                 shim = bootstrap.shim_path()
                 shim.parent.mkdir(parents=True, exist_ok=True)
+                target_other = Path(f"{bootstrap.console_script(proj)}-other")
+                target_other.touch()
                 shim.write_text(
                     f"#!/bin/sh\n# {bootstrap.SHIM_MARKER}\n"
-                    f'exec "{bootstrap.console_script(proj)}-other" "$@"\n',
+                    f'exec "{target_other}" "$@"\n',
                     encoding="utf-8",
                 )
                 state = bootstrap.check_state(proj)
@@ -889,7 +891,7 @@ class RootEntryForceContract(unittest.TestCase):
 
         installed = []
 
-        def fake_run(root=None, force=False, out=None):
+        def fake_run(root=None, force=False, out=None, **_kw):
             forced.append(force)
             installed.append(True)
             return 0
@@ -926,7 +928,7 @@ class RootEntryForceContract(unittest.TestCase):
 
         forced = []
 
-        def fake_run(root=None, force=False, out=None):
+        def fake_run(root=None, force=False, out=None, **_kw):
             forced.append(force)
             return 0
 

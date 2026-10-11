@@ -4,11 +4,9 @@ on:
   push:
     branches:
       - main
-      - audit/project-wide-reliability
   pull_request:
     branches:
       - main
-      - audit/project-wide-reliability
 
 permissions:
   contents: read

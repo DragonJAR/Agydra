@@ -165,19 +165,23 @@ class TestExportRefusesBusy(BaseCase):
         self.store = Store()
 
     def test_export_refuses_when_live_holder_is_registered(self):
-        """A live session registered in the lease holder list must fail
-        the export before any byte is written, even when flock is free
-        (R3). The mutation lock is the single source of that check."""
         self.store.create("busy", engine="agy")
         data = self.store.profile_data_dir("busy", engine="agy")
         (data / "antigravity-cli").mkdir(parents=True, exist_ok=True)
         (data / "antigravity-cli" / "antigravity-oauth-token").write_text(
             "{}", encoding="utf-8"
         )
-        with mock.patch.object(locks, "try_mutation_lock", return_value=None):
+        locks.acquire_lease(self.store, "busy")
+        try:
+            rc = cli.cmd_export(self.store, _args("busy", self._tmp / "out.zip"))
+            self.assertEqual(rc, 0)
+        finally:
+            locks.release_lease(self.store, "busy")
+
+        with mock.patch.object(locks, "try_read_lock", return_value=None):
             with self.assertRaises(StoreError):
                 cli.cmd_export(
-                    self.store, _args("busy", self._tmp / "out.zip")
+                    self.store, _args("busy", self._tmp / "out2.zip")
                 )
 
 

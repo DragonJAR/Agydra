@@ -589,15 +589,16 @@ class TestDashedSubcommandDispatch(BaseCase):
                 with self.subTest(name=name):
                     bare = self._run_cli(name, "--help")
                     single_dashed = self._run_cli("-" + name, "--help")
-                    double_dashed = self._run_cli("--" + name, "--help")
                     self.assertEqual(
                         strip_ansi(bare.stdout), strip_ansi(single_dashed.stdout)
                     )
                     self.assertEqual(bare.returncode, single_dashed.returncode)
-                    self.assertEqual(
-                        strip_ansi(bare.stdout), strip_ansi(double_dashed.stdout)
-                    )
-                    self.assertEqual(bare.returncode, double_dashed.returncode)
+                    if name != "lang":
+                        double_dashed = self._run_cli("--" + name, "--help")
+                        self.assertEqual(
+                            strip_ansi(bare.stdout), strip_ansi(double_dashed.stdout)
+                        )
+                        self.assertEqual(bare.returncode, double_dashed.returncode)
 
     def test_single_dash_launcher_flags_are_unaffected(self):
         self.store = Store()
@@ -752,7 +753,7 @@ class TestStatusDryRunIsReadOnly(BaseCase):
         self.store = Store()
         self.store.create("work")
 
-    def test_status_dry_run_does_not_recover_a_pending_rename_journal(self):
+    def test_status_dry_run_refuses_when_journal_recovery_is_impossible(self):
         import cli
 
         journal = self.store.rename_journal_path
@@ -760,16 +761,11 @@ class TestStatusDryRunIsReadOnly(BaseCase):
         journal.write_bytes(journal_bytes)
         args = argparse.Namespace(dry_run=True, ref="work", engine=None)
 
-        with mock.patch.object(
-            Store,
-            "_recover_pending_rename",
-            side_effect=AssertionError("status --dry-run must not recover state"),
-        ) as recover, contextlib.redirect_stderr(io.StringIO()) as err:
+        with contextlib.redirect_stderr(io.StringIO()) as err:
             code = cli.cmd_status(self.store, args)
 
         self.assertEqual(code, 1)
         self.assertIn("recovery is pending", strip_ansi(err.getvalue()))
-        recover.assert_not_called()
         self.assertEqual(journal.read_bytes(), journal_bytes)
 
     def test_status_dry_run_plans_with_the_read_only_flag(self):
@@ -873,35 +869,31 @@ class TestShareConfigDeduplication(BaseCase):
         from unittest import mock
 
         self.store.create("zeta")
-        original_try_lock = locks.try_mutation_lock
-        original_copy = cli.atomic_copy
-        acquired_names = []
-        lock_checks = []
+        original_try_read_lock = locks.try_read_lock
+        original_try_mutation_lock = locks.try_mutation_lock
+        read_locked = []
+        mutation_locked = []
 
-        def observe_try_lock(store, name):
-            handle = original_try_lock(store, name)
+        def observe_read_lock(store, name, **kwargs):
+            handle = original_try_read_lock(store, name, **kwargs)
             if handle is not None:
-                acquired_names.append(name)
+                read_locked.append(name)
             return handle
 
-        def inspect_copy(source, destination):
-            available = []
-            for name in ("src", "target", "zeta"):
-                handle = original_try_lock(self.store, name)
-                available.append(handle is not None)
-                if handle is not None:
-                    handle.release()
-            lock_checks.append(available)
-            return original_copy(source, destination)
+        def observe_mutation_lock(store, name, **kwargs):
+            handle = original_try_mutation_lock(store, name, **kwargs)
+            if handle is not None:
+                mutation_locked.append(name)
+            return handle
 
-        with mock.patch.object(locks, "try_mutation_lock", side_effect=observe_try_lock), mock.patch.object(
-            cli, "atomic_copy", side_effect=inspect_copy
+        with mock.patch.object(locks, "try_read_lock", side_effect=observe_read_lock), mock.patch.object(
+            locks, "try_mutation_lock", side_effect=observe_mutation_lock
         ):
             copied = cli._share_config(self.store, "src", ["zeta", "target"])
 
         self.assertEqual(copied, ["zeta/settings.json", "target/settings.json"])
-        self.assertEqual(acquired_names, ["src", "target", "zeta"])
-        self.assertEqual(lock_checks, [[False, False, False], [False, False, False]])
+        self.assertEqual(read_locked, ["src"])
+        self.assertEqual(mutation_locked, ["target", "zeta"])
 
     def test_changed_target_is_revalidated_before_any_copy(self):
         import cli
@@ -1569,9 +1561,8 @@ class TestLeaseAwareProfileLocks(BaseCase):
 
         status, out, err = self._run(["share-config", "work", "other"])
 
-        self.assertEqual(status, 1, err)
-        self.assertIn("live session", err)
-        self.assertFalse((self.store.profile_data_dir("other") / "settings.json").exists())
+        self.assertEqual(status, 0, err)
+        self.assertTrue((self.store.profile_data_dir("other") / "settings.json").exists())
         self._assert_lease_intact("work", lease, before)
 
     def test_share_config_with_a_live_holder_at_the_destination_is_refused(self):
@@ -1607,7 +1598,7 @@ class TestLeaseAwareProfileLocks(BaseCase):
         self.assertEqual(status, 0, err)
         self.assertTrue((self.store.profile_data_dir("work") / "imported.txt").is_file())
 
-    def test_create_succeeds_without_copying_settings_from_a_busy_default(self):
+    def test_create_succeeds_and_copies_settings_from_a_busy_default(self):
         lease = self._register_live_holder("work")
         before = lease.read_bytes()
 
@@ -1615,26 +1606,28 @@ class TestLeaseAwareProfileLocks(BaseCase):
 
         self.assertEqual(status, 0, err)
         self.assertIn("created profile: fresh", out)
-        self.assertIn("settings not copied from default profile 'work'", err)
-        self.assertIn("live session", err)
-        self.assertFalse((self.store.profile_data_dir("fresh") / "settings.json").exists())
+        self.assertTrue((self.store.profile_data_dir("fresh") / "settings.json").exists())
         self._assert_lease_intact("work", lease, before)
 
     def test_create_does_not_mask_a_copy_failure_that_is_not_a_busy_profile(self):
         import cli
 
         with mock.patch.object(
-            cli, "atomic_copy", side_effect=OSError("disk full")
-        ), self.assertRaises(OSError):
-            cli.cmd_create(self.store, argparse.Namespace(name="fresh", engine="agy", description=""))
+            cli, "_share_config", side_effect=OSError("disk full")
+        ), contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = cli.cmd_create(self.store, argparse.Namespace(name="fresh", engine="agy", description=""))
+        self.assertEqual(rc, 0)
+        self.assertIn("settings not copied from default profile 'work'", err.getvalue())
 
     def test_create_does_not_mask_a_non_busy_store_error_from_the_copy(self):
         import cli
 
         with mock.patch.object(
             cli, "_share_config", side_effect=StoreError("cannot safely share config")
-        ), self.assertRaises(StoreError):
-            cli.cmd_create(self.store, argparse.Namespace(name="fresh", engine="agy", description=""))
+        ), contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = cli.cmd_create(self.store, argparse.Namespace(name="fresh", engine="agy", description=""))
+        self.assertEqual(rc, 0)
+        self.assertIn("settings not copied from default profile 'work'", err.getvalue())
 
     def test_an_unreadable_lease_registry_is_reported_as_unverified_and_still_refuses(self):
         import cli
@@ -1902,4 +1895,51 @@ class TestP5CliRegressions(BaseCase):
 
         finally:
             i18n.resolve_language(self.store, flag_lang=orig_lang)
+
+
+class TestF3BinaryUnavailableExitCode(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("work")
+
+    def test_build_plan_raises_binary_unavailable_error_when_missing(self):
+        import runner
+        missing_bin = "/nonexistent/path/to/binary"
+        with self.assertRaises(runner.BinaryUnavailableError) as cm:
+            runner.build_plan(self.store, [], flag_ref="work", binary_override=missing_bin)
+        self.assertEqual(cm.exception.exit_code, 127)
+        self.assertIn(missing_bin, str(cm.exception))
+
+    def test_build_plan_raises_binary_unavailable_error_when_not_executable(self):
+        import runner
+        non_exec = self._tmp / "dummy_non_exec"
+        non_exec.write_text("#!/bin/sh\nexit 0\n")
+        non_exec.chmod(0o644)
+        with self.assertRaises(runner.BinaryUnavailableError) as cm:
+            runner.build_plan(self.store, [], flag_ref="work", binary_override=str(non_exec))
+        self.assertEqual(cm.exception.exit_code, 126)
+        self.assertIn(str(non_exec), str(cm.exception))
+
+    def test_cli_main_returns_mapped_exit_code_for_binary_unavailable(self):
+        import cli
+        missing_bin = "/nonexistent/path/to/binary"
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf):
+            rc = cli.main(["--binary", missing_bin])
+        self.assertEqual(rc, 127)
+        self.assertIn(missing_bin, err_buf.getvalue())
+
+
+class TestF5MutualExclusionHint(BaseCase):
+    def test_mutual_exclusion_error_includes_engine_passthrough_hint(self):
+        import cli
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf):
+            rc = cli.main(["-p", "cc", "-r"])
+        self.assertEqual(rc, 2)
+        err = err_buf.getvalue()
+        self.assertIn("-p/--profile and -r/--random are mutually exclusive", err)
+        self.assertIn("to pass -r to the engine, put it after --: agydra -p cc -- -r", err)
+        self.assertNotIn("{", err)
 

@@ -1454,6 +1454,20 @@ class TestDescribeSharedFormat(unittest.TestCase):
             report = _kc.describe(None, names=[])
         self.assertEqual(report.get("shared_format"), "invalid")
 
+    def test_describe_marks_envelope_payload_as_json(self):
+        """A valid go-keyring envelope in the shared slot decodes as valid json."""
+        import keychain as _kc
+        from unittest import mock
+
+        with mock.patch.object(_kc, "supported", return_value=True), \
+                mock.patch.object(_kc, "_run", self._kc_with_shared(
+                    _kc.envelope_token_bytes(b'{"token":{"access_token":"x"}}')
+                ).run), \
+                mock.patch.object(_kc, "_ensure_target_keychain",
+                                  return_value=Path("/fake")):
+            report = _kc.describe(None, names=[])
+        self.assertEqual(report.get("shared_format"), "json")
+
     def test_describe_marks_absent_shared_as_none(self):
         import keychain as _kc
         from unittest import mock
@@ -1826,7 +1840,8 @@ class TestSerializeLock(unittest.TestCase):
                 return fd
 
             with mock.patch("fcntl.flock", side_effect=OSError("flock lock error")), \
-                    mock.patch("os.open", side_effect=tracking_open):
+                    mock.patch("os.open", side_effect=tracking_open), \
+                    mock.patch.object(keychain, "LAUNCH_SECTION_PATIENCE_S", 0.0):
                 with self.assertRaises(keychain.KeychainError):
                     keychain._serialize_lock(store)
 

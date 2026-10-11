@@ -93,6 +93,10 @@ class _RenameRecoveryRequired(Exception):
     pass
 
 
+class _RenameRecoveryActionFailed(StoreError):
+    pass
+
+
 def _atomic_write_json(path: Path, data: dict) -> None:
     payload = (json.dumps(data, indent=2, sort_keys=False) + "\n").encode("utf-8")
     atomic_write_bytes(path, payload)
@@ -810,11 +814,12 @@ class Store:
 
     def exists(self, name: str) -> bool:
         self.validate_name(name)
-        self._recover_pending_rename()
+        self._recover_pending_rename(target_name=name)
         return self._with_recoverable_sequence_lock(
             "checking a profile",
             lambda: self._exists_unlocked(name),
             allow_missing_store=True,
+            target_name=name,
         )
 
     def _exists_unlocked(self, name: str) -> bool:
@@ -823,25 +828,29 @@ class Store:
         return self.profile_meta_path(name).exists()
 
     def create(self, name: str, description: str = "", engine: str = "agy") -> Profile:
-        self.validate_name(name)
-        self._recover_pending_rename()
-        return self._with_profile_locks(
-            (name,),
-            "creating",
-            lambda: self._with_sequence_lock(
-                "creating",
-                lambda: self._create_locked(name, description, engine),
-            ),
-        )
-
-    def _create_locked(self, name: str, description: str, engine: str) -> Profile:
         import engines
 
-        profile_dir = self._require_profile_paths_are_real(name)
+        self.validate_name(name)
+        self._recover_pending_rename()
         try:
             driver = engines.get_engine(engine)
         except ValueError as exc:
             raise StoreError(str(exc)) from exc
+
+        def _create_under_locks() -> Profile:
+            if driver.needs_keychain:
+                import keychain
+
+                keychain.purge_profile_slot(self, name)
+            return self._with_sequence_lock(
+                "creating",
+                lambda: self._create_locked(name, description, driver),
+            )
+
+        return self._with_profile_locks((name,), "creating", _create_under_locks)
+
+    def _create_locked(self, name: str, description: str, driver: "engines.EngineDriver") -> Profile:
+        profile_dir = self._require_profile_paths_are_real(name)
         config = self.load_config()
         config_writable = self._config_writable()
         self._cleanup_create_stages(name)
@@ -861,10 +870,6 @@ class Store:
                 )
             )
             data_dir = stage_dir / "data"
-            if driver.needs_keychain:
-                import keychain
-
-                keychain.purge_profile_slot(self, name)
             profile = Profile(name=name, seq=seq, description=description, engine=driver.name)
             if driver.name != "claude":
                 platforms.ensure_dir(data_dir)
@@ -977,7 +982,8 @@ class Store:
         self,
         action: str,
         operation: Callable[[], _Result],
-        patience_s: float = 0.0,
+        patience_s: float = READ_LOCK_PATIENCE_S,
+        target_name: Optional[str] = None,
     ) -> _Result:
         import locks
 
@@ -999,7 +1005,15 @@ class Store:
                 message = "profile sequence lock is busy"
             raise StoreError(f"{message}; retry {action}")
         try:
-            if action != "recovering rename" and self._read_rename_journal() is not None:
+            journal = self._read_rename_journal()
+            if (
+                action != "recovering rename"
+                and journal is not None
+                and (
+                    target_name is None
+                    or target_name in (journal.get("old"), journal.get("new"))
+                )
+            ):
                 raise _RenameRecoveryRequired()
             return operation()
         finally:
@@ -1011,6 +1025,7 @@ class Store:
         operation: Callable[[], _Result],
         *,
         allow_missing_store: bool = False,
+        target_name: Optional[str] = None,
     ) -> _Result:
         """Serialize a read when a store exists, with an empty-store fast path.
 
@@ -1034,10 +1049,13 @@ class Store:
         for _ in range(3):
             try:
                 return self._with_sequence_lock(
-                    action, operation, patience_s=self.READ_LOCK_PATIENCE_S
+                    action,
+                    operation,
+                    patience_s=self.READ_LOCK_PATIENCE_S,
+                    target_name=target_name,
                 )
             except _RenameRecoveryRequired:
-                self._recover_pending_rename()
+                self._recover_pending_rename(target_name=target_name)
         raise StoreError("rename state changed repeatedly; retry the operation")
 
     def _store_root_exists(self) -> bool:
@@ -1074,7 +1092,10 @@ class Store:
         expected_fields = {"version", "old", "new", "default_was_old"}
         if version == _RENAME_JOURNAL_VERSION:
             expected_fields.add("recovery_action")
-        if set(data) != expected_fields:
+        extra_fields = set(data) - expected_fields
+        if not expected_fields.issubset(set(data)) or not extra_fields.issubset(
+            {"action_failed", "action_error"}
+        ):
             raise StoreError(f"rename journal {path} has an invalid schema")
         if not isinstance(data["old"], str) or not isinstance(data["new"], str):
             raise StoreError(f"rename journal {path} has invalid profile names")
@@ -1139,7 +1160,7 @@ class Store:
                 f"cannot remove completed rename journal {self.rename_journal_path} ({exc})"
             ) from exc
 
-    def _recover_pending_rename(self) -> None:
+    def _recover_pending_rename(self, target_name: Optional[str] = None) -> None:
         journal = self._read_rename_journal()
         if journal is None:
             return
@@ -1155,9 +1176,13 @@ class Store:
                 "recovering rename", lambda: self._recover_rename_locked(current)
             )
 
-        self._with_profile_locks(
-            (journal["old"], journal["new"]), "recovering", operation
-        )
+        try:
+            self._with_profile_locks(
+                (journal["old"], journal["new"]), "recovering", operation
+            )
+        except _RenameRecoveryActionFailed:
+            if target_name is None or target_name in (journal["old"], journal["new"]):
+                raise
 
     def _require_rename_recovery_handler(self, journal: dict) -> Optional[Callable]:
         descriptor = journal.get("recovery_action")
@@ -1179,7 +1204,11 @@ class Store:
         try:
             handler(self, journal["old"], journal["new"], descriptor["data"])
         except Exception as exc:
-            raise StoreError(
+            warn(
+                f"rename recovery action {descriptor['name']!r} failed; "
+                f"journal retained ({exc})"
+            )
+            raise _RenameRecoveryActionFailed(
                 f"rename recovery action {descriptor['name']!r} failed; "
                 f"journal retained ({exc})"
             ) from exc
@@ -1338,11 +1367,12 @@ class Store:
 
     def get(self, name: str) -> Profile:
         self.validate_name(name)
-        self._recover_pending_rename()
+        self._recover_pending_rename(target_name=name)
         return self._with_recoverable_sequence_lock(
             "reading a profile",
             lambda: self._get_unlocked(name),
             allow_missing_store=True,
+            target_name=name,
         )
 
     def _get_unlocked(self, name: str) -> Profile:
@@ -1371,7 +1401,7 @@ class Store:
         closed). Pure ``lstat``: no locks, recovery or writes."""
         return self._probe_rename_journal()[0]
 
-    def _require_no_pending_rename(self) -> None:
+    def _require_no_pending_rename(self, target_name: Optional[str] = None) -> None:
         pending, error = self._probe_rename_journal()
         if not pending:
             return
@@ -1380,29 +1410,40 @@ class Store:
                 f"cannot inspect rename journal {self.rename_journal_path} ({error}); "
                 "refusing a read-only read"
             ) from error
+        try:
+            journal = self._read_rename_journal()
+        except StoreError:
+            journal = None
+        if (
+            journal is not None
+            and target_name is not None
+            and target_name not in (journal.get("old"), journal.get("new"))
+        ):
+            return
         raise StoreError(
-            "profile rename recovery is pending; run any agydra command that writes "
-            "(for example: agydra list) to finish it, then retry"
+            "profile rename recovery is pending; a profile rename is being finished; retry in a moment"
         )
 
-    def _readonly(self, operation: Callable[[], _Result]) -> _Result:
+    def _readonly(
+        self, operation: Callable[[], _Result], target_name: Optional[str] = None
+    ) -> _Result:
         """Run a pure read with no locks, recovery or mutation.
 
         Fails closed: a pending rename journal before OR after the read means
         the metadata may describe a half-moved profile, so the answer is
         discarded.
         """
-        self._require_no_pending_rename()
+        self._require_no_pending_rename(target_name=target_name)
         try:
             result = operation()
         except OSError as exc:
             raise StoreError(f"cannot read the profile store ({exc})") from exc
-        self._require_no_pending_rename()
+        self._require_no_pending_rename(target_name=target_name)
         return result
 
     def get_readonly(self, name: str) -> Profile:
         self.validate_name(name)
-        return self._readonly(lambda: self._get_unlocked(name))
+        return self._readonly(lambda: self._get_unlocked(name), target_name=name)
 
     def scan_readonly(self) -> tuple:
         return self._readonly(self._scan)
@@ -1481,7 +1522,7 @@ class Store:
                 profile.seq, [profile.name, *conflicting_names]
             )
 
-    def _scan(self) -> tuple:
+    def _scan(self, tolerant: bool = False) -> tuple:
         """One pass over metadata: (parsed profiles sorted by seq, unreadable names)."""
         profiles: List[Profile] = []
         unreadable: List[str] = []
@@ -1514,12 +1555,12 @@ class Store:
                 except (OSError, ValueError, KeyError, TypeError, StoreError):
                     unreadable.append(profile_dir.name)
         for sequence, names in sorted(sequence_owners.items()):
-            if len(names) > 1:
+            if len(names) > 1 and not tolerant:
                 raise self._duplicate_profile_sequence_error(sequence, names)
         profiles.sort(key=lambda p: (p.seq, p.name))
         return profiles, unreadable
 
-    def scan(self) -> tuple:
+    def scan(self, tolerant: bool = False) -> tuple:
         """Public two-for-one: profiles + unreadable names in ONE pass.
 
         Callers needing both lists (doctor) must use this instead of
@@ -1528,7 +1569,9 @@ class Store:
         """
         self._recover_pending_rename()
         return self._with_recoverable_sequence_lock(
-            "reading profiles", self._scan, allow_missing_store=True
+            "reading profiles",
+            lambda: self._scan(tolerant=tolerant) if tolerant else self._scan(),
+            allow_missing_store=True,
         )
 
     def list(self) -> List[Profile]:
@@ -1561,7 +1604,11 @@ class Store:
             raise StoreError(f"{message}: {overlay} ({exc})") from exc
 
     def _with_profile_locks(
-        self, names: Sequence[str], action: str, operation: Callable[[], _Result]
+        self,
+        names: Sequence[str],
+        action: str,
+        operation: Callable[[], _Result],
+        patience_s: Optional[float] = None,
     ) -> _Result:
         import locks
 
@@ -1571,7 +1618,12 @@ class Store:
             try:
                 for name in sorted(set(names)):
                     try:
-                        handle = locks.try_mutation_lock(self, name)
+                        if patience_s is None:
+                            handle = locks.try_mutation_lock(self, name)
+                        else:
+                            handle = locks.try_mutation_lock(
+                                self, name, patience_s=patience_s
+                            )
                     except locks.LockError as exc:
                         raise StoreError(
                             f"cannot safely proceed with {action} profile {name!r}: {exc}"

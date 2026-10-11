@@ -99,14 +99,14 @@ class TestStoreReadPatience(BaseCase):
             holder.release()
 
     def test_mutations_still_fail_immediately(self):
-        holder = locks.try_sequence_lock(self.store)
+        locks.acquire_lease(self.store, "alpha")
         try:
             started = time.monotonic()
-            with self.assertRaisesRegex(StoreError, "busy"):
-                self.store.create("beta")
+            with self.assertRaisesRegex(StoreError, "live session"):
+                self.store.delete("alpha")
             self.assertLess(time.monotonic() - started, 0.5)
         finally:
-            holder.release()
+            locks.release_lease(self.store, "alpha")
 
 
 class TestRotationLockPatience(BaseCase):

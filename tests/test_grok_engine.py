@@ -369,7 +369,7 @@ class TestGrokEngine(unittest.TestCase):
         with patch("usage.fetch_grok_billing_payload", side_effect=urllib.error.URLError("Network down")), \
              patch("usage.fetch_grok_settings_payload", return_value=None):
             res_offline = usage.query_grok_usage(data_dir, "grok-mock")
-            self.assertTrue(res_offline.ok)
+            self.assertFalse(res_offline.ok)
             self.assertEqual(res_offline.groups, [])
             self.assertIn("offline", res_offline.error)
 

@@ -110,11 +110,18 @@ class EngineDriver:
     ) -> Optional["account.ClaudeAuthStatus"]:
         return None
 
-    def resolve_binary(self, explicit: Optional[str] = None) -> Optional[Path]:
+    def resolve_binary(
+        self,
+        explicit: Optional[str] = None,
+        *,
+        config_val: Optional[str] = None,
+    ) -> Optional[Path]:
         return platforms.resolve_binary(
             self.binary_name,
             env_var=self.env_bin_var,
             explicit=explicit,
+            config_val=config_val,
+            config_key=self.config_binary_attr,
         )
 
     def prepare_args(self, args: Sequence[str]) -> List[str]:

@@ -263,7 +263,11 @@ def _stale_flags(entries: Iterable[Dict[str, Any]], refreshed: Iterable[str]) ->
     """
     seen = set(refreshed)
     for entry in entries:
-        entry["stale"] = entry.get("name") not in seen
+        entry["stale"] = (
+            entry.get("name") not in seen
+            or entry.get("quality") == "stale"
+            or not entry.get("ok")
+        )
 
 
 def build_snapshot(
@@ -292,7 +296,12 @@ def build_snapshot(
         scope=scope,
         carry=_carried_entries(previous),
     )
-    _stale_flags(entries, [getattr(profile, "name", None) for profile in profiles])
+    refreshed = [
+        getattr(p, "name", None)
+        for p, r in zip(profiles, results)
+        if getattr(r, "ok", False) and getattr(r, "quality", None) != "stale"
+    ]
+    _stale_flags(entries, refreshed)
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": _utc_iso(generated),

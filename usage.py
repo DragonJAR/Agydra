@@ -551,10 +551,10 @@ def query_codex_usage(
         else:
             return UsageResult(
                 name=name,
-                ok=True,
+                ok=False,
                 engine="codex",
                 email=detected_email,
-                plan=detected_plan or "ChatGPT Plus",
+                plan=detected_plan,
                 error=f"usage unavailable (HTTP {exc.code})",
                 authentication_state="authenticated",
             )
@@ -572,10 +572,10 @@ def query_codex_usage(
         _close_http_error(exc)
         return UsageResult(
             name=name,
-            ok=True,
+            ok=False,
             engine="codex",
             email=detected_email,
-            plan=detected_plan or "ChatGPT Plus",
+            plan=detected_plan,
             error=f"offline ({exc})",
             authentication_state="authenticated",
         )
@@ -586,13 +586,13 @@ def query_codex_usage(
             ok=False,
             engine="codex",
             email=detected_email,
-            plan=detected_plan or "ChatGPT Plus",
+            plan=detected_plan,
             error="no usage data in response",
             authentication_state="authenticated",
         )
 
     groups, api_plan, api_email = parse_codex_usage_payload(payload)
-    final_plan = api_plan or detected_plan or "ChatGPT Plus"
+    final_plan = api_plan or detected_plan
     final_email = api_email or detected_email
 
     if not groups:
@@ -784,6 +784,7 @@ def query_grok_usage(
     email: Optional[str] = None,
     plan: Optional[str] = None,
     timeout: float = DEFAULT_TIMEOUT_S,
+    store: Optional[Any] = None,
 ) -> UsageResult:
     """Query xAI Grok usage and billing via cli-chat-proxy. Never raises."""
     import account
@@ -837,34 +838,58 @@ def query_grok_usage(
             if exc.code != 401:
                 return UsageResult(
                     name=name,
-                    ok=True,
+                    ok=False,
                     engine="grok",
                     email=detected_email,
-                    plan=detected_plan or "Grok (xAI)",
+                    plan=detected_plan,
                     error=f"usage unavailable (HTTP {exc.code})",
                     authentication_state="authenticated",
                 )
             if attempt == 0 and (auth_info or {}).get("refresh_token"):
-                grant = _refresh_grok_safely(auth_info, timeout)
-                if grant and _has_credential(grant.get("access_token")):
-                    new_access = grant["access_token"]
-                    new_refresh = (
-                        grant.get("refresh_token")
-                        if _has_credential(grant.get("refresh_token"))
-                        else None
-                    )
+                import locks
+                active_store = store
+                if active_store is None:
                     try:
-                        account.update_grok_tokens(
-                            data_dir,
-                            access_token=new_access,
-                            refresh_token=new_refresh,
-                            previous_access_token=used_previous,
-                        )
+                        from store import Store
+                        active_store = Store()
                     except Exception:
-                        pass
-                    used_token = new_access
-                    used_previous = new_access
-                    continue
+                        active_store = None
+                handle = (
+                    locks.try_mutation_lock(active_store, name)
+                    if active_store is not None
+                    else None
+                )
+                if handle is None:
+                    return UsageResult(
+                        name=name,
+                        ok=False,
+                        engine="grok",
+                        email=detected_email,
+                        plan=detected_plan,
+                        error="session expired (401)",
+                        authentication_state="unauthenticated",
+                    )
+                with handle:
+                    grant = _refresh_grok_safely(auth_info, timeout)
+                    if grant and _has_credential(grant.get("access_token")):
+                        new_access = grant["access_token"]
+                        new_refresh = (
+                            grant.get("refresh_token")
+                            if _has_credential(grant.get("refresh_token"))
+                            else None
+                        )
+                        try:
+                            account.update_grok_tokens(
+                                data_dir,
+                                access_token=new_access,
+                                refresh_token=new_refresh,
+                                previous_access_token=used_previous,
+                            )
+                        except Exception:
+                            pass
+                        used_token = new_access
+                        used_previous = new_access
+                        continue
             return UsageResult(
                 name=name,
                 ok=False,
@@ -891,10 +916,10 @@ def query_grok_usage(
             _close_http_error(exc)
             return UsageResult(
                 name=name,
-                ok=True,
+                ok=False,
                 engine="grok",
                 email=detected_email,
-                plan=detected_plan or "Grok (xAI)",
+                plan=detected_plan,
                 error=f"offline ({exc})",
                 authentication_state="authenticated",
             )
@@ -995,6 +1020,7 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
             name,
             email=profile.email,
             timeout=timeout,
+            store=store,
         )
 
     if engine != "agy":

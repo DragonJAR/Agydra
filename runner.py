@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import shutil
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -30,6 +31,12 @@ import profile_rotation
 import resolver
 from store import Store, StoreError
 from ui import note, warn
+
+
+class BinaryUnavailableError(StoreError):
+    def __init__(self, message: str, exit_code: int = 1):
+        super().__init__(message)
+        self.exit_code = exit_code
 
 
 _PLAN_ENV_DISPLAY = (
@@ -119,6 +126,7 @@ def build_plan(
     exclude: Optional[set] = None,
     read_only: bool = False,
     rotation: Optional[profile_rotation.Rotation] = None,
+    causes: Optional[Dict[str, str]] = None,
 ) -> LaunchPlan:
     """Resolve everything needed to launch the tool without mutating anything.
 
@@ -135,35 +143,72 @@ def build_plan(
     cwd = Path(cwd) if cwd is not None else None
     random_pick = random_pick and flag_ref is None
     read_only = read_only or (random_pick and rotation is None)
-    if random_pick:
-        resolution = resolver.pick_free_profile(
-            store,
-            cwd=cwd,
-            force=force,
-            engine=engine,
-            exclude=exclude,
-            read_only=read_only,
-            rotation=rotation,
-        )
-    else:
-        resolution = resolver.resolve(
-            store,
-            flag_ref=flag_ref,
-            cwd=cwd,
-            engine=engine,
-            read_only=read_only,
-        )
-    profile = (store.get_readonly if read_only else store.get)(resolution.name)
-    driver = engines.get_engine(profile.engine)
+    excluded = set(exclude or ())
+    causes_dict: Dict[str, str] = dict(causes or {})
+    causes = causes_dict
+    while True:
+        if random_pick:
+            try:
+                resolution = resolver.pick_free_profile(
+                    store,
+                    cwd=cwd,
+                    force=force,
+                    engine=engine,
+                    exclude=excluded,
+                    read_only=read_only,
+                    rotation=rotation,
+                )
+            except resolver.NoEligibleProfileError as exhausted:
+                if not excluded:
+                    raise
+                scope = f"{engine} engine" if engine else "any engine"
+                if causes and len(causes) > 1:
+                    cause_str = "; ".join(f"{n}: {causes[n]}" for n in sorted(causes))
+                elif causes:
+                    cause_str = next(iter(causes.values()))
+                else:
+                    cause_str = str(exhausted)
+                raise resolver.NoEligibleProfileError(
+                    f"{cause_str}; no other {scope} profile could be joined "
+                    f"({', '.join(sorted(excluded))} already tried)"
+                ) from exhausted
+        else:
+            resolution = resolver.resolve(
+                store,
+                flag_ref=flag_ref,
+                cwd=cwd,
+                engine=engine,
+                read_only=read_only,
+            )
+        profile = (store.get_readonly if read_only else store.get)(resolution.name)
+        driver = engines.get_engine(profile.engine)
 
-    config = store.load_config()
-    config_bin = getattr(config, driver.config_binary_attr, None)
-    binary = driver.resolve_binary(binary_override or config_bin)
-    if binary is None:
-        raise StoreError(
-            f"could not find the {driver.binary_name} binary; install {driver.binary_name} first, "
-            f"or point agydra to it with --binary <path> or the {driver.env_bin_var} env var"
-        )
+        config = store.load_config()
+        config_bin = getattr(config, driver.config_binary_attr, None)
+        binary = driver.resolve_binary(binary_override, config_val=config_bin)
+        if binary is None:
+            if binary_override:
+                override_path = Path(binary_override).expanduser()
+                if not override_path.exists() and not shutil.which(binary_override):
+                    raise BinaryUnavailableError(
+                        f"could not find binary {binary_override!r}",
+                        exit_code=127,
+                    )
+                raise BinaryUnavailableError(
+                    f"binary {binary_override!r} is not executable",
+                    exit_code=126,
+                )
+            err = BinaryUnavailableError(
+                f"could not find the {driver.binary_name} binary; install {driver.binary_name} first, "
+                f"or point agydra to it with --binary <path> or the {driver.env_bin_var} env var",
+                exit_code=1,
+            )
+            if not random_pick:
+                raise err
+            excluded.add(profile.name)
+            causes[profile.name] = str(err)
+            continue
+        break
 
     plan_env: Dict[str, str] = {}
     agy_file_auth = random_pick and driver.name == "agy"
@@ -259,8 +304,12 @@ def _grok_socket_destination(overlay: Path, data_dir_name: str) -> str:
 
 
 def _next_random_plan(
-    store: Store, plan: LaunchPlan, excluded: set, cause: Exception,
+    store: Store,
+    plan: LaunchPlan,
+    excluded: set,
+    cause: Exception,
     rotation: Optional[profile_rotation.Rotation] = None,
+    causes: Optional[Dict[str, str]] = None,
 ) -> LaunchPlan:
     """Exclude a busy or unusable candidate and replan with a finite scope.
 
@@ -268,21 +317,34 @@ def _next_random_plan(
     Exhaustion preserves the actual preparation error.
     """
     excluded.add(plan.profile)
+    if causes is not None:
+        causes[plan.profile] = str(cause)
     try:
         return build_plan(
-            store, plan.raw_args,
-            binary_override=plan.binary_override, random_pick=True,
+            store,
+            plan.raw_args,
+            binary_override=plan.binary_override,
+            random_pick=True,
             launch_as_child=plan.launch_as_child,
             cwd=plan.cwd,
             force=plan.force,
             engine=plan.engine_filter,
             exclude=excluded,
             rotation=rotation,
+            causes=causes,
         )
-    except StoreError as exhausted:
+    except resolver.NoEligibleProfileError as exhausted:
+        if "already tried" in str(exhausted):
+            raise
         scope = f"{plan.engine_filter} engine" if plan.engine_filter else "any engine"
-        raise StoreError(
-            f"{cause}; no other {scope} profile could be joined "
+        if causes and len(causes) > 1:
+            cause_str = "; ".join(f"{n}: {causes[n]}" for n in sorted(causes))
+        elif causes:
+            cause_str = next(iter(causes.values()))
+        else:
+            cause_str = str(cause)
+        raise resolver.NoEligibleProfileError(
+            f"{cause_str}; no other {scope} profile could be joined "
             f"({', '.join(sorted(excluded))} already tried)"
         ) from exhausted
 
@@ -334,10 +396,10 @@ def _keep_file_login(store: Store, name: str, data_dir: Path):
     """Back up a credential written by a file-auth login for Keychain launches."""
     yield
     try:
-        if account.agy_token_path(data_dir).is_file():
-            raw = account.scoped_agy_token_bytes(store, store.get(name), data_dir)
-            if raw is not None:
-                keychain.save_file_credential(store, name, raw)
+        path = account.agy_token_path(data_dir)
+        if path.is_file():
+            raw = path.read_bytes()
+            keychain.adopt_login_credential(store, name, data_dir, raw)
     except (keychain.KeychainError, OSError, StoreError) as exc:
         warn(
             f"could not back up the new Antigravity credential of profile "
@@ -354,6 +416,7 @@ def _run_prepared(
     import engines
 
     excluded: set = set()
+    causes: Dict[str, str] = {}
     slot_busy: Optional[keychain.KeychainBusyError] = None
     limit = None if plan.force else store.load_config().session_limit()
     while True:
@@ -363,125 +426,132 @@ def _run_prepared(
         leased: Optional[str] = None
         started = False
         try:
-            _prepare_file_auth(store, plan, slot_busy)
-            membership = {"keychain": False} if plan.agy_file_auth else {}
-            joined = locks.acquire_lease(
-                store, plan.profile, patience_s=locks.LEASE_PATIENCE_S, max_holders=limit,
-                **membership,
-            )
-        except (locks.LockError, isolation.AgyCredentialUnavailableError) as exc:
-            if plan.random_pick:
-                plan = _next_random_plan(store, plan, excluded, exc, rotation)
-                continue
-            if isinstance(exc, locks.LeaseLimitError):
-                raise StoreError(
-                    f"{exc}; wait for one to finish, raise "
-                    "settings.max_sessions_per_profile in agydra.json, or "
-                    "bypass with -f/--force"
-                ) from exc
-            if isinstance(exc, locks.LockError):
-                raise StoreError(
-                    f"profile {plan.profile!r} is locked by a store operation "
-                    f"({exc}); retry in a moment"
-                ) from exc
-            raise
-        leased = plan.profile
-        if joined and driver.name in ("codex", "grok"):
-            warn(
-                f"joining {joined} live session(s) on profile {plan.profile!r}: "
-                "concurrent sessions share the on-disk auth.json and may force "
-                "a re-login (refresh-token rotation)"
-            )
-        if joined and plan.launch_as_child:
-            warn(
-                f"re-login while {joined} live session(s) run on profile "
-                f"{plan.profile!r}; those sessions may be logged out"
-            )
-        try:
-            profile = store.get(plan.profile)
-            data_dir = store.profile_data_dir(plan.profile, engine=plan.engine)
-            _prepare_file_auth(store, plan, slot_busy)
-            profile.touch()
-            store.save(profile)
-
-            overlay = isolation.build_overlay(plan.profile, data_dir, store.root, engine=plan.engine)
-            usage_env: Dict[str, str] = {}
-            if driver.name == "claude":
-                import claude_usage
-
-                if _changes_claude_identity(plan.args, plan.raw_args):
-                    try:
-                        claude_usage.invalidate_profile_usage(store, plan.profile)
-                    except Exception as exc:
-                        raise StoreError(
-                            f"could not invalidate the Claude usage cache before "
-                            f"{' '.join(plan.args[:2])} for profile {plan.profile!r} ({exc}); "
-                            "launch aborted so a stale session cannot resurrect it"
-                        ) from exc
-                usage_env = claude_usage.capture_environment(store, profile)
-            inherited = driver.inherited_foreign_auth(os.environ)
-            if inherited:
-                warn(
-                    f"ignoring inherited {', '.join(inherited)} for {driver.name} profile "
-                    f"{plan.profile!r}: identity comes only from the profile's own login"
-                )
-            extra = {resolver.PROFILE_ENV: plan.profile, **usage_env}
-            if plan.agy_file_auth:
-                extra[account.AGY_FILE_AUTH_ENV] = account.AGY_FILE_AUTH_VALUE
-            env = isolation.isolated_env(
-                overlay,
-                extra=extra,
-                engine=plan.engine,
-                config_windows_redirect_home=plan.windows_redirect_home,
-                store_root=store.root,
-            )
-
-            argv = [str(plan.binary), *plan.args]
-            if plan.use_sandbox:
-                argv = isolation.sandbox_wrap(argv)
-
-            if needs_keychain:
-                guard = keychain.launch_guard(store, plan.profile, capture=plan.launch_as_child)
-            elif plan.agy_file_auth and plan.launch_as_child:
-                guard = _keep_file_login(store, plan.profile, data_dir)
-            else:
-                guard = contextlib.nullcontext()
             try:
-                with guard:
-                    started = True
-                    if rotation is not None:
-                        if plan.random_pick:
-                            rotation.commit(profile)
-                        else:
-                            rotation.release()
-                    if platforms.is_windows():
-                        rc = platforms.launch_argv(argv, env)
-                        platforms.drain_tty_input()
-                        return rc
-                    if plan.use_sandbox or plan.launch_as_child or keychain_needs_waited_child:
-                        rc = platforms.run_wait(argv, env)
-                        platforms.drain_tty_input()
-                        return rc
-                    return platforms.launch_argv(argv, env)
-            except keychain.KeychainBusyError as exc:
-                if exc.owner is None or plan.agy_file_auth:
-                    raise StoreError(str(exc)) from exc
-                note(
-                    f"profile {exc.owner!r} owns the shared Antigravity Keychain "
-                    f"slot; profile {plan.profile!r} uses its private file "
-                    "credential instead"
+                _prepare_file_auth(store, plan, slot_busy)
+                membership = {"keychain": False} if plan.agy_file_auth else {}
+                joined = locks.acquire_lease(
+                    store, plan.profile, patience_s=locks.LEASE_PATIENCE_S, max_holders=limit,
+                    **membership,
                 )
-                slot_busy = exc
-                plan = replace(plan, agy_file_auth=True)
+            except (locks.LockError, isolation.AgyCredentialUnavailableError) as exc:
+                if plan.random_pick:
+                    plan = _next_random_plan(store, plan, excluded, exc, rotation, causes)
+                    continue
+                if isinstance(exc, locks.LeaseLimitError):
+                    raise StoreError(
+                        f"{exc}; wait for one to finish, raise "
+                        "settings.max_sessions_per_profile in agydra.json, or "
+                        "bypass with -f/--force"
+                    ) from exc
+                if isinstance(exc, locks.LockError):
+                    raise StoreError(
+                        f"profile {plan.profile!r} is locked by a store operation "
+                        f"({exc}); retry in a moment"
+                    ) from exc
+                raise
+            leased = plan.profile
+            if joined and driver.name in ("codex", "grok"):
+                warn(
+                    f"joining {joined} live session(s) on profile {plan.profile!r}: "
+                    "concurrent sessions share the on-disk auth.json and may force "
+                    "a re-login (refresh-token rotation)"
+                )
+            if joined and plan.launch_as_child:
+                warn(
+                    f"re-login while {joined} live session(s) run on profile "
+                    f"{plan.profile!r}; those sessions may be logged out"
+                )
+            try:
+                profile = store.get(plan.profile)
+                data_dir = store.profile_data_dir(plan.profile, engine=plan.engine)
+                _prepare_file_auth(store, plan, slot_busy)
+                profile.touch()
+                store.save(profile)
+
+                overlay = isolation.build_overlay(plan.profile, data_dir, store.root, engine=plan.engine)
+                usage_env: Dict[str, str] = {}
+                if driver.name == "claude":
+                    import claude_usage
+
+                    if _changes_claude_identity(plan.args, plan.raw_args):
+                        try:
+                            claude_usage.invalidate_profile_usage(store, plan.profile)
+                        except Exception as exc:
+                            raise StoreError(
+                                f"could not invalidate the Claude usage cache before "
+                                f"{' '.join(plan.args[:2])} for profile {plan.profile!r} ({exc}); "
+                                "launch aborted so a stale session cannot resurrect it"
+                            ) from exc
+                    usage_env = claude_usage.capture_environment(store, profile)
+                inherited = driver.inherited_foreign_auth(os.environ)
+                if inherited:
+                    warn(
+                        f"ignoring inherited {', '.join(inherited)} for {driver.name} profile "
+                        f"{plan.profile!r}: identity comes only from the profile's own login"
+                    )
+                extra = {resolver.PROFILE_ENV: plan.profile, **usage_env}
+                if plan.agy_file_auth:
+                    extra[account.AGY_FILE_AUTH_ENV] = account.AGY_FILE_AUTH_VALUE
+                env = isolation.isolated_env(
+                    overlay,
+                    extra=extra,
+                    engine=plan.engine,
+                    config_windows_redirect_home=plan.windows_redirect_home,
+                    store_root=store.root,
+                )
+
+                argv = [str(plan.binary), *plan.args]
+                if plan.use_sandbox:
+                    argv = isolation.sandbox_wrap(argv)
+
+                if needs_keychain:
+                    guard = keychain.launch_guard(store, plan.profile, capture=plan.launch_as_child)
+                elif plan.agy_file_auth and plan.launch_as_child:
+                    guard = _keep_file_login(store, plan.profile, data_dir)
+                else:
+                    guard = contextlib.nullcontext()
+                try:
+                    with guard:
+                        started = True
+                        if rotation is not None:
+                            if plan.random_pick:
+                                rotation.commit(profile)
+                            else:
+                                rotation.release()
+                        if platforms.is_windows():
+                            rc = platforms.launch_argv(argv, env)
+                            platforms.drain_tty_input()
+                            return rc
+                        if plan.use_sandbox or plan.launch_as_child or keychain_needs_waited_child:
+                            rc = platforms.run_wait(argv, env)
+                            platforms.drain_tty_input()
+                            return rc
+                        return platforms.launch_argv(argv, env)
+                except keychain.KeychainBusyError as exc:
+                    if exc.owner is None or plan.agy_file_auth:
+                        raise StoreError(str(exc)) from exc
+                    note(
+                        f"profile {exc.owner!r} owns the shared Antigravity Keychain "
+                        f"slot; profile {plan.profile!r} uses its private file "
+                        "credential instead"
+                    )
+                    slot_busy = exc
+                    plan = replace(plan, agy_file_auth=True)
+            except (isolation.IsolationError, isolation.AgyCredentialUnavailableError, locks.LockError, BinaryUnavailableError) as prep_exc:
+                if plan.random_pick and not started:
+                    plan = _next_random_plan(store, plan, excluded, prep_exc, rotation, causes)
+                    continue
+                raise
         finally:
-            try:
-                locks.release_lease(store, leased, patience_s=1.0)
-            except locks.LockError as exc:
-                warn(
-                    f"could not release the session lease for profile "
-                    f"{leased!r} ({exc}); it self-heals on the next "
-                    "launch"
-                )
+            if leased is not None:
+                try:
+                    locks.release_lease(store, leased, patience_s=1.0)
+                except locks.LockError as exc:
+                    warn(
+                        f"could not release the session lease for profile "
+                        f"{leased!r} ({exc}); it self-heals on the next "
+                        "launch"
+                    )
             if leased and started:
                 try:
                     account.record_profile_email(store, plan.profile)

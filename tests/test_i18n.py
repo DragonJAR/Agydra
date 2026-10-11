@@ -141,6 +141,64 @@ class TestI18nCli(BaseCase):
         self.assertEqual(res_idioma.returncode, 0)
         self.assertIn("Current language: en", res_idioma.stdout)
 
+    def test_language_query_supported_languages_localized(self):
+        self._run_cli("language", "es")
+        res_es = self._run_cli("language")
+        self.assertIn("soportados: en, es", res_es.stdout)
+
+        self._run_cli("language", "en")
+        res_en = self._run_cli("language")
+        self.assertIn("supported : en, es", res_en.stdout)
+
+    def test_cmd_list_empty_profiles_localized(self):
+        res_en = self._run_cli("--lang=en", "list")
+        self.assertEqual(res_en.returncode, 0)
+        self.assertIn("no profiles; create one with: agydra create <name>", res_en.stdout)
+
+        res_es = self._run_cli("--lang=es", "list")
+        self.assertEqual(res_es.returncode, 0)
+        self.assertIn("sin perfiles; crea uno con: agydra create <nombre>", res_es.stdout)
+
+    def test_cmd_list_spanish_table_formatting_and_labels(self):
+        import locks
+
+        store = Store(self.store_root)
+        store.create("perfil1", engine="agy")
+        store.create("perfil2", engine="claude")
+
+        locks.acquire_lease(store, "perfil1")
+        try:
+            res_es = self._run_cli("--lang=es", "list")
+            self.assertEqual(res_es.returncode, 0)
+            lines = res_es.stdout.strip().splitlines()
+            header_line = lines[0]
+            row1_line = lines[1]
+            row2_line = lines[2]
+
+            self.assertIn("OCUPADO  MOTOR", header_line)
+            self.assertNotIn("OCUPADOMOTOR", header_line)
+            self.assertIn("AUTENT.", header_line)
+            self.assertIn("PREDET.", header_line)
+            self.assertIn("ÚLTIMO USO", header_line)
+
+            self.assertIn("sí", row1_line)
+            self.assertIn("no autenticado", row1_line)
+            self.assertIn("no autenticado", row2_line)
+        finally:
+            locks.release_lease(store, "perfil1")
+
+        res_en = self._run_cli("--lang=en", "list")
+        self.assertEqual(res_en.returncode, 0)
+        en_lines = res_en.stdout.strip().splitlines()
+        en_header = en_lines[0]
+        en_row1 = en_lines[1]
+
+        self.assertIn("BUSY  ENGINE", en_header)
+        self.assertIn("AUTH", en_header)
+        self.assertIn("DEFAULT", en_header)
+        self.assertIn("LAST USED", en_header)
+        self.assertIn("not-authenticated", en_row1)
+
 
 if __name__ == "__main__":
     unittest.main()

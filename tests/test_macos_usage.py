@@ -586,7 +586,7 @@ class TestMacosSlotLease(BaseCase):
             self._join_lease("alpha")
             with keychain.launch_guard(self.store, "alpha", capture=True):
                 pass
-            self.assertIsNotNone(self.kc.shared)
+            self.assertIsNone(self.kc.shared)
             self.assertIsNone(self._slot_lease_state()["owner"])
             secret = keychain.load_profile_slot(self.store, "alpha")
             self.assertEqual(

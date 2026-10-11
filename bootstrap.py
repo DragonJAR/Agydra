@@ -22,6 +22,7 @@ Design invariants (see AGENTS.md):
 """
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import shlex
@@ -36,6 +37,7 @@ import platforms
 MIN_PYTHON = (3, 9)
 VENV_DIRNAME = ".venv"
 PIP_FLOOR = (21, 3)
+BOOTSTRAP_TIMEOUT_S = 600.0
 SHIM_MARKER = "Managed by agydra setup"
 INSTALLED_NOTICE = (
     "agydra is installed as a package: pip/pipx manages this installation, so "
@@ -192,7 +194,31 @@ def _shim_content(target: Path) -> str:
 
 
 
-def _run(argv: Sequence[str], cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
+def shim_target(shim: Optional[Path] = None) -> Optional[Path]:
+    """Parse the delegate target from a managed agydra PATH shim."""
+    target_shim = shim_path() if shim is None else Path(shim)
+    if not _shim_entry_exists(target_shim):
+        return None
+    try:
+        body = target_shim.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if SHIM_MARKER not in body:
+        return None
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("exec ") and line.endswith('"$@"'):
+            parts = shlex.split(line)
+            if len(parts) >= 2:
+                return Path(parts[1])
+    return None
+
+
+def _run(
+    argv: Sequence[str],
+    cwd: Optional[Path] = None,
+    timeout: Optional[float] = BOOTSTRAP_TIMEOUT_S,
+) -> subprocess.CompletedProcess:
     display = " ".join(str(a) for a in argv[:4])
     try:
         return subprocess.run(
@@ -203,7 +229,10 @@ def _run(argv: Sequence[str], cwd: Optional[Path] = None) -> subprocess.Complete
             encoding="utf-8",
             errors="replace",
             cwd=None if cwd is None else str(cwd),
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise BootstrapError(f"command timed out after {timeout}s: {display}") from exc
     except OSError as exc:
         raise BootstrapError(f"cannot run {display}: {exc}") from exc
 
@@ -264,6 +293,23 @@ def _pip_supports_pep660(vpy: Path) -> bool:
     return (_pip_version(vpy) or (0, 0)) >= PIP_FLOOR
 
 
+def _is_network_failure(tail: str) -> bool:
+    low = tail.lower()
+    return any(
+        err in low
+        for err in (
+            "could not fetch url",
+            "connection refused",
+            "network is unreachable",
+            "timed out",
+            "temporary failure in name resolution",
+            "nodename nor servname provided",
+            "failed to establish a new connection",
+            "ssl: certificate_verify_failed",
+        )
+    )
+
+
 def install_editable(root: Path, vpy: Path, out: Callable[[str], None]) -> None:
     """``pip install -e <root>`` inside the venv (local metadata, no index)."""
     if not _pip_supports_pep660(vpy):
@@ -271,6 +317,10 @@ def install_editable(root: Path, vpy: Path, out: Callable[[str], None]) -> None:
         proc = _run([str(vpy), "-m", "pip", "install", "--quiet", "--no-input", "--upgrade", "pip"])
         if proc.returncode != 0:
             upgrade_note = _tail(proc)
+            if _is_network_failure(upgrade_note):
+                raise BootstrapError(
+                    f"network failure during install: {upgrade_note}"
+                )
             raise BootstrapError(
                 f"pip is too old for editable installs and its upgrade failed "
                 f"(exit {proc.returncode}): {upgrade_note}"
@@ -280,8 +330,11 @@ def install_editable(root: Path, vpy: Path, out: Callable[[str], None]) -> None:
         [str(vpy), "-m", "pip", "install", "--quiet", "--no-input", "-e", str(root)]
     )
     if proc.returncode != 0:
+        tail = _tail(proc)
+        if _is_network_failure(tail):
+            raise BootstrapError(f"network failure during install: {tail}")
         raise BootstrapError(
-            f"pip install -e . failed (exit {proc.returncode}): {_tail(proc)}"
+            f"pip install -e . failed (exit {proc.returncode}): {tail}"
         )
     script = console_script(root)
     if not script.exists():
@@ -316,7 +369,12 @@ def _atomic_write_text(path: Path, content: str, mode: int) -> None:
         raise
 
 
-def ensure_path_shim(root: Path, out: Callable[[str], None], force: bool = False) -> Optional[Path]:
+def ensure_path_shim(
+    root: Path,
+    out: Callable[[str], None],
+    force: bool = False,
+    explicit: bool = False,
+) -> Optional[Path]:
     """Write (or refresh) the ``~/.local/bin/agydra`` shim.
 
     Only shims carrying ``SHIM_MARKER`` are rewritten (unless ``force=True``);
@@ -356,6 +414,11 @@ def ensure_path_shim(root: Path, out: Callable[[str], None], force: bool = False
                         f"refusing to overwrite foreign file at {shim}; "
                         "inspect it and remove it manually, then re-run setup (or use --force)"
                     )
+                curr_target = shim_target(shim)
+                if curr_target is not None and curr_target.exists():
+                    if not explicit and not force:
+                        out(f"managed shim points to existing {curr_target}; leaving untouched")
+                        return shim
                 out(f"refreshing stale shim: {shim}")
         _atomic_write_text(shim, content, mode=0o755)
     except OSError as exc:
@@ -430,10 +493,40 @@ def check_state(root: Path) -> dict:
                 state["shim_ok"] = True
                 state["shim_state"] = "ok"
             elif SHIM_MARKER in body:
-                state["shim_state"] = "stale"
+                target = shim_target(shim)
+                if target is not None and not target.exists():
+                    state["shim_state"] = "dead"
+                else:
+                    state["shim_state"] = "stale"
             else:
                 state["shim_state"] = "foreign"
     return state
+
+
+def setup_parser(prog: str = "agydra setup") -> argparse.ArgumentParser:
+    """Argparse definition for agydra setup flags, shared by CLI and entrypoint."""
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="One-command installer for agydra (venv + console script + PATH shim).",
+    )
+    parser.add_argument(
+        "-n", "--dry-run", action="store_true",
+        help="print what setup would do without touching anything",
+    )
+    parser.add_argument(
+        "-f", "--force", action="store_true",
+        help="force overwrite of foreign or existing shim at ~/.local/bin/agydra",
+    )
+    return parser
+
+
+def parse_setup_args(argv: Sequence[str], prog: str = "agydra setup") -> argparse.Namespace:
+    """Parse and validate setup arguments, enforcing mutual exclusion of -n and -f."""
+    parser = setup_parser(prog=prog)
+    args = parser.parse_args(list(argv))
+    if args.dry_run and args.force:
+        parser.error("-f/--force has no effect with -n/--dry-run (nothing is written)")
+    return args
 
 
 def report_state(root: Optional[Path] = None) -> None:
@@ -458,6 +551,7 @@ def run(
     out: Optional[Callable[[str], None]] = None,
     root: Optional[Path] = None,
     force: bool = False,
+    explicit: bool = False,
 ) -> int:
     """Full bootstrap: venv -> editable install -> shim -> verify.
 
@@ -479,7 +573,7 @@ def run(
             )
         vpy = ensure_venv(target_root, say)
         install_editable(target_root, vpy, say)
-        ensure_path_shim(target_root, say, force=force)
+        ensure_path_shim(target_root, say, force=force, explicit=explicit)
         if not verify_install(target_root, say):
             say("setup: verification failed — see the lines above")
             return 1

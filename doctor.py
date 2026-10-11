@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agydra import __version__
 import account
@@ -47,7 +47,7 @@ class _DoctorContext:
 
 def _check_binary(store: Store, ctx: "_DoctorContext"):
     config = store.load_config()
-    agy_bin = platforms.resolve_agy_binary(config.agy_binary)
+    agy_bin = platforms.resolve_agy_binary(config_val=config.agy_binary)
     has_profiles = bool(ctx.scan[0])
     has_agy_profile = any(getattr(p, "engine", "agy") == "agy" for p in ctx.scan[0]) if has_profiles else True
     has_codex_profile = any(getattr(p, "engine", "agy") == "codex" for p in ctx.scan[0])
@@ -69,21 +69,21 @@ def _check_binary(store: Store, ctx: "_DoctorContext"):
         else:
             lines.append(f"{prefix}agy binary: {agy_bin}")
     if has_codex_profile:
-        codex_bin = platforms.resolve_codex_binary(config.codex_binary)
+        codex_bin = platforms.resolve_codex_binary(config_val=config.codex_binary)
         if codex_bin is None:
             status = FAIL
             lines.append(f"{prefix}codex binary not found (install codex or set {platforms.CODEX_BIN_ENV})")
         else:
             lines.append(f"{prefix}codex binary: {codex_bin}")
     if has_grok_profile:
-        grok_bin = platforms.resolve_grok_binary(config.grok_binary)
+        grok_bin = platforms.resolve_grok_binary(config_val=config.grok_binary)
         if grok_bin is None:
             status = FAIL
             lines.append(f"{prefix}grok binary not found (install grok or set {platforms.GROK_BIN_ENV})")
         else:
             lines.append(f"{prefix}grok binary: {grok_bin}")
     if has_claude_profile:
-        claude_bin = platforms.resolve_claude_binary(config.claude_binary)
+        claude_bin = platforms.resolve_claude_binary(config_val=config.claude_binary)
         if claude_bin is None:
             status = FAIL
             lines.append(f"{prefix}claude binary not found (install claude or set {platforms.CLAUDE_BIN_ENV})")
@@ -117,6 +117,20 @@ def _check_profiles(store: Store, ctx: "_DoctorContext"):
     profiles, unreadable = ctx.scan
     problems = []
     lines = [f"profiles: {len(profiles)}"]
+    sequence_owners: Dict[int, List[str]] = {}
+    for p in profiles:
+        if type(p.seq) is int and p.seq > 0:
+            sequence_owners.setdefault(p.seq, []).append(p.name)
+    duplicate_errors = []
+    for sequence, names in sorted(sequence_owners.items()):
+        if len(names) > 1:
+            paths = ", ".join(str(store.profile_meta_path(name)) for name in sorted(names))
+            err = store._duplicate_profile_sequence_error(sequence, names)
+            duplicate_errors.append(f"{err} (files: {paths})")
+            lines.append(f"  - duplicate sequence {sequence}: {paths}")
+    if duplicate_errors:
+        lines.insert(0, "; ".join(duplicate_errors))
+        return FAIL, "\n".join(lines)
     for p in profiles:
         engine = getattr(p, "engine", "agy") or "agy"
         data_dir = store.profile_data_dir(p.name, engine=engine)
@@ -140,6 +154,9 @@ def _check_profiles(store: Store, ctx: "_DoctorContext"):
             f"unreadable profile metadata: {', '.join(unreadable)} "
             "(remove with: agydra delete <name>)"
         )
+    if duplicate_errors:
+        lines.insert(0, "; ".join(duplicate_errors))
+        return FAIL, "\n".join(lines)
     if problems:
         lines.insert(0, "; ".join(problems))
         return WARN, "\n".join(lines)
@@ -166,11 +183,27 @@ def _check_locks(store: Store, ctx: "_DoctorContext"):
     if not ctx.names:
         return WARN, "locks: no profiles to check"
     try:
-        busy = locks.in_use_names(store, names=ctx.names)
+        busy = []
+        unreadable = []
+        for name in ctx.names:
+            lock_p = locks.lock_path(store, name)
+            if not lock_p.exists():
+                continue
+            holders = locks.lease_holders(store, name)
+            if holders is None:
+                unreadable.append(str(lock_p))
+            elif holders or locks.is_locked(store, name):
+                busy.append(name)
     except OSError as exc:
         return WARN, f"locks: cannot inspect ({exc})"
+    lines = []
+    if unreadable:
+        for p in unreadable:
+            lines.append(f"locks: unreadable lease registry {p}")
     if busy:
-        return WARN, f"locks: live sessions: {', '.join(busy)}"
+        lines.append(f"locks: live sessions: {', '.join(busy)}")
+    if lines:
+        return WARN, "\n".join(lines)
     return OK, "locks: no live sessions"
 
 
@@ -564,6 +597,14 @@ def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
         scan = orphans.find_orphans(store, ctx.names)
     if not scan.is_empty():
         lines.extend(scan.describe_actions())
+    import locks
+    for name in ctx.names:
+        lock_p = locks.lock_path(store, name)
+        if lock_p.exists() and locks.lease_holders(store, name) is None:
+            handle = locks.try_read_lock(store, name)
+            if handle is not None:
+                handle.release()
+                lines.append(f"reset unreadable lease registry {lock_p}")
     return lines
 
 
@@ -772,10 +813,25 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
         finally:
             handle.release()
     _fix_orphans(store, current_names)
+    for name in current_names:
+        lock_p = locks.lock_path(store, name)
+        if lock_p.exists() and locks.lease_holders(store, name) is None:
+            handle = locks.try_lock(store, name)
+            if handle is not None:
+                try:
+                    os.lseek(handle._fd, 0, os.SEEK_SET)
+                    os.ftruncate(handle._fd, 0)
+                    os.write(handle._fd, b'{"holders": []}\n')
+                    console_print(
+                        paint("[fix]", "cyan", "bold")
+                        + f" reset unreadable lease registry for {name!r}"
+                    )
+                finally:
+                    handle.release()
 
 
 def _build_ctx(store: Store) -> "_DoctorContext":
-    scan = store.scan()
+    scan = store.scan(tolerant=True)
     return _DoctorContext(
         scan=scan, names=[p.name for p in scan[0]],
     )

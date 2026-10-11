@@ -10,7 +10,9 @@ readable ``reason`` so ``status`` can explain why a profile was picked:
 Only the explicit flag is binding against a requested engine. The
 environment variable (inherited from an enclosing agydra session) and the
 marker are ambient pins: a pin naming a profile of another engine yields to
-the next step, while a pin naming no profile still raises.
+the next step. When AGYDRA_PROFILE names no profile, agydra warns once and
+continues the cascade, while an explicit flag or marker naming no profile
+still raises.
 4. configured default profile
 5. first profile by number
 """
@@ -30,6 +32,10 @@ from ui import warn
 
 PROFILE_ENV = "AGYDRA_PROFILE"
 MARKER_FILE = ".agydra"
+
+
+class NoEligibleProfileError(StoreError):
+    """Raised when rotation candidate pool is empty or completely exhausted."""
 
 
 @dataclass
@@ -105,9 +111,13 @@ def resolve(
 
     env_ref = env.get(PROFILE_ENV)
     if env_ref:
-        name = resolve_ref(env_ref)
-        if serves_engine(name):
-            return Resolution(name, f"environment {PROFILE_ENV}={env_ref}")
+        try:
+            name = resolve_ref(env_ref)
+        except StoreError:
+            warn(f"ignoring stale {PROFILE_ENV}={env_ref}")
+        else:
+            if serves_engine(name):
+                return Resolution(name, f"environment {PROFILE_ENV}={env_ref}")
 
     marker = _marker_resolution(store, cwd, read_only=read_only)
     if marker is not None and serves_engine(marker.name):
@@ -195,11 +205,11 @@ def pick_free_profile(
         profiles = [p for p in profiles if p.engine == target_engine]
     if not profiles:
         if target_engine is not None:
-            raise StoreError(
+            raise NoEligibleProfileError(
                 f"no profiles found for engine {target_engine!r}; "
                 f"create them with: agydra create <name> -e {target_engine}"
             )
-        raise StoreError(_NO_PROFILES)
+        raise NoEligibleProfileError(_NO_PROFILES)
 
     limit = None if force else store.load_config().session_limit()
     busy: Dict[str, bool] = {}
@@ -249,8 +259,14 @@ def pick_free_profile(
         )
     except profile_rotation.NoEligibleProfileError as exc:
         if saturated:
-            raise StoreError(_AT_LIMIT.format(limit=limit)) from exc
-        raise StoreError(_NOT_AUTHENTICATED) from exc
+            raise NoEligibleProfileError(_AT_LIMIT.format(limit=limit)) from exc
+        raise NoEligibleProfileError(_NOT_AUTHENTICATED) from exc
+    except StoreError as exc:
+        if "rotation scope" in str(exc):
+            if saturated:
+                raise NoEligibleProfileError(_AT_LIMIT.format(limit=limit)) from exc
+            raise NoEligibleProfileError(str(exc)) from exc
+        raise
     scope = target_engine or "all engines"
     reason = f"profile selected from {scope} rotation; session state, saved quota, LRU and stable identity order (-r)"
     session = "joining busy profile" if session_priority(candidate)[0] else "free profile"

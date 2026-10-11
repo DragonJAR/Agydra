@@ -57,7 +57,7 @@ pip install .              # or: pipx install .
 agydra doctor
 ```
 
-`python3 agydra.py` bootstraps a source checkout and re-executes the installed command; after a `pip`/`pipx` install (`python -m agydra` enters the CLI directly), `agydra setup` detects the pip-owned installation, reports it and writes nothing — update or remove it with pip/pipx.
+`python3 agydra.py` bootstraps a source checkout and re-executes the installed command; after a `pip`/`pipx` install (`python -m agydra` enters the CLI directly), `agydra setup` detects the pip-owned installation, reports it and writes nothing — update or remove it with pip/pipx. Editable install metadata resolves from local files; pip build isolation or pip upgrade when older than 21.3 may access PyPI, bounded by a 60-second timeout with clean error reporting.
 
 ### One profile per engine
 
@@ -158,6 +158,8 @@ Copy or merge the printed `statusLine` object **manually into `settings.json` at
 
 **Dry-run.** `agydra -np work` prints paths, environment, and argv and does not launch.
 
+**Engine flags.** Use `--` to pass engine flags that clash with Agydra subcommands or options (for example, passing `-c` to Claude Code or `-r` to resume a Claude session: `agydra -p claude-work -- -r`).
+
 **Language.** `agydra lang es` stores `en` or `es` in `agydra.json`. `AGYDRA_LANG=es` covers one process. `agydra lang` prints the active language and supported codes.
 
 ### What each engine isolates
@@ -173,7 +175,7 @@ Copy or merge the printed `statusLine` object **manually into `settings.json` at
 
 ## 🧭 Command & Flag Reference
 
-Management commands also accept `--NAME` or `-NAME` (`agydra --list` == `agydra list`). A profile is a name or the 1-based index from `agydra list`.
+Management commands also accept `--NAME` or `-NAME` (`agydra --list` == `agydra list`). To pass flags like `-c` directly to the engine instead of invoking a management command or alias, separate them with `--` (e.g. `agydra -- -c`). A profile is a name or the 1-based index from `agydra list`.
 
 | Command | Aliases | Description |
 |---|---|---|
@@ -189,7 +191,7 @@ Management commands also accept `--NAME` or `-NAME` (`agydra --list` == `agydra 
 | `status [NAME\|#] [-p NAME\|#] [-e ENGINE] [-n]` | `st` | Resolved profile, engine, binary (`not found` when the engine CLI is not installed), email, auth, live sessions. `-n` prints the launch plan and does need the binary. |
 | `usage [NAME\|#]` | `us` | Quotas for `agy`, `codex`, `grok`, and Claude Code (live queries and informational snapshots). `--claude-settings PROFILE` prints opt-in capture settings; `--apply` (only with `--claude-settings`) writes the `statusLine` into the profile's `settings.json` (creating it, or atomically merging it while preserving other keys); no-op if already present; refuses and leaves the file untouched if a different `statusLine` or invalid JSON exists. |
 | `share-config SRC TARGET...` | `share` | Copies config files while holding the source and target profile locks through all copies. Leaves credentials in the source. Claude profiles are rejected. |
-| `doctor [--fix [-f]]` | `doc` | Ten health checks. `--fix` repairs overlay data links and dangling defaults, and purges only orphan artifacts; `-f` skips the `--fix` confirmation and is rejected without `--fix`. |
+| `doctor [--fix [-f]]` | `doc` | Ten health checks. `--fix` repairs overlay data links, dangling defaults, resets unreadable lease registries when free, and purges only orphan artifacts; `-f` skips the `--fix` confirmation and is rejected without `--fix`. |
 | `setup [-n] [-f]` | `install` | Idempotent venv, console script, and PATH shim. `-n` previews; `-f` overwrites a foreign shim. |
 | `language [CODE]` | `lang`, `idioma`, `locale` | Display language: `en` or `es`. |
 | `version` | `--version` | Prints the Agydra version and author. |
@@ -207,7 +209,7 @@ Launcher flags go **before** engine arguments.
 | `-b PATH` | `--binary` | Override the engine binary for this run. |
 | `-f` | `--force` | Ignore the optional `max_sessions_per_profile` cap. Joining a busy profile is already the default. |
 
-Short flags bundle (`-nr` == `-n -r`). `-p` together with `-r` exits `2`.
+Short flags bundle (`-nr` == `-n -r`). `-p` together with `-r` exits `2` (pass `-- -r` to pass `-r` to the engine: `agydra -p cc -- -r`).
 
 | Combination | Purpose |
 |---|---|
@@ -223,7 +225,7 @@ Without `-p`, the first match wins:
 
 ```
 1. --profile / -p
-   └── 2. AGYDRA_PROFILE (skipped when -e asks for another engine)
+   └── 2. AGYDRA_PROFILE (skipped when -e asks for another engine; ignored with a warning when stale)
        └── 3. .agydra marker (nearest ancestor; ignored by -r)
            └── 4. default_profile in agydra.json
                └── 5. First profile by number (creation order; `agy` profiles first)
@@ -257,7 +259,7 @@ Session locks use `<store>/locks/<profile>.lock`; the sentinel file persists, wh
 
 Before moving a profile directory, `rename` atomically writes its intent to `<store>/profile-rename.json`, including a Keychain slot migration recovery action and the `source_present` snapshot for Antigravity; Claude rename does not add this action. A later public profile read or mutation recovers that journal while holding the old and new profile locks in sorted order, followed by the sequence lock. If only the old directory exists, recovery restores the old default when needed and removes the journal; if only the new directory exists, recovery finishes forward by fixing profile metadata and the default when needed, removing the old overlay, then running the recorded Keychain action before removing the journal. Forward recovery runs that action while holding the sorted profile locks, the sequence lock, and `swap.lock`; if it fails, the journal remains for retry on the next store operation. On the normal rename path, the callback runs with the profile locks held after the sequence lock is released. If both or neither directory exists, the journal or metadata is malformed, or a required lock is busy, recovery fails closed and retains the journal and profile data.
 
-When enabled (the default; `--no-backup` disables it), `delete` writes and verifies its ZIP backup before removing profile data: the backup is written and verified while holding the profile lock, then the commit phase re-acquires the sequence lock, re-checks the profile's identity and paths, and only then purges. At most the last 5 backup ZIPs per profile are kept. For Antigravity, the CLI keeps the profile lock through its post-delete keychain purge, after releasing the sequence lock; on macOS, that purge uses `swap.lock` to serialize cleanup of the profile's saved slot and system Keychain entry with keychain swaps. A purge failure is reported as a warning after deletion. `import` holds its target profile lock through the copy (plus `swap.lock` on macOS for Antigravity so the imported credential cannot race a live swap), and `share-config` holds the source and target profile locks until all copies finish. `doctor --fix` holds the profile lock while migrating and relinking overlay data.
+When enabled (the default; `--no-backup` disables it), `delete` writes and verifies its ZIP backup before removing profile data: the backup is written and verified while holding the profile lock, then the commit phase re-acquires the sequence lock, re-checks the profile's identity and paths, and only then purges. At most the last 5 backup ZIPs per profile are kept. For Antigravity, the CLI keeps the profile lock through its post-delete keychain purge, after releasing the sequence lock; on macOS, that purge uses `swap.lock` to serialize cleanup of the profile's saved slot and system Keychain entry with keychain swaps. A purge failure is reported as a warning after deletion. `import` holds its target profile lock through the copy (plus `swap.lock` on macOS for Antigravity so the imported credential cannot race a live swap), and `share-config` holds the source read lock and target profile locks until all copies finish. `doctor --fix` holds the profile lock while migrating and relinking overlay data.
 
 Store paths are hardened: a symlink or junction at the profiles root, a profile directory, `profile.json`, `data/`, the overlays root or the Claude config path fails closed instead of redirecting a write outside the store, and two profiles claiming the same sequence number are refused rather than aliasing one Claude configuration. On macOS, brief `swap.lock` contention in the shared Keychain bridge reports a clean busy error for explicit selection/login (a slot owned by another profile's session switches to file authentication instead); random `agy` sessions never take that swap lock.
 
@@ -304,7 +306,7 @@ All binary keys (`agy_binary`, `codex_binary`, `grok_binary`, and `claude_binary
 
 | Variable | Purpose |
 |---|---|
-| `AGYDRA_PROFILE` | Fallback profile, set inside agydra sessions. `-p` wins; it is skipped when `-e` asks for another engine. |
+| `AGYDRA_PROFILE` | Fallback profile, set inside agydra sessions. `-p` wins; skipped when `-e` asks for another engine, and ignored with a warning when stale. |
 | `AGYDRA_LANG` | `en` or `es` for one process. |
 | `AGYDRA_HOME` | Store and overlays. |
 | `AGYDRA_AGY_BIN` / `AGYDRA_CODEX_BIN` / `AGYDRA_GROK_BIN` / `AGYDRA_CLAUDE_BIN` | Binary override. |
@@ -320,7 +322,7 @@ python3 -W error::ResourceWarning -m pytest tests/ -q
 python3 -m unittest discover -s tests -q
 ```
 
-The suite uses temporary stores and leaves the host home alone. Native CI matrix (`.github/workflows/tests.yml`) runs the full suite on three runners: Windows 2022 (Python 3.9), Ubuntu 24.04 (Python 3.9) and macOS 15 (Python 3.14); intermediate Python versions are not part of the matrix. It runs on pushes and pull requests targeting `main` or `audit/project-wide-reliability`.
+The suite uses temporary stores and leaves the host home alone. Native CI matrix (`.github/workflows/tests.yml`) runs the full suite on three runners: Windows 2022 (Python 3.9), Ubuntu 24.04 (Python 3.9) and macOS 15 (Python 3.14); intermediate Python versions are not part of the matrix. It runs on pushes and pull requests targeting `main`.
 
 ---
 

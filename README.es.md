@@ -57,7 +57,7 @@ pip install .              # o: pipx install .
 agydra doctor
 ```
 
-`python3 agydra.py` prepara un checkout de fuentes y re-ejecuta el comando instalado; tras una instalación con `pip`/`pipx` (`python -m agydra` entra directo a la CLI), `agydra setup` detecta la instalación propiedad de pip, lo informa y no escribe nada — actualízala o elimínala con pip/pipx.
+`python3 agydra.py` prepara un checkout de fuentes y re-ejecuta el comando instalado; tras una instalación con `pip`/`pipx` (`python -m agydra` entra directo a la CLI), `agydra setup` detecta la instalación propiedad de pip, lo informa y no escribe nada — actualízala o elimínala con pip/pipx. Los metadatos de instalación editable se resuelven desde archivos locales; el aislamiento de build o la actualización de pip cuando es anterior a 21.3 pueden consultar PyPI, delimitados por un tiempo límite de 60 segundos y reporte claro de errores.
 
 ### Un perfil por motor
 
@@ -158,6 +158,8 @@ Copia o combina el objeto `statusLine` impreso **manualmente en `settings.json` 
 
 **Simulación.** `agydra -np trabajo` imprime rutas, entorno y argv, y no lanza nada.
 
+**Banderas del motor.** Usa `--` para pasar banderas del motor que colisionen con los subcomandos u opciones de Agydra (por ejemplo, pasar `-c` a Claude Code o `-r` para reanudar una sesión de Claude: `agydra -p claude-work -- -r`).
+
 **Idioma.** `agydra lang es` guarda `en` o `es` en `agydra.json`. `AGYDRA_LANG=es` vale para un solo proceso. `agydra lang` muestra el idioma activo y los códigos disponibles.
 
 ### Qué aísla cada motor
@@ -173,7 +175,7 @@ Copia o combina el objeto `statusLine` impreso **manualmente en `settings.json` 
 
 ## 🧭 Comandos y flags
 
-Los comandos de gestión también aceptan `--NOMBRE` o `-NOMBRE` (`agydra --list` == `agydra list`). Un perfil es un nombre o el índice en base 1 de `agydra list`.
+Los comandos de gestión también aceptan `--NOMBRE` o `-NOMBRE` (`agydra --list` == `agydra list`). Para pasar flags como `-c` directamente al motor en lugar de invocar un comando de gestión o alias, sepárelos con `--` (ej. `agydra -- -c`). Un perfil es un nombre o el índice en base 1 de `agydra list`.
 
 | Comando | Alias | Descripción |
 |---|---|---|
@@ -189,7 +191,7 @@ Los comandos de gestión también aceptan `--NOMBRE` o `-NOMBRE` (`agydra --list
 | `status [NOMBRE\|#] [-p NOMBRE\|#] [-e MOTOR] [-n]` | `st` | Perfil resuelto, motor, binario (`not found` si el CLI del motor no está instalado), correo, auth y sesiones activas. `-n` imprime el plan de lanzamiento y sí necesita el binario. |
 | `usage [NOMBRE\|#]` | `us` | Cuotas de `agy`, `codex`, `grok` y Claude Code (consultas en vivo y snapshots informativos). `--claude-settings PERFIL` imprime ajustes opt-in; `--apply` (solo con `--claude-settings`) escribe el `statusLine` en el `settings.json` del perfil (lo crea o lo combina de forma atómica conservando las demás claves); no hace nada si ya está presente; se niega y deja el archivo intacto si hay un `statusLine` distinto o JSON inválido. |
 | `share-config ORIGEN DESTINO...` | `share` | Copia archivos de configuración mientras mantiene los locks de los perfiles de origen y destino hasta terminar todas las copias. Las credenciales se quedan en el origen. Los perfiles Claude se rechazan. |
-| `doctor [--fix [-f]]` | `doc` | Diez chequeos. `--fix` repara los enlaces de datos del overlay y los defaults colgantes, y purga solo artefactos huérfanos; `-f` omite la confirmación de `--fix` y se rechaza sin `--fix`. |
+| `doctor [--fix [-f]]` | `doc` | Diez chequeos. `--fix` repara los enlaces de datos del overlay y los defaults colgantes, restablece registros de leases ilegibles cuando el lock está libre, y purga solo artefactos huérfanos; `-f` omite la confirmación de `--fix` y se rechaza sin `--fix`. |
 | `setup [-n] [-f]` | `install` | Venv, script de consola y shim en el PATH, de forma idempotente. `-n` previsualiza; `-f` sobrescribe un shim ajeno. |
 | `language [CÓDIGO]` | `lang`, `idioma`, `locale` | Idioma de la interfaz: `en` o `es`. |
 | `version` | `--version` | Imprime la versión y el autor de Agydra. |
@@ -207,7 +209,7 @@ Los flags del lanzador van **antes** de los argumentos del motor.
 | `-b RUTA` | `--binary` | Sustituye el binario del motor en esta ejecución. |
 | `-f` | `--force` | Ignora el límite opcional `max_sessions_per_profile`. Unirse a un perfil ocupado ya es el comportamiento por defecto. |
 
-Los flags cortos se agrupan (`-nr` == `-n -r`). `-p` junto con `-r` sale con código `2`.
+Los flags cortos se agrupan (`-nr` == `-n -r`). `-p` junto con `-r` sale con código `2` (usa `-- -r` para pasar `-r` al motor: `agydra -p cc -- -r`).
 
 | Combinación | Para qué |
 |---|---|
@@ -223,7 +225,7 @@ Sin `-p`, gana la primera coincidencia:
 
 ```
 1. --profile / -p
-   └── 2. AGYDRA_PROFILE (se omite si -e pide otro motor)
+   └── 2. AGYDRA_PROFILE (se omite si -e pide otro motor; se ignora con advertencia si ya no existe)
        └── 3. Marcador .agydra (ancestro más cercano; ignorado por -r)
            └── 4. default_profile en agydra.json
                └── 5. Primer perfil por número (orden de creación; primero los de `agy`)
@@ -257,7 +259,7 @@ Los locks de sesión usan `<store>/locks/<perfil>.lock`; el archivo marcador per
 
 Antes de mover el directorio de un perfil, `rename` escribe atómicamente su intención en `<store>/profile-rename.json`, que incluye una acción de recuperación para migrar el slot de Keychain y la instantánea `source_present` para Antigravity; el rename de Claude no añade esta acción. Una lectura pública o mutación posterior de perfiles recupera ese journal mientras mantiene, en orden ascendente por nombre, los locks de los perfiles anterior y nuevo, seguidos por el lock de secuencia. Si solo existe el directorio anterior, la recuperación restaura el default anterior cuando hace falta y elimina el journal; si solo existe el nuevo, completa el cambio: corrige los metadatos y el default cuando hace falta, elimina el overlay anterior y luego ejecuta la acción de Keychain registrada antes de borrar el journal. La recuperación forward ejecuta esa acción mientras mantiene los locks de perfil ordenados, el lock de secuencia y `swap.lock`; si falla, conserva el journal para reintentar en la siguiente operación del almacén. En el camino normal de rename, el callback se ejecuta con los locks de perfil mantenidos, después de liberar el lock de secuencia. Si existen ambos directorios o ninguno, el journal o los metadatos están dañados, o algún lock requerido está ocupado, la recuperación falla de forma segura y conserva el journal y los datos de perfil.
 
-Cuando está activado (por defecto; `--no-backup` lo desactiva), `delete` crea y verifica el ZIP de respaldo antes de borrar los datos del perfil: el respaldo se escribe y verifica manteniendo el lock de perfil, y la fase de confirmación vuelve a tomar el lock de secuencia, revalida la identidad y las rutas del perfil y solo entonces borra. Se conservan como máximo los últimos 5 ZIP por perfil. Para Antigravity, la CLI conserva el lock de perfil durante la purga de llavero posterior al borrado, después de liberar el lock de secuencia; en macOS, la purga usa `swap.lock` para serializar la limpieza del slot guardado y de la entrada del Llavero del sistema con los cambios de credenciales. Si falla la purga, se informa una advertencia después del borrado. `import` mantiene el lock del perfil de destino durante la copia (más `swap.lock` en macOS para Antigravity, para que la credencial importada no compita con un intercambio en curso) y `share-config` mantiene los locks de los perfiles de origen y destino hasta terminar todas las copias. `doctor --fix` mantiene el lock del perfil mientras migra y vuelve a enlazar los datos del overlay.
+Cuando está activado (por defecto; `--no-backup` lo desactiva), `delete` crea y verifica el ZIP de respaldo antes de borrar los datos del perfil: el respaldo se escribe y verifica manteniendo el lock de perfil, y la fase de confirmación vuelve a tomar el lock de secuencia, revalida la identidad y las rutas del perfil y solo entonces borra. Se conservan como máximo los últimos 5 ZIP por perfil. Para Antigravity, la CLI conserva el lock de perfil durante la purga de llavero posterior al borrado, después de liberar el lock de secuencia; en macOS, la purga usa `swap.lock` para serializar la limpieza del slot guardado y de la entrada del Llavero del sistema con los cambios de credenciales. Si falla la purga, se informa una advertencia después del borrado. `import` mantiene el lock del perfil de destino durante la copia (más `swap.lock` en macOS para Antigravity, para que la credencial importada no compita con un intercambio en curso) y `share-config` mantiene el lock de lectura del origen y los locks de destino hasta terminar todas las copias. `doctor --fix` mantiene el lock del perfil mientras migra y vuelve a enlazar los datos del overlay.
 
 Las rutas del almacén están blindadas: un symlink o junction en la raíz de perfiles, un directorio de perfil, `profile.json`, `data/`, la raíz de overlays o la ruta de configuración de Claude falla de forma segura en lugar de redirigir una escritura fuera del almacén, y dos perfiles que reclamen la misma secuencia se rechazan en vez de aliasar una configuración de Claude. En macOS, la contención del puente del llavero informa un error limpio para selección explícita/login; la rotación `agy` nunca toma ese lock de intercambio.
 
@@ -304,7 +306,7 @@ Todas las claves de binarios (`agy_binary`, `codex_binary`, `grok_binary` y `cla
 
 | Variable | Para qué |
 |---|---|
-| `AGYDRA_PROFILE` | Perfil de respaldo, definido dentro de las sesiones de agydra. Gana `-p`; se omite cuando `-e` pide otro motor. |
+| `AGYDRA_PROFILE` | Perfil de respaldo, definido dentro de las sesiones de agydra. Gana `-p`; se omite cuando `-e` pide otro motor y se ignora con advertencia si ya no existe. |
 | `AGYDRA_LANG` | `en` o `es` para un proceso. |
 | `AGYDRA_HOME` | Almacén y overlays. |
 | `AGYDRA_AGY_BIN` / `AGYDRA_CODEX_BIN` / `AGYDRA_GROK_BIN` / `AGYDRA_CLAUDE_BIN` | Binario alternativo. |
@@ -320,7 +322,7 @@ python3 -W error::ResourceWarning -m pytest tests/ -q
 python3 -m unittest discover -s tests -q
 ```
 
-La suite usa almacenes temporales y deja el home del host en paz. La matriz nativa de CI (`.github/workflows/tests.yml`) corre la suite completa en tres runners: Windows 2022 (Python 3.9), Ubuntu 24.04 (Python 3.9) y macOS 15 (Python 3.14); las versiones intermedias de Python no forman parte de la matriz. Se ejecuta en push y pull request hacia `main` o `audit/project-wide-reliability`.
+La suite usa almacenes temporales y deja el home del host en paz. La matriz nativa de CI (`.github/workflows/tests.yml`) corre la suite completa en tres runners: Windows 2022 (Python 3.9), Ubuntu 24.04 (Python 3.9) y macOS 15 (Python 3.14); las versiones intermedias de Python no forman parte de la matriz. Se ejecuta en push y pull request hacia `main`.
 
 ---
 

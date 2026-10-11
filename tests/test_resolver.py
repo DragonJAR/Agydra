@@ -78,10 +78,27 @@ class TestResolver(BaseCase):
             self._resolve_engine("codex", flag="personal")
         self.assertIn("was requested", str(ctx.exception))
 
-    def test_dangling_env_profile_still_raises_with_an_engine(self):
+    def test_stale_env_profile_warns_and_continues_cascade(self):
         self.store.create("openai", engine="codex")
+        with mock.patch("resolver.warn") as mock_warn:
+            res = self._resolve_engine("codex", env={resolver.PROFILE_ENV: "ghost"})
+            self.assertEqual(res.name, "openai")
+            mock_warn.assert_any_call("ignoring stale AGYDRA_PROFILE=ghost")
+
+    def test_stale_env_profile_without_engine_warns_and_falls_back_to_default(self):
+        with mock.patch("resolver.warn") as mock_warn:
+            res = self._resolve(env={resolver.PROFILE_ENV: "gone"}, cwd=self.fake_home)
+            self.assertEqual(res.name, "work")
+            mock_warn.assert_any_call("ignoring stale AGYDRA_PROFILE=gone")
+
+    def test_missing_flag_or_marker_profile_still_raises(self):
         with self.assertRaises(StoreError):
-            self._resolve_engine("codex", env={resolver.PROFILE_ENV: "ghost"})
+            self._resolve(flag="ghost")
+        project = self._tmp / "project" / "ghost_marker"
+        project.mkdir(parents=True)
+        (project / ".agydra").write_text("ghost", encoding="utf-8")
+        with self.assertRaises(StoreError):
+            self._resolve(cwd=project)
 
     def test_marker_file_wins_over_default(self):
         project = self._tmp / "project" / "sub"
@@ -157,7 +174,7 @@ class TestResolver(BaseCase):
             "_recover_pending_rename",
             side_effect=AssertionError("read-only planning must not recover state"),
         ):
-            with self.assertRaisesRegex(StoreError, "recovery is pending"):
+            with self.assertRaisesRegex(StoreError, "recovery is pending|unreadable or malformed"):
                 runner.build_plan(
                     self.store, [], flag_ref="work", read_only=True
                 )
@@ -448,6 +465,37 @@ class TestPickFreeProfileClaudeProbeCount(BaseCase):
         self.assertEqual(res.name, "c1")
         self.assertIn("native CLI probe, not probed", res.reason)
         self.assertFalse(self.log.exists())
+
+
+class TestF2StoreErrorPropagation(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        for name in ("alpha", "beta"):
+            self.store.create(name)
+
+    def test_pick_free_profile_raises_no_eligible_profile_error(self):
+        with self.assertRaises(resolver.NoEligibleProfileError):
+            resolver.pick_free_profile(self.store, exclude={"alpha", "beta"})
+
+    def test_build_plan_does_not_mask_store_wide_error_when_candidates_excluded(self):
+        calls = 0
+
+        def fake_pick(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return resolver.Resolution(name="alpha", reason="rot")
+            raise StoreError("FATAL ROOT PERMISSION FAILURE")
+
+        import engines
+        driver = engines.get_engine("agy")
+        with mock.patch("resolver.pick_free_profile", side_effect=fake_pick), \
+             mock.patch.object(driver, "resolve_binary", side_effect=[None, Path("/bin/echo")]):
+            with self.assertRaises(StoreError) as cm:
+                runner.build_plan(self.store, [], random_pick=True)
+            self.assertEqual(str(cm.exception), "FATAL ROOT PERMISSION FAILURE")
+
 
 if __name__ == "__main__":
     unittest.main()

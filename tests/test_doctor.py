@@ -1011,5 +1011,51 @@ class TestOrphanScanCaching(BaseCase):
         self.assertEqual(self.store.default_name(), "work")
 
 
+class TestDoctorLockRegistryCorrupt(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+
+    def test_unreadable_lease_registry_reported_and_fixed(self):
+        import locks
+        self.store.create("work")
+        lock_file = locks.lock_path(self.store, "work")
+        lock_file.write_text("{corrupt registry json", encoding="utf-8")
+
+        ctx = doctor._build_ctx(self.store)
+        status, message = doctor._check_locks(self.store, ctx)
+        self.assertEqual(status, doctor.WARN)
+        self.assertIn(f"unreadable lease registry {lock_file}", message)
+        self.assertNotIn("live sessions: work", message)
+
+        preview = doctor._preview_fixables(self.store, ctx)
+        self.assertIn(f"reset unreadable lease registry {lock_file}", preview)
+
+        doctor._apply_fixes(self.store, ctx)
+        self.assertEqual(locks.lease_holders(self.store, "work"), [])
+
+        status_after, message_after = doctor._check_locks(self.store, ctx)
+        self.assertEqual(status_after, doctor.OK)
+        self.assertIn("no live sessions", message_after)
+
+    def test_unreadable_lease_registry_busy_lock_not_reset_by_fix(self):
+        import locks
+        self.store.create("work")
+        lock_file = locks.lock_path(self.store, "work")
+        lock_file.write_text("{corrupt registry json", encoding="utf-8")
+
+        ctx = doctor._build_ctx(self.store)
+        handle = locks.try_read_lock(self.store, "work")
+        self.assertIsNotNone(handle)
+        try:
+            preview = doctor._preview_fixables(self.store, ctx)
+            self.assertNotIn(f"reset unreadable lease registry {lock_file}", preview)
+
+            doctor._apply_fixes(self.store, ctx)
+            self.assertEqual(lock_file.read_text(encoding="utf-8"), "{corrupt registry json")
+        finally:
+            handle.release()
+
+
 if __name__ == "__main__":
     unittest.main()

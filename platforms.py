@@ -143,50 +143,93 @@ def _probe_pathext(p: Path) -> Optional[Path]:
     return None
 
 
+def _is_executable_file(p: Path) -> bool:
+    return p.is_file() and (is_windows() or os.access(p, os.X_OK))
+
+
+def _validate_binary_candidate(candidate: str) -> Optional[Path]:
+    p = Path(candidate).expanduser()
+    if _is_executable_file(p):
+        return p
+    which_p = shutil.which(str(p))
+    if which_p:
+        return Path(which_p)
+    if is_windows():
+        if os.path.dirname(str(p)) and not p.suffix:
+            probed = _probe_pathext(p)
+            if probed:
+                return probed
+    return None
+
+
 def resolve_binary(
     binary_name: str,
     env_var: Optional[str] = None,
     explicit: Optional[str] = None,
+    *,
+    config_val: Optional[str] = None,
+    config_key: Optional[str] = None,
 ) -> Optional[Path]:
     """Locate an executable binary without fragile heuristics.
 
-    Order: explicit flag → env var → shutil.which(binary_name).
-    Returns None when not found.
+    Order: explicit flag (-b) → env var → config_val → shutil.which(binary_name).
+    An invalid explicit path returns None immediately (stays an error).
+    An invalid env var returns None immediately.
+    An invalid config_val warns and falls through to PATH.
     """
-    candidate = explicit or (os.environ.get(env_var) if env_var else None)
-    if candidate:
-        p = Path(candidate).expanduser()
-        if p.is_file() and (is_windows() or os.access(p, os.X_OK)):
-            return p
-        which_p = shutil.which(str(p))
-        if which_p:
-            return Path(which_p)
-        if is_windows():
-            if os.path.dirname(str(p)) and not p.suffix:
-                probed = _probe_pathext(p)
-                if probed:
-                    return probed
-        return None
+    if explicit:
+        return _validate_binary_candidate(explicit)
+    if env_var:
+        env_val = os.environ.get(env_var)
+        if env_val:
+            return _validate_binary_candidate(env_val)
+    if config_val:
+        cand = _validate_binary_candidate(config_val)
+        if cand:
+            return cand
+        import ui
+        key_name = config_key or f"{binary_name}_binary"
+        ui.warn(f"invalid {key_name} {config_val!r}; falling through to PATH")
     found = shutil.which(binary_name)
     return Path(found) if found else None
 
 
-def resolve_agy_binary(explicit: Optional[str] = None) -> Optional[Path]:
+def resolve_agy_binary(
+    explicit: Optional[str] = None,
+    *,
+    config_val: Optional[str] = None,
+) -> Optional[Path]:
     """Locate the real agy binary without fragile heuristics.
 
-    Order: explicit flag → ``AGYDRA_AGY_BIN`` → ``shutil.which("agy")``.
+    Order: explicit flag → ``AGYDRA_AGY_BIN`` → config → ``shutil.which("agy")``.
     Returns ``None`` when not found.
     """
-    return resolve_binary("agy", AGY_BIN_ENV, explicit)
+    return resolve_binary(
+        "agy",
+        AGY_BIN_ENV,
+        explicit=explicit,
+        config_val=config_val,
+        config_key="agy_binary",
+    )
 
 
-def resolve_codex_binary(explicit: Optional[str] = None) -> Optional[Path]:
+def resolve_codex_binary(
+    explicit: Optional[str] = None,
+    *,
+    config_val: Optional[str] = None,
+) -> Optional[Path]:
     """Locate the real codex binary without fragile heuristics.
 
-    Order: explicit flag → ``AGYDRA_CODEX_BIN`` → ``shutil.which("codex")``.
+    Order: explicit flag → ``AGYDRA_CODEX_BIN`` → config → ``shutil.which("codex")``.
     Returns ``None`` when not found.
     """
-    return resolve_binary("codex", CODEX_BIN_ENV, explicit)
+    return resolve_binary(
+        "codex",
+        CODEX_BIN_ENV,
+        explicit=explicit,
+        config_val=config_val,
+        config_key="codex_binary",
+    )
 
 
 def codex_data_dir(home: Optional[Path] = None) -> Path:
@@ -194,13 +237,23 @@ def codex_data_dir(home: Optional[Path] = None) -> Path:
     return (Path(home) if home is not None else real_home()) / CODEX_DATA_DIR_NAME
 
 
-def resolve_grok_binary(explicit: Optional[str] = None) -> Optional[Path]:
+def resolve_grok_binary(
+    explicit: Optional[str] = None,
+    *,
+    config_val: Optional[str] = None,
+) -> Optional[Path]:
     """Locate the real grok binary without fragile heuristics.
 
-    Order: explicit flag → ``AGYDRA_GROK_BIN`` → ``shutil.which("grok")``.
+    Order: explicit flag → ``AGYDRA_GROK_BIN`` → config → ``shutil.which("grok")``.
     Returns ``None`` when not found.
     """
-    return resolve_binary("grok", GROK_BIN_ENV, explicit)
+    return resolve_binary(
+        "grok",
+        GROK_BIN_ENV,
+        explicit=explicit,
+        config_val=config_val,
+        config_key="grok_binary",
+    )
 
 
 def grok_data_dir(home: Optional[Path] = None) -> Path:
@@ -208,13 +261,23 @@ def grok_data_dir(home: Optional[Path] = None) -> Path:
     return (Path(home) if home is not None else real_home()) / GROK_DATA_DIR_NAME
 
 
-def resolve_claude_binary(explicit: Optional[str] = None) -> Optional[Path]:
+def resolve_claude_binary(
+    explicit: Optional[str] = None,
+    *,
+    config_val: Optional[str] = None,
+) -> Optional[Path]:
     """Locate the real claude binary without fragile heuristics.
 
-    Order: explicit flag → ``AGYDRA_CLAUDE_BIN`` → ``shutil.which("claude")``.
+    Order: explicit flag → ``AGYDRA_CLAUDE_BIN`` → config → ``shutil.which("claude")``.
     Returns ``None`` when not found.
     """
-    return resolve_binary("claude", CLAUDE_BIN_ENV, explicit)
+    return resolve_binary(
+        "claude",
+        CLAUDE_BIN_ENV,
+        explicit=explicit,
+        config_val=config_val,
+        config_key="claude_binary",
+    )
 
 
 def claude_data_dir(home: Optional[Path] = None) -> Path:

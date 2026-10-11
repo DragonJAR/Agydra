@@ -630,10 +630,11 @@ class TestCodexUsage(BaseCase):
         (data_dir / "auth.json").write_text(json.dumps(auth_data), encoding="utf-8")
 
         res = usage.query_codex_usage(data_dir, "cx_offline")
-        self.assertTrue(res.ok)
+        self.assertFalse(res.ok)
         self.assertEqual(res.email, "offline@example.com")
         self.assertEqual(res.groups, [])
         self.assertIn("offline", res.error)
+        self.assertIsNone(res.plan)
 
     @mock.patch("usage.fetch_codex_usage_payload")
     def test_query_codex_usage_non_auth_http_error_keeps_authenticated_state(self, mock_fetch):
@@ -652,10 +653,11 @@ class TestCodexUsage(BaseCase):
 
         res = usage.query_codex_usage(data_dir, "cx_http_unavailable")
 
-        self.assertTrue(res.ok, res.error)
+        self.assertFalse(res.ok, res.error)
         self.assertEqual(res.error, "usage unavailable (HTTP 503)")
         self.assertEqual(res.email, "unavailable@example.com")
         self.assertEqual(res.groups, [])
+        self.assertIsNone(res.plan)
 
     def test_query_codex_usage_without_access_token_is_read_only(self):
         auth_data = {"tokens": {"refresh_token": "ref_tok"}}
@@ -878,10 +880,11 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
             (transport_result, "offline"),
             (http_result, "usage unavailable (HTTP 503)"),
         ):
-            self.assertTrue(result.ok, result.error)
+            self.assertFalse(result.ok, result.error)
             self.assertEqual(result.email, "grok@example.com")
             self.assertEqual(result.groups, [])
             self.assertIn(error, result.error)
+            self.assertEqual(result.plan, "Grok (xAI)")
         mock_settings.assert_not_called()
         mock_refresh.assert_not_called()
         self.assertEqual(
@@ -1361,6 +1364,203 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
 
         self.assertTrue(res.ok, res.error)
         self.assertEqual(mock_billing.call_args_list[1][0][0], "fresh")
+
+
+class TestRecordUsageSnapshotPreservesCachedReading(BaseCase):
+    def test_offline_error_preserves_good_cached_reading(self):
+        from datetime import datetime, timezone
+        import cli
+        import usage_snapshot
+        from store import Store
+
+        store = Store(self._tmp / "snap_store")
+        p = store.create("codex_p", engine="codex")
+        good_bucket = usage.UsageBucket(
+            id="bucket_1",
+            name="Primary",
+            window="weekly",
+            remaining_fraction=0.75,
+            reset_time=datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc),
+        )
+        good_group = usage.UsageGroup(name="Codex", buckets=[good_bucket])
+        t0 = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
+        good_result = usage.UsageResult(
+            name="codex_p",
+            ok=True,
+            engine="codex",
+            plan="ChatGPT Plus",
+            groups=[good_group],
+            authentication_state="authenticated",
+            observed_at=t0,
+        )
+        cli._record_usage_snapshot(store, [p], [good_result], scope="all")
+        doc1 = usage_snapshot.read_snapshot(store)
+        self.assertEqual(len(doc1["profiles"][0]["groups"]), 1)
+        self.assertEqual(
+            usage_snapshot._parse_instant(doc1["profiles"][0]["observed_at"]), t0
+        )
+        self.assertFalse(doc1["profiles"][0]["stale"])
+
+        offline_result = usage.UsageResult(
+            name="codex_p",
+            ok=False,
+            engine="codex",
+            plan=None,
+            groups=[],
+            error="offline (HTTP Error 503: Service Unavailable)",
+            authentication_state="authenticated",
+        )
+        cli._record_usage_snapshot(store, [p], [offline_result], scope="all")
+        doc2 = usage_snapshot.read_snapshot(store)
+        self.assertFalse(doc2["profiles"][0]["ok"])
+        self.assertEqual(doc2["profiles"][0]["error"], "offline (HTTP Error 503: Service Unavailable)")
+        self.assertEqual(len(doc2["profiles"][0]["groups"]), 1)
+        self.assertEqual(
+            doc2["profiles"][0]["groups"][0]["buckets"][0]["remaining_fraction"], 0.75
+        )
+        self.assertEqual(doc2["profiles"][0]["plan"], "ChatGPT Plus")
+        self.assertEqual(
+            usage_snapshot._parse_instant(doc2["profiles"][0]["observed_at"]), t0
+        )
+        self.assertTrue(doc2["profiles"][0]["stale"])
+        self.assertEqual(doc2["profiles"][0]["quality"], "stale")
+
+        unauth_result = usage.UsageResult(
+            name="codex_p",
+            ok=False,
+            engine="codex",
+            plan=None,
+            groups=[],
+            error="not authenticated",
+            authentication_state="unauthenticated",
+        )
+        cli._record_usage_snapshot(store, [p], [unauth_result], scope="all")
+        doc3 = usage_snapshot.read_snapshot(store)
+        self.assertFalse(doc3["profiles"][0]["ok"])
+        self.assertEqual(doc3["profiles"][0]["groups"], [])
+
+    def test_offline_carried_reading_preserves_renamed_profile_by_seq(self):
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+        import cli
+        import usage_snapshot
+        from store import Store
+
+        store = Store(self._tmp / "snap_store_rename")
+        p = store.create("orig_name", engine="codex")
+        self.assertGreater(p.seq, 0)
+        t0 = datetime(2026, 10, 10, 11, 0, tzinfo=timezone.utc)
+        good_bucket = usage.UsageBucket(
+            id="b1",
+            name="5h",
+            window="5h",
+            remaining_fraction=0.5,
+            reset_time=datetime(2026, 10, 10, 16, 0, tzinfo=timezone.utc),
+        )
+        good_result = usage.UsageResult(
+            name="orig_name",
+            ok=True,
+            engine="codex",
+            plan="Pro",
+            groups=[usage.UsageGroup(name="Codex", buckets=[good_bucket])],
+            authentication_state="authenticated",
+            observed_at=t0,
+        )
+        cli._record_usage_snapshot(store, [p], [good_result], scope="all")
+
+        store.rename("orig_name", "renamed_name")
+        p_renamed = store.get("renamed_name")
+        self.assertEqual(p_renamed.seq, p.seq)
+
+        offline_result = usage.UsageResult(
+            name="renamed_name",
+            ok=False,
+            engine="codex",
+            groups=[],
+            error="offline (connection refused)",
+            authentication_state="authenticated",
+        )
+        updated = cli._record_usage_snapshot(store, [p_renamed], [offline_result], scope="all")
+        self.assertEqual(len(updated[0].groups), 1)
+        self.assertEqual(updated[0].observed_at, t0)
+        self.assertEqual(updated[0].quality, "stale")
+
+        doc = usage_snapshot.read_snapshot(store)
+        entry = doc["profiles"][0]
+        self.assertEqual(entry["name"], "renamed_name")
+        self.assertEqual(
+            usage_snapshot._parse_instant(entry["observed_at"]), t0
+        )
+        self.assertTrue(entry["stale"])
+
+    def test_compact_and_detail_usage_display_offline_error_and_age(self):
+        from datetime import datetime, timedelta, timezone
+        import io
+        import contextlib
+        from types import SimpleNamespace
+        import cli
+        import usage_snapshot
+        from store import Store
+
+        store = Store(self._tmp / "snap_store_disp")
+        p = store.create("cx_disp", engine="codex")
+        fixed_now = datetime(2026, 10, 10, 12, 10, tzinfo=timezone.utc)
+        t0 = fixed_now - timedelta(minutes=10)
+
+        good_bucket = usage.UsageBucket(
+            id="b1",
+            name="5h",
+            window="5h",
+            remaining_fraction=0.8,
+            reset_time=fixed_now + timedelta(hours=4),
+        )
+        good_result = usage.UsageResult(
+            name="cx_disp",
+            ok=True,
+            engine="codex",
+            plan="Team",
+            groups=[usage.UsageGroup(name="Codex", buckets=[good_bucket])],
+            authentication_state="authenticated",
+            observed_at=t0,
+        )
+        cli._record_usage_snapshot(store, [p], [good_result], scope="all", now=t0)
+
+        offline_result = usage.UsageResult(
+            name="cx_disp",
+            ok=False,
+            engine="codex",
+            groups=[],
+            error="offline (Network down)",
+            authentication_state="authenticated",
+        )
+
+        out_compact = io.StringIO()
+        with mock.patch("cli.datetime") as mock_dt, \
+                mock.patch.object(usage, "gather_usage_report", return_value=[offline_result]), \
+                contextlib.redirect_stdout(out_compact):
+            mock_dt.now.return_value = fixed_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            code = cli.cmd_usage(store, SimpleNamespace(ref=None, claude_settings=None))
+        self.assertEqual(code, 0)
+        compact_text = out_compact.getvalue()
+        self.assertIn("offline (Network down)", compact_text)
+        self.assertIn("cached 10m ago", compact_text)
+
+        out_detail = io.StringIO()
+        err_detail = io.StringIO()
+        with mock.patch("cli.datetime") as mock_dt, \
+                mock.patch.object(usage, "query_profile_usage", return_value=offline_result), \
+                contextlib.redirect_stdout(out_detail), \
+                contextlib.redirect_stderr(err_detail):
+            mock_dt.now.return_value = fixed_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            code = cli.cmd_usage(store, SimpleNamespace(ref="cx_disp", claude_settings=None))
+        self.assertEqual(code, 1)
+        detail_all = out_detail.getvalue() + err_detail.getvalue()
+        self.assertIn("offline (Network down)", detail_all)
+        self.assertIn("10m ago", detail_all)
+        self.assertIn("Codex", out_detail.getvalue())
+        self.assertIn("status    : authenticated", out_detail.getvalue())
 
 
 if __name__ == "__main__":

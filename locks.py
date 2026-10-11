@@ -674,31 +674,63 @@ def try_lock(store, name: str) -> Optional[LockHandle]:
     return _try_lock_path(lock_path(store, name), "session lock", True)
 
 
-def try_mutation_lock(store, name: str) -> Optional[LockHandle]:
+def try_read_lock(store, name: str, patience_s: float = 0.0) -> Optional[LockHandle]:
+    """Take ``name``'s lock for a read-only operation (blocks mutations).
+
+    Unlike ``try_mutation_lock``, this does not check for registered live
+    holders, because live sessions only hold the flock briefly during
+    lease acquire/release and a read-only operation (such as export or
+    reading configuration to share) can safely coexist with a live session.
+    Holding this flock prevents concurrent mutations (delete, rename, or
+    destructive writes) from modifying the profile during the read.
+    """
+    path = lock_path(store, name)
+    deadline = time.monotonic() + max(0.0, patience_s)
+    while True:
+        handle = _try_lock_path(path, "profile read lock", False)
+        if handle is not None:
+            return handle
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(POLL_INTERVAL_S)
+
+
+MUTATION_LOCK_PATIENCE_S = 2.0
+
+
+def try_mutation_lock(
+    store, name: str, patience_s: float = MUTATION_LOCK_PATIENCE_S
+) -> Optional[LockHandle]:
     """Take ``name``'s lock for a store mutation, refusing live leased sessions.
 
     Sessions join through the holders registry and only hold the flock
     briefly, so a free flock does not prove the profile is idle. This takes
-    the same non-blocking flock as ``try_lock`` but never inherits it and
-    never truncates the file (that would wipe the registry), then reads the
-    registry through the SAME locked fd: a joiner either registered before
-    this read (seen here) or has to wait for the flock this handle holds,
-    so there is no check-then-act gap. Returns None when the flock is held,
-    a live holder is registered, or the registry cannot be decoded or read
-    (fail closed). Raises LockError only when the lock cannot be managed.
+    the same flock as ``try_lock`` (waiting up to ``patience_s`` if flock-busy)
+    but never inherits it and never truncates the file (that would wipe the
+    registry), then reads the registry through the SAME locked fd: a joiner
+    either registered before this read (seen here) or has to wait for the
+    flock this handle holds, so there is no check-then-act gap. Returns None
+    immediately when a live holder is registered or the registry cannot be
+    decoded or read (fail closed). Returns None if the flock remains busy after
+    patience expires. Raises LockError only when the lock cannot be managed.
     """
-    handle = _try_lock_path(lock_path(store, name), "session lock", False)
-    if handle is None:
-        return None
-    try:
-        parsed = _parse_holders(_read_all(handle._fd))
-        if parsed is None or _prune_holders(parsed):
-            handle.release()
+    path = lock_path(store, name)
+    deadline = time.monotonic() + max(0.0, patience_s)
+    while True:
+        handle = _try_lock_path(path, "session lock", False)
+        if handle is not None:
+            try:
+                parsed = _parse_holders(_read_all(handle._fd))
+                if parsed is None or _prune_holders(parsed):
+                    handle.release()
+                    return None
+            except OSError:
+                handle.release()
+                return None
+            return handle
+        if time.monotonic() >= deadline:
             return None
-    except OSError:
-        handle.release()
-        return None
-    return handle
+        time.sleep(POLL_INTERVAL_S)
 
 
 def try_sequence_lock(store) -> Optional[LockHandle]:

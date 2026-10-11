@@ -201,7 +201,7 @@ class TestKeychainLoginCapture(unittest.TestCase):
         with isolated_store_env():
             store = Store()
             store.create("work")
-            fresh = b"fresh-token"
+            fresh = b'{"token":{"access_token":"acc","refresh_token":"ref"},"auth_method":"consumer"}'
             with mock.patch.object(
                 keychain, "supported", return_value=True
             ), mock.patch.object(

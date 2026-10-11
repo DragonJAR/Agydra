@@ -86,35 +86,43 @@ def main() -> int:
 
     repo = platforms.canonical_path(here)
     script = _venv_script(repo)
-    setup_request = _is_setup_request(sys.argv[1:])
-    setup_dry_run = setup_request and (
-        "-n" in sys.argv[2:] or "--dry-run" in sys.argv[2:]
-    )
-    force = setup_request and ("-f" in sys.argv[2:] or "--force" in sys.argv[2:])
 
-    if setup_request and not setup_dry_run:
+    if _is_setup_request(sys.argv[1:]):
         try:
             import bootstrap
         except ImportError as exc:
             return _fail(f"cannot import bootstrap from {repo}: {exc}")
-        return bootstrap.run(root=repo, force=force)
-
-    if setup_request and setup_dry_run and not os.path.isfile(script):
         try:
-            import bootstrap
-        except ImportError as exc:
-            return _fail(f"cannot import bootstrap from {repo}: {exc}")
-        bootstrap.report_state(repo)
-        print("run `python3 agydra.py setup` to create the venv, console script and PATH shim")
-        return 0
+            setup_args = bootstrap.parse_setup_args(sys.argv[2:])
+        except SystemExit as exc:
+            return int(exc.code) if exc.code is not None else 0
 
-    if not os.path.isfile(script):
-        try:
-            import bootstrap
-        except ImportError as exc:
-            return _fail(f"cannot import bootstrap from {repo}: {exc}")
-        print("agydra.py: no installation detected — running setup...")
-        code = bootstrap.run(root=repo, force=force)
+        if setup_args.dry_run and not os.path.isfile(script):
+            bootstrap.report_state(repo)
+            print("run `python3 agydra.py setup` to create the venv, console script and PATH shim")
+            return 0
+        if not setup_args.dry_run:
+            return bootstrap.run(root=repo, force=setup_args.force, explicit=True)
+
+    try:
+        import bootstrap
+    except ImportError as exc:
+        return _fail(f"cannot import bootstrap from {repo}: {exc}")
+
+    vpy = bootstrap.venv_python(repo)
+    broken_venv = not os.path.isfile(script) or not vpy.exists()
+    stale_modules = False
+    if not broken_venv:
+        stale_modules = bool(bootstrap.unimportable_modules(repo, vpy))
+
+    if broken_venv or stale_modules:
+        reason = (
+            "no installation detected"
+            if not os.path.isfile(script)
+            else ("broken venv interpreter" if not vpy.exists() else "unimportable runtime modules")
+        )
+        print(f"agydra.py: {reason} — running setup...")
+        code = bootstrap.run(root=repo, force=False, explicit=False)
         if code != 0:
             return code
         if not os.path.isfile(script):
@@ -122,6 +130,11 @@ def main() -> int:
                 "setup finished but the console script is missing",
                 f"expected it at {script}",
             )
+
+    if not platforms.is_windows():
+        shim_state = bootstrap.check_state(repo).get("shim_state")
+        if shim_state in ("missing", "dead"):
+            bootstrap.ensure_path_shim(repo, lambda line: None, explicit=False)
 
     argv = [script, *sys.argv[1:]]
     return platforms.launch_argv(argv, os.environ)

@@ -12,7 +12,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from agydra import __version__
 import account
@@ -32,7 +32,7 @@ import vocab
 import agydra
 from bootstrap import BootstrapError
 from isolation import IsolationError
-from store import Store, StoreError, atomic_copy, atomic_write_bytes, atomic_write_text, rename_dir_with_retry
+from store import Store, StoreError, _unreadable_metadata_message, atomic_copy, atomic_write_bytes, atomic_write_text, rename_dir_with_retry
 from ui import bar as _bar, error as _error, note as _note, pad, paint, paint_each, warn as _warn
 from ui import console_print as print
 
@@ -488,6 +488,9 @@ def _ensure_ref_unchanged(store: Store, ref: object, expected_name: str, action:
         )
 
 
+SHARED_CONFIG_FILES = ("settings.json", "mcp.json", "config.toml")
+
+
 def _acquire_profile_lock(
     store: Store, name: str, action: str
 ) -> locks.LockHandle:
@@ -501,6 +504,24 @@ def _acquire_profile_lock(
         _assert_free(store, name, action)
         raise ProfileBusyError(
             f"profile {name!r} became busy before {action}; retry when it is idle"
+        )
+    return handle
+
+
+def _acquire_profile_read_lock(
+    store: Store, name: str, action: str
+) -> locks.LockHandle:
+    try:
+        handle = locks.try_read_lock(
+            store, name, patience_s=store.READ_LOCK_PATIENCE_S
+        )
+    except locks.LockError as exc:
+        raise StoreError(
+            f"cannot safely proceed with {action} profile {name!r}: {exc}"
+        ) from exc
+    if handle is None:
+        raise ProfileBusyError(
+            f"profile {name!r} is busy with a concurrent operation; retry {action}"
         )
     return handle
 
@@ -551,45 +572,58 @@ def _table_headers() -> Dict[str, str]:
 
 
 def cmd_list(store: Store, _args) -> int:
-    profiles = store.list()
-    if not profiles:
-        print("no profiles; create one with: agydra create <name>")
+    profiles, unreadable = store.scan()
+    if not profiles and not unreadable:
+        print(i18n.t("cmd.list.no_profiles", default="no profiles; create one with: agydra create <name>"))
         return 0
-    default = store.default_name()
-    headers = _table_headers()
-    width = max(len(p.name) for p in profiles)
-    width = max(width, len(headers["profile"]))
-    header = (
-        f"{'#':<3}{headers['profile']:<{width + 2}}{headers['email']:<{_EMAIL_COL_WIDTH}}{headers['auth']:<20}"
-        f"{headers['default']:<9}{headers['busy']:<6}{headers['engine']:<9}{headers['last_used']}"
-    )
-    print(paint(header, "bold"))
-    for idx, profile in enumerate(profiles, start=1):
-        busy = locks.is_locked(store, profile.name)
-        engine = profile.engine
-        if engine == "claude":
-            native = account.claude_auth_status(store.profile_data_dir(profile.name, engine=engine), store)
-            email = native.email or "-"
-            state = native.auth_state_label
-        else:
-            if not busy:
-                synced = account.sync_profile_email(store, profile.name)
-                if synced and not profile.email:
-                    profile.email = synced
-            email = account.display_email(store, profile) or "-"
-            state = account.auth_state(
-                store.profile_data_dir(profile.name, engine=engine), store, profile.name, engine=engine,
-            )
-        is_default = paint("*", "green", "bold") if profile.name == default else ""
-        state_color = "green" if state == "authenticated" else None
-        state_shown = paint(state, state_color) if state_color else state
-        busy_shown = paint("yes", "yellow", "bold") if busy else "-"
-        last = paint(profile.last_used or "-", "dim")
-        email = ui.console_text(email)
-        print(
-            f"{idx:<3}{profile.name:<{width + 2}}{email:<{_EMAIL_COL_WIDTH}}"
-            f"{pad(state_shown, 20)}{pad(is_default, 9)}{pad(busy_shown, 6)}{pad(engine, 9)}{last}"
+    if profiles:
+        default = store.default_name()
+        headers = _table_headers()
+        busy_yes = i18n.t("cmd.list.busy_yes", default="yes")
+        width = max(len(p.name) for p in profiles)
+        width = max(width, len(headers["profile"]))
+        auth_w = max(20, len(headers["auth"]) + 2)
+        def_w = max(9, len(headers["default"]) + 2)
+        busy_w = max(6, len(headers["busy"]) + 2, len(busy_yes) + 2)
+        eng_w = max(9, len(headers["engine"]) + 2)
+        for p in profiles:
+            eng_w = max(eng_w, len(p.engine) + 2)
+        header = (
+            f"{'#':<3}{headers['profile']:<{width + 2}}{headers['email']:<{_EMAIL_COL_WIDTH}}{headers['auth']:<{auth_w}}"
+            f"{headers['default']:<{def_w}}{headers['busy']:<{busy_w}}{headers['engine']:<{eng_w}}{headers['last_used']}"
         )
+        print(paint(header, "bold"))
+        for idx, profile in enumerate(profiles, start=1):
+            busy = locks.is_locked(store, profile.name)
+            engine = profile.engine
+            if engine == "claude":
+                native = account.claude_auth_status(store.profile_data_dir(profile.name, engine=engine), store)
+                email = native.email or account.display_email(store, profile) or "-"
+                state = native.auth_state_label
+            else:
+                if not busy:
+                    synced = account.record_profile_email(store, profile.name)
+                    if synced and not profile.email:
+                        profile.email = synced
+                email = account.display_email(store, profile) or "-"
+                state = account.auth_state(
+                    store.profile_data_dir(profile.name, engine=engine), store, profile.name, engine=engine,
+                )
+            state_key = "cmd.list.state_" + state.replace("-", "_")
+            state_label = i18n.t(state_key, default=state)
+            is_default = paint("*", "green", "bold") if profile.name == default else ""
+            state_color = "green" if state == "authenticated" else None
+            state_shown = paint(state_label, state_color) if state_color else state_label
+            busy_shown = paint(busy_yes, "yellow", "bold") if busy else "-"
+            last = paint(profile.last_used or "-", "dim")
+            email = ui.console_text(email)
+            print(
+                f"{idx:<3}{profile.name:<{width + 2}}{email:<{_EMAIL_COL_WIDTH}}"
+                f"{pad(state_shown, auth_w)}{pad(is_default, def_w)}{pad(busy_shown, busy_w)}{pad(engine, eng_w)}{last}"
+            )
+    if unreadable:
+        for name in sorted(unreadable):
+            _warn(_unreadable_metadata_message(name))
     return 0
 
 
@@ -611,7 +645,7 @@ def cmd_create(store: Store, args) -> int:
                 if default_profile.engine == "agy":
                     try:
                         _share_config(store, default, [profile.name])
-                    except ProfileBusyError as exc:
+                    except (ProfileBusyError, StoreError, OSError) as exc:
                         _note(
                             f"settings not copied from default profile "
                             f"{default!r} ({exc})"
@@ -628,7 +662,6 @@ def cmd_login(store: Store, args) -> int:
     else:
         resolve_ref = store.resolve_ref_readonly if dry_run else store.resolve_ref
         name = resolve_ref(args.ref)
-    _assert_free(store, name, "logging in")
     profile = store.get_readonly(name) if dry_run else store.get(name)
     engine = profile.engine
     data_dir = store.profile_data_dir(name, engine=engine)
@@ -709,7 +742,7 @@ def cmd_status(store: Store, args) -> int:
     data_dir = store.profile_data_dir(name, engine=engine)
     native = account.claude_auth_status(data_dir, store) if engine == "claude" else None
     if native:
-        email = native.email or "-"
+        email = native.email or account.display_email(store, profile) or "-"
         state = native.auth_state_label
     else:
         email = account.display_email(store, profile) or "-"
@@ -895,7 +928,92 @@ def cmd_usage(store: Store, args) -> int:
     return _cmd_usage_compact(store, args)
 
 
-def _record_usage_snapshot(store: Store, profiles, results, scope: Optional[str]) -> None:
+def _restore_cached_groups(cached_groups: Any) -> List[usage.UsageGroup]:
+    """Restore structured UsageGroup objects from serialized snapshot entries."""
+    restored: List[usage.UsageGroup] = []
+    if not isinstance(cached_groups, list):
+        return restored
+    for g in cached_groups:
+        if not isinstance(g, dict):
+            continue
+        buckets: List[usage.UsageBucket] = []
+        for b in g.get("buckets", []):
+            if not isinstance(b, dict):
+                continue
+            reset_at = b.get("reset_at")
+            reset_dt = usage.parse_iso_utc(reset_at) if reset_at else None
+            try:
+                frac = float(b.get("remaining_fraction") or 0.0)
+            except (TypeError, ValueError):
+                frac = 0.0
+            buckets.append(
+                usage.UsageBucket(
+                    id=str(b.get("id") or ""),
+                    name=str(b.get("name") or ""),
+                    window=str(b.get("window") or ""),
+                    remaining_fraction=frac,
+                    reset_time=reset_dt,
+                )
+            )
+        restored.append(usage.UsageGroup(name=str(g.get("name") or ""), buckets=buckets))
+    return restored
+
+
+def _find_previous_entry(
+    previous: Optional[Mapping[str, Any]], profile: Any
+) -> Optional[Mapping[str, Any]]:
+    """Locate the profile's prior entry in the previous snapshot document.
+
+    Matches by monotonic sequence (seq > 0) and engine first, so renamed
+    profiles retain their cached reading. Falls back to name and engine for
+    legacy seq=0 profiles.
+    """
+    if not isinstance(previous, dict):
+        return None
+    seq = getattr(profile, "seq", 0) or 0
+    engine = getattr(profile, "engine", "") or ""
+    name = getattr(profile, "name", None)
+    return usage_snapshot._matching_entry(previous, seq, engine, name)
+
+
+def _format_age(
+    observed_at: Optional[datetime], *, now: Optional[datetime] = None
+) -> str:
+    """Compact elapsed age, e.g. ``"10m ago"``, ``"2h ago"``, ``"1d ago"``, ``"<1m ago"``."""
+    if observed_at is None:
+        return ""
+    if isinstance(observed_at, str):
+        observed_at = usage.parse_iso_utc(observed_at)
+        if observed_at is None:
+            return ""
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    seconds = int((current - observed_at).total_seconds())
+    if seconds < 0:
+        seconds = 0
+    if seconds < 60:
+        return "<1m ago"
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+    if days > 0:
+        return f"{days}d ago"
+    if hours > 0:
+        return f"{hours}h ago"
+    return f"{minutes}m ago"
+
+
+def _record_usage_snapshot(
+    store: Store,
+    profiles,
+    results,
+    scope: Optional[str],
+    *,
+    now: Optional[datetime] = None,
+) -> List[usage.UsageResult]:
     """Refresh the store's single usage snapshot after a quota inspection.
 
     Every ``agydra usage`` run replaces ``<store>/usage-latest.json`` so a
@@ -910,7 +1028,29 @@ def _record_usage_snapshot(store: Store, profiles, results, scope: Optional[str]
     the previous document in place instead of turning a successful quota
     inspection into an error.
     """
-    usage_snapshot.write_snapshot(store, profiles=profiles, results=results, scope=scope)
+    previous = usage_snapshot.read_snapshot(store)
+    updated_results = list(results)
+    if isinstance(previous, dict) and previous.get("profiles"):
+        for idx, (p, r) in enumerate(zip(profiles, results)):
+            if not r.ok and r.error != "not authenticated" and r.authentication_state != "unauthenticated":
+                prev_entry = _find_previous_entry(previous, p)
+                if prev_entry:
+                    cached_groups = _restore_cached_groups(prev_entry.get("groups"))
+                    if cached_groups:
+                        raw_obs = prev_entry.get("observed_at") or previous.get("generated_at")
+                        observed_dt = usage_snapshot._parse_instant(raw_obs)
+                        updated_results[idx] = dataclasses.replace(
+                            r,
+                            groups=cached_groups,
+                            plan=r.plan or prev_entry.get("plan"),
+                            observed_at=observed_dt,
+                            quality="stale",
+                        )
+    results = updated_results
+    usage_snapshot.write_snapshot(
+        store, profiles=profiles, results=results, scope=scope, now=now
+    )
+    return results
 
 
 def _truncate_account(email: Optional[str], max_len: int = 12) -> str:
@@ -1028,9 +1168,9 @@ def _claude_state_label(result: "usage.UsageResult") -> str:
 
 
 def _cmd_usage_compact(store: Store, _args) -> int:
-    profiles, _unreadable = store.scan_readonly()
+    profiles, _unreadable = store.scan()
     if not profiles:
-        print("no profiles; create one with: agydra create <name>")
+        print(i18n.t("cmd.list.no_profiles", default="no profiles; create one with: agydra create <name>"))
         return 0
     _fill_claude_accounts(store, profiles)
     names = [p.name for p in profiles]
@@ -1040,7 +1180,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
         )
     finally:
         _clear_usage_progress(sys.stderr, names)
-    _record_usage_snapshot(store, profiles, results, scope="all")
+    results = _record_usage_snapshot(store, profiles, results, scope="all")
 
     agy_entries = [(p, r) for p, r in zip(profiles, results) if p.engine == "agy"]
     codex_entries = [(p, r) for p, r in zip(profiles, results) if p.engine == "codex"]
@@ -1158,7 +1298,12 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                     not_auth = paint(i18n.t("auth.not_authenticated", default="not authenticated"), "dim")
                     print(row_pfx + pad(not_auth, gem_col_w) + not_auth)
                 else:
-                    err_msg = paint(f"({result.error})", "dim")
+                    if result.groups:
+                        age = _format_age(result.observed_at)
+                        tag = f"cached {age}" if age else "cached"
+                        err_msg = paint(f"({result.error} · {tag})", "dim")
+                    else:
+                        err_msg = paint(f"({result.error})", "dim")
                     print(row_pfx + err_msg)
             else:
                 summary = usage.extract_model_summary(result.groups)
@@ -1215,7 +1360,13 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                 row += _usage_account_cell(account_labels[profile.name], account_mode, account_w)
             plan = tail(result)
             if not result.ok:
-                print(row + _plan_separated(_usage_error_cell(result.error), quota_width) + plan)
+                if result.groups:
+                    age = _format_age(result.observed_at)
+                    tag = f"cached {age}" if age else "cached"
+                    err_cell = paint(f"({result.error} · {tag})", "dim")
+                else:
+                    err_cell = _usage_error_cell(result.error)
+                print(row + _plan_separated(err_cell, quota_width) + plan)
             elif not result.groups:
                 if result.error == usage.PLAN_WITHOUT_QUOTA:
                     cell = paint("─ " + i18n.t("usage.plan_no_quota"), "dim")
@@ -1298,10 +1449,11 @@ def _cmd_usage_compact(store: Store, _args) -> int:
 
 
 def _cmd_usage_detail(store: Store, args) -> int:
-    name = store.resolve_ref_readonly(args.ref)
-    profile = store.get_readonly(name)
+    name = store.resolve_ref(args.ref)
+    profile = store.get(name)
     result = usage.query_profile_usage(store, name)
-    _record_usage_snapshot(store, [profile], [result], scope=profile.name)
+    results = _record_usage_snapshot(store, [profile], [result], scope=profile.name)
+    result = results[0]
     print(i18n.t("cmd.status.profile", name=profile.name))
     print(i18n.t("cmd.status.engine", engine=profile.engine))
     if profile.engine == "claude":
@@ -1327,15 +1479,27 @@ def _cmd_usage_detail(store: Store, args) -> int:
         print(f"status    : {state_str}")
         print(f"data dir  : {store.profile_data_dir(name, engine=profile.engine)}")
         if not result.ok:
-            if result.error and result.error != "not authenticated":
-                _error(f"usage unavailable: {result.error}")
-            return 1
-        if result.error == usage.PLAN_WITHOUT_QUOTA:
+            if not result.groups:
+                if result.error and result.error != "not authenticated":
+                    _error(f"usage unavailable: {result.error}")
+                return 1
+            age = _format_age(result.observed_at)
+            tag = f"from {age}" if age else "cached"
+            _warn(f"{result.error} (showing cached reading {tag})")
+            print(paint(f"warning   : {result.error} (showing cached reading {tag})", "yellow"))
+        elif result.error == usage.PLAN_WITHOUT_QUOTA:
             print(f"usage     : {i18n.t('usage.plan_no_quota')}")
+        elif result.error:
+            _error(f"usage unavailable: {result.error}")
+            return 1
         if not result.groups:
             return 0
 
-    if not result.ok:
+    if not result.ok and not result.groups:
+        if result.error and result.error != usage.PLAN_WITHOUT_QUOTA:
+            _error(f"usage unavailable: {result.error}")
+        return 1
+    if result.error and result.error != usage.PLAN_WITHOUT_QUOTA and not result.groups:
         _error(f"usage unavailable: {result.error}")
         return 1
     for group in result.groups:
@@ -1347,7 +1511,7 @@ def _cmd_usage_detail(store: Store, args) -> int:
             gauge = paint(_bar(bucket.remaining_fraction), color)
             countdown = usage.format_countdown(bucket.reset_time)
             print(f"  {bucket.name:<28}[{gauge}] {pct:5.1f}%  reset in {countdown}")
-    return 0
+    return 1 if not result.ok else 0
 
 
 def cmd_default(store: Store, args) -> int:
@@ -1439,7 +1603,7 @@ def _finish_delete(store: Store, name: str, no_backup: bool) -> int:
             purge_errors.append(exc)
 
     needs_keychain = (
-        engines.get_engine(engine).needs_keychain if engine in engines.SUPPORTED_ENGINES else False
+        engines.get_engine(engine).needs_keychain if engine in engines.SUPPORTED_ENGINES else True
     )
     backup = store.delete(
         name,
@@ -1499,7 +1663,6 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
     All targets are validated (existence, self-copy, live sessions) BEFORE
     the first byte is copied: a bad third target must not leave the first
     two half-copied. Source and target locks stay held until every copy ends."""
-    allowed = ("settings.json", "mcp.json", "config.toml")
     resolved: List[str] = []
     references: List[Tuple[str, str]] = []
     seen: set = set()
@@ -1513,7 +1676,8 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
         seen.add(target_name)
         resolved.append(target_name)
     with ExitStack() as stack:
-        for name in sorted({src, *resolved}):
+        stack.enter_context(_acquire_profile_read_lock(store, src, "sharing config"))
+        for name in sorted(resolved):
             stack.enter_context(_acquire_profile_lock(store, name, "sharing config"))
         for reference, expected_name in references:
             _ensure_ref_unchanged(store, reference, expected_name, "sharing config")
@@ -1531,15 +1695,29 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
             profile.engine == "claude" for profile in target_profiles.values()
         ):
             raise StoreError(i18n.t("claude.share_unsupported"))
+        source_payloads: Dict[str, bytes] = {}
+        for name in SHARED_CONFIG_FILES:
+            file = src_dir / name
+            if file.is_file():
+                try:
+                    raw = file.read_bytes()
+                except OSError as exc:
+                    _note(f"skipping unreadable {name} in {src}: {exc}")
+                    continue
+                if name.endswith(".json"):
+                    try:
+                        json.loads(raw)
+                    except (ValueError, UnicodeDecodeError) as exc:
+                        _note(f"skipping invalid JSON {name} in {src}: {exc}")
+                        continue
+                source_payloads[name] = raw
         copied: List[str] = []
         for target_name in resolved:
             target_profile = target_profiles[target_name]
             target_dir = store.profile_data_dir(target_name, engine=target_profile.engine)
-            for name in allowed:
-                file = src_dir / name
-                if file.is_file():
-                    atomic_copy(file, target_dir / name)
-                    copied.append(f"{target_name}/{name}")
+            for name, payload in source_payloads.items():
+                atomic_write_bytes(target_dir / name, payload)
+                copied.append(f"{target_name}/{name}")
         return copied
 
 
@@ -1612,15 +1790,19 @@ def cmd_import(store: Store, args) -> int:
                 f"plain `{driver.binary_name}` to create it, then retry: agydra import " + name
             )
         data_dir = store.profile_data_dir(name, engine=engine)
-        if data_dir.exists() and any(data_dir.iterdir()):
-            raise StoreError(
-                f"profile {name!r} already has data ({data_dir}); "
-                "delete it first (agydra delete " + name + ") or pick an empty profile."
-            )
+        if data_dir.exists():
+            unexpected = [
+                p.name for p in data_dir.iterdir() if p.name not in SHARED_CONFIG_FILES
+            ]
+            if unexpected:
+                raise StoreError(
+                    f"profile {name!r} already has data ({data_dir}); "
+                    "delete it first (agydra delete " + name + ") or pick an empty profile."
+                )
         if driver.needs_keychain:
             guards.enter_context(keychain.serialized_access(store))
         if data_dir.exists():
-            data_dir.rmdir()
+            shutil.rmtree(data_dir)
         platforms.ensure_dir(data_dir.parent)
         tmp = Path(tempfile.mkdtemp(prefix=f".import-{name}.", dir=data_dir.parent))
         try:
@@ -1686,7 +1868,11 @@ def cmd_export(store: Store, args) -> int:
     engine_excluded = list(driver.export_credential_ignore())
     excluded_relpaths: List[str] = [f"data/{p}" for p in engine_excluded]
     excluded_relpaths.append("_keychain/")
-    with _acquire_profile_lock(store, name, "exporting it"):
+    with _acquire_profile_read_lock(store, name, "exporting it"):
+        if locks.is_locked(store, name):
+            _note(
+                f"exporting live profile {name!r}; the archive is a best-effort snapshot"
+            )
         _ensure_ref_unchanged(store, args.ref, name, "export")
         dest = Path(args.output) if args.output is not None else _default_export_path(name)
         manifest = {
@@ -1793,7 +1979,7 @@ def cmd_language(store: Store, args) -> int:
         current = i18n._get_active()
         print(i18n.t("cmd.lang.current", lang=current))
         supported = ", ".join(i18n.SUPPORTED_LANGS)
-        print(f"supported : {supported}")
+        print(i18n.t("cmd.lang.supported", supported=supported, default=f"supported : {supported}"))
     return 0
 
 
@@ -1907,6 +2093,9 @@ def _report_error(exc: BaseException) -> int:
     if isinstance(exc, KeyboardInterrupt):
         _print_cancelled(file=sys.stderr)
         return 130
+    if isinstance(exc, runner.BinaryUnavailableError):
+        _error(str(exc))
+        return exc.exit_code
     if isinstance(exc, _CLI_REPORTABLE_ERRORS):
         _error(str(exc))
         return 1
@@ -1957,39 +2146,58 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _register_keychain_rename_recovery(store)
 
     lang_val = None
-    filtered_raw: List[str] = []
+    is_dry_run = False
+    leading_raw: List[str] = []
     i = 0
-    while i < len(raw):
+    n = len(raw)
+    while i < n:
         token = raw[i]
         if token == "--":
-            filtered_raw.extend(raw[i:])
+            leading_raw.extend(raw[i:])
+            i = n
             break
         if token == "--lang":
-            if i + 1 < len(raw) and not raw[i + 1].startswith("-"):
+            if i + 1 < n and not raw[i + 1].startswith("-"):
                 lang_val = raw[i + 1]
                 i += 2
                 continue
+            else:
+                _error("--lang requires a value")
+                return 2
         elif token.startswith("--lang="):
             lang_val = token.split("=", 1)[1]
             i += 1
             continue
-        filtered_raw.append(token)
+        matched = _match_flag(token)
+        if matched is None:
+            leading_raw.extend(raw[i:])
+            break
+        if any(key == "dry-run" for key, _val, _w in matched):
+            is_dry_run = True
+        leading_raw.append(token)
         i += 1
+        for key, inline, width in matched:
+            if width == 2 and i < n:
+                leading_raw.append(raw[i])
+                i += 1
+    raw = leading_raw
 
     if lang_val is not None:
-        try:
-            i18n.set_language(store, lang_val)
-        except ValueError as exc:
-            _error(str(exc))
+        norm = i18n._normalize(lang_val)
+        if norm is None:
+            supported_str = ", ".join(repr(s) for s in i18n.SUPPORTED_LANGS)
+            _error(i18n.t("lang.unknown", lang=lang_val, supported=supported_str))
             return 2
-        except StoreError as exc:
-            _error(str(exc))
-            return 1
-        i18n.resolve_language(store, flag_lang=lang_val)
-        if not filtered_raw:
+        if not is_dry_run:
+            try:
+                i18n.set_language(store, lang_val)
+            except StoreError as exc:
+                _error(str(exc))
+                return 1
+        i18n.resolve_language(store, flag_lang=norm)
+        if not raw:
             print(i18n.t("lang.set_ok"))
             return 0
-        raw = filtered_raw
     else:
         i18n.resolve_language(store)
 
@@ -2178,7 +2386,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         flags = _consume_launch_flags(raw)
         values, agy_args = flags
         if values["profile"] is not None and values["random"]:
-            _error("-p/--profile and -r/--random are mutually exclusive")
+            _error(
+                "-p/--profile and -r/--random are mutually exclusive; to pass -r "
+                f"to the engine, put it after --: agydra -p {values['profile']} -- -r"
+            )
             return 2
         if not flags.swallowed:
             _warn_late_flags(values, raw)

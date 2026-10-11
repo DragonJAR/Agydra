@@ -71,7 +71,7 @@ class TestCliParameterMatrix(BaseCase):
             (["--binary", str(self.agy_bin), "-n"], 0, str(self.agy_bin)),
             ([f"-b{self.agy_bin}", "-n"], 0, str(self.agy_bin)),
             ([f"--binary={self.agy_bin}", "-n"], 0, str(self.agy_bin)),
-            (["-b", "/nonexistent/path/agy", "-n"], 1, "could not find"),
+            (["-b", "/nonexistent/path/agy", "-n"], 127, "could not find binary '/nonexistent/path/agy'"),
         ]
         for args, expected_rc, needle in cases:
             with self.subTest(args=args):

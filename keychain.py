@@ -211,7 +211,10 @@ def _run(
             except OSError:
                 pass
         if feeder is not None:
-            feeder.join(timeout=2.0)
+            try:
+                feeder.join(timeout=2.0)
+            except RuntimeError:
+                pass
         out_fh.close()
         err_fh.close()
 
@@ -717,32 +720,116 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
     )
 
 
-def save_file_credential(store, name: str, data: bytes) -> None:
-    """Back up a private file credential as ``name``'s slot.
+def adopt_login_credential(
+    store, name: str, data_dir: Path, plain_json_bytes: bytes
+) -> None:
+    """Adopt a fresh login credential across private slot and disk stores.
 
-    A login that ran with file authentication (because another profile
-    owned the shared slot) leaves its token only on disk; this makes it
-    available to later Keychain launches through the same identity guard
-    as a Keychain login capture, inside the same waiting swap section.
+    Explicit user-confirmed identity choice: validates the payload as a usable
+    Antigravity token, quarantines any existing private slot backup with a
+    different identity, saves the new envelope backup, atomically writes the
+    disk token with 0600 permissions, and re-anchors profile metadata email.
     """
-    with _launch_section(store):
-        _persist_if_trusted(store, name, data)
+    import account
 
-
-def _serialize_lock(store):
-    """Cross-process non-blocking mutex for shared-slot swaps (macOS only)."""
-    import locks
-
-    path = swap_lock_path(store)
-    try:
-        handle = locks.try_lock_path(
-            path, description="keychain swap lock", inherit_on_exec=False
+    if plain_json_bytes.startswith(_GO_KEYRING_PREFIX):
+        decoded = decode_go_keyring_secret(plain_json_bytes)
+        raw_bytes = (
+            json.dumps(decoded, separators=(",", ":")).encode("utf-8")
+            if decoded is not None
+            else b""
         )
-    except OSError as exc:
-        raise KeychainError(f"cannot acquire keychain swap lock ({exc})") from exc
+        envelope = plain_json_bytes
+    else:
+        try:
+            decoded = json.loads(plain_json_bytes.decode("utf-8"))
+        except (RecursionError, ValueError, UnicodeDecodeError):
+            decoded = None
+        raw_bytes = plain_json_bytes
+        envelope = envelope_token_bytes(plain_json_bytes)
+
+    if not isinstance(decoded, dict) or not account._usable_agy_token(decoded):
+        warn(f"could not adopt invalid login credential for profile {name!r}")
+        return
+
+    candidate = account.email_from_raw(decoded)
+    existing_slot = load_profile_slot(store, name)
+    if existing_slot is not None and candidate is not None:
+        existing_candidate = _secret_identity(existing_slot)
+        if existing_candidate is not None and not account.same_email(
+            existing_candidate, candidate
+        ):
+            _quarantine_profile_slot(store, name)
+
+    save_profile_slot(store, name, envelope)
+
+    token_path = data_dir / account.AGY_CLI_DIR / account.TOKEN_FILE
+    platforms.ensure_dir(token_path.parent)
+    verified_path = account.agy_token_path(data_dir)
+    atomic_write_bytes(verified_path, raw_bytes)
+
+    account.record_profile_email(store, name)
+
+
+def save_file_credential(store, name: str, data: bytes) -> None:
+    """Back up a private file credential as ``name``'s slot."""
+    try:
+        data_dir = store.profile_data_dir(name, engine="agy")
+    except Exception:
+        data_dir = None
+    if data_dir is not None:
+        adopt_login_credential(store, name, data_dir, data)
+    else:
+        with _launch_section(store):
+            _persist_if_trusted(store, name, data)
+
+
+LAUNCH_SECTION_PATIENCE_S = 3.0
+
+
+def _acquire_swap_lock(
+    store,
+    *,
+    timeout_s: Optional[float] = None,
+    on_os_error: type[Exception] = SwapSectionError,
+):
+    import locks as locks_module
+
+    if timeout_s is None:
+        timeout_s = LAUNCH_SECTION_PATIENCE_S
+    path = swap_lock_path(store)
+    handle = None
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            handle = locks_module.try_lock_path(
+                path, description="keychain swap lock", inherit_on_exec=False
+            )
+        except OSError as exc:
+            raise on_os_error(
+                f"cannot acquire keychain swap lock ({exc})"
+            ) from exc
+        if handle is not None or time.monotonic() >= deadline:
+            break
+        time.sleep(locks_module.POLL_INTERVAL_S)
     if handle is None:
         raise _swap_lock_busy_error(store)
     return handle
+
+
+def _serialize_lock(store, timeout_s: Optional[float] = None):
+    """Cross-process mutex for shared-slot swaps with bounded wait (macOS only)."""
+    return _acquire_swap_lock(store, timeout_s=timeout_s, on_os_error=KeychainError)
+
+
+@contextmanager
+def _launch_section(store) -> Iterator[None]:
+    """Brief ``swap.lock`` section for launch-time slot operations."""
+    handle = _acquire_swap_lock(store, on_os_error=SwapSectionError)
+    try:
+        yield
+    finally:
+        handle.release()
 
 
 @contextmanager
@@ -937,51 +1024,6 @@ def _save_slot_lease(
     atomic_write_bytes(_slot_lease_path(store), json.dumps(record).encode("utf-8"))
 
 
-LAUNCH_SECTION_PATIENCE_S = 3.0
-"""How long a launch waits for ``swap.lock`` held by sibling launches.
-
-The section runs ``security`` subprocesses, so several simultaneous launches
-serialize for well over a few milliseconds; a bounded wait lets them queue
-instead of failing. A genuinely stuck holder still fails after this budget.
-"""
-
-
-@contextmanager
-def _launch_section(store) -> Iterator[None]:
-    """Brief ``swap.lock`` section for launch-time slot operations.
-
-    Unlike ``serialized_access`` (instant-busy, used by mutations and
-    read-only queries), a launch waits out micro-contentions — two tabs
-    starting the same profile in the same instant must both succeed, the
-    loser joins as soon as the winner's swap section ends. Still fail-fast
-    after :data:`LAUNCH_SECTION_PATIENCE_S`: a genuinely long holder (a rename recovery) is
-    the same hard contention the old whole-session lock reported.
-    """
-    import locks as locks_module
-
-    path = swap_lock_path(store)
-    handle = None
-    deadline = time.monotonic() + LAUNCH_SECTION_PATIENCE_S
-    while True:
-        try:
-            handle = locks_module.try_lock_path(
-                path, description="keychain swap lock", inherit_on_exec=False
-            )
-        except OSError as exc:
-            raise SwapSectionError(
-                f"cannot acquire keychain swap lock ({exc})"
-            ) from exc
-        if handle is not None or time.monotonic() >= deadline:
-            break
-        time.sleep(locks_module.POLL_INTERVAL_S)
-    if handle is None:
-        raise _swap_lock_busy_error(store)
-    try:
-        yield
-    finally:
-        handle.release()
-
-
 def _login_keychain_path() -> Path:
     return platforms.real_home() / "Library" / "Keychains" / "login.keychain-db"
 
@@ -996,7 +1038,7 @@ def _parse_keychain_list(stdout: bytes) -> List[str]:
     return paths
 
 
-def _ensure_target_keychain(store) -> Optional[Path]:
+def _ensure_target_keychain(store, create: bool = True) -> Optional[Path]:
     """Resolve the keychain `security` should target, self-healing once.
 
     Every call in this module used to rely on macOS's ambient "default
@@ -1009,6 +1051,7 @@ def _ensure_target_keychain(store) -> Optional[Path]:
     profile store: a failed attempt (e.g. the user cancels the native
     create-keychain password prompt) writes a marker so later launches
     degrade straight to fail-open instead of repeating the prompt.
+    ``create=False`` provides a resolve-only mode for read-only inspection.
     """
     marker = _slots_dir(store) / _SKIP_MARKER_NAME
     if marker.exists():
@@ -1021,17 +1064,21 @@ def _ensure_target_keychain(store) -> Optional[Path]:
                 return Path(candidates[0])
 
         target = _login_keychain_path()
-        if not target.exists():
-            created = _run(["create-keychain", str(target)], timeout=KEYCHAIN_CREATE_TIMEOUT_S)
-            if created.returncode != 0:
-                platforms.ensure_dir(marker.parent)
-                marker.touch()
-                warn(
-                    "could not create a login keychain "
-                    f"(rc={created.returncode}); keychain bridge disabled "
-                    "until it exists (see `agydra doctor`)"
-                )
-                return None
+        if target.exists():
+            return target
+        if not create:
+            return None
+
+        created = _run(["create-keychain", str(target)], timeout=KEYCHAIN_CREATE_TIMEOUT_S)
+        if created.returncode != 0:
+            platforms.ensure_dir(marker.parent)
+            marker.touch()
+            warn(
+                "could not create a login keychain "
+                f"(rc={created.returncode}); keychain bridge disabled "
+                "until it exists (see `agydra doctor`)"
+            )
+            return None
 
         listed = _run(["list-keychains", "-d", "user"])
         existing = _parse_keychain_list(listed.stdout) if listed.returncode == 0 else []
@@ -1239,7 +1286,31 @@ def launch_guard(store, profile: str, capture: bool = False,
                         self._keychain_path,
                     )
                     self._wrote_payload = True
-            if slot is None and shared_now is not None:
+            if slot is None:
+                try:
+                    profile_obj = store.get(profile)
+                    data_dir = store.profile_data_dir(profile, engine="agy")
+                    disk_bytes = account.scoped_agy_token_bytes(
+                        store, profile_obj, data_dir
+                    )
+                except Exception:
+                    disk_bytes = None
+                if disk_bytes is not None:
+                    try:
+                        payload = token_payload_for_slot(_as_envelope(disk_bytes))
+                    except ValueError as exc:
+                        warn(
+                            f"keychain swap skipped ({exc}); continuing without "
+                            "per-profile credential swap"
+                        )
+                    else:
+                        write_slot(
+                            shared_slot(),
+                            payload,
+                            self._keychain_path,
+                        )
+                        self._wrote_payload = True
+            if not self._wrote_payload and shared_now is not None:
                 delete_slot(shared_slot(), self._keychain_path)
             _save_slot_lease(
                 store,
@@ -1278,6 +1349,8 @@ def launch_guard(store, profile: str, capture: bool = False,
                 with _launch_section(store):
                     state = _load_slot_lease(store)
                     if state.owner == profile:
+                        if capture:
+                            self._capture_and_keep()
                         import locks as locks_module
 
                         holders = locks_module.lease_keychain_holders(store, profile)
@@ -1293,24 +1366,25 @@ def launch_guard(store, profile: str, capture: bool = False,
 
         def _finalize_ownership(self, state: SlotLeaseState) -> None:
             had_shared = _decode_shared(state.had_shared)
-            if capture:
-                self._capture_and_keep()
-                _save_slot_lease(store, None, None)
-                return
             current: Optional[bytes] = None
-            read_once = self._persist_on_exit or had_shared is not None
-            if read_once:
-                current = read_slot(shared_slot(), self._keychain_path)
-            if self._persist_on_exit and current is not None:
-                _persist_if_trusted(store, profile, current)
+            if not capture:
+                read_once = self._persist_on_exit or had_shared is not None
+                if read_once:
+                    current = read_slot(shared_slot(), self._keychain_path)
+                if self._persist_on_exit and current is not None:
+                    _persist_if_trusted(store, profile, current)
             if had_shared is not None:
-                if current != had_shared:
+                if capture or current != had_shared:
                     write_slot(shared_slot(), had_shared, self._keychain_path)
             else:
                 has_content = (
-                    current
-                    if self._persist_on_exit
-                    else read_slot(shared_slot(), self._keychain_path)
+                    True
+                    if capture
+                    else (
+                        current
+                        if self._persist_on_exit
+                        else read_slot(shared_slot(), self._keychain_path)
+                    )
                 )
                 if has_content is not None:
                     try:
@@ -1322,7 +1396,14 @@ def launch_guard(store, profile: str, capture: bool = False,
         def _capture_and_keep(self):
             data = read_slot(shared_slot(), self._keychain_path)
             if data is not None:
-                _persist_if_trusted(store, profile, data)
+                try:
+                    data_dir = store.profile_data_dir(profile, engine="agy")
+                except Exception:
+                    data_dir = None
+                if data_dir is not None:
+                    adopt_login_credential(store, profile, data_dir, data)
+                else:
+                    _persist_if_trusted(store, profile, data)
 
     return _Guard(persist_on_exit)
 
@@ -1498,7 +1579,7 @@ def orphan_slots(store, known_names: List[str], keychain_path=_UNRESOLVED_KEYCHA
     if not supported():
         return []
     if keychain_path is _UNRESOLVED_KEYCHAIN_PATH:
-        keychain_path = _ensure_target_keychain(store)
+        keychain_path = _ensure_target_keychain(store, create=False)
     args = ["dump-keychain"]
     try:
         if keychain_path is not None:
@@ -1606,16 +1687,25 @@ def describe(store, names: Optional[List[str]] = None) -> Dict[str, object]:
         except OSError:
             slots[name] = False
     try:
-        keychain_path = _ensure_target_keychain(store) if store is not None else None
+        keychain_path = (
+            _ensure_target_keychain(store, create=False)
+            if store is not None
+            else None
+        )
         payload = read_slot(shared_slot(), keychain_path)
         shared = payload is not None
         shared_format = None
         if payload is not None:
+            normalized = _normalize_read_slot_value(payload)
             try:
-                parsed = json.loads(payload)
+                parsed = json.loads(normalized)
                 shared_format = "json" if isinstance(parsed, dict) else "other"
             except (ValueError, TypeError):
-                shared_format = "invalid"
+                envelope_secret = decode_go_keyring_secret(normalized)
+                if envelope_secret is not None and isinstance(envelope_secret, dict):
+                    shared_format = "json"
+                else:
+                    shared_format = "invalid"
     except KeychainError:
         shared = None
         shared_format = None
