@@ -169,7 +169,7 @@ class TestD3BinaryResolutionOrder(BaseCase):
     def test_invalid_config_warns_and_falls_through_to_path(self):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td)
-            path_bin = bin_dir / "agy"
+            path_bin = bin_dir / ("agy.exe" if platforms.is_windows() else "agy")
             path_bin.touch(mode=0o755)
 
             with mock.patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=False):
@@ -185,7 +185,7 @@ class TestD3BinaryResolutionOrder(BaseCase):
     def test_explicit_invalid_stays_error_and_does_not_fall_through(self):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td)
-            path_bin = bin_dir / "agy"
+            path_bin = bin_dir / ("agy.exe" if platforms.is_windows() else "agy")
             path_bin.touch(mode=0o755)
 
             with mock.patch.dict(os.environ, {"PATH": str(bin_dir)}):
@@ -273,6 +273,8 @@ class TestD8ExitCodesForInvalidBinary(BaseCase):
         self.assertIn("/nonexistent/agy/path", str(ctx.exception))
 
     def test_build_plan_not_executable_binary_exits_126(self):
+        if platforms.is_windows():
+            self.skipTest("POSIX exec semantics")
         self.store.create("work")
         with tempfile.NamedTemporaryFile() as tf:
             os.chmod(tf.name, 0o644)

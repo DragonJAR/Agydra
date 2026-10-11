@@ -252,7 +252,7 @@ class TestSpanishListFormatting(BaseCase):
 
     def test_spanish_columns_never_fuse_and_rows_are_localized(self):
         self.store.create("p1", engine="agy")
-        self.store.create("p2", engine="claude")
+        self.store.create("p2", engine="codex")
 
         locks.acquire_lease(self.store, "p1")
         try:
@@ -274,4 +274,21 @@ class TestSpanishListFormatting(BaseCase):
         finally:
             locks.release_lease(self.store, "p1")
 
+    def test_spanish_list_localizes_unknown_auth_state(self):
+        import account
+        self.store.create("p_unk", engine="claude")
+        status = account.ClaudeAuthStatus(state=account.CLAUDE_STATE_UNKNOWN)
+        with mock.patch("account.claude_auth_status", return_value=status):
+            buf_es = io.StringIO()
+            with mock.patch("i18n._get_active", return_value="es"):
+                with contextlib.redirect_stdout(buf_es):
+                    ret = cli.cmd_list(self.store, None)
+            self.assertEqual(ret, 0)
+            self.assertIn("desconocido", buf_es.getvalue())
 
+            buf_en = io.StringIO()
+            with mock.patch("i18n._get_active", return_value="en"):
+                with contextlib.redirect_stdout(buf_en):
+                    ret = cli.cmd_list(self.store, None)
+            self.assertEqual(ret, 0)
+            self.assertIn("unknown", buf_en.getvalue())

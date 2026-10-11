@@ -164,7 +164,7 @@ class TestI18nCli(BaseCase):
 
         store = Store(self.store_root)
         store.create("perfil1", engine="agy")
-        store.create("perfil2", engine="claude")
+        store.create("perfil2", engine="codex")
 
         locks.acquire_lease(store, "perfil1")
         try:
@@ -198,6 +198,28 @@ class TestI18nCli(BaseCase):
         self.assertIn("DEFAULT", en_header)
         self.assertIn("LAST USED", en_header)
         self.assertIn("not-authenticated", en_row1)
+
+    def test_cmd_list_unknown_auth_state_localized(self):
+        import io
+        import contextlib
+        from unittest import mock
+        import account
+        import cli
+        store = Store(self.store_root)
+        store.create("perfil_unk", engine="claude")
+        status = account.ClaudeAuthStatus(state=account.CLAUDE_STATE_UNKNOWN)
+        with mock.patch("account.claude_auth_status", return_value=status):
+            buf_es = io.StringIO()
+            with mock.patch("i18n._get_active", return_value="es"):
+                with contextlib.redirect_stdout(buf_es):
+                    self.assertEqual(cli.cmd_list(store, None), 0)
+            self.assertIn("desconocido", buf_es.getvalue())
+
+            buf_en = io.StringIO()
+            with mock.patch("i18n._get_active", return_value="en"):
+                with contextlib.redirect_stdout(buf_en):
+                    self.assertEqual(cli.cmd_list(store, None), 0)
+            self.assertIn("unknown", buf_en.getvalue())
 
 
 if __name__ == "__main__":

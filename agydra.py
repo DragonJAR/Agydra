@@ -97,12 +97,14 @@ def main() -> int:
         except SystemExit as exc:
             return int(exc.code) if exc.code is not None else 0
 
-        if setup_args.dry_run and not os.path.isfile(script):
-            bootstrap.report_state(repo)
-            print("run `python3 agydra.py setup` to create the venv, console script and PATH shim")
-            return 0
-        if not setup_args.dry_run:
-            return bootstrap.run(root=repo, force=setup_args.force, explicit=True)
+        if setup_args.dry_run:
+            if not os.path.isfile(script):
+                bootstrap.report_state(repo)
+                print("run `python3 agydra.py setup` to create the venv, console script and PATH shim")
+                return 0
+            argv = [script, *sys.argv[1:]]
+            return platforms.launch_argv(argv, os.environ)
+        return bootstrap.run(root=repo, force=setup_args.force, explicit=True)
 
     try:
         import bootstrap
@@ -131,10 +133,13 @@ def main() -> int:
                 f"expected it at {script}",
             )
 
-    if not platforms.is_windows():
-        shim_state = bootstrap.check_state(repo).get("shim_state")
-        if shim_state in ("missing", "dead"):
-            bootstrap.ensure_path_shim(repo, lambda line: None, explicit=False)
+    if not platforms.is_windows() and os.path.isfile(script):
+        try:
+            state = bootstrap.check_state(repo)
+            if state.get("console") and state.get("shim_state") in ("missing", "dead"):
+                bootstrap.ensure_path_shim(repo, lambda line: None, explicit=False)
+        except (bootstrap.BootstrapError, OSError):
+            pass
 
     argv = [script, *sys.argv[1:]]
     return platforms.launch_argv(argv, os.environ)

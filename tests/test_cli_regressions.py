@@ -1912,6 +1912,9 @@ class TestF3BinaryUnavailableExitCode(BaseCase):
         self.assertIn(missing_bin, str(cm.exception))
 
     def test_build_plan_raises_binary_unavailable_error_when_not_executable(self):
+        import platforms
+        if platforms.is_windows():
+            self.skipTest("POSIX exec semantics")
         import runner
         non_exec = self._tmp / "dummy_non_exec"
         non_exec.write_text("#!/bin/sh\nexit 0\n")

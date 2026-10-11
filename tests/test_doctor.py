@@ -1052,9 +1052,9 @@ class TestDoctorLockRegistryCorrupt(BaseCase):
             self.assertNotIn(f"reset unreadable lease registry {lock_file}", preview)
 
             doctor._apply_fixes(self.store, ctx)
-            self.assertEqual(lock_file.read_text(encoding="utf-8"), "{corrupt registry json")
         finally:
             handle.release()
+        self.assertEqual(lock_file.read_text(encoding="utf-8"), "{corrupt registry json")
 
 
 if __name__ == "__main__":

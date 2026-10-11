@@ -8,6 +8,7 @@ import sys
 import time
 from pathlib import Path
 from unittest import mock
+import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -161,6 +162,10 @@ class TestA3RestoreHadSharedOnLoginExit(BaseCase):
             self.assertEqual(shared_state.get("gemini"), ambient_had_shared)
 
 
+@unittest.skipIf(
+    sys.platform == "win32",
+    "macOS-only: Keychain bridge and simulated POSIX session pids",
+)
 class TestF1ConcurrentLoginAdoption(BaseCase):
     def setUp(self):
         super().setUp()

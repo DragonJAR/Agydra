@@ -250,8 +250,8 @@ class TestFxLifecycle(BaseCase):
         status, message = doctor._check_profiles(self.store, ctx)
         self.assertEqual(status, doctor.FAIL)
         self.assertIn("duplicate positive profile sequence", message)
-        self.assertIn("first-c/profile.json", message)
-        self.assertIn("second-c/profile.json", message)
+        self.assertIn(str(self.store.profile_meta_path("first-c")), message)
+        self.assertIn(str(self.store.profile_meta_path("second-c")), message)
 
     def test_g1_readonly_never_mutates_or_recovers_pending_rename(self):
         self.store.create("old")

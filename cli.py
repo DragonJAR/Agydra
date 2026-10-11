@@ -593,6 +593,19 @@ def cmd_list(store: Store, _args) -> int:
             f"{headers['default']:<{def_w}}{headers['busy']:<{busy_w}}{headers['engine']:<{eng_w}}{headers['last_used']}"
         )
         print(paint(header, "bold"))
+
+        def _auth_state_label(raw_state: str) -> str:
+            norm = (raw_state or "").lower().replace("-", "_")
+            mapping = {
+                "authenticated": i18n.t("cmd.list.state_authenticated", default="authenticated"),
+                "not_authenticated": i18n.t("cmd.list.state_not_authenticated", default="not-authenticated"),
+                "unauthenticated": i18n.t("cmd.list.state_not_authenticated", default="not-authenticated"),
+                "unknown": i18n.t("auth.unknown", default="unknown"),
+            }
+            if norm in mapping:
+                return mapping[norm]
+            return i18n.t(f"cmd.list.state_{norm}", default=i18n.t(f"auth.{norm}", default=raw_state))
+
         for idx, profile in enumerate(profiles, start=1):
             busy = locks.is_locked(store, profile.name)
             engine = profile.engine
@@ -609,8 +622,7 @@ def cmd_list(store: Store, _args) -> int:
                 state = account.auth_state(
                     store.profile_data_dir(profile.name, engine=engine), store, profile.name, engine=engine,
                 )
-            state_key = "cmd.list.state_" + state.replace("-", "_")
-            state_label = i18n.t(state_key, default=state)
+            state_label = _auth_state_label(state)
             is_default = paint("*", "green", "bold") if profile.name == default else ""
             state_color = "green" if state == "authenticated" else None
             state_shown = paint(state_label, state_color) if state_color else state_label
