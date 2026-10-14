@@ -67,7 +67,7 @@ class TestCodexIsolation(BaseCase):
             engine="codex",
         )
 
-        self.assertEqual(env["HOME"], str(overlay))
+        self.assertEqual(env[platforms.home_redirect_var()], str(overlay))
         self.assertEqual(env["CODEX_HOME"], str(overlay / ".codex"))
         self.assertEqual(env["AGYDRA_REAL_HOME"], str(self.fake_home))
         self.assertEqual(env["AGYDRA_PROFILE"], "openai-work")

@@ -73,6 +73,21 @@ def is_link(path: Union[Path, str], *, strict: bool = False) -> bool:
     )
 
 
+def read_link_target(path: Union[Path, str]) -> str:
+    """Read a link target and normalize Windows extended-length prefixes."""
+    target = os.readlink(path)
+    if not is_windows():
+        return target
+    lower = target.lower()
+    if lower.startswith("\\\\?\\unc\\"):
+        return "\\\\" + target[8:]
+    if lower.startswith("\\??\\unc\\"):
+        return "\\\\" + target[8:]
+    if target.startswith(("\\\\?\\", "\\??\\")):
+        return target[4:]
+    return target
+
+
 def home_redirect_var() -> str:
     """Environment variable agy reads to resolve its data directory.
 

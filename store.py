@@ -470,7 +470,7 @@ def _zip_tree_without_following(
         info = zipfile.ZipInfo(arcname)
         info.create_system = 3
         info.external_attr = (stat.S_IFLNK | 0o777) << 16
-        zf.writestr(info, os.readlink(path))
+        zf.writestr(info, platforms.read_link_target(path))
 
     if platforms.is_link(root):
         add_link(root, prefix)

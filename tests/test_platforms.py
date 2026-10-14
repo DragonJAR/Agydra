@@ -448,6 +448,73 @@ class TestLinkDetection(unittest.TestCase):
             self.assertTrue(platforms.is_link(path, strict=True))
 
 
+class TestReadLinkTarget(unittest.TestCase):
+    def test_windows_drive_target_drops_extended_prefix(self):
+        with mock.patch.object(platforms.os, "readlink", return_value="\\\\?\\C:\\store\\target"), mock.patch.object(
+            platforms, "is_windows", return_value=True
+        ):
+            self.assertEqual(platforms.read_link_target("link"), "C:\\store\\target")
+
+    def test_windows_unc_target_normalizes_to_unc_path(self):
+        with mock.patch.object(
+            platforms.os,
+            "readlink",
+            return_value="\\\\?\\UNC\\server\\share\\target",
+        ), mock.patch.object(platforms, "is_windows", return_value=True):
+            self.assertEqual(
+                platforms.read_link_target("link"), "\\\\server\\share\\target"
+            )
+
+    def test_windows_unc_target_case_insensitive(self):
+        with mock.patch.object(
+            platforms.os,
+            "readlink",
+            return_value="\\\\?\\unc\\server\\share\\target",
+        ), mock.patch.object(platforms, "is_windows", return_value=True):
+            self.assertEqual(
+                platforms.read_link_target("link"), "\\\\server\\share\\target"
+            )
+
+    def test_windows_nt_target_drops_extended_prefix(self):
+        with mock.patch.object(platforms.os, "readlink", return_value="\\??\\C:\\store\\target"), mock.patch.object(
+            platforms, "is_windows", return_value=True
+        ):
+            self.assertEqual(platforms.read_link_target("link"), "C:\\store\\target")
+
+    def test_windows_nt_unc_target_normalizes_to_unc_path(self):
+        with mock.patch.object(
+            platforms.os,
+            "readlink",
+            return_value="\\??\\UNC\\server\\share\\target",
+        ), mock.patch.object(platforms, "is_windows", return_value=True):
+            self.assertEqual(
+                platforms.read_link_target("link"), "\\\\server\\share\\target"
+            )
+
+    def test_windows_regular_target_unchanged(self):
+        with mock.patch.object(platforms.os, "readlink", return_value="C:\\store\\target"), mock.patch.object(
+            platforms, "is_windows", return_value=True
+        ):
+            self.assertEqual(platforms.read_link_target("link"), "C:\\store\\target")
+
+    def test_posix_target_is_unchanged(self):
+        with mock.patch.object(platforms.os, "readlink", return_value="\\\\?\\target"), mock.patch.object(
+            platforms, "is_windows", return_value=False
+        ):
+            self.assertEqual(platforms.read_link_target("link"), "\\\\?\\target")
+
+    def test_real_symlink_reads_target(self):
+        with tempfile.TemporaryDirectory(prefix="agydra-readlink-") as directory:
+            target = Path(directory) / "target.txt"
+            target.write_text("hello", encoding="utf-8")
+            link = Path(directory) / "link.txt"
+            try:
+                link.symlink_to(target)
+            except OSError:
+                self.skipTest("symlinks unavailable on this platform")
+            self.assertEqual(platforms.read_link_target(link), str(target))
+
+
 class TestDrainTtyInput(unittest.TestCase):
     """``drain_tty_input`` discards terminal query responses left in the TTY
     input queue by TUI children (Bubble Tea apps like agy's login) that exit

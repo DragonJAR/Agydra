@@ -275,7 +275,7 @@ class TestEnvironment(ClaudeBase):
             overlay = isolation.build_overlay("p", data, self.store_root, engine="codex")
             env = isolation.isolated_env(overlay, {}, engine="codex")
         self.assertEqual(env["ANTHROPIC_API_KEY"], "sk")
-        self.assertEqual(env["HOME"], str(overlay))
+        self.assertEqual(env[platforms.home_redirect_var()], str(overlay))
 
     def test_driver_reports_inherited_names(self):
         driver = engines.get_engine("claude")
