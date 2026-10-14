@@ -127,11 +127,23 @@ class TestRunnerForce(BaseCase):
         self.assertIn("force   : off", plan_unforced.describe())
 
     def test_dry_run_with_force_succeeds(self):
+        import contextlib
+        import io
+
         plan = runner.build_plan(
             self.store, ["chat"], flag_ref="work", force=True,
         )
-        rc = runner.run(plan, store=self.store, dry_run=True)
+        self.assertTrue(plan.force)
+        self.assertIn("force   : on", plan.describe())
+        buf = io.StringIO()
+        with mock.patch.object(runner.platforms, "launch_argv") as launch, \
+                mock.patch.object(runner.platforms, "run_wait") as waited_launch, \
+                contextlib.redirect_stdout(buf):
+            rc = runner.run(plan, store=self.store, dry_run=True)
         self.assertEqual(rc, 0)
+        self.assertIn("force   : on", buf.getvalue())
+        launch.assert_not_called()
+        waited_launch.assert_not_called()
 
     def test_random_force_fallback_preserves_binary_and_launch_options(self):
         self.store.create("beta")
@@ -231,7 +243,7 @@ class TestRunnerForce(BaseCase):
             ), mock.patch.object(
                 platforms, "process_alive", return_value=True
             ), mock.patch.object(
-                platforms, "run_wait", side_effect=lambda argv, env: spawned.append(argv) or 0
+                platforms, "run_wait", side_effect=lambda argv, env, **kwargs: (kwargs.get("on_started") and kwargs["on_started"]()) or spawned.append(argv) or 0
             ):
                 rc = runner.run(plan, store=self.store)
             self.assertEqual((rc, len(spawned)), (0, 1))

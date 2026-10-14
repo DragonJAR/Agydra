@@ -565,13 +565,30 @@ class SnapshotStoreIntegrationTests(BaseCase):
         self.assertEqual(scan.keychain_quarantine, [])
 
     def test_doctor_reports_store_writable_with_snapshot_present(self):
-        self.store.create("neto")
-        self._write([Profile(name="neto", seq=1)], [_agy_result()])
+        import contextlib
+        import io
         import doctor
 
-        with mock.patch("sys.stdout"):
+        self.store.create("neto")
+        self._write([Profile(name="neto", seq=1)], [_agy_result()])
+        snapshot_path = self.store.root / usage_snapshot.SNAPSHOT_FILENAME
+        self.assertTrue(snapshot_path.exists())
+
+        ctx = doctor._DoctorContext(scan=self.store.scan(), names=self.store.names())
+        status, msg = doctor._check_store(self.store, ctx)
+        self.assertEqual(status, doctor.OK)
+        self.assertIn("store writable", msg)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
             code = doctor.run_checks(self.store)
+        report = buf.getvalue()
         self.assertEqual(code, 0)
+        self.assertIn("store writable", report)
+        self.assertTrue(snapshot_path.exists())
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        profile_names = [p.get("name") for p in payload.get("profiles", [])]
+        self.assertIn("neto", profile_names)
 
 
 class SnapshotCliWiringTests(BaseCase):

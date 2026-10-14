@@ -756,9 +756,10 @@ def _private_unix_socket_dir(uid: int) -> Path:
 def _require_private_dir(path: Path, uid: int) -> None:
     try:
         st = path.lstat()
+        linked = platforms.is_link(path, strict=True)
     except OSError as exc:
         raise IsolationError(f"refusing grok leader socket dir {path}: {exc}") from exc
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+    if linked or not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
         raise IsolationError(
             f"refusing grok leader socket dir {path}: not a private directory owned by uid {uid}"
         )
@@ -793,18 +794,20 @@ def _reclaim_owned_socket(path: Path) -> None:
     """
     try:
         st = path.lstat()
+        linked = platforms.is_link(path, strict=True)
     except (FileNotFoundError, OSError):
         return
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+    if linked or not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
         return
     if _leader_socket_is_listening(path):
         return
     try:
         again = path.lstat()
+        again_linked = platforms.is_link(path, strict=True)
     except (FileNotFoundError, OSError):
         return
     if (
-        stat.S_ISLNK(again.st_mode)
+        again_linked
         or not stat.S_ISSOCK(again.st_mode)
         or again.st_uid != os.getuid()
         or again.st_ino != st.st_ino

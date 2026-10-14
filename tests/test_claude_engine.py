@@ -28,6 +28,7 @@ from store import Store, StoreError
 
 from conftest import (
     BaseCase,
+    LiveHolders,
     make_dir_link,
     posix_only,
     snapshot_tree,
@@ -984,12 +985,18 @@ class TestRunner(ClaudeBase):
         registry holder from another session does not block a launch — the
         new session joins, runs, and releases its own entry."""
         self.make_profile("work")
-        locks.acquire_lease(self.store, "work")
-        try:
-            rc = runner.run(self.plan_for("work"), store=self.store)
-            self.assertEqual(rc, 0)
-        finally:
-            locks.release_lease(self.store, "work")
+        with LiveHolders(self.store, "work", 1):
+            initial_holders = locks.lease_holders(self.store, "work")
+            self.assertEqual(len(initial_holders), 1)
+            with mock.patch.object(
+                runner.platforms, "run_wait", wraps=runner.platforms.run_wait
+            ) as waited_launch:
+                rc = runner.run(self.plan_for("work"), store=self.store)
+                self.assertEqual(rc, 0)
+                waited_launch.assert_called_once()
+            final_holders = locks.lease_holders(self.store, "work")
+            self.assertEqual(len(final_holders), 1)
+            self.assertEqual(final_holders, initial_holders)
 
     def test_dry_run_touches_nothing(self):
         self.make_profile("work")
@@ -1103,7 +1110,11 @@ class TestReadonlyStoreApi(ClaudeBase):
         ):
             with self.assertRaises(StoreError) as ctx:
                 call()
-            self.assertIn("rename recovery is pending", str(ctx.exception))
+            msg = str(ctx.exception)
+            self.assertTrue(
+                "rename recovery is pending" in msg
+                or "profile rename was interrupted" in msg
+            )
         self.assertEqual(self.store.rename_journal_path.read_text(encoding="utf-8"), journal)
         self.assertTrue(self.store.profile_dir("alpha").exists())
 

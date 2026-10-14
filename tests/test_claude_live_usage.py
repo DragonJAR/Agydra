@@ -61,7 +61,8 @@ import json, os, sys, time
 mode = os.environ.get("FAKE_USAGE_MODE", "ok")
 dump = os.environ.get("FAKE_USAGE_DUMP")
 if dump:
-    json.dump({{"argv": sys.argv[1:], "env": dict(os.environ)}}, open(dump, "w"))
+    with open(dump, "w", encoding="utf-8") as output:
+        json.dump({{"argv": sys.argv[1:], "env": dict(os.environ)}}, output)
 if mode == "hang":
     time.sleep(30)
 if mode == "garbage":

@@ -275,20 +275,16 @@ class TestFxLifecycle(BaseCase):
                 with self.assertRaises(StoreError) as cm:
                     self.store.get_readonly(target)
                 err_msg = str(cm.exception)
-                self.assertIn("a profile rename is being finished; retry in a moment", err_msg)
+                self.assertIn("next launch or profile-changing command", err_msg)
                 self.assertNotIn("run any agydra command that writes", err_msg)
 
             with self.assertRaises(StoreError) as cm:
                 self.store.scan_readonly()
             err_msg = str(cm.exception)
-            self.assertIn("a profile rename is being finished; retry in a moment", err_msg)
+            self.assertIn("next launch or profile-changing command", err_msg)
             self.assertNotIn("run any agydra command that writes", err_msg)
 
-            with self.assertRaises(StoreError) as cm:
-                self.store.resolve_ref_readonly("other")
-            err_msg = str(cm.exception)
-            self.assertIn("a profile rename is being finished; retry in a moment", err_msg)
-            self.assertNotIn("run any agydra command that writes", err_msg)
+            self.assertEqual(self.store.resolve_ref_readonly("other"), "other")
 
             mock_lock.assert_not_called()
             mock_mutation_lock.assert_not_called()
@@ -330,7 +326,7 @@ class TestUsageFinishesPendingRename(BaseCase):
         report = out + err
         self.assertEqual(status, 1, report)
         self.assertIn("profile rename recovery is pending", report)
-        self.assertIn("retry in a moment", report)
+        self.assertIn("next launch or profile-changing command", report)
         self.assertEqual(self.store.rename_journal_path.read_bytes(), journal_before)
 
         with mock.patch.object(cli, "Store", return_value=self.store):
@@ -339,13 +335,13 @@ class TestUsageFinishesPendingRename(BaseCase):
         self.assertEqual(status, 0)
         self.assertFalse(self.store.rename_journal_path.exists())
         status, out, err = self._usage(argv)
-        self.assertNotIn("retry in a moment", out + err)
+        self.assertNotIn("next launch or profile-changing command", out + err)
 
     def test_usage_table_reports_retry_then_next_command_heals(self):
         self._assert_read_reports_retry_and_next_command_heals(["usage"])
 
     def test_usage_detail_reports_retry_then_next_command_heals(self):
-        self._assert_read_reports_retry_and_next_command_heals(["usage", "other"])
+        self._assert_read_reports_retry_and_next_command_heals(["usage", "new"])
 
 
 class TestPendingRenameCommandRecovery(BaseCase):
@@ -422,7 +418,9 @@ class TestPendingRenameCommandRecovery(BaseCase):
                 result = cli.main(argv)
 
             self.assertEqual(result, 1)
-            self.assertIn("retry in a moment", out.getvalue() + err.getvalue())
+            self.assertIn(
+                "next launch or profile-changing command", out.getvalue() + err.getvalue()
+            )
             self.assertEqual(self.store.rename_journal_path.read_bytes(), journal_before)
         self.assertTrue(self.store.rename_journal_path.exists())
 

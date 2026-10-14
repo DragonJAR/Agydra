@@ -49,6 +49,14 @@ def _fail(msg: str, hint: str = "") -> int:
     return 1
 
 
+def _t(key: str, **kwargs: object) -> str:
+    try:
+        import bootstrap
+    except (ImportError, SyntaxError):
+        return key
+    return bootstrap._t(key, **kwargs)
+
+
 def _venv_script(repo: Path) -> str:
     import platforms
 
@@ -71,6 +79,22 @@ def _is_setup_request(args: list) -> bool:
     return vocab.CANONICAL.get(name) == "setup"
 
 
+def _launch(script: str) -> int:
+    """Flush buffered launcher output, then re-exec the console script.
+
+    ``launch_argv`` replaces the process image (execvpe), so any
+    block-buffered progress on a redirected stdout is lost unless it is
+    flushed first; every launcher exec path must go through this helper.
+    """
+    import platforms
+
+    try:
+        sys.stdout.flush()
+    except (AttributeError, ValueError, OSError):
+        pass
+    return platforms.launch_argv([script, *sys.argv[1:]], os.environ)
+
+
 def main() -> int:
     if tuple(sys.version_info[:2]) < MIN_PYTHON:
         return _fail(
@@ -81,6 +105,12 @@ def main() -> int:
 
     here = Path(__file__).resolve().parent
     sys.path.insert(0, str(here))
+    try:
+        import bootstrap
+
+        bootstrap.resolve_language()
+    except (ImportError, SyntaxError):
+        pass
     if not (here / "pyproject.toml").is_file():
         import cli
 
@@ -103,10 +133,9 @@ def main() -> int:
         if setup_args.dry_run:
             if not os.path.isfile(script):
                 bootstrap.report_state(repo)
-                print("run `python3 agydra.py setup` to create the venv, console script and PATH shim")
+                print(_t("launcher.dry_run_hint"))
                 return 0
-            argv = [script, *sys.argv[1:]]
-            return platforms.launch_argv(argv, os.environ)
+            return _launch(script)
         return bootstrap.run(root=repo, force=setup_args.force, explicit=True)
 
     try:
@@ -121,12 +150,13 @@ def main() -> int:
         stale_modules = bool(bootstrap.unimportable_modules(repo, vpy))
 
     if broken_venv or stale_modules:
-        reason = (
-            "no installation detected"
+        reason_key = (
+            "launcher.reason_no_install"
             if not os.path.isfile(script)
-            else ("broken venv interpreter" if not vpy.exists() else "unimportable runtime modules")
+            else ("launcher.reason_broken_venv" if not vpy.exists() else "launcher.reason_unimportable_modules")
         )
-        print(f"agydra.py: {reason} — running setup...")
+        reason = _t(reason_key)
+        print(_t("launcher.running_setup", reason=reason))
         result = bootstrap.perform_install(
             lambda line: print(line), root=repo, explicit=False
         )
@@ -136,8 +166,8 @@ def main() -> int:
             script = str(result.console)
         if not os.path.isfile(script):
             return _fail(
-                "setup finished but the console script is missing",
-                f"expected it at {script}",
+                _t("launcher.fail_missing_script"),
+                _t("launcher.fail_expected_script", path=script),
             )
 
     if not platforms.is_windows() and os.path.isfile(script):
@@ -148,8 +178,7 @@ def main() -> int:
         except (bootstrap.BootstrapError, OSError):
             pass
 
-    argv = [script, *sys.argv[1:]]
-    return platforms.launch_argv(argv, os.environ)
+    return _launch(script)
 
 
 if __name__ == "__main__":

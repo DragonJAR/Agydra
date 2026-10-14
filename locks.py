@@ -446,6 +446,14 @@ def _lock_read_brief(fd: int) -> bool:
         return False
 
 
+REGISTRY_ISSUE_BUSY = "is busy during validation"
+
+
+def registry_issue_is_busy(issue: Optional[str]) -> bool:
+    """True iff the persistent issue indicates lock contention rather than corruption."""
+    return bool(issue and REGISTRY_ISSUE_BUSY in issue)
+
+
 def lease_registry_state_issue(store, name: str) -> Optional[str]:
     """Read-only validation shared by doctor and lease recovery policy."""
     path = lock_path(store, name)
@@ -466,7 +474,7 @@ def lease_registry_state_issue(store, name: str) -> Optional[str]:
     try:
         locked = _lock_read_brief(fd)
         if not locked:
-            return f"{path} is busy during validation"
+            return f"{path} {REGISTRY_ISSUE_BUSY}"
         if not _same_file(fd, path):
             return f"{path} changed during validation"
         try:

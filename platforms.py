@@ -15,7 +15,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence, Union
+from typing import Any, Callable, Mapping, Optional, Sequence, Union
 
 APP_NAME = "agydra"
 
@@ -79,9 +79,7 @@ def read_link_target(path: Union[Path, str]) -> str:
     if not is_windows():
         return target
     lower = target.lower()
-    if lower.startswith("\\\\?\\unc\\"):
-        return "\\\\" + target[8:]
-    if lower.startswith("\\??\\unc\\"):
+    if lower.startswith(("\\\\?\\unc\\", "\\??\\unc\\")):
         return "\\\\" + target[8:]
     if target.startswith(("\\\\?\\", "\\??\\")):
         return target[4:]
@@ -135,6 +133,12 @@ def agy_data_dir(home: Optional[Path] = None) -> Path:
 _DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 
 
+def _pathext_suffixes() -> list[str]:
+    """Ordered non-empty executable suffixes from PATHEXT or Windows defaults."""
+    pathext = os.environ.get("PATHEXT") or _DEFAULT_PATHEXT
+    return [ext for ext in pathext.split(";") if ext]
+
+
 def _probe_pathext(p: Path) -> Optional[Path]:
     """Probe PATHEXT-suffixed variants of an extension-less Windows path.
 
@@ -143,24 +147,28 @@ def _probe_pathext(p: Path) -> Optional[Path]:
     PATHEXT entirely (verified against CPython's own ``shutil.which``
     source: the pre-3.12 implementation returns right after
     ``_access_check(cmd, mode)`` when ``os.path.dirname(cmd)`` is truthy;
-    3.12+ rewrote it to also try PATHEXT in that case). Reusing this one
-    helper wherever an explicit, extension-less agy path might need a
-    PATHEXT suffix keeps the probing DRY. Always splits on ``;`` — real
-    Windows PATHEXT is semicolon-delimited regardless of ``os.pathsep``.
+    3.12+ rewrote it to also try PATHEXT in that case). Always splits on
+    ``;`` — real Windows PATHEXT is semicolon-delimited regardless of
+    ``os.pathsep``.
     """
-    pathext = os.environ.get("PATHEXT") or _DEFAULT_PATHEXT
-    for ext in pathext.split(";"):
-        if not ext:
-            continue
+    for ext in _pathext_suffixes():
         candidate = Path(str(p) + ext)
         if candidate.is_file():
             return candidate
     return None
 
 
+def clean_path_value(value: str) -> str:
+    """Strip whitespace and surrounding quotes from a path or path list entry."""
+    return value.strip().strip('"\'')
+
+
+_clean_path_entry = clean_path_value
+
+
 def normalize_path_entry(entry: str) -> str:
     """Normalize a PATH directory entry, stripping whitespace and surrounding quotes."""
-    cleaned = entry.strip().strip('"\'')
+    cleaned = clean_path_value(entry)
     if not cleaned:
         return ""
     if is_windows():
@@ -176,27 +184,23 @@ def _sanitized_path_env() -> Optional[str]:
         return raw
     entries = []
     for part in raw.split(";"):
-        cleaned = part.strip().strip('"\'')
+        cleaned = clean_path_value(part)
         if cleaned:
             entries.append(cleaned)
     return ";".join(entries)
 
 
-def _is_executable_file(p: Path) -> bool:
+def is_executable_file(p: Path) -> bool:
     if not p.is_file():
         return False
     if is_windows():
-        pathext = os.environ.get("PATHEXT") or _DEFAULT_PATHEXT
-        valid_exts = {e.lower() for e in pathext.split(";") if e}
+        valid_exts = {e.lower() for e in _pathext_suffixes()}
         return p.suffix.lower() in valid_exts
     return os.access(p, os.X_OK)
 
 
-is_executable_file = _is_executable_file
-
-
 def _validate_binary_candidate(candidate: str) -> Optional[Path]:
-    candidate_clean = candidate.strip().strip('"\'')
+    candidate_clean = clean_path_value(candidate)
     if not candidate_clean:
         return None
     p = Path(candidate_clean).expanduser()
@@ -480,21 +484,38 @@ def console_script(venv_base: Path, name: str = "agydra") -> Path:
 def _execution_error(argv: Sequence[str], reason: object, status: int) -> int:
     """Keep launch failures readable even on legacy Windows stderr streams."""
     from ui import console_print
+    import i18n
 
-    console_print(f"agydra: cannot execute {argv[0]}: {reason}", file=sys.stderr)
+    if reason == "not found":
+        reason_text = i18n.t("platforms.reason_not_found", default="not found")
+    else:
+        reason_text = str(reason)
+    msg = i18n.t(
+        "platforms.cannot_execute",
+        cmd=argv[0],
+        reason=reason_text,
+        default=f"agydra: cannot execute {argv[0]}: {reason_text}",
+    )
+    console_print(msg, file=sys.stderr)
     return status
 
 
-def launch_argv(argv: Sequence[str], env: Mapping[str, str]) -> int:
+def launch_argv(
+    argv: Sequence[str],
+    env: Mapping[str, str],
+    *,
+    on_started: Optional[Callable[[], None]] = None,
+) -> int:
     """Launch agy replacing the current process when possible.
 
     On POSIX (macOS/Linux) ``os.execvpe`` replaces the process image so the
     terminal sees agy directly (zero wrapper overhead, signals work). On
     Windows ``execvpe`` spawns-and-exits without waiting, so we use
-    ``subprocess.run`` and propagate the child's exit code.
+    ``run_wait`` and propagate the child's exit code. ``on_started`` is
+    called after a waited child has been created successfully.
     """
     if is_windows():
-        return run_wait(argv, env)
+        return run_wait(argv, env, on_started=on_started)
     try:
         os.execvpe(str(argv[0]), list(argv), dict(env))
     except FileNotFoundError:
@@ -723,18 +744,35 @@ def run_with_group_kill(
         popen_kwargs["start_new_session"] = True
     proc = subprocess.Popen(_normalize_windows_argv(argv), **popen_kwargs)
     try:
-        out, err = proc.communicate(timeout=timeout)
-    except (subprocess.TimeoutExpired, KeyboardInterrupt):
-        _kill_process_group(proc)
         try:
-            proc.communicate(timeout=2.0)
-        except (subprocess.TimeoutExpired, OSError, KeyboardInterrupt):
-            pass
-        raise
+            out, err = proc.communicate(timeout=timeout)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            _kill_process_group(proc)
+            try:
+                proc.communicate(timeout=2.0)
+            except (subprocess.TimeoutExpired, OSError, KeyboardInterrupt):
+                pass
+            raise
+    finally:
+        for stream in (
+            getattr(proc, "stdout", None),
+            getattr(proc, "stderr", None),
+            getattr(proc, "stdin", None),
+        ):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
     return subprocess.CompletedProcess(list(argv), proc.returncode, out, err)
 
 
-def run_wait(argv: Sequence[str], env: Mapping[str, str]) -> int:
+def run_wait(
+    argv: Sequence[str],
+    env: Mapping[str, str],
+    *,
+    on_started: Optional[Callable[[], None]] = None,
+) -> int:
     """Wait for child exit, including its cleanup after a console interrupt.
 
     Parent and child share the console's signal delivery. An interrupted
@@ -752,6 +790,8 @@ def run_wait(argv: Sequence[str], env: Mapping[str, str]) -> int:
         return _execution_error(argv, "not found", 127)
     except OSError as exc:
         return _execution_error(argv, exc, 126)
+    if on_started is not None:
+        on_started()
     interrupted = False
     while True:
         try:

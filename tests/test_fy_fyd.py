@@ -343,3 +343,197 @@ class TestPerformInstallEssentialOptionalSplit(BaseCaseWithCheckout):
         self.assertTrue(result.essential_ok)
         self.assertEqual(result.code, 1)
         self.assertEqual(result.console, bootstrap.console_script(root))
+
+
+class TestCorruptManagedShimSelfHeals(BaseCaseWithCheckout):
+    """FYF20 (audit finding 1): an unparseable managed shim must degrade.
+
+    A managed shim whose exec line ends with ``"$@"`` but carries an
+    unterminated quote used to crash ``shim_target`` with
+    ``ValueError: No closing quotation``, taking ``check_state``,
+    ``verify_install``, doctor, ``setup -n`` and the launcher down with
+    it. The repaired contract: ``shim_target`` returns None, the state
+    reads stale, verification falls back to the own console script, and
+    ``ensure_path_shim`` refreshes the shim (self-healing).
+    """
+
+    CORRUPT_SHIM_BODY = (
+        "#!/bin/sh\n"
+        f"# {bootstrap.SHIM_MARKER}\n"
+        'exec "/x/unterminated "$@"\n'
+    )
+
+    def _write_corrupt_shim(self) -> Path:
+        shim = self.fake_home / ".local" / "bin" / "agydra"
+        shim.parent.mkdir(parents=True, exist_ok=True)
+        shim.write_text(self.CORRUPT_SHIM_BODY, encoding="utf-8")
+        shim.chmod(0o755)
+        return shim
+
+    def test_shim_target_returns_none_for_an_unparseable_line(self) -> None:
+        shim = self._write_corrupt_shim()
+        self.assertIsNone(bootstrap.shim_target(shim))
+
+    @posix_only("shim is POSIX-only")
+    def test_check_state_classifies_an_unparseable_shim_as_stale(self) -> None:
+        self._write_corrupt_shim()
+        root = self._make_checkout("checkout", with_console=True)
+        self.assertEqual(bootstrap.check_state(root)["shim_state"], "stale")
+
+    @posix_only("shim is POSIX-only")
+    def test_verify_install_falls_back_to_the_console_script(self) -> None:
+        self._write_corrupt_shim()
+        root = self._make_checkout("checkout", with_console=True)
+        lines = []
+        self.assertTrue(bootstrap.verify_install(root, lines.append))
+        self.assertTrue(any("verified" in line for line in lines))
+
+    @posix_only("shim is POSIX-only")
+    def test_ensure_path_shim_replaces_an_unparseable_shim(self) -> None:
+        shim = self._write_corrupt_shim()
+        root = self._make_checkout("checkout", with_console=True)
+        result = bootstrap.ensure_path_shim(root, lambda line: None)
+        self.assertEqual(result, shim)
+        self.assertIn(bootstrap.SHIM_MARKER, shim.read_text(encoding="utf-8"))
+        self.assertEqual(bootstrap.shim_target(shim), bootstrap.console_script(root))
+
+
+class _RecordingStdout:
+    def __init__(self, inner):
+        self._inner = inner
+        self.flushed = False
+
+    def write(self, text):
+        return self._inner.write(text)
+
+    def flush(self):
+        self.flushed = True
+        return self._inner.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class TestLauncherFlushesBeforeExec(BaseCaseWithCheckout):
+    @posix_only("exec path is POSIX-only")
+    def test_launcher_flushes_stdout_before_reexec(self) -> None:
+        """FYF20 (audit finding 4): buffered setup lines must survive exec.
+
+        ``launch_argv`` replaces the process image with ``execvpe``, so any
+        block-buffered setup progress on a redirected stdout is lost unless
+        the launcher flushes first.
+        """
+        root = self._make_checkout("checkout", with_console=True)
+        recorder = _RecordingStdout(sys.stdout)
+        with mock.patch.object(sys, "stdout", recorder), \
+                mock.patch.object(agydra, "__file__", str(root / "agydra.py")), \
+                mock.patch.object(sys, "argv", ["agydra.py", "--version"]), \
+                mock.patch("platforms.launch_argv", return_value=0):
+            code = agydra.main()
+        self.assertEqual(code, 0)
+        self.assertTrue(recorder.flushed)
+
+    @posix_only("exec path is POSIX-only")
+    def test_installed_dry_run_setup_flushes_before_reexec(self) -> None:
+        """FYF20d (FYF25 review): the installed ``setup -n`` exec path too.
+
+        The installed-setup dry-run branch delegates to ``launch_argv``
+        directly and must go through the same flush-then-exec contract
+        as the repair launch path, so no launcher exec can drop
+        buffered stdout.
+        """
+        root = self._make_checkout("checkout", with_console=True)
+        recorder = _RecordingStdout(sys.stdout)
+        with mock.patch.object(sys, "stdout", recorder), \
+                mock.patch.object(agydra, "__file__", str(root / "agydra.py")), \
+                mock.patch.object(sys, "argv", ["agydra.py", "setup", "-n"]), \
+                mock.patch("platforms.launch_argv", return_value=0):
+            code = agydra.main()
+        self.assertEqual(code, 0)
+        self.assertTrue(recorder.flushed)
+
+
+class TestShimEntrySeesJunctions(BaseCaseWithCheckout):
+    """FYF20b (audit follow-up): `_shim_entry_exists` is junction-blind.
+
+    ``Path.is_symlink()`` is False for Windows junctions/reparse points,
+    so a dangling junction at the shim path looked like a MISSING shim
+    and the foreign-file/dangling-link safety rules never fired. The
+    entry probe must consult ``platforms.is_link`` (lstat-based, reparse
+    aware) exactly like ``_is_dangling_link`` and orphans/doctor do.
+    Mock-based so it runs on every OS.
+    """
+
+    def _dangling_junction_mock(self):
+        entry = mock.Mock(spec=Path)
+        entry.exists.return_value = False
+        entry.is_symlink.return_value = False
+        return entry
+
+    def test_shim_entry_exists_detects_a_junction_like_link(self) -> None:
+        entry = self._dangling_junction_mock()
+        with mock.patch.object(bootstrap.platforms, "is_link", return_value=True):
+            self.assertTrue(bootstrap._shim_entry_exists(entry))
+
+    def test_shim_entry_exists_ignores_a_missing_path(self) -> None:
+        entry = self._dangling_junction_mock()
+        with mock.patch.object(bootstrap.platforms, "is_link", return_value=False):
+            self.assertFalse(bootstrap._shim_entry_exists(entry))
+
+
+class TestDanglingJunctionSelfHeal(BaseCaseWithCheckout):
+    """FYF20c (FYF20b "known limitation"): self-heal a dangling junction.
+
+    ``os.replace`` cannot replace a Windows directory reparse point, so a
+    dangling junction at the shim path must first be removed as a link
+    entry itself (junction via ``os.rmdir``, file symlink via ``unlink``
+    — store's shared remover, never the target), then the shim is
+    written atomically onto the freed path. Foreign real files keep
+    their refusal semantics.
+    """
+
+    def test_dangling_branch_removes_the_link_entry_before_writing(self) -> None:
+        root = self._make_checkout("checkout", with_console=True)
+        shim = self.fake_home / ".local" / "bin" / "agydra"
+        removed = []
+
+        def _record(path):
+            removed.append(path)
+
+        with mock.patch.object(bootstrap, "_is_dangling_link", return_value=True), \
+                mock.patch.object(bootstrap, "_remove_shim_link_entry", side_effect=_record):
+            result = bootstrap.ensure_path_shim(root, lambda line: None)
+        self.assertEqual(result, shim)
+        self.assertEqual(removed, [shim])
+        self.assertEqual(bootstrap.shim_target(shim), bootstrap.console_script(root))
+
+    def test_remover_delegates_to_the_store_link_primitive(self) -> None:
+        entry = mock.Mock(spec=Path)
+        with mock.patch.object(bootstrap.store, "remove_link") as remove:
+            bootstrap._remove_shim_link_entry(entry)
+        remove.assert_called_once_with(entry)
+
+    @posix_only("junctions cannot be constructed on POSIX; a symlink stands in")
+    def test_real_dangling_symlink_self_heals_end_to_end(self) -> None:
+        root = self._make_checkout("checkout", with_console=True)
+        shim = self.fake_home / ".local" / "bin" / "agydra"
+        shim.parent.mkdir(parents=True, exist_ok=True)
+        gone = self.fake_home / "vanished-target"
+        shim.symlink_to(gone)
+        self.assertTrue(shim.is_symlink())
+        result = bootstrap.ensure_path_shim(root, lambda line: None)
+        self.assertEqual(result, shim)
+        self.assertFalse(shim.is_symlink())
+        self.assertEqual(bootstrap.shim_target(shim), bootstrap.console_script(root))
+        self.assertFalse(gone.exists())
+
+    def test_real_foreign_file_is_still_refused_without_force(self) -> None:
+        root = self._make_checkout("checkout", with_console=True)
+        shim = self.fake_home / ".local" / "bin" / "agydra"
+        shim.parent.mkdir(parents=True, exist_ok=True)
+        shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        with mock.patch.object(bootstrap, "_remove_shim_link_entry") as remove:
+            with self.assertRaises(bootstrap.BootstrapError):
+                bootstrap.ensure_path_shim(root, lambda line: None)
+        remove.assert_not_called()
+        self.assertEqual(shim.read_text(encoding="utf-8"), "#!/bin/sh\nexit 0\n")

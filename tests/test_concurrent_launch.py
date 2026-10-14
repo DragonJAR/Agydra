@@ -471,8 +471,12 @@ class TestSessionEndRecordsEmail(BaseCase):
         self.assertIsNone(self.store.get("andrea").email)
 
         plan = runner.build_plan(self.store, ["chat"], flag_ref="andrea", launch_as_child=True)
+        def started_child(_argv, _env, *, on_started):
+            on_started()
+            return 0
+
         with simulated_macos_keychain(), \
-                mock.patch.object(platforms, "run_wait", return_value=0), \
+                mock.patch.object(platforms, "run_wait", side_effect=started_child), \
                 mock.patch.object(platforms, "launch_argv", return_value=0):
             rc = runner.run(plan, store=self.store)
         self.assertEqual(rc, 0)

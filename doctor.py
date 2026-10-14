@@ -138,7 +138,7 @@ def _check_persistent_state(store: Store, _ctx: "_DoctorContext"):
                 declaration.name, declaration.recovery
             ),
         ))
-        if "busy during validation" not in issue:
+        if not locks.registry_issue_is_busy(issue):
             status = FAIL
     return status, "\n".join(lines)
 
@@ -233,9 +233,18 @@ def _check_locks(store: Store, ctx: "_DoctorContext"):
             if not lock_p.exists():
                 continue
             holders = locks.lease_holders(store, name)
-            if holders is None:
-                unreadable.append(str(lock_p))
-            elif holders or locks.is_locked(store, name):
+            if holders:
+                busy.append(name)
+            elif holders is None:
+                issue = locks.lease_registry_state_issue(store, name)
+                if locks.registry_issue_is_busy(issue):
+                    busy.append(name)
+                elif issue is None:
+                    if locks.is_locked(store, name):
+                        busy.append(name)
+                else:
+                    unreadable.append(str(lock_p))
+            elif locks.is_locked(store, name):
                 busy.append(name)
     except OSError as exc:
         return WARN, i18n.t("doctor.locks.error", error=exc)
@@ -639,7 +648,7 @@ def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
     profiles_by_name = {p.name: p for p in ctx.scan[0]}
     lines: List[str] = []
     for declaration, issue in store.persistent_state_issues():
-        if "busy during validation" in issue:
+        if locks.registry_issue_is_busy(issue):
             continue
         if declaration.name == "lease registry":
             lines.append(i18n.t(
@@ -699,7 +708,7 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
     import locks
 
     for declaration, issue in store.persistent_state_issues():
-        if "busy during validation" in issue:
+        if locks.registry_issue_is_busy(issue):
             continue
         try:
             repaired = store.repair_persistent_state(declaration.path)
@@ -891,7 +900,7 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
         except StoreError as exc:
             warn(i18n.t("doctor.fix.safe_purge_failed", name=orphan, error=exc))
             continue
-        if profile_dir.exists() or profile_dir.is_symlink():
+        if profile_dir.exists() or platforms.is_link(profile_dir):
             warn(i18n.t(
                 "doctor.fix.skip_keychain",
                 name=orphan,
@@ -911,7 +920,7 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
             ))
             continue
         try:
-            if profile_dir.exists() or profile_dir.is_symlink():
+            if profile_dir.exists() or platforms.is_link(profile_dir):
                 warn(i18n.t(
                     "doctor.fix.skip_keychain",
                     name=orphan,

@@ -208,6 +208,26 @@ class TestResolveAgyBinary(unittest.TestCase):
         os.environ[platforms.AGY_BIN_ENV] = "agy-custom-env"
         self.assertEqual(platforms.resolve_agy_binary(), found)
 
+    def test_quoted_explicit_binary_path_resolved(self):
+        found = self._touch("agy")
+        self.assertEqual(platforms.resolve_agy_binary(f'"{found}"'), found)
+
+    def test_quoted_env_var_binary_path_resolved(self):
+        found = self._touch("agy")
+        os.environ[platforms.AGY_BIN_ENV] = f'"{found}"'
+        self.assertEqual(platforms.resolve_agy_binary(), found)
+
+    def test_quoted_command_name_on_path_resolved(self):
+        found = self._touch("agy-quoted-cmd")
+        os.environ["PATH"] = str(found.parent)
+        self.assertEqual(platforms.resolve_agy_binary('"agy-quoted-cmd"'), found)
+
+    def test_quoted_env_var_command_name_on_path_resolved(self):
+        found = self._touch("agy-quoted-env-cmd")
+        os.environ["PATH"] = str(found.parent)
+        os.environ[platforms.AGY_BIN_ENV] = '"agy-quoted-env-cmd"'
+        self.assertEqual(platforms.resolve_agy_binary(), found)
+
     def test_nonexistent_explicit_returns_none(self):
         self.assertIsNone(
             platforms.resolve_agy_binary(str(self._tmp / "missing-agy"))
@@ -323,6 +343,38 @@ class TestLaunch(unittest.TestCase):
         script = write_fake_binary(self._tmp, "noexec", executable=False)
         code = platforms.launch_argv([str(script)], dict(os.environ))
         self.assertEqual(code, 126)
+
+    def test_windows_launch_signals_creation_when_child_exits_127(self):
+        proc = mock.Mock()
+        proc.wait.return_value = 127
+        started = mock.Mock()
+        with mock.patch.object(platforms, "is_windows", return_value=True):
+            with mock.patch.object(platforms.subprocess, "Popen", return_value=proc):
+                status = platforms.launch_argv(
+                    ["missing.exe"], dict(os.environ), on_started=started
+                )
+
+        self.assertEqual(status, 127)
+        started.assert_called_once_with()
+
+    def test_windows_launch_spawn_failure_does_not_signal_creation(self):
+        started = mock.Mock()
+        with mock.patch.object(platforms, "is_windows", return_value=True):
+            with mock.patch.object(
+                platforms.subprocess, "Popen", side_effect=FileNotFoundError
+            ):
+                with mock.patch.object(
+                    platforms, "_execution_error", return_value=127
+                ) as execution_error:
+                    status = platforms.launch_argv(
+                        ["missing.exe"], dict(os.environ), on_started=started
+                    )
+
+        self.assertEqual(status, 127)
+        started.assert_not_called()
+        execution_error.assert_called_once_with(
+            ["missing.exe"], "not found", 127
+        )
 
 
 class TestWaitedInterrupt(unittest.TestCase):
@@ -513,6 +565,54 @@ class TestReadLinkTarget(unittest.TestCase):
             except OSError:
                 self.skipTest("symlinks unavailable on this platform")
             self.assertEqual(platforms.read_link_target(link), str(target))
+
+
+class TestPathHelpers(unittest.TestCase):
+    def test_pathext_suffixes_default(self):
+        with mock.patch.dict(platforms.os.environ, {}, clear=True):
+            self.assertEqual(
+                platforms._pathext_suffixes(),
+                [".COM", ".EXE", ".BAT", ".CMD"],
+            )
+
+    def test_pathext_suffixes_custom_splits_and_drops_empty(self):
+        with mock.patch.dict(platforms.os.environ, {"PATHEXT": ";.EXE;;.BAT;.CMD;"}):
+            self.assertEqual(
+                platforms._pathext_suffixes(),
+                [".EXE", ".BAT", ".CMD"],
+            )
+
+    def test_clean_path_value_strips_quotes_and_whitespace(self):
+        self.assertEqual(platforms.clean_path_value('  "C:\\Path"  '), "C:\\Path")
+        self.assertEqual(platforms.clean_path_value(" 'C:\\Path' "), "C:\\Path")
+        self.assertEqual(platforms.clean_path_value('""'), "")
+        self.assertEqual(platforms.clean_path_value("   "), "")
+        self.assertEqual(platforms._clean_path_entry('  "C:\\Path"  '), "C:\\Path")
+
+    def test_runner_binary_candidates_handle_quoted_values(self):
+        import runner
+        with tempfile.TemporaryDirectory(prefix="agydra-runner-") as directory:
+            bin_path = Path(directory) / "custom-bin"
+            bin_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            bin_path.chmod(0o755)
+            self.assertEqual(
+                runner._existing_binary_candidate(f'"{bin_path}"'),
+                bin_path,
+            )
+            self.assertEqual(
+                runner._existing_binary_candidate(f"'{bin_path}'"),
+                bin_path,
+            )
+
+    def test_is_executable_file_checks_pathext_case_insensitively(self):
+        with tempfile.TemporaryDirectory(prefix="agydra-exec-") as directory:
+            bat = Path(directory) / "run.BAT"
+            bat.write_text("echo hi", encoding="utf-8")
+            txt = Path(directory) / "read.txt"
+            txt.write_text("hello", encoding="utf-8")
+            with mock.patch.object(platforms, "is_windows", return_value=True):
+                self.assertTrue(platforms.is_executable_file(bat))
+                self.assertFalse(platforms.is_executable_file(txt))
 
 
 class TestDrainTtyInput(unittest.TestCase):

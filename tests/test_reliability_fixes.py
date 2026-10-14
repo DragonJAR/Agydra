@@ -509,8 +509,9 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
 
         captured = {}
 
-        def fake_run_wait(argv, env):
+        def fake_run_wait(argv, env, *, on_started):
             captured["pid_while_held"] = locks.lock_holder_pid(store, "work")
+            on_started()
             return 0
 
         with isolated_store_env(), mock.patch.dict(

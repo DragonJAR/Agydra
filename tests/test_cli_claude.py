@@ -91,7 +91,8 @@ class TestClaudeCli(BaseCase):
             events.append("invalidate")
             return invalidate(store, name)
 
-        def native_login(argv, env):
+        def native_login(argv, env, *, on_started):
+            on_started()
             events.append("native login")
             self.assertEqual(argv[-2:], ["auth", "login"])
             self.assertEqual(env[claude_usage.GENERATION_ENV], "1")

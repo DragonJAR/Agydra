@@ -40,7 +40,7 @@ class BinaryUnavailableError(StoreError):
 
 
 def _existing_binary_candidate(value: str) -> Optional[Path]:
-    cleaned = value.strip().strip('"\'')
+    cleaned = platforms.clean_path_value(value)
     if not cleaned:
         return None
     try:
@@ -74,7 +74,7 @@ def _unavailable_binary_candidate(
         candidate = _existing_binary_candidate(explicit)
         if candidate is not None:
             return candidate
-        cleaned = explicit.strip().strip('"\'')
+        cleaned = platforms.clean_path_value(explicit)
         if not os.path.dirname(cleaned):
             return _path_binary_candidate(cleaned)
         return None
@@ -83,7 +83,7 @@ def _unavailable_binary_candidate(
         candidate = _existing_binary_candidate(env_value)
         if candidate is not None:
             return candidate
-        cleaned = env_value.strip().strip('"\'')
+        cleaned = platforms.clean_path_value(env_value)
         if not os.path.dirname(cleaned):
             return _path_binary_candidate(cleaned)
         return None
@@ -536,6 +536,24 @@ def _keep_file_login(store: Store, name: str, data_dir: Path):
         )
 
 
+def _launch_engine(
+    argv: Sequence[str], env: Dict[str, str], wait_for_child: bool
+) -> Tuple[int, bool]:
+    started = False
+
+    def mark_started() -> None:
+        nonlocal started
+        started = True
+
+    if platforms.is_windows():
+        status = platforms.launch_argv(argv, env, on_started=mark_started)
+    elif wait_for_child:
+        status = platforms.run_wait(argv, env, on_started=mark_started)
+    else:
+        return platforms.launch_argv(argv, env), False
+    return status, started
+
+
 def _run_prepared(
     plan: LaunchPlan, store: Store,
     rotation: Optional[profile_rotation.Rotation] = None,
@@ -627,19 +645,20 @@ def _run_prepared(
                 try:
                     with keychain.defer_login_email_recording():
                         with guard:
-                            started = True
                             if rotation is not None:
                                 if plan.random_pick:
                                     rotation.commit(profile)
-                            if platforms.is_windows():
-                                rc = platforms.launch_argv(argv, env)
+                            wait_for_child = (
+                                plan.use_sandbox
+                                or plan.launch_as_child
+                                or keychain_needs_waited_child
+                            )
+                            rc, started = _launch_engine(
+                                argv, env, wait_for_child
+                            )
+                            if platforms.is_windows() or wait_for_child:
                                 platforms.drain_tty_input()
-                                return rc
-                            if plan.use_sandbox or plan.launch_as_child or keychain_needs_waited_child:
-                                rc = platforms.run_wait(argv, env)
-                                platforms.drain_tty_input()
-                                return rc
-                            return platforms.launch_argv(argv, env)
+                            return rc
                 except keychain.KeychainBusyError as exc:
                     if exc.owner is None or plan.agy_file_auth:
                         raise StoreError(str(exc)) from exc

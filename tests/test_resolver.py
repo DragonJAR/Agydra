@@ -438,7 +438,8 @@ class TestPickFreeProfileClaudeProbeCount(BaseCase):
             body=(
                 f"#!{sys.executable}\n"
                 "import json, os, sys\n"
-                f"open({str(self.log)!r}, 'a').write(os.environ.get('CLAUDE_CONFIG_DIR', '') + '\\n')\n"
+                f"with open({str(self.log)!r}, 'a', encoding='utf-8') as output:\n"
+                "    output.write(os.environ.get('CLAUDE_CONFIG_DIR', '') + '\\n')\n"
                 "print(json.dumps({'loggedIn': True, 'authMethod': 'claude.ai', "
                 "'apiProvider': 'firstParty', 'email': 'cc@example.test', "
                 "'configDirectory': os.environ.get('CLAUDE_CONFIG_DIR')}))\n"

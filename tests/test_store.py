@@ -29,6 +29,159 @@ class TestStore(BaseCase):
     def _run_child(self, source, *args):
         return run_python_child(source, *args)
 
+    def _assert_nested_rmtree_retry(self, operation):
+        root = self._tmp / f"{operation}-tree"
+        nested = root / "nested"
+        nested.mkdir(parents=True)
+        (nested / "payload").write_text("payload", encoding="utf-8")
+        os.chmod(nested, 0o444)
+        original = nested.lstat()
+        expected_identity = (original.st_dev, original.st_ino)
+        state = {"injected": False}
+        restore_calls = []
+        real_restore = store_mod._restore_rmtree_modes
+
+        def recording_restore(changed_paths):
+            restore_calls.append(tuple(changed_paths))
+            return real_restore(changed_paths)
+
+        if operation == "open":
+            real_open = os.open
+
+            def transient_open(target, flags, *args, **kwargs):
+                if (
+                    not state["injected"]
+                    and kwargs.get("dir_fd") is not None
+                    and os.fsdecode(target) == nested.name
+                ):
+                    state["injected"] = True
+                    raise PermissionError("transient fd-relative open failure")
+                return real_open(target, flags, *args, **kwargs)
+
+            patch_callback = unittest.mock.patch.object(
+                store_mod.os, "open", transient_open
+            )
+        else:
+            real_scandir = os.scandir
+
+            def transient_scandir(target):
+                if not state["injected"]:
+                    opened = os.fstat(target) if isinstance(target, int) else os.lstat(target)
+                    identity = (opened.st_dev, opened.st_ino)
+                    if identity == expected_identity:
+                        state["injected"] = True
+                        raise PermissionError("transient nested scandir failure")
+                return real_scandir(target)
+
+            patch_callback = unittest.mock.patch.object(
+                store_mod.os, "scandir", transient_scandir
+            )
+
+        try:
+            with patch_callback:
+                with unittest.mock.patch.object(
+                    store_mod, "_restore_rmtree_modes", recording_restore
+                ):
+                    store_mod.rmtree(root)
+        finally:
+            if nested.exists():
+                os.chmod(nested, 0o755)
+
+        self.assertTrue(state["injected"])
+        self.assertFalse(root.exists())
+        self.assertEqual(len(restore_calls), 1)
+        self.assertIn(
+            (nested, original.st_dev, original.st_ino, stat.S_IMODE(original.st_mode)),
+            restore_calls[0],
+        )
+
+    def _assert_nested_rmtree_persistent_failure(self, operation):
+        root = self._tmp / f"persistent-{operation}-tree"
+        nested = root / "nested"
+        nested.mkdir(parents=True)
+        (nested / "payload").write_text("payload", encoding="utf-8")
+        external = self._tmp / f"persistent-{operation}-external"
+        external.mkdir()
+        external_payload = external / "payload"
+        external_payload.write_text("external", encoding="utf-8")
+        link = nested / "external-link"
+        link.symlink_to(external, target_is_directory=True)
+        os.chmod(nested, 0o444)
+        original = nested.lstat()
+        expected_identity = (original.st_dev, original.st_ino)
+        injected = []
+        restore_calls = []
+        real_restore = store_mod._restore_rmtree_modes
+
+        def recording_restore(changed_paths):
+            restore_calls.append(tuple(changed_paths))
+            return real_restore(changed_paths)
+
+        if operation == "open":
+            real_open = os.open
+
+            def persistent_open(target, flags, *args, **kwargs):
+                current = None
+                if not flags & getattr(os, "O_DIRECTORY", 0):
+                    dir_fd = kwargs.get("dir_fd")
+                    if dir_fd is not None and os.fsdecode(target) == nested.name:
+                        current = os.stat(target, dir_fd=dir_fd, follow_symlinks=False)
+                    elif Path(os.fsdecode(target)) == nested:
+                        current = os.lstat(target)
+                if current is not None and (current.st_dev, current.st_ino) == expected_identity:
+                    injected.append(target)
+                    raise PermissionError("persistent nested open failure")
+                return real_open(target, flags, *args, **kwargs)
+
+            patch_callback = unittest.mock.patch.object(
+                store_mod.os, "open", persistent_open
+            )
+        else:
+            real_scandir = os.scandir
+
+            def persistent_scandir(target):
+                current = os.fstat(target) if isinstance(target, int) else os.lstat(target)
+                if (current.st_dev, current.st_ino) == expected_identity:
+                    injected.append(target)
+                    raise PermissionError("persistent nested scandir failure")
+                return real_scandir(target)
+
+            patch_callback = unittest.mock.patch.object(
+                store_mod.os, "scandir", persistent_scandir
+            )
+
+        surviving_mode = None
+        link_survived = False
+        external_contents = None
+        try:
+            with patch_callback:
+                with unittest.mock.patch.object(
+                    store_mod, "_restore_rmtree_modes", recording_restore
+                ):
+                    with self.assertRaises(PermissionError) as caught:
+                        store_mod.rmtree(root)
+                    surviving_mode = stat.S_IMODE(nested.lstat().st_mode)
+                    os.chmod(nested, 0o755)
+                    link_survived = link.is_symlink()
+                    os.chmod(nested, surviving_mode)
+                    external_contents = external_payload.read_text(encoding="utf-8")
+        finally:
+            if nested.exists():
+                os.chmod(nested, 0o755)
+            store_mod.rmtree(root)
+            store_mod.rmtree(external)
+
+        self.assertEqual(type(caught.exception), PermissionError)
+        self.assertEqual(len(injected), 2)
+        self.assertEqual(len(restore_calls), 1)
+        self.assertIn(
+            (nested, original.st_dev, original.st_ino, stat.S_IMODE(original.st_mode)),
+            restore_calls[0],
+        )
+        self.assertEqual(surviving_mode, expected_file_mode(0o444))
+        self.assertTrue(link_survived)
+        self.assertEqual(external_contents, "external")
+
     def test_relative_store_root_is_anchored_at_construction(self):
         previous_directory = Path.cwd()
         try:
@@ -1092,6 +1245,71 @@ class TestStore(BaseCase):
             store_mod._rmtree_readonly_ok(fail_without_mode_change, str(path), None)
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), expected_file_mode(0o755))
 
+    @posix_only
+    def test_readonly_removal_open_retry_closes_descriptor(self):
+        path = self._tmp / "opened-directory"
+        path.mkdir()
+        descriptors = []
+        real_open = os.open
+
+        def recording_open(target, flags, *args, **kwargs):
+            descriptor = real_open(target, flags, *args, **kwargs)
+            descriptors.append(descriptor)
+            return descriptor
+
+        with unittest.mock.patch.object(store_mod.os, "open", recording_open):
+            store_mod._rmtree_readonly_ok(os.open, str(path), None)
+
+        self.assertGreaterEqual(len(descriptors), 1)
+        for descriptor in descriptors:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    @posix_only
+    def test_rmtree_recovers_nested_transient_fd_open_failure(self):
+        self._assert_nested_rmtree_retry("open")
+
+    @posix_only
+    def test_rmtree_recovers_nested_transient_scandir_failure(self):
+        self._assert_nested_rmtree_retry("scandir")
+
+    @posix_only
+    def test_rmtree_stops_after_persistent_nested_open_failure(self):
+        self._assert_nested_rmtree_persistent_failure("open")
+
+    @posix_only
+    def test_rmtree_stops_after_persistent_nested_scandir_failure(self):
+        self._assert_nested_rmtree_persistent_failure("scandir")
+
+    def test_readonly_removal_close_callback_reraises_original_error(self):
+        path = self._tmp / "close-target"
+        path.write_text("payload", encoding="utf-8")
+        mode = stat.S_IMODE(path.stat().st_mode)
+        onexc_error = OSError("close failed")
+        close_calls = []
+
+        def failing_close(*args, **kwargs):
+            close_calls.append(args)
+            raise AssertionError("os.close must not be called with a path")
+
+        with unittest.mock.patch.object(store_mod.os, "close", failing_close):
+            with self.assertRaises(OSError) as caught:
+                store_mod._rmtree_readonly_ok(os.close, str(path), onexc_error)
+            self.assertIs(caught.exception, onexc_error)
+
+            onerror_error = OSError("legacy close failed")
+            try:
+                raise onerror_error
+            except OSError:
+                error_info = sys.exc_info()
+            with self.assertRaises(OSError) as caught:
+                store_mod._rmtree_readonly_ok(os.close, str(path), error_info)
+            self.assertIs(caught.exception, onerror_error)
+
+        self.assertEqual(close_calls, [])
+        self.assertTrue(path.exists())
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+
     def test_readonly_removal_restores_readonly_mode_after_failed_retry(self):
         path = self._tmp / "readonly-file"
         path.write_text("payload", encoding="utf-8")
@@ -1150,9 +1368,16 @@ class TestStore(BaseCase):
         original = readonly.lstat()
         original_mode = stat.S_IMODE(original.st_mode)
 
+        def fail_nested_removal(target, *, onexc=None, onerror=None):
+            callback = onexc or onerror
+            callback(os.rmdir, str(readonly), PermissionError("still busy"))
+
         try:
-            with self.assertRaises(OSError):
-                store_mod.rmtree(root)
+            with unittest.mock.patch.object(
+                store_mod.shutil, "rmtree", side_effect=fail_nested_removal
+            ):
+                with self.assertRaises(OSError):
+                    store_mod.rmtree(root)
             current = readonly.lstat()
             self.assertEqual((current.st_dev, current.st_ino), (original.st_dev, original.st_ino))
             self.assertEqual(stat.S_IMODE(current.st_mode), original_mode)
@@ -1643,6 +1868,8 @@ store.create("live")
             stderr=subprocess.STDOUT,
             text=True,
         )
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.stdin.close)
         ready = threading.Event()
         output = []
 
@@ -1833,6 +2060,8 @@ Store(root=root).rename("old", "new")
             stderr=subprocess.STDOUT,
             text=True,
         )
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.stdin.close)
         ready = threading.Event()
         output = []
 

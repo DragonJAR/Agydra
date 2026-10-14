@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import AbstractSet, Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar, Union
+from typing import AbstractSet, Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, TypeVar, Union
 
 import platforms
 import vocab
@@ -337,13 +337,67 @@ def _raise_rmtree_failure(
         ) from restore_errors[0][1]
 
 
+def _verify_rmtree_directory(path: Path, original, current) -> None:
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or not os.path.samestat(original, current)
+        or platforms.is_link(path, strict=True)
+    ):
+        raise OSError(f"{path} changed while retrying recursive removal")
+
+
+def _verify_rmtree_directory_identity(path: Path, original) -> None:
+    if getattr(os, "O_DIRECTORY", None) is not None and getattr(os, "O_NOFOLLOW", None) is not None:
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | os.O_DIRECTORY | os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            _verify_rmtree_directory(path, original, os.fstat(descriptor))
+        finally:
+            os.close(descriptor)
+    else:
+        _verify_rmtree_directory(path, original, os.lstat(path))
+
+
+def _raise_rmtree_callback_error(excinfo) -> None:
+    if isinstance(excinfo, BaseException):
+        raise excinfo
+    if isinstance(excinfo, tuple) and len(excinfo) > 1:
+        error = excinfo[1]
+        if isinstance(error, BaseException):
+            traceback = excinfo[2] if len(excinfo) > 2 else None
+            raise error.with_traceback(traceback)
+    raise OSError("recursive removal callback omitted its original error")
+
+
+def _retry_rmtree_callback(
+    function, path: Path, original, excinfo, changed_paths, retried_callbacks
+) -> None:
+    if function in (os.open, os.scandir):
+        identity = (original.st_dev, original.st_ino, function)
+        if identity in retried_callbacks:
+            _raise_rmtree_callback_error(excinfo)
+        _verify_rmtree_directory_identity(path, original)
+        retried_callbacks.add(identity)
+        _run_rmtree_with_readonly_retry(path, changed_paths, retried_callbacks)
+        _require_rmtree_removed(path)
+        return
+    function(path)
+
+
 def _rmtree_readonly_ok(
-    function, path, _excinfo, changed_paths: Optional[List[Tuple[Path, int, int, int]]] = None
+    function,
+    path,
+    _excinfo,
+    changed_paths: Optional[List[Tuple[Path, int, int, int]]] = None,
+    retried_callbacks: Optional[Set[Tuple[int, int, object]]] = None,
 ):
     """Retry read-only removals and defer surviving-mode restoration to rmtree."""
+    if function is os.close:
+        _raise_rmtree_callback_error(_excinfo)
     path = Path(path)
     owns_changes = changed_paths is None
     changes = [] if changed_paths is None else changed_paths
+    retries = set() if retried_callbacks is None else retried_callbacks
     cleanup_error = None
     try:
         try:
@@ -361,9 +415,9 @@ def _rmtree_readonly_ok(
                 path, writable_mode, original.st_dev, original.st_ino
             )
         if linked:
-            _remove_link(path)
+            remove_link(path)
         else:
-            function(path)
+            _retry_rmtree_callback(function, path, original, _excinfo, changes, retries)
     except FileNotFoundError:
         pass
     except BaseException as exc:
@@ -373,6 +427,28 @@ def _rmtree_readonly_ok(
         _raise_rmtree_failure(path, cleanup_error, restore_errors)
 
 
+def _run_rmtree_with_readonly_retry(
+    path: Path,
+    changed_paths: List[Tuple[Path, int, int, int]],
+    retried_callbacks: Set[Tuple[int, int, object]],
+) -> None:
+    def retry_readonly(function, target, error) -> None:
+        _rmtree_readonly_ok(function, target, error, changed_paths, retried_callbacks)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry_readonly)
+    else:
+        shutil.rmtree(path, onerror=retry_readonly)
+
+
+def _require_rmtree_removed(path: Path) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise OSError(f"could not fully remove {path}")
+
+
 def _tree_has_entries(root: Path) -> bool:
     """True when ``root`` is a link or holds any file/link, never following links."""
     if platforms.is_link(root):
@@ -380,7 +456,7 @@ def _tree_has_entries(root: Path) -> bool:
     if not root.is_dir():
         return False
     for _dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        if filenames or any(os.path.islink(os.path.join(_dirpath, d)) for d in dirnames):
+        if filenames or any(platforms.is_link(Path(_dirpath) / d) for d in dirnames):
             return True
     return False
 
@@ -567,7 +643,7 @@ def rmtree(path: Path) -> None:
     except FileNotFoundError:
         return
     if platforms.is_link(path, strict=True):
-        _remove_link(path)
+        remove_link(path)
     elif not stat.S_ISDIR(metadata.st_mode):
         try:
             path.unlink()
@@ -579,30 +655,19 @@ def rmtree(path: Path) -> None:
                 raise
     else:
         changed_paths: List[Tuple[Path, int, int, int]] = []
+        retried_callbacks: Set[Tuple[int, int, object]] = set()
         cleanup_error = None
-
-        def retry_readonly(function, target, error) -> None:
-            _rmtree_readonly_ok(function, target, error, changed_paths)
-
         try:
-            try:
-                if sys.version_info >= (3, 12):
-                    shutil.rmtree(path, onexc=retry_readonly)
-                else:
-                    shutil.rmtree(path, onerror=retry_readonly)
-            except FileNotFoundError:
-                pass
-            except BaseException as exc:
-                cleanup_error = exc
+            _run_rmtree_with_readonly_retry(path, changed_paths, retried_callbacks)
+        except FileNotFoundError:
+            pass
+        except BaseException as exc:
+            cleanup_error = exc
         finally:
             restore_errors = _restore_rmtree_modes(changed_paths)
         if cleanup_error is not None or restore_errors:
             _raise_rmtree_failure(path, cleanup_error, restore_errors)
-    try:
-        path.lstat()
-    except FileNotFoundError:
-        return
-    raise OSError(f"could not fully remove {path}")
+    _require_rmtree_removed(path)
 
 
 def _is_junction(path: Path, metadata) -> bool:
@@ -619,7 +684,8 @@ def _is_junction(path: Path, metadata) -> bool:
     return getattr(metadata, "st_reparse_tag", None) == mount_point_tag
 
 
-def _remove_link(path: Path) -> None:
+def remove_link(path: Path) -> None:
+    """Remove a symlink or Windows reparse point without following it."""
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -1497,7 +1563,7 @@ class Store:
                 )
             ):
                 if read_only:
-                    raise StoreError(_store_text("store.rename.pending"))
+                    raise self._pending_rename_error(journal)
                 raise _RenameRecoveryRequired()
             return operation()
         finally:
@@ -1544,7 +1610,9 @@ class Store:
                 )
             except _RenameRecoveryRequired:
                 if read_only:
-                    raise StoreError(_store_text("store.rename.pending"))
+                    raise self._pending_rename_error(
+                        self._read_rename_journal()
+                    )
                 self.recover_pending_rename(target_name=target_name)
         raise StoreError(_store_text("store.rename.state_changed"))
 
@@ -2032,6 +2100,33 @@ class Store:
             and (target_name is None or target_name not in names)
         )
 
+    def _pending_rename_error(
+        self,
+        journal: Optional[dict],
+    ) -> StoreError:
+        """Choose the pending-rename message from existing lock probes.
+
+        A read-only path never recovers the journal. When no process holds
+        either affected profile lock, explain that a later launch or
+        profile-changing command will perform recovery. Rename takes both
+        profile locks before its sequence lock, so these probes detect a live
+        renamer without acquiring or creating a lock file.
+        """
+        import locks
+
+        if journal is None:
+            return StoreError(_store_text("store.rename.pending"))
+
+        try:
+            busy = any(
+                locks.is_locked(self, name)
+                for name in (journal["old"], journal["new"])
+            )
+        except (locks.LockError, OSError):
+            busy = True
+        message = "store.rename.pending" if busy else "store.rename.interrupted"
+        return StoreError(_store_text(message))
+
     def _require_no_pending_rename(self, target_name: Optional[str] = None) -> None:
         pending, error = self._probe_rename_journal()
         if not pending:
@@ -2057,10 +2152,13 @@ class Store:
             and target_name not in (journal.get("old"), journal.get("new"))
         ):
             return
-        raise StoreError(_store_text("store.rename.pending"))
+        raise self._pending_rename_error(journal)
 
     def _readonly(
-        self, operation: Callable[[], _Result], target_name: Optional[str] = None
+        self,
+        operation: Callable[[], _Result],
+        target_name: Optional[str] = None,
+        result_target_name: Optional[Callable[[_Result], Optional[str]]] = None,
     ) -> _Result:
         """Run a pure read with no locks, recovery or mutation.
 
@@ -2073,7 +2171,10 @@ class Store:
             result = operation()
         except OSError as exc:
             raise StoreError(_store_text("store.store.read_failed", error=exc)) from exc
-        self._require_no_pending_rename(target_name=target_name)
+        resolved_target = (
+            result_target_name(result) if result_target_name is not None else target_name
+        )
+        self._require_no_pending_rename(target_name=resolved_target)
         return result
 
     def get_readonly(self, name: str, profile: Optional[Profile] = None) -> Profile:
@@ -2095,8 +2196,15 @@ class Store:
         return self.scan_readonly()[0]
 
     def resolve_ref_readonly(self, ref: str) -> str:
-        profiles, unreadable = self.scan_readonly()
-        return self._resolve_ref_in(profiles, unreadable, ref)
+        def resolve() -> str:
+            profiles, unreadable = self._scan()
+            return self._resolve_ref_in(profiles, unreadable, ref)
+
+        return self._readonly(
+            resolve,
+            target_name=ref,
+            result_target_name=lambda name: name,
+        )
 
     def save(self, profile: Profile) -> None:
         self._write_profile_metadata(profile)

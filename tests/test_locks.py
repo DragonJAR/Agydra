@@ -674,5 +674,34 @@ class TestInaccessibleProcessKeepsItsLease(BaseCase):
         self.assertFalse(locks.is_locked(self.store, "work"))
 
 
+class TestRegistryIssueBusy(BaseCase):
+    def test_registry_issue_is_busy_none_or_unrelated(self):
+        self.assertFalse(locks.registry_issue_is_busy(None))
+        self.assertFalse(locks.registry_issue_is_busy(""))
+        self.assertFalse(locks.registry_issue_is_busy("/path/to/work.lock has an unreadable registry"))
+        self.assertFalse(locks.registry_issue_is_busy("cannot inspect file"))
+
+    def test_registry_issue_is_busy_matches_constant(self):
+        self.assertTrue(
+            locks.registry_issue_is_busy(f"/path/to/work.lock {locks.REGISTRY_ISSUE_BUSY}")
+        )
+        self.assertTrue(
+            locks.registry_issue_is_busy("/path/to/work.lock is busy during validation")
+        )
+
+    def test_registry_issue_is_busy_with_actual_state_issue(self):
+        self.store = Store()
+        self.store.create("work")
+        handle = locks.try_lock(self.store, "work")
+        try:
+            issue = locks.lease_registry_state_issue(self.store, "work")
+            self.assertTrue(locks.registry_issue_is_busy(issue))
+        finally:
+            handle.release()
+
+        issue_free = locks.lease_registry_state_issue(self.store, "work")
+        self.assertFalse(locks.registry_issue_is_busy(issue_free))
+
+
 if __name__ == "__main__":
     unittest.main()

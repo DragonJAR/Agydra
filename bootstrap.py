@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
 import platforms
+import store
 
 MIN_PYTHON = (3, 9)
 VENV_DIRNAME = ".venv"
@@ -47,6 +48,72 @@ PIP_FLOOR = (21, 3)
 would need tomllib, which is Python 3.11+, above the project floor. Keep in
 sync by hand, exactly like agydra.MIN_PYTHON."""
 SETUPTOOLS_FLOOR = (77, 0)
+
+
+_FALLBACK_STRINGS = {
+    "launcher.dry_run_hint": "run `python3 agydra.py setup` to create the venv, console script and PATH shim",
+    "launcher.fail_expected_script": "expected it at {path}",
+    "launcher.fail_missing_script": "setup finished but the console script is missing",
+    "launcher.reason_broken_venv": "broken venv interpreter",
+    "launcher.reason_no_install": "no installation detected",
+    "launcher.reason_unimportable_modules": "unimportable runtime modules",
+    "launcher.running_setup": "agydra.py: {reason} — running setup...",
+    "setup.dry_run_state_header": "agydra setup (dry run) — current install state:",
+    "setup.item.venv": "venv",
+    "setup.item.console_script": "console script",
+    "setup.report_shim": "  [{mark}] shim: {state}",
+    "setup.report_path": "  [{mark}] shim dir on PATH: {on_path}",
+    "setup.dry_run_footer": "run `agydra setup` to create or repair anything marked [--]/[!!]",
+    "setup.step.venv_present": "venv already present: {path}",
+    "setup.step.broken_reason.no_interpreter": "no interpreter",
+    "setup.step.broken_reason.no_pip": "no pip",
+    "setup.step.removing_broken_venv": "removing broken venv ({reason}): {path}",
+    "setup.step.creating_venv": "creating venv: {path}",
+    "setup.step.installing_setuptools": "installing the setuptools build backend into the venv (needs >= {floor})",
+    "setup.step.upgrading_pip": "upgrading pip inside the venv (needs >= {floor} for editable installs)",
+    "setup.step.installing_editable": "installing agydra (editable) into {path}",
+    "setup.step.replacing_dangling_shim": "replacing dangling shim link: {shim}",
+    "setup.step.shim_installed": "shim installed: {shim} -> {target}",
+    "setup.step.refreshing_stale_shim": "refreshing stale shim: {shim}",
+    "setup.step.verified": "verified: {cand} -> {version}",
+    "setup.step.verify_failed": "verify: no installed candidate responded to --version",
+    "setup.step.verification_failed_lines": "setup: verification failed — see the lines above",
+    "setup.step.finished_with_warnings": "setup: finished with warnings — agydra is installed and usable; exit 1 reports the non-essential failures above (PATH shim, verification), not a broken install",
+    "setup.step.path_notice": "note: {bindir} is not on this shell's PATH; add it or re-login",
+    "setup.step.ready": "setup: agydra is installed and ready (run `agydra doctor` next)",
+    "setup.shim_state.dead": "dead",
+    "setup.shim_state.foreign": "foreign",
+    "setup.shim_state.missing": "missing",
+    "setup.shim_state.n/a": "n/a",
+    "setup.shim_state.ok": "ok",
+    "setup.shim_state.pip_managed": "pip-managed",
+    "setup.shim_state.stale": "stale",
+}
+
+
+def resolve_language() -> None:
+    try:
+        import i18n
+
+        i18n.resolve_language()
+    except (ImportError, SyntaxError):
+        pass
+
+
+def _t(key: str, **kwargs: object) -> str:
+    try:
+        import i18n
+    except (ImportError, SyntaxError):
+        template = _FALLBACK_STRINGS.get(key, key)
+        if not kwargs:
+            return template
+        try:
+            return template.format_map(kwargs)
+        except (KeyError, ValueError, IndexError):
+            return template
+
+    return i18n.t(key, **kwargs)
+
 BOOTSTRAP_TIMEOUT_S = 600.0
 SHIM_MARKER = "Managed by agydra setup"
 INSTALLED_NOTICE = (
@@ -215,7 +282,7 @@ def _dir_on_path(d: Path) -> bool:
 
 
 def _shim_entry_exists(path: Path) -> bool:
-    return path.exists() or path.is_symlink()
+    return path.exists() or platforms.is_link(path)
 
 
 def _is_dangling_link(path: Path) -> bool:
@@ -226,6 +293,18 @@ def _is_dangling_link(path: Path) -> bool:
     equivalent of the "dead" state and is replaced without --force.
     """
     return platforms.is_link(path) and not path.exists()
+
+
+def _remove_shim_link_entry(shim: Path) -> None:
+    """Remove a dangling symlink/junction entry itself, never its target.
+
+    Delegates to store's shared link remover so Windows junctions
+    (directory reparse points) go through ``os.rmdir`` while file
+    symlinks unlink; non-link entries are refused. A dangling junction
+    cannot be replaced by ``os.replace``, so the entry must be cleared
+    before the shim is written atomically onto the freed path.
+    """
+    store.remove_link(shim)
 
 
 def _shim_content(target: Path) -> str:
@@ -240,7 +319,14 @@ def _shim_content(target: Path) -> str:
 
 
 def shim_target(shim: Optional[Path] = None) -> Optional[Path]:
-    """Parse the delegate target from a managed agydra PATH shim."""
+    """Parse the delegate target from a managed agydra PATH shim.
+
+    A managed shim that cannot be parsed (e.g. a hand-edit or partial
+    write left the exec line with an unterminated quote) parses as None
+    instead of raising, so every consumer treats it like a stale shim:
+    state reports, verification falls back to the own console script,
+    and setup refreshes the file (self-healing).
+    """
     target_shim = shim_path() if shim is None else Path(shim)
     if not _shim_entry_exists(target_shim):
         return None
@@ -253,7 +339,10 @@ def shim_target(shim: Optional[Path] = None) -> Optional[Path]:
     for line in body.splitlines():
         line = line.strip()
         if line.startswith("exec ") and line.endswith('"$@"'):
-            parts = shlex.split(line)
+            try:
+                parts = shlex.split(line)
+            except ValueError:
+                return None
             if len(parts) >= 2:
                 return Path(parts[1])
     return None
@@ -297,18 +386,23 @@ def ensure_venv(root: Path, out: Callable[[str], None]) -> Path:
     vpy = venv_python(root)
     has_interpreter = vpy.exists()
     if has_interpreter and not _pip_missing(vpy):
-        out(f"venv already present: {venv_dir(root)}")
+        out(_t("setup.step.venv_present", path=venv_dir(root)))
         return vpy
     target = venv_dir(root)
     if os.path.lexists(target):
-        out(f"removing broken venv ({'no interpreter' if not has_interpreter else 'no pip'}): {target}")
+        reason = (
+            _t("setup.step.broken_reason.no_interpreter")
+            if not has_interpreter
+            else _t("setup.step.broken_reason.no_pip")
+        )
+        out(_t("setup.step.removing_broken_venv", reason=reason, path=target))
         import store as _store
 
         try:
             _store.rmtree(target)
         except OSError as exc:
             raise BootstrapError(f"cannot remove broken venv {target}: {exc}") from exc
-    out(f"creating venv: {venv_dir(root)}")
+    out(_t("setup.step.creating_venv", path=venv_dir(root)))
     proc = _run([sys.executable, "-m", "venv", str(venv_dir(root))])
     if proc.returncode != 0:
         raise BootstrapError(
@@ -393,7 +487,7 @@ def ensure_build_backend(vpy: Path, out: Callable[[str], None]) -> None:
     if _setuptools_floor_ok(vpy):
         return
     floor = ".".join(map(str, SETUPTOOLS_FLOOR))
-    out(f"installing the setuptools build backend into the venv (needs >= {floor})")
+    out(_t("setup.step.installing_setuptools", floor=floor))
     proc = _run(
         [
             str(vpy), "-m", "pip", "install", "--quiet", "--no-input",
@@ -439,7 +533,12 @@ def install_editable(root: Path, vpy: Path, out: Callable[[str], None]) -> None:
             f"the venv at {venv_dir(root)} has no pip; run `agydra setup` to recreate it"
         )
     if not _pip_supports_pep660(vpy):
-        out(f"upgrading pip inside the venv (needs >= {'.'.join(map(str, PIP_FLOOR))} for editable installs)")
+        out(
+            _t(
+                "setup.step.upgrading_pip",
+                floor=".".join(map(str, PIP_FLOOR)),
+            )
+        )
         proc = _run([str(vpy), "-m", "pip", "install", "--quiet", "--no-input", "--upgrade", "pip"])
         if proc.returncode != 0:
             upgrade_note = _tail(proc)
@@ -452,7 +551,7 @@ def install_editable(root: Path, vpy: Path, out: Callable[[str], None]) -> None:
                 f"(exit {proc.returncode}): {upgrade_note}"
             )
     ensure_build_backend(vpy, out)
-    out(f"installing agydra (editable) into {venv_dir(root)}")
+    out(_t("setup.step.installing_editable", path=venv_dir(root)))
     proc = _run(
         [
             str(vpy), "-m", "pip", "install", "--quiet", "--no-input",
@@ -526,7 +625,8 @@ def ensure_path_shim(
     try:
         platforms.ensure_dir(shim.parent)
         if _is_dangling_link(shim):
-            out(f"replacing dangling shim link: {shim}")
+            out(_t("setup.step.replacing_dangling_shim", shim=shim))
+            _remove_shim_link_entry(shim)
         elif _shim_entry_exists(shim):
             try:
                 body = shim.read_text(encoding="utf-8", errors="replace")
@@ -538,7 +638,7 @@ def ensure_path_shim(
                     ) from exc
                 body = ""
             if body == content and os.access(shim, os.X_OK):
-                out(f"shim installed: {shim} -> {target}")
+                out(_t("setup.step.shim_installed", shim=shim, target=target))
                 return shim
             if body != content:
                 if SHIM_MARKER not in body and not force:
@@ -551,11 +651,11 @@ def ensure_path_shim(
                     if not explicit and not force:
                         out(f"managed shim points to existing {curr_target}; leaving untouched")
                         return shim
-                out(f"refreshing stale shim: {shim}")
+                out(_t("setup.step.refreshing_stale_shim", shim=shim))
         _atomic_write_text(shim, content, mode=0o755)
     except OSError as exc:
         raise BootstrapError(f"could not write shim at {shim}: {exc}") from exc
-    out(f"shim installed: {shim} -> {target}")
+    out(_t("setup.step.shim_installed", shim=shim, target=target))
     return shim
 
 
@@ -595,10 +695,10 @@ def verify_install(root: Path, out: Callable[[str], None]) -> bool:
             continue
         got = (proc.stdout or "").strip()
         if proc.returncode == 0 and got.startswith("agydra "):
-            out(f"verified: {cand} -> {got}")
+            out(_t("setup.step.verified", cand=cand, version=got))
             return True
         out(f"candidate failed: {cand} (exit {proc.returncode}: {got})")
-    out("verify: no installed candidate responded to --version")
+    out(_t("setup.step.verify_failed"))
     return False
 
 
@@ -692,13 +792,16 @@ def report_state(root: Optional[Path] = None) -> None:
     """
     from ui import console_print
 
+    resolve_language()
     state = check_state(project_root() if root is None else root)
-    console_print("agydra setup (dry run) — current install state:")
-    for key, present in (("venv", state["venv"]), ("console script", state["console"])):
+    console_print(_t("setup.dry_run_state_header"))
+    for key, present in ((_t("setup.item.venv"), state["venv"]), (_t("setup.item.console_script"), state["console"])):
         console_print(f"  {'[ok]' if present else '[--]'} {key}")
-    console_print(f"  [{'ok' if state['shim_ok'] else '!!'}] shim: {state['shim_state']}")
-    console_print(f"  [{'ok' if state['on_path'] else '!!'}] shim dir on PATH: {state['on_path']}")
-    console_print("run `agydra setup` to create or repair anything marked [--]/[!!]")
+    raw_state = str(state["shim_state"]).replace("-", "_")
+    localized_state = _t(f"setup.shim_state.{raw_state}")
+    console_print(_t("setup.report_shim", mark="ok" if state["shim_ok"] else "!!", state=localized_state))
+    console_print(_t("setup.report_path", mark="ok" if state["on_path"] else "!!", on_path=state["on_path"]))
+    console_print(_t("setup.dry_run_footer"))
 
 
 def perform_install(
@@ -716,6 +819,7 @@ def perform_install(
     through ``console`` whenever the essential steps succeeded, whatever
     happened to the shim.
     """
+    resolve_language()
     try:
         if not python_ok(sys.version_info):
             raise BootstrapError(
@@ -740,7 +844,7 @@ def perform_install(
     verified = verify_install(root, out)
     code = 0 if not shim_note and verified else 1
     if not verified:
-        out("setup: verification failed — see the lines above")
+        out(_t("setup.step.verification_failed_lines"))
     return InstallResult(code=code, essential_ok=True, console=console)
 
 
@@ -758,6 +862,7 @@ def run(
     (pip/pipx installation) nothing is written: the notice is printed and 0
     is returned.
     """
+    resolve_language()
     say = out if out is not None else (lambda line: print(line))
     target_root = platforms.canonical_path(root) if root is not None else project_root()
     if not is_source_checkout(target_root):
@@ -766,15 +871,11 @@ def run(
     result = perform_install(say, target_root, force=force, explicit=explicit)
     if result.code != 0:
         if result.essential_ok:
-            say(
-                "setup: finished with warnings — agydra is installed and usable; "
-                "exit 1 reports the non-essential failures above (PATH shim, "
-                "verification), not a broken install"
-            )
+            say(_t("setup.step.finished_with_warnings"))
         return result.code
     state = check_state(target_root)
     if not state["on_path"]:
         bindir = console_script(target_root).parent if platforms.is_windows() else user_bin_dir()
-        say(f"note: {bindir} is not on this shell's PATH; add it or re-login")
-    say("setup: agydra is installed and ready (run `agydra doctor` next)")
+        say(_t("setup.step.path_notice", bindir=bindir))
+    say(_t("setup.step.ready"))
     return 0

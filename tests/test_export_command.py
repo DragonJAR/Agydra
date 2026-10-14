@@ -132,10 +132,12 @@ class TestExportRefusals(BaseCase):
 
     def test_export_unknown_engine_is_impossible_because_create_rejects_it(self):
         self.store.create("ok", engine="agy")
+        out = self._tmp / "out.zip"
         with mock.patch.object(engines, "get_engine") as get_engine:
             get_engine.side_effect = ValueError("unknown engine 'martian'")
-            with self.assertRaises(Exception):
-                cli.cmd_export(self.store, _args("ok", self._tmp / "out.zip"))
+            with self.assertRaises(ValueError):
+                cli.cmd_export(self.store, _args("ok", out))
+        self.assertFalse(out.exists())
 
     def test_export_keeps_engine_agnostic_by_assembling_exclusions_in_cli(self):
         """Sanity guard: the store's filter only sees paths, never engine

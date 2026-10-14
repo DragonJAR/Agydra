@@ -137,7 +137,8 @@ def _read_json_object(path: Path, limit: int) -> dict:
 
     try:
         metadata = path.lstat()
-        if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        linked = platforms.is_link(path, strict=True)
+        if not stat.S_ISREG(metadata.st_mode) or linked:
             raise UsageCacheError("usage cache entry is not a regular file")
         if metadata.st_size > limit:
             raise UsageCacheError("usage cache entry exceeds its size limit")
@@ -203,11 +204,12 @@ def _read_generation(store: Any, seq: int) -> Tuple[int, bool]:
     _safe_directory_chain(store, path.parent)
     try:
         metadata = path.lstat()
+        linked = platforms.is_link(path, strict=True)
     except FileNotFoundError:
         return 0, False
     except OSError as exc:
         raise UsageCacheError("usage cache generation could not be inspected") from exc
-    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    if not stat.S_ISREG(metadata.st_mode) or linked:
         raise UsageCacheError("usage cache generation is not a regular file")
     raw = _read_json_object(path, MAX_CACHE_BYTES)
     if set(raw) != {"version", "seq", "generation", "deleted"}:
@@ -393,9 +395,10 @@ def _current_claude_profile(store: Any, seq: int) -> Optional["Profile"]:
         config_dir = Path(store.claude_config_dir_for_seq(seq))
         _safe_directory_chain(store, config_dir)
         metadata = config_dir.lstat()
+        linked = platforms.is_link(config_dir, strict=True)
     except Exception:
         return None
-    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+    if not stat.S_ISDIR(metadata.st_mode) or linked:
         return None
     return matches[0]
 
@@ -576,7 +579,12 @@ def invalidate_claude_usage_cache(
             for entry in entries:
                 try:
                     metadata = entry.lstat()
-                    if stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                    linked = platforms.is_link(entry, strict=True)
+                    if linked:
+                        import store as store_module
+
+                        store_module.remove_link(entry)
+                    elif stat.S_ISREG(metadata.st_mode):
                         entry.unlink()
                 except OSError as exc:
                     failures.append(exc)

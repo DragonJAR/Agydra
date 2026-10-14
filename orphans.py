@@ -164,7 +164,7 @@ def _unlink_if_present(path: Path, label: str, removed: List[str]) -> None:
     try:
         path.lstat()
         if platforms.is_link(path, strict=True):
-            store_mod._remove_link(path)
+            store_mod.remove_link(path)
         else:
             path.unlink()
     except (FileNotFoundError, OSError):

@@ -43,6 +43,7 @@ from store import (
     cannot_safely_proceed_message,
     read_json_object,
     rename_dir_with_retry,
+    rmtree as store_rmtree,
 )
 from ui import bar as _bar, error as _error, note as _note, pad, paint, paint_each, warn as _warn
 from ui import console_print as print
@@ -468,8 +469,14 @@ def _warn_late_flags(
             else:
                 spelling = token
             _note(
-                f"'{spelling}' was passed to agy, not agydra — agydra flags "
-                f"must come first: agydra {spelling} <agy args...>"
+                i18n.t(
+                    "cli.note_late_flags",
+                    spelling=spelling,
+                    default=(
+                        f"'{spelling}' was passed to agy, not agydra — agydra flags "
+                        f"must come first: agydra {spelling} <agy args...>"
+                    ),
+                )
             )
             return
 
@@ -772,18 +779,30 @@ def _cmd_login_in_recovery_scope(store: Store, args) -> int:
     return runner.run(plan, store=store, dry_run=dry_run)
 
 
+def _resolve_profile_target_readonly(
+    store: Store, ref: Optional[str] = None, engine: Optional[str] = None
+):
+    """Resolve a profile target using read-only semantics (no rename recovery)."""
+    resolution = resolver.resolve(store, flag_ref=ref, engine=engine, read_only=True)
+    profile = (
+        resolution.profile
+        if getattr(resolution, "profile", None) is not None
+        else store.get_readonly(resolution.name)
+    )
+    resolution.profile = profile
+    return resolution, profile
+
+
 def _status_target(store: Store, ref: Optional[str], engine: Optional[str]):
     """Resolve the profile ``status`` inspects and its engine binary (or None).
 
     Unlike a launch plan this never requires the engine binary: inspecting an
     existing profile must work before (or without) installing the CLI.
     """
-    resolution = resolver.resolve(store, flag_ref=ref, engine=engine)
-    profile = resolution.profile if getattr(resolution, "profile", None) is not None else store.get(resolution.name)
+    resolution, profile = _resolve_profile_target_readonly(store, ref=ref, engine=engine)
     driver = engines.get_engine(profile.engine)
     config = store.load_config()
     binary = driver.resolve_configured_binary(config)
-    resolution.profile = profile
     return resolution, binary, driver
 
 
@@ -802,8 +821,11 @@ def cmd_status(store: Store, args) -> int:
         _error(str(exc))
         return 1
     name = resolution.name
-    binary_text = str(binary) if binary is not None else (
-        f"(not found; install {driver.binary_name} or set {driver.env_bin_var})"
+    binary_text = str(binary) if binary is not None else i18n.t(
+        "cmd.status.binary_missing",
+        binary=driver.binary_name,
+        env_var=driver.env_bin_var,
+        default=f"(not found; install {driver.binary_name} or set {driver.env_bin_var})",
     )
     profile = resolution.profile if getattr(resolution, "profile", None) is not None else store.get(name)
     engine = profile.engine
@@ -865,7 +887,13 @@ def _usage_progress(stream, names: Sequence[str]) -> "usage.ProgressCallback":
     width = _usage_progress_width(names)
 
     def _report(index: int, total: int, name: str) -> None:
-        message = f"checking {name}... ({index}/{total})"
+        message = i18n.t(
+            "usage.progress_checking",
+            name=name,
+            index=index,
+            total=total,
+            default=f"checking {name}... ({index}/{total})",
+        )
         if is_tty:
             stream.write("\r" + message.ljust(width))
             stream.flush()
@@ -938,7 +966,11 @@ def _enable_claude_capture(store: Store, profile) -> str:
             existing = raw
             current_status = raw.get("statusLine")
             if current_status == payload["statusLine"]:
-                return f"capture already enabled for profile {profile.name!r} (no change)"
+                return i18n.t(
+                    "claude.capture_already_enabled",
+                    name=profile.name,
+                    default=f"capture already enabled for profile {profile.name!r} (no change)",
+                )
             if current_status is not None:
                 raise StoreError(
                     f"{settings_path} already defines a statusLine; agydra refuses "
@@ -957,11 +989,16 @@ def _enable_claude_capture(store: Store, profile) -> str:
             raise StoreError(
                 f"failed to write {settings_path}: {exc}"
             ) from exc
-        return (
-            f"wrote {settings_path}: statusLine capture enabled for profile "
-            f"{profile.name!r}. Run `agydra -p {profile.name}` (or plain "
-            "Claude Code) once so the statusLine fires and the cache populates; "
-            "`agydra usage " + profile.name + "` will then show quota windows."
+        return i18n.t(
+            "claude.capture_enabled",
+            path=str(settings_path),
+            name=profile.name,
+            default=(
+                f"wrote {settings_path}: statusLine capture enabled for profile "
+                f"{profile.name!r}. Run `agydra -p {profile.name}` (or plain "
+                "Claude Code) once so the statusLine fires and the cache populates; "
+                f"`agydra usage {profile.name}` will then show quota windows."
+            ),
         )
     finally:
         handle.release()
@@ -1037,7 +1074,7 @@ def _find_previous_entry(
 def _format_age(
     observed_at: Optional[datetime], *, now: Optional[datetime] = None
 ) -> str:
-    """Compact elapsed age, e.g. ``"10m ago"``, ``"2h ago"``, ``"1d ago"``, ``"<1m ago"``."""
+    """Compact elapsed age, e.g. ``"10m"``, ``"2h"``, ``"1d"``, ``"<1m"``."""
     if observed_at is None:
         return ""
     if isinstance(observed_at, str):
@@ -1053,15 +1090,15 @@ def _format_age(
     if seconds < 0:
         seconds = 0
     if seconds < 60:
-        return "<1m ago"
+        return "<1m"
     days, remainder = divmod(seconds, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes, _ = divmod(remainder, 60)
     if days > 0:
-        return f"{days}d ago"
+        return f"{days}d"
     if hours > 0:
-        return f"{hours}h ago"
-    return f"{minutes}m ago"
+        return f"{hours}h"
+    return f"{minutes}m"
 
 
 def _record_usage_snapshot(
@@ -1361,7 +1398,11 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                 else:
                     if result.groups:
                         age = _format_age(result.observed_at)
-                        tag = f"cached {age}" if age else "cached"
+                        tag = (
+                            i18n.t("usage.cached_age", age=age, default=f"cached {age} ago")
+                            if age
+                            else i18n.t("usage.cached_tag", default="cached")
+                        )
                         err_msg = paint(f"({result.error} · {tag})", "dim")
                     else:
                         err_msg = paint(f"({result.error})", "dim")
@@ -1423,7 +1464,11 @@ def _cmd_usage_compact(store: Store, _args) -> int:
             if not result.ok:
                 if result.groups:
                     age = _format_age(result.observed_at)
-                    tag = f"cached {age}" if age else "cached"
+                    tag = (
+                        i18n.t("usage.cached_age", age=age, default=f"cached {age} ago")
+                        if age
+                        else i18n.t("usage.cached_tag", default="cached")
+                    )
                     err_cell = paint(f"({result.error} · {tag})", "dim")
                 else:
                     err_cell = _usage_error_cell(result)
@@ -1510,8 +1555,8 @@ def _cmd_usage_compact(store: Store, _args) -> int:
 
 
 def _cmd_usage_detail(store: Store, args) -> int:
-    name = store.resolve_ref(args.ref)
-    profile = store.get(name)
+    resolution, profile = _resolve_profile_target_readonly(store, ref=args.ref)
+    name = resolution.name
     result = usage.query_profile_usage(store, name)
     results = _record_usage_snapshot(store, [profile], [result], scope=profile.name)
     result = results[0]
@@ -1537,8 +1582,14 @@ def _cmd_usage_detail(store: Store, args) -> int:
             if authenticated
             else i18n.t("auth.not_authenticated", default="not authenticated")
         )
-        print(f"status    : {state_str}")
-        print(f"data dir  : {store.profile_data_dir(name, engine=profile.engine, profile=profile)}")
+        print(i18n.t("usage.status_label", state=state_str, default=f"status    : {state_str}"))
+        print(
+            i18n.t(
+                "usage.data_dir_label",
+                path=store.profile_data_dir(name, engine=profile.engine, profile=profile),
+                default=f"data dir  : {store.profile_data_dir(name, engine=profile.engine, profile=profile)}",
+            )
+        )
         if not result.ok:
             if not result.groups:
                 if result.error and result.error.strip().lower() not in ("not authenticated", "not-authenticated", "unauthenticated"):
@@ -1546,7 +1597,7 @@ def _cmd_usage_detail(store: Store, args) -> int:
                 return 1
             age = _format_age(result.observed_at)
             tag = (
-                i18n.t("usage.cached_age", age=age, default=f"from {age}")
+                i18n.t("usage.cached_age", age=age, default=f"cached {age} ago")
                 if age
                 else i18n.t("usage.cached_tag", default="cached")
             )
@@ -1557,9 +1608,9 @@ def _cmd_usage_detail(store: Store, args) -> int:
                 default=f"{result.error} (showing cached reading {tag})",
             )
             _warn(msg)
-            print(paint(f"warning   : {msg}", "yellow"))
+            print(paint(i18n.t("usage.warning_label", msg=msg, default=f"warning   : {msg}"), "yellow"))
         elif result.error == usage.PLAN_WITHOUT_QUOTA:
-            print(f"usage     : {i18n.t('usage.plan_no_quota')}")
+            print(i18n.t("usage.usage_label", value=i18n.t("usage.plan_no_quota"), default=f"usage     : {i18n.t('usage.plan_no_quota')}"))
         elif result.error:
             _error(i18n.t("usage.unavailable_with_error", error=result.error, default=f"usage unavailable: {result.error}"))
             return 1
@@ -1578,7 +1629,8 @@ def _cmd_usage_detail(store: Store, args) -> int:
             color = usage.usage_color(bucket.remaining_fraction)
             gauge = paint(_bar(bucket.remaining_fraction), color)
             countdown = usage.format_countdown(bucket.reset_time)
-            print(f"  {bucket.name:<28}[{gauge}] {pct:5.1f}%  reset in {countdown}")
+            reset_str = i18n.t("usage.reset_in", countdown=countdown, default=f"reset in {countdown}")
+            print(f"  {bucket.name:<28}[{gauge}] {pct:5.1f}%  {reset_str}")
     return 1 if not result.ok else 0
 
 
@@ -1775,13 +1827,29 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
                 try:
                     raw = file.read_bytes()
                 except OSError as exc:
-                    _note(f"skipping unreadable {name} in {src}: {exc}")
+                    _note(
+                        i18n.t(
+                            "cmd.share_config.skip_unreadable",
+                            name=name,
+                            src=src,
+                            exc=exc,
+                            default=f"skipping unreadable {name} in {src}: {exc}",
+                        )
+                    )
                     continue
                 if name.endswith(".json"):
                     try:
                         locks.json_loads_utf8(raw)
                     except (ValueError, UnicodeDecodeError) as exc:
-                        _note(f"skipping invalid JSON {name} in {src}: {exc}")
+                        _note(
+                            i18n.t(
+                                "cmd.share_config.skip_invalid_json",
+                                name=name,
+                                src=src,
+                                exc=exc,
+                                default=f"skipping invalid JSON {name} in {src}: {exc}",
+                            )
+                        )
                         continue
                 source_payloads[name] = raw
         copied: List[str] = []
@@ -1893,7 +1961,7 @@ def cmd_import(store: Store, args) -> int:
             except shutil.Error as exc:
                 raise StoreError(_summarize_import_failure(exc, real)) from exc
             if data_dir.exists():
-                shutil.rmtree(data_dir)
+                store_rmtree(data_dir)
             rename_dir_with_retry(tmp, data_dir)
         except BaseException:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -1905,8 +1973,11 @@ def cmd_import(store: Store, args) -> int:
                 raise
             except (OSError, AttributeError) as exc:
                 _warn(
-                    f"keychain import capture skipped ({exc}); "
-                    "continuing without it"
+                    i18n.t(
+                        "cmd.import.keychain_skipped",
+                        exc=exc,
+                        default=f"keychain import capture skipped ({exc}); continuing without it",
+                    )
                 )
         print(i18n.t("cmd.import.ok", name=name, path=data_dir, default=f"imported generic data into profile {name!r}: {data_dir}"))
         return 0
@@ -1934,9 +2005,12 @@ def cmd_export(store: Store, args) -> int:
     list, so the store stays engine-agnostic: it only sees paths it must
     skip, never the policy that produced them.
 
-    A profile that is busy (R3) is refused before any bytes are written;
-    a Claude profile is refused up front because R4 forbids portable
-    Claude Code archives until a safe selective contract exists.
+    Acquires a shared read lock to protect against concurrent destructive
+    mutations (rename/delete) while coexisting with live sessions; when
+    live sessions exist, it writes a best-effort snapshot and emits an
+    informational note. A Claude profile is refused up front because security
+    policy forbids portable Claude Code archives until a safe selective
+    contract exists.
     """
     name = store.resolve_ref(args.ref)
     profile = store.get(name)
@@ -2028,10 +2102,10 @@ def cmd_doctor(store: Store, args) -> int:
 
     preview = doctor._preview_fixables(store, ctx)
     if not preview:
-        print("no fixable items")
+        print(i18n.t("cmd.doctor.no_fixables", default="no fixable items"))
         return exit_code
     print()
-    print("fixable items:")
+    print(i18n.t("cmd.doctor.fix_preview_header", default="fixable items:"))
     for line in preview:
         print(f"  - {line}")
     prompt = i18n.t("cmd.doctor.fix_confirm", default="apply these repairs?")
@@ -2080,7 +2154,7 @@ _SUBCOMMAND_HELP: Dict[str, str] = {
     "create": f"create an isolated profile store (-e {'|'.join(engines.SUPPORTED_ENGINES)})",
     "login": f"run engine authentication flow isolated to a profile ({', '.join(engines.SUPPORTED_ENGINES)})",
     "import": "copy generic data dir into an existing profile (target engine auto-detected; Claude Code import unsupported)",
-    "export": "write a portable profile archive (ZIP) with credentials excluded by R4 policy (Claude Code unsupported)",
+    "export": "write a portable profile archive (ZIP) with credentials excluded by security policy (Claude Code unsupported)",
     "status": "show resolved profile, engine, binary, and credentials (zero side effects)",
     "default": "get or set the fallback default profile",
     "use": "pin a profile to the current directory (.agydra marker)",

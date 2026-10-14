@@ -364,15 +364,15 @@ def write_fake_binary(
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     if sys.platform.startswith("win"):
-        pathext = os.environ.get("PATHEXT") or platforms._DEFAULT_PATHEXT
+        suffixes = platforms._pathext_suffixes()
         suffix = Path(name).suffix
         if extension is not None:
             suffix = extension
-        elif suffix.lower() not in {item.lower() for item in pathext.split(";")}:
+        elif suffix.lower() not in {item.lower() for item in suffixes}:
             suffix = next(
                 (
                     item.lower()
-                    for item in pathext.split(";")
+                    for item in suffixes
                     if item.lower() in (".cmd", ".bat")
                 ),
                 "",
@@ -438,14 +438,36 @@ def snapshot_tree(
     they carry no durable profile data and Windows msvcrt mandatory byte-range
     locking forbids concurrent reads while held.
     """
+    import platforms
+
     root = Path(root)
     result = {}
-    if not root.exists():
+    if not root.exists() and not platforms.is_link(root):
         return result
 
     excluded = tuple(Path(path).absolute() for path in exclude)
 
-    for path in sorted(root.rglob("*")):
+    paths = []
+
+    def _walk(curr: Path):
+        try:
+            with os.scandir(curr) as it:
+                children = sorted(it, key=lambda e: e.name)
+        except (OSError, FileNotFoundError):
+            return
+        for entry in children:
+            p = Path(entry.path)
+            paths.append(p)
+            if not platforms.is_link(p) and entry.is_dir(follow_symlinks=False):
+                _walk(p)
+
+    if platforms.is_link(root):
+        paths = [root]
+    else:
+        _walk(root)
+        paths.sort()
+
+    for path in paths:
         relative = path.relative_to(root)
         if "locks" in relative.parts or path.name.endswith(".lock"):
             continue
@@ -458,20 +480,15 @@ def snapshot_tree(
         except FileNotFoundError:
             continue
 
-        if files_only:
-            if stat.S_ISREG(st.st_mode):
-                record = ("file", path.read_bytes() if contents else None)
-            elif stat.S_ISLNK(st.st_mode) and path.is_file():
-                record = ("file", path.read_bytes() if contents else None)
-            else:
-                continue
-        elif stat.S_ISLNK(st.st_mode):
-            record = ("link", os.readlink(path))
+        is_link_entry = platforms.is_link(path)
+        if is_link_entry:
+            record = ("link", platforms.read_link_target(path))
+        elif stat.S_ISREG(st.st_mode):
+            record = ("file", path.read_bytes() if contents else None)
+        elif files_only:
+            continue
         elif stat.S_ISDIR(st.st_mode):
             record = ("dir", None)
-        elif stat.S_ISREG(st.st_mode):
-            data = path.read_bytes() if contents else None
-            record = ("file", data)
         else:
             record = ("other", None)
 

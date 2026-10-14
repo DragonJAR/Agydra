@@ -150,14 +150,29 @@ class TestCodexRunner(BaseCase):
         self.assertEqual(profile.description, "OpenAI account")
 
     def test_cli_dry_run_launch_codex(self):
+        import contextlib
+        import io
+
         self.store.create("cx-dev", engine="codex")
-        rc = cli.main(["-p", "cx-dev", "-n", "chat", "hello"])
+        buf = io.StringIO()
+        with mock.patch.object(runner.platforms, "launch_argv") as launch, \
+                mock.patch.object(runner.platforms, "run_wait") as waited_launch, \
+                contextlib.redirect_stdout(buf):
+            rc = cli.main(["-p", "cx-dev", "-n", "chat", "hello"])
         self.assertEqual(rc, 0)
+        output = buf.getvalue()
+        self.assertIn("profile : cx-dev", output)
+        self.assertIn("engine  : codex", output)
+        self.assertIn("--no-daemon chat hello", output)
+        launch.assert_not_called()
+        waited_launch.assert_not_called()
 
     def test_cli_rotate_flag_alias(self):
+        import contextlib
+        import io
+
         self.store.create("agy1", engine="agy")
         self.store.create("agy2", engine="agy")
-        # Setup tokens so profiles are authenticated
         token1 = self.store.profile_data_dir("agy1") / "antigravity-cli" / "antigravity-oauth-token"
         token1.parent.mkdir(parents=True, exist_ok=True)
         token1.write_text(json.dumps({"token": {"access_token": "tok1", "id_token": _make_jwt({"email": "a1@example.com"})}}), encoding="utf-8")
@@ -165,8 +180,20 @@ class TestCodexRunner(BaseCase):
         token2.parent.mkdir(parents=True, exist_ok=True)
         token2.write_text(json.dumps({"token": {"access_token": "tok2", "id_token": _make_jwt({"email": "a2@example.com"})}}), encoding="utf-8")
 
-        rc = cli.main(["--rotate", "-n", "chat"])
+        rotation_file = self.store.root / "rotation.json"
+        buf = io.StringIO()
+        with mock.patch.object(runner.platforms, "launch_argv") as launch, \
+                mock.patch.object(runner.platforms, "run_wait") as waited_launch, \
+                contextlib.redirect_stdout(buf):
+            rc = cli.main(["--rotate", "-n", "chat"])
         self.assertEqual(rc, 0)
+        output = buf.getvalue()
+        self.assertTrue("profile : agy1" in output or "profile : agy2" in output)
+        self.assertIn("engine  : agy", output)
+        self.assertIn("read-only random plan candidate", output)
+        self.assertFalse(rotation_file.exists())
+        launch.assert_not_called()
+        waited_launch.assert_not_called()
 
     def test_resolver_resolve_with_engine(self):
         self.store.create("agy1", engine="agy")

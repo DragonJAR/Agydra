@@ -61,8 +61,27 @@ class TestDoctor(BaseCase):
     def test_healthy_store_returns_zero(self):
         self.store.create("work")
         (self.store.profile_data_dir("work") / "antigravity-cli").mkdir()
-        exit_code = doctor.run_checks(self.store)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exit_code = doctor.run_checks(self.store)
+        report = output.getvalue()
         self.assertEqual(exit_code, 0)
+        self.assertIn("result: healthy", report)
+        self.assertNotIn("\n[XX]", report)
+        ctx = self._ctx()
+        status, msg = doctor._check_store(self.store, ctx)
+        self.assertEqual(status, doctor.OK)
+        self.assertIn("store writable", msg)
+        status, msg = doctor._check_persistent_state(self.store, ctx)
+        self.assertEqual(status, doctor.OK)
+        self.assertIn("valid", msg)
+        status, msg = doctor._check_profiles(self.store, ctx)
+        self.assertEqual(status, doctor.OK)
+        status, msg = doctor._check_locks(self.store, ctx)
+        self.assertEqual(status, doctor.OK)
+        self.assertIn("no live sessions", msg)
+        status, msg = doctor._check_schema_canary(self.store, ctx)
+        self.assertEqual(status, doctor.OK)
 
     def test_report_messages_use_the_active_catalog_language(self):
         import i18n
@@ -84,8 +103,15 @@ class TestDoctor(BaseCase):
     def test_missing_binary_returns_one(self):
         self.store.create("work")
         os.environ["AGYDRA_AGY_BIN"] = str(self.bin_dir / "missing-agy")
-        exit_code = doctor.run_checks(self.store)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exit_code = doctor.run_checks(self.store)
+        report = output.getvalue()
         self.assertEqual(exit_code, 1)
+        self.assertIn("[XX] agy binary not found", report)
+        status, message = doctor._check_binary(self.store, self._ctx())
+        self.assertEqual(status, doctor.FAIL)
+        self.assertIn("agy binary not found", message)
 
     def test_corrupt_metadata_does_not_break_run(self):
         self.store.create("work")
@@ -131,15 +157,43 @@ class TestDoctor(BaseCase):
         self.store.create("work")
         handle = locks.try_lock(self.store, "work")
         try:
-            exit_code = doctor.run_checks(self.store)
+            status, message = doctor._check_locks(self.store, self._ctx())
         finally:
             handle.release()
-        self.assertEqual(exit_code, 0)
+        self.assertEqual(status, doctor.WARN)
+        self.assertIn("live sessions: work", message)
+        self.assertNotIn("unreadable", message)
 
     def test_locks_check_passes_when_free(self):
         self.store.create("work")
-        exit_code = doctor.run_checks(self.store)
-        self.assertEqual(exit_code, 0)
+        status, message = doctor._check_locks(self.store, self._ctx())
+        self.assertEqual(status, doctor.OK)
+        self.assertIn("no live sessions", message)
+
+    def test_locks_check_transition_from_write_contention_to_clean(self):
+        import locks
+
+        self.store.create("work")
+        with mock.patch.object(locks, "lease_holders", return_value=None), \
+                mock.patch.object(locks, "lease_registry_state_issue", return_value=None), \
+                mock.patch.object(locks, "is_locked", return_value=False):
+            status, message = doctor._check_locks(self.store, self._ctx())
+        self.assertEqual(status, doctor.OK)
+        self.assertIn("no live sessions", message)
+        self.assertNotIn("unreadable", message)
+        self.assertNotIn("live sessions: work", message)
+
+    def test_locks_check_transition_from_write_contention_to_still_locked(self):
+        import locks
+
+        self.store.create("work")
+        with mock.patch.object(locks, "lease_holders", return_value=None), \
+                mock.patch.object(locks, "lease_registry_state_issue", return_value=None), \
+                mock.patch.object(locks, "is_locked", return_value=True):
+            status, message = doctor._check_locks(self.store, self._ctx())
+        self.assertEqual(status, doctor.WARN)
+        self.assertIn("live sessions: work", message)
+        self.assertNotIn("unreadable", message)
 
     def _secret_for(self, email):
         jwt = _make_jwt({"email": email})
@@ -786,6 +840,36 @@ class TestIsolationRecovery(BaseCase):
         self.assertEqual(deleted, [])
         self.assertTrue(corrupt_dir.exists())
 
+    def test_fix_skips_keychain_slot_when_profile_directory_is_dangling_junction_or_link(self):
+        profile_dir = self.store.profile_dir("junction_profile")
+        fake_path = Path("/fake/login.keychain-db")
+        deleted = []
+
+        def fake_delete_slot(service, keychain_path=None):
+            deleted.append(service)
+
+        real_is_link = platforms.is_link
+
+        def mock_is_link(path, strict=False):
+            if Path(path) == profile_dir:
+                return True
+            return real_is_link(path, strict=strict)
+
+        with mock.patch.object(keychain, "supported", return_value=True), \
+                mock.patch.object(
+                    doctor.keychain, "_ensure_target_keychain", return_value=fake_path
+                ), \
+                mock.patch.object(
+                    doctor.keychain, "orphan_slots", return_value=["junction_profile"]
+                ), \
+                mock.patch.object(
+                    doctor.keychain, "delete_slot", side_effect=fake_delete_slot
+                ), \
+                mock.patch.object(platforms, "is_link", side_effect=mock_is_link):
+            doctor._apply_fixes(self.store, self._ctx())
+
+        self.assertEqual(deleted, [])
+
     def test_fix_rechecks_profile_directory_after_acquiring_its_lock(self):
         import locks
         original_try_lock = locks.try_mutation_lock
@@ -853,6 +937,7 @@ class TestIsolationRecovery(BaseCase):
         clears must not leave the run reporting FAIL/exit 1 for that item
         (regression for the double full-report / pre-fix-exit-code bug)."""
         import cli
+        import i18n
 
         config = self.store.load_config()
         config.default_profile = "ghost"
@@ -870,8 +955,9 @@ class TestIsolationRecovery(BaseCase):
             output.count("agydra doctor —"), 1,
             "the check-report banner must be printed exactly once:\n" + output,
         )
+        preview_header = i18n.t("cmd.doctor.fix_preview_header", default="fixable items:")
         self.assertEqual(
-            output.count("fixable items:"), 1,
+            output.count(preview_header), 1,
             "the fixable-items preview must be printed exactly once:\n" + output,
         )
         self.assertEqual(rc, 0)

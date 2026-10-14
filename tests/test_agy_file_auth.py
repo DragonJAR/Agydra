@@ -560,7 +560,8 @@ class TestRandomAgyFileLaunch(BaseCase):
             "id_token": _make_jwt({"email": "gamma@example.com"}),
         }).encode("utf-8")
 
-        def native_login(_argv, env):
+        def native_login(_argv, env, *, on_started):
+            on_started()
             self.assertEqual(env["AGYDRA_PROFILE"], "gamma")
             self.assertEqual(env[account.AGY_FILE_AUTH_ENV], account.AGY_FILE_AUTH_VALUE)
             self.assertFalse(locks.lease_holders(self.store, "gamma")[0].keychain)

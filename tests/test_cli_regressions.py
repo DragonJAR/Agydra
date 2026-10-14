@@ -29,7 +29,7 @@ import shutil as shutil_mod
 import ui
 from ui import strip_ansi
 
-from conftest import BaseCase, posix_only, run_python_child, write_fake_binary
+from conftest import BaseCase, posix_only, run_python_child, snapshot_tree, write_fake_binary
 
 
 class TestListColumnsAlignWithColor(BaseCase):
@@ -1019,12 +1019,15 @@ class TestDoctorFixDeclinedExitCode(BaseCase):
             fix = True
             force = False
 
-        from unittest import mock
+        before = snapshot_tree(self.store.root)
         with mock.patch("doctor.run_checks", return_value=0), \
              mock.patch("doctor._preview_fixables", return_value=["orphan overlay"]), \
+             mock.patch("doctor._apply_fixes") as apply_fixes, \
              mock.patch("cli._confirm", return_value=False):
             code = cli.cmd_doctor(self.store, Args())
             self.assertEqual(code, 1)
+            apply_fixes.assert_not_called()
+        self.assertEqual(snapshot_tree(self.store.root), before)
 
 
 class TestRenameKeepsProfileLockedThroughKeychainMigration(BaseCase):
@@ -1351,7 +1354,10 @@ os._exit(0)
                     self.assertEqual(old_slot.read_bytes(), b"source-credential")
                     self.assertEqual(new_slot.read_bytes(), b"stale-target-credential")
 
-                    with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
+                    with self.assertRaisesRegex(
+                        StoreError,
+                        "rename recovery is pending|profile rename was interrupted",
+                    ):
                         store.list()
                     self.assertTrue(store.rename_journal_path.is_file())
 
