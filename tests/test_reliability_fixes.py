@@ -14,7 +14,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from conftest import isolated_store_env
+from conftest import _make_jwt, isolated_store_env
 
 import keychain
 import models
@@ -201,7 +201,12 @@ class TestKeychainLoginCapture(unittest.TestCase):
         with isolated_store_env():
             store = Store()
             store.create("work")
-            fresh = b'{"token":{"access_token":"acc","refresh_token":"ref"},"auth_method":"consumer"}'
+            fresh = (
+                '{"token":{"access_token":"acc","refresh_token":"ref"},'
+                '"id_token":"'
+                + _make_jwt({"email": "work@example.com"})
+                + '","auth_method":"consumer"}'
+            ).encode("utf-8")
             with mock.patch.object(
                 keychain, "supported", return_value=True
             ), mock.patch.object(
@@ -217,12 +222,13 @@ class TestKeychainLoginCapture(unittest.TestCase):
                 keychain, "save_profile_slot"
             ) as save, mock.patch.object(
                 keychain, "fcntl"
-            ):
+            ), mock.patch("account.record_profile_email") as record_email:
                 with keychain.launch_guard(store, "work", capture=True):
                     pass
             save.assert_called_once_with(
                 store, "work", keychain.envelope_token_bytes(fresh)
             )
+            record_email.assert_called_once_with(store, "work")
 
 
 @unittest.skipIf(
@@ -487,15 +493,6 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
                 os.environ.pop("AGYDRA_AGY_BIN", None)
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    "The test mocks platforms.is_windows to False but the runner.run "
-    "internal path also queries subprocess.Popen with the runner's "
-    "real shell (PowerShell on Windows-2022) which produces different "
-    "behaviour than POSIX when launching the shebang script. The test "
-    "is a Linux contract; the Windows runner would need an alternative "
-    "execution path that doesn't reach subprocess.Popen at all.",
-)
 class TestLockHolderPidExecPathOnly(unittest.TestCase):
     """The lease registry names a process that is REALLY running for the
     session. On the plain ``execvpe`` path the pid survives the exec, so

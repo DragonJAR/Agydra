@@ -591,7 +591,12 @@ class TestStore(BaseCase):
         )
         self.assertTrue(store.rename_journal_path.is_file())
 
-        self.assertEqual([profile.name for profile in store.list()], ["new"])
+        with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
+            store.list()
+        self.assertTrue(store.rename_journal_path.is_file())
+
+        store.set_default("new")
+
         self.assertFalse(store.rename_journal_path.exists())
         self.assertEqual(len(handler_observations), 1)
         old_name, new_name, data, profile_locks, sequence_handle = handler_observations[0]
@@ -853,23 +858,24 @@ class TestStore(BaseCase):
         self.assertIsNotNone(reacquired)
         reacquired.release()
 
-    def test_corrupt_sequence_state_blocks_mutations_without_partial_changes(self):
+    def test_corrupt_sequence_state_is_quarantined_before_mutations(self):
         store = Store()
         store.create("first")
         store.create("second")
         store.sequence_state_path.write_text("{invalid", encoding="utf-8")
 
-        with self.assertRaisesRegex(StoreError, "sequence state"):
-            store.create("new")
-        with self.assertRaisesRegex(StoreError, "sequence state"):
-            store.rename("first", "renamed")
-        with self.assertRaisesRegex(StoreError, "sequence state"):
-            store.delete("second", backup=False)
+        created = store.create("new")
+        store.rename("first", "renamed")
+        store.delete("second", backup=False)
 
-        self.assertTrue(store.profile_dir("first").is_dir())
-        self.assertTrue(store.profile_dir("second").is_dir())
-        self.assertFalse(store.profile_dir("new").exists())
-        self.assertFalse(store.profile_dir("renamed").exists())
+        self.assertEqual(created.seq, 3)
+        self.assertFalse(store.profile_dir("first").exists())
+        self.assertFalse(store.profile_dir("second").exists())
+        self.assertTrue(store.profile_dir("new").is_dir())
+        self.assertTrue(store.profile_dir("renamed").is_dir())
+        quarantined = list(store.root.glob("profile-sequence.json.corrupt-*"))
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].read_text(encoding="utf-8"), "{invalid")
 
     def test_sequence_state_write_failure_prevents_partial_mutations(self):
         store = Store()
@@ -1748,6 +1754,10 @@ store.rename("old", "new")
                 self.assertEqual(result.returncode, exit_code, result.stderr)
 
                 reopened = Store(root=root)
+                with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
+                    reopened.list()
+                self.assertTrue(reopened.rename_journal_path.is_file())
+                reopened.set_default(expected_name)
                 profiles = reopened.list()
                 self.assertEqual([(item.name, item.seq) for item in profiles], [(expected_name, profile.seq)])
                 self.assertEqual(reopened.unreadable_profiles(), [])
@@ -1782,8 +1792,11 @@ store.rename("old", "new")
         }
         journal_before = store.rename_journal_path.read_bytes()
 
-        with self.assertRaisesRegex(StoreError, "duplicate positive profile sequence 1"):
+        with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
             store.list()
+
+        with self.assertRaisesRegex(StoreError, "duplicate positive profile sequence 1"):
+            store.set_default("new")
 
         self.assertTrue(store.rename_journal_path.is_file())
         self.assertEqual(store.rename_journal_path.read_bytes(), journal_before)
@@ -1814,11 +1827,12 @@ store.rename("old", "new")
             self.assertEqual(unreadable, [])
             self.assertTrue((overlay / "marker").is_file())
 
-            with self.assertRaisesRegex(StoreError, "overlay"):
+            with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
                 store.list()
             self.assertTrue(store.rename_journal_path.is_file())
             self.assertTrue(store.profile_dir("new").is_dir())
 
+        store.set_default("new")
         profiles = store.list()
         self.assertEqual([(profile.name, profile.seq) for profile in profiles], [("new", 1)])
         self.assertEqual(store.default_name(), "new")
@@ -1863,7 +1877,7 @@ Store(root=root).rename("old", "new")
         try:
             self.assertTrue(ready.wait(5), "renamer did not reach metadata boundary")
             self.assertTrue(store.rename_journal_path.is_file())
-            with self.assertRaisesRegex(StoreError, "live session"):
+            with self.assertRaisesRegex(StoreError, "retry reading profiles"):
                 store.list()
             self.assertTrue(store.rename_journal_path.is_file())
             self.assertTrue(store.profile_meta_path("new").is_file())
@@ -1877,6 +1891,7 @@ Store(root=root).rename("old", "new")
                 process.kill()
                 returncode = process.wait(timeout=5)
         self.assertEqual(returncode, 0, output)
+        store.set_default("new")
         profiles = store.list()
         self.assertEqual([(item.name, item.seq) for item in profiles], [("new", 1)])
         self.assertEqual(store.default_name(), "new")
@@ -1953,7 +1968,7 @@ Store(root=root).rename("old", "new")
         self.assertFalse(store.profile_dir("new").exists())
         self.assertTrue(store.rename_journal_path.is_file())
 
-    def test_read_recovers_rename_journal_created_after_preflight(self):
+    def test_read_reports_retry_when_rename_journal_appears_after_preflight(self):
         import locks
 
         store = Store()
@@ -1982,9 +1997,13 @@ Store(root=root).rename("old", "new")
         with unittest.mock.patch.object(
             locks, "try_sequence_lock", side_effect=crash_like_rename_before_sequence_acquire
         ):
-            profile = store.get("new")
+            with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
+                store.get("new")
 
         self.assertTrue(injected)
+        self.assertTrue(store.rename_journal_path.is_file())
+        store.set_default("new")
+        profile = store.get("new")
         self.assertEqual((profile.name, profile.seq), ("new", 1))
         self.assertEqual(store.default_name(), "new")
         self.assertFalse(store.rename_journal_path.exists())
@@ -2464,6 +2483,66 @@ class TestStoreRmtreeAndScan(BaseCase):
         (self.store.claude_config_root / "99").mkdir()
         orphans = self.store.claude_config_orphans([])
         self.assertEqual(orphans, ["99"])
+
+    def test_profile_not_found_message_is_shared_and_localized(self):
+        import i18n
+
+        original = i18n._get_active()
+        try:
+            i18n._set_active("en")
+            english = store_mod._profile_missing_message("missing")
+            self.assertEqual(
+                english,
+                "profile 'missing' does not exist (see: agydra list)",
+            )
+            i18n._set_active("es")
+            spanish = store_mod._profile_missing_message("missing")
+        finally:
+            i18n._set_active(original)
+        self.assertEqual(
+            spanish,
+            "el perfil 'missing' no existe (consulta: agydra list)",
+        )
+
+    def test_round_five_a_rename_launch_errors_are_localized(self):
+        import i18n
+
+        original = i18n._get_active()
+        try:
+            i18n._set_active("es")
+            self.store.rename_journal_path.write_text("{invalid", encoding="utf-8")
+            with self.assertRaises(StoreError) as unreadable:
+                self.store._recover_pending_rename(
+                    target_name="old", for_launch=True
+                )
+            self.assertIn("no se inició el lanzamiento", str(unreadable.exception))
+            self.assertIn("conservar su contenido", str(unreadable.exception))
+
+            self.store.rename_journal_path.unlink()
+            self.store.create("old")
+            self.store.create("new")
+            self.store._write_rename_journal("old", "new", False)
+            with self.assertRaises(StoreError) as conflict:
+                self.store._recover_pending_rename(
+                    target_name="old", for_launch=True
+                )
+            self.assertIn("estado de perfil conflictivo", str(conflict.exception))
+            self.assertIn("se conservaron el diario y los datos", str(conflict.exception))
+        finally:
+            i18n._set_active(original)
+
+    def test_invalid_engine_error_is_localized(self):
+        import i18n
+
+        original = i18n._get_active()
+        try:
+            i18n._set_active("es")
+            with self.assertRaises(StoreError) as error:
+                self.store.create("profile", engine="invalid")
+        finally:
+            i18n._set_active(original)
+        self.assertIn("motor desconocido 'invalid'", str(error.exception))
+        self.assertIn("motores disponibles:", str(error.exception))
 
 
 if __name__ == "__main__":

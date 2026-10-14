@@ -162,8 +162,8 @@ class TestSyncProfileEmailKeychainPoisoning(unittest.TestCase):
     every non-busy profile. A profile's `.secret` backup swapped to hold a
     DIFFERENT identity's credential must never launder itself into
     ``profile.email`` through this path -- that would also poison
-    ``keychain._known_identity``'s trust anchor, letting a corrupted
-    `.secret` masquerade as "already known" on the very next launch/doctor
+    preferred ``profile.email`` trust anchor, letting a corrupted `.secret`
+    masquerade as "already known" on the very next launch/doctor
     check."""
 
     def _write_secret(self, store, name, email):
@@ -210,7 +210,7 @@ class TestSyncProfileEmailKeychainPoisoning(unittest.TestCase):
             self.assertEqual(refreshed.email, "alice@example.com")
 
             with simulated_macos_keychain():
-                known = keychain._known_identity(store, "alice", include_secret=False)
+                known = account.anchor_for(store, "alice", include_secret=False)
                 secret = keychain.load_profile_slot(store, "alice")
                 candidate = keychain._secret_identity(secret)
 

@@ -322,15 +322,297 @@ class TestUsageFinishesPendingRename(BaseCase):
         with mock.patch.object(usage, "query_profile_usage", side_effect=fake_query), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             status = cli.main(argv)
-        return status, err.getvalue()
+        return status, out.getvalue(), err.getvalue()
 
-    def test_usage_table_finishes_a_pending_rename_without_a_manual_step(self):
-        status, err = self._usage(["usage"])
-        self.assertEqual(status, 0, err)
-        self.assertNotIn("retry in a moment", err)
-        self.assertFalse(self.store.rename_journal_path.exists())
+    def _assert_read_reports_retry_and_next_command_heals(self, argv):
+        journal_before = self.store.rename_journal_path.read_bytes()
+        status, out, err = self._usage(argv)
+        report = out + err
+        self.assertEqual(status, 1, report)
+        self.assertIn("profile rename recovery is pending", report)
+        self.assertIn("retry in a moment", report)
+        self.assertEqual(self.store.rename_journal_path.read_bytes(), journal_before)
 
-    def test_usage_detail_finishes_a_pending_rename_without_a_manual_step(self):
-        status, err = self._usage(["usage", "other"])
-        self.assertNotIn("retry in a moment", err)
+        with mock.patch.object(cli, "Store", return_value=self.store):
+            with mock.patch("sys.stdout", new_callable=__import__("io").StringIO):
+                status = cli.main(["create", "recovered", "--engine", "codex"])
+        self.assertEqual(status, 0)
         self.assertFalse(self.store.rename_journal_path.exists())
+        status, out, err = self._usage(argv)
+        self.assertNotIn("retry in a moment", out + err)
+
+    def test_usage_table_reports_retry_then_next_command_heals(self):
+        self._assert_read_reports_retry_and_next_command_heals(["usage"])
+
+    def test_usage_detail_reports_retry_then_next_command_heals(self):
+        self._assert_read_reports_retry_and_next_command_heals(["usage", "other"])
+
+
+class TestPendingRenameCommandRecovery(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("old", engine="codex")
+        self.store.create("other", engine="codex")
+        self.store._write_rename_journal("old", "new", True)
+        self.store.profile_dir("old").rename(self.store.profile_dir("new"))
+
+    def _launch(self, argv, random_pick):
+        import contextlib
+        import io
+
+        def build_after_recovery(store, *_args, **_kwargs):
+            self.assertFalse(store.rename_journal_path.exists())
+            self.assertEqual(store.get("new").name, "new")
+            return mock.sentinel.plan
+
+        with mock.patch.object(cli, "Store", return_value=self.store), mock.patch.object(
+            cli.runner, "build_plan", side_effect=build_after_recovery
+        ) as build_plan, mock.patch.object(
+            cli.runner, "run", return_value=0
+        ) as run, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            io.StringIO()
+        ):
+            result = cli.main(argv)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(build_plan.called)
+        self.assertTrue(run.called)
+        self.assertFalse(self.store.rename_journal_path.exists())
+        if random_pick:
+            self.assertTrue(build_plan.call_args.kwargs["random_pick"])
+        else:
+            self.assertEqual(build_plan.call_args.kwargs["flag_ref"], "new")
+
+    def test_explicit_launch_recovers_before_profile_resolution(self):
+        self._launch(["--profile", "new"], random_pick=False)
+
+    def test_random_launch_recovers_before_profile_resolution(self):
+        self._launch(["--random"], random_pick=True)
+
+    def test_default_command_recovers_before_resolving_reference(self):
+        import contextlib
+        import io
+
+        with mock.patch.object(cli, "Store", return_value=self.store), contextlib.redirect_stdout(
+            io.StringIO()
+        ), contextlib.redirect_stderr(io.StringIO()):
+            result = cli.main(["default", "new"])
+
+        self.assertEqual(result, 0)
+        self.assertFalse(self.store.rename_journal_path.exists())
+        self.assertEqual(self.store.default_name(), "new")
+
+    def test_list_status_and_dry_run_report_retry_without_recovery(self):
+        import contextlib
+        import io
+
+        journal_before = self.store.rename_journal_path.read_bytes()
+        for argv in (
+            ["list"],
+            ["status", "new"],
+            ["default"],
+            ["--profile", "new", "--dry-run"],
+        ):
+            with self.subTest(argv=argv), mock.patch.object(
+                cli, "Store", return_value=self.store
+            ), contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(
+                io.StringIO()
+            ) as err:
+                result = cli.main(argv)
+
+            self.assertEqual(result, 1)
+            self.assertIn("retry in a moment", out.getvalue() + err.getvalue())
+            self.assertEqual(self.store.rename_journal_path.read_bytes(), journal_before)
+        self.assertTrue(self.store.rename_journal_path.exists())
+
+
+class TestUnsafeRenameLaunchRecovery(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.store = Store()
+        self.store.create("old", engine="codex")
+        self.store.create("new", engine="codex")
+        self.store.create("unrelated", engine="codex")
+        self.store._write_rename_journal("old", "new", True)
+
+    def _run_launch(self, argv, build_plan):
+        import contextlib
+        import io
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(cli, "Store", return_value=self.store), mock.patch.object(
+            cli.runner, "build_plan", side_effect=build_plan
+        ) as plan, mock.patch.object(cli.runner, "run", return_value=0) as run, contextlib.redirect_stdout(
+            out
+        ), contextlib.redirect_stderr(err):
+            result = cli.main(argv)
+        return result, out.getvalue() + err.getvalue(), plan, run
+
+    def test_malformed_journal_blocks_unrelated_launch_then_mutation_repairs_it(self):
+        import contextlib
+        import io
+
+        raw = b"{broken journal"
+        self.store.rename_journal_path.write_bytes(raw)
+        result, output, plan, run = self._run_launch(
+            ["--profile", "unrelated"], lambda *_args, **_kwargs: mock.sentinel.plan
+        )
+
+        self.assertEqual(result, 1, output)
+        self.assertIn("launch was not started", output)
+        self.assertIn("ordinary mutating command", output)
+        plan.assert_not_called()
+        run.assert_not_called()
+        self.assertEqual(self.store.rename_journal_path.read_bytes(), raw)
+        self.assertTrue(self.store.profile_dir("unrelated").is_dir())
+        self.assertFalse(list(self.store.root.glob("profile-rename.json.corrupt-*")))
+
+        with mock.patch.object(cli, "Store", return_value=self.store), contextlib.redirect_stdout(
+            io.StringIO()
+        ), contextlib.redirect_stderr(io.StringIO()):
+            result = cli.main(["create", "healed", "--engine", "codex"])
+
+        self.assertEqual(result, 0)
+        self.assertFalse(self.store.rename_journal_path.exists())
+        quarantines = list(self.store.root.glob("profile-rename.json.corrupt-*"))
+        self.assertEqual(len(quarantines), 1)
+        self.assertEqual(quarantines[0].read_bytes(), raw)
+
+    def test_conflicting_journal_blocks_launches_of_both_ambiguous_names(self):
+        import store as store_module
+
+        journal_before = self.store.rename_journal_path.read_bytes()
+        for directories_present in (True, False):
+            if not directories_present:
+                for name in ("old", "new"):
+                    store_module.rmtree(self.store.profile_dir(name))
+            for name in ("old", "new"):
+                with self.subTest(directories_present=directories_present, name=name):
+                    result, output, plan, run = self._run_launch(
+                        ["--profile", name], lambda *_args, **_kwargs: mock.sentinel.plan
+                    )
+
+                    self.assertEqual(result, 1, output)
+                    self.assertIn("conflicting profile state", output)
+                    plan.assert_not_called()
+                    run.assert_not_called()
+                    self.assertEqual(
+                        self.store.rename_journal_path.read_bytes(), journal_before
+                    )
+                    self.assertEqual(self.store.profile_dir("old").is_dir(), directories_present)
+                    self.assertEqual(self.store.profile_dir("new").is_dir(), directories_present)
+
+    def test_conflicting_journal_allows_unrelated_launch_without_state_changes(self):
+        import store as store_module
+
+        def build_unrelated(store, *_args, **_kwargs):
+            profiles, _unreadable = store.scan()
+            self.assertEqual({profile.name for profile in profiles}, {"unrelated"})
+            self.assertEqual(store.get("unrelated").name, "unrelated")
+            return mock.sentinel.plan
+
+        for directories_present in (True, False):
+            if not directories_present:
+                for name in ("old", "new"):
+                    store_module.rmtree(self.store.profile_dir(name))
+            journal_before = self.store.rename_journal_path.read_bytes()
+            with self.subTest(directories_present=directories_present):
+                result, output, plan, run = self._run_launch(
+                    ["--profile", "unrelated"], build_unrelated
+                )
+
+                self.assertEqual(result, 0, output)
+                plan.assert_called_once()
+                run.assert_called_once_with(
+                    mock.sentinel.plan, store=self.store, dry_run=False
+                )
+                self.assertEqual(
+                    self.store.rename_journal_path.read_bytes(), journal_before
+                )
+                self.assertEqual(
+                    self.store.profile_dir("old").is_dir(), directories_present
+                )
+                self.assertEqual(
+                    self.store.profile_dir("new").is_dir(), directories_present
+                )
+                with self.assertRaisesRegex(
+                    StoreError, "profile rename recovery is pending"
+                ):
+                    self.store.scan()
+                self.assertFalse(
+                    list(self.store.root.glob("profile-rename.json.corrupt-*"))
+                )
+
+    def test_conflicting_journal_allows_random_launch_for_unrelated_profile(self):
+        import sys
+
+        selected = []
+
+        def run(plan, **_kwargs):
+            selected.append(plan.profile)
+            return 0
+
+        journal_before = self.store.rename_journal_path.read_bytes()
+        with mock.patch.object(cli, "Store", return_value=self.store), mock.patch(
+            "account.passive_auth_state", return_value="authenticated"
+        ), mock.patch.object(cli.runner, "run", side_effect=run):
+            result = cli.main(["-r", "--binary", sys.executable])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(selected, ["unrelated"])
+        self.assertEqual(self.store.rename_journal_path.read_bytes(), journal_before)
+        self.assertTrue(self.store.profile_dir("old").is_dir())
+        self.assertTrue(self.store.profile_dir("new").is_dir())
+
+    def test_direct_public_recovery_never_leaves_launch_filter_installed(self):
+        with self.assertRaises(TypeError):
+            self.store.recover_pending_rename(
+                target_name="unrelated", for_launch=True
+            )
+
+        with self.assertRaises(StoreError):
+            self.store.recover_pending_rename(target_name="unrelated")
+
+        self.assertIsNone(self.store._launch_rename_conflict.get())
+        with self.assertRaises(StoreError):
+            self.store.scan()
+
+    def test_conflicting_launch_scope_is_context_local_across_threads(self):
+        from queue import Queue
+        from threading import Thread
+
+        outcomes = Queue()
+
+        def scan_from_another_thread():
+            try:
+                outcomes.put(self.store.scan())
+            except Exception as exc:
+                outcomes.put(exc)
+
+        with self.store.launch_recovery_scope(target_name="unrelated"):
+            worker = Thread(target=scan_from_another_thread)
+            worker.start()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        outcome = outcomes.get_nowait()
+        self.assertIsInstance(outcome, StoreError)
+        self.assertIn("rename", str(outcome))
+
+    def test_conflicting_launch_scope_resets_after_exception(self):
+        with self.assertRaisesRegex(RuntimeError, "scope failure"):
+            with self.store.launch_recovery_scope(target_name="unrelated"):
+                self.assertEqual(
+                    {profile.name for profile in self.store.scan()[0]},
+                    {"unrelated"},
+                )
+                with self.assertRaises(StoreError):
+                    self.store.get_readonly("old")
+                with self.assertRaises(StoreError):
+                    self.store.get("new")
+                raise RuntimeError("scope failure")
+
+        self.assertIsNone(self.store._launch_rename_conflict.get())
+        with self.assertRaises(StoreError):
+            self.store.scan()

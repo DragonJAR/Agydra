@@ -19,6 +19,7 @@ from unittest.mock import patch
 from conftest import BaseCase
 import account
 import cli
+import locks
 import usage
 import usage_snapshot
 from store import Store, StoreError
@@ -389,10 +390,12 @@ class TestClaudeCli(BaseCase):
 
         live.assert_called_once()
         self.assertEqual(live.call_args.args[1], "cc")
+        snapshot_lock = f"locks/.usage-snapshot{locks.LOCK_SUFFIX}"
         changed = {
             name
             for name in before.keys() | after.keys()
             if before.get(name) != after.get(name)
+            and name != snapshot_lock
         }
         self.assertEqual(changed, {usage_snapshot.SNAPSHOT_FILENAME})
 

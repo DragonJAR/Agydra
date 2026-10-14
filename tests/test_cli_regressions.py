@@ -1203,7 +1203,7 @@ os._exit(0)
         ), mock.patch.object(
             locks, "try_sequence_lock", side_effect=observe_sequence_lock
         ), contextlib.redirect_stdout(io.StringIO()):
-            result = cli.main(["list"])
+            result = cli.main(["create", "recovery-probe", "--engine", "codex"])
 
         self.assertEqual(result, 0)
         expected_lock_order = [
@@ -1268,7 +1268,7 @@ os._exit(0)
                 reopened = self._recover_through_cli(root, observed_locks)
                 self.assertEqual(
                     [(profile.name, profile.seq) for profile in reopened.list()],
-                    [("new", 1)],
+                    [("new", 1), ("recovery-probe", 2)],
                 )
                 self.assertEqual(reopened.default_name(), "new")
                 self.assertFalse(reopened.rename_journal_path.exists())
@@ -1297,6 +1297,7 @@ os._exit(0)
         self.assertEqual(
             read_json_object(reopened.profile_meta_path("new"))["name"], "new"
         )
+        self.assertEqual(reopened.get("recovery-probe").engine, "codex")
         self.assertEqual(reopened.default_name(), "new")
         self.assertFalse(reopened.rename_journal_path.exists())
         self.assertFalse(keychain.slot_backup_path(reopened, "old").exists())
@@ -1354,7 +1355,7 @@ os._exit(0)
                     self.assertEqual(old_slot.read_bytes(), b"source-credential")
                     self.assertEqual(new_slot.read_bytes(), b"stale-target-credential")
 
-                    with self.assertRaisesRegex(StoreError, "journal retained"):
+                    with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
                         store.list()
                     self.assertTrue(store.rename_journal_path.is_file())
 
@@ -1363,7 +1364,11 @@ os._exit(0)
                             keychain, "_ensure_target_keychain", return_value=self.fake_home
                         ), \
                         mock.patch.object(keychain, "delete_slot"):
-                    self.assertEqual([profile.name for profile in store.list()], ["new"])
+                    store.create("recovery-probe", engine="codex")
+                    self.assertEqual(
+                        [profile.name for profile in store.list()],
+                        ["new", "recovery-probe"],
+                    )
 
                 self.assertFalse(store.rename_journal_path.exists())
                 self.assertFalse(old_slot.exists())

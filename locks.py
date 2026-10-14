@@ -18,11 +18,13 @@ The lock lives exactly as long as the session it protects:
   region unreliable enough to skip rather than guess).
 
 Beyond the flock, the SAME file now carries a holders registry: a JSON
-list of ``{"pid", "start", "keychain"}`` entries describing every live session that
-joined the profile. ``lease_holders`` is the single parser for that
+list of session records and temporary reader records. ``lease_holders`` is
+the single parser for that
 content (legacy PID-only files parse as one token-less holder), sessions
 join via ``acquire_lease`` and leave via ``release_lease`` under a brief
-exclusive flock, and liveness comes from ``platforms.process_alive`` plus
+exclusive flock. Readers register and unregister under that same brief lock;
+their entries block mutations without counting as sessions or Keychain
+participants. Liveness comes from ``platforms.process_alive`` plus
 ``platforms.process_start_token`` so a crashed session's entry is pruned
 on the next read instead of lingering. ``is_locked`` reports busy when
 EITHER the flock is held (store mutations, legacy sessions) OR the
@@ -93,16 +95,24 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, NamedTuple, Optional
+from typing import Callable, List, Optional, TypeVar
 
 import platforms
+
+def json_loads_utf8(raw: bytes) -> object:
+    """Decode UTF-8 JSON, accepting the BOM some Windows tools add."""
+    return json.loads(raw.decode("utf-8-sig"))
+
 
 LOCK_DIR_NAME = "locks"
 LOCK_SUFFIX = ".lock"
 _SEQUENCE_LOCK_NAME = ".profile-sequence.lock"
+_WaitResult = TypeVar("_WaitResult")
 
 if platforms.is_windows():
     import msvcrt
@@ -121,6 +131,7 @@ if platforms.is_windows():
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         except OSError:
             pass
+
 else:
     import fcntl
 
@@ -136,7 +147,6 @@ else:
             fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
             pass
-
 
 class LockError(OSError):
     """The lock could not be managed at all (unwritable dir, AV blocking...).
@@ -204,6 +214,26 @@ class LockHandle:
         self._recorded_pid = True
 
 
+class ReadLeaseHandle:
+    __slots__ = ("_release_callback", "_released")
+
+    def __init__(self, release_callback: Callable[[], None]) -> None:
+        self._release_callback = release_callback
+        self._released = False
+
+    def __enter__(self) -> "ReadLeaseHandle":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.release()
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._release_callback()
+        self._released = True
+
+
 def lock_dir(store) -> Path:
     return store.root / LOCK_DIR_NAME
 
@@ -216,19 +246,28 @@ def sequence_lock_path(store) -> Path:
     return lock_dir(store) / _SEQUENCE_LOCK_NAME
 
 
-class Holder(NamedTuple):
-    """One live session registered on a profile's lease.
+@dataclass(frozen=True)
+class Holder:
+    """One live session or read operation registered on a profile.
 
     ``start`` is the opaque ``platforms.process_start_token`` of ``pid``
     when it could be read, else None (legacy entries, or unreadable
     identity). A None start never prunes the holder on identity grounds —
-    only a dead pid does. ``keychain`` is shared-slot participation; every
-    holder still protects mutations and counts toward session limits.
+    only a dead pid does. ``keychain`` is shared-slot participation. Reader
+    entries protect mutations but do not count as sessions.
     """
 
     pid: int
     start: Optional[str]
     keychain: bool = True
+    kind: str = "session"
+    reader_id: Optional[str] = None
+    keychain_explicit: bool = field(default=False, compare=False)
+    start_explicit: bool = field(default=False, compare=False)
+
+    @property
+    def is_reader(self) -> bool:
+        return self.kind == "reader"
 
 
 _OWN_START_TOKEN: Optional[str] = None
@@ -248,7 +287,7 @@ def _parse_holders(raw: bytes) -> Optional[List[Holder]]:
     """THE single parser of lease-file content (DRY: nothing else parses).
 
     Three accepted shapes: empty → no holders; legacy PID-only (digits) →
-    one token-less holder; JSON ``{"holders": [{"pid", "start"}]}``. Any
+    one token-less holder; JSON session records with optional reader records.
     Missing authentication markers retain legacy Keychain membership.
     Other content returns None = "undecodable": both readers and writers
     fail closed without overwriting potentially live holders.
@@ -265,7 +304,7 @@ def _parse_holders(raw: bytes) -> Optional[List[Holder]]:
         except ValueError:
             return None
     try:
-        data = json.loads(nul_stripped.decode("utf-8"))
+        data = json_loads_utf8(nul_stripped)
     except (RecursionError, ValueError, UnicodeDecodeError):
         return None
     if not isinstance(data, dict) or not isinstance(data.get("holders"), list):
@@ -277,13 +316,34 @@ def _parse_holders(raw: bytes) -> Optional[List[Holder]]:
         pid = entry.get("pid")
         start = entry.get("start")
         keychain = entry.get("keychain", True)
+        keychain_explicit = "keychain" in entry
+        start_explicit = "start" in entry
+        kind = entry.get("kind", "session")
+        reader_id = entry.get("reader_id")
         if not isinstance(pid, int) or isinstance(pid, bool):
             return None
         if start is not None and not isinstance(start, str):
             return None
         if not isinstance(keychain, bool):
             return None
-        holders.append(Holder(pid, start, keychain))
+        if kind not in ("session", "reader"):
+            return None
+        if kind == "reader":
+            if not isinstance(reader_id, str) or not reader_id:
+                return None
+        elif reader_id is not None:
+            return None
+        holders.append(
+            Holder(
+                pid,
+                start,
+                keychain,
+                kind,
+                reader_id,
+                keychain_explicit,
+                start_explicit,
+            )
+        )
     return holders
 
 
@@ -328,14 +388,20 @@ def _read_all(fd: int) -> bytes:
 def _write_in_place(fd: int, payload: bytes) -> None:
     """Write arbitrary bytes to an open lock or registry descriptor.
 
-    Seeks to the beginning, writes all bytes in a loop, then truncates to the
-    exact payload length. By writing before truncating, a failed write leaves
-    previous content in place (fail-closed) rather than an empty file that
-    would unlock a busy profile. Raises LockError on any OS or short write error.
+    When shrinking, pads the new JSON payload with whitespace to the old file
+    length before truncating. A crash after the write and before the truncate
+    therefore leaves a complete JSON document with harmless trailing spaces.
+    Raises LockError on any OS or short write error.
     """
     try:
+        old_size = os.fstat(fd).st_size
+        durable_payload = (
+            payload + b" " * (old_size - len(payload))
+            if len(payload) < old_size
+            else payload
+        )
         os.lseek(fd, 0, os.SEEK_SET)
-        view = memoryview(payload)
+        view = memoryview(durable_payload)
         while view:
             written = os.write(fd, view)
             if written <= 0:
@@ -347,25 +413,19 @@ def _write_in_place(fd: int, payload: bytes) -> None:
 
 
 def _write_holders(fd: int, holders: List[Holder]) -> None:
-    payload = json.dumps(
-        {"holders": [{"pid": h.pid, "start": h.start, "keychain": h.keychain} for h in holders]}
-    ).encode("utf-8")
+    entries = []
+    for holder in holders:
+        entry = {"pid": holder.pid}
+        if holder.start_explicit:
+            entry["start"] = holder.start
+        if holder.keychain_explicit or holder.is_reader:
+            entry["keychain"] = holder.keychain
+        if holder.is_reader:
+            entry["kind"] = "reader"
+            entry["reader_id"] = holder.reader_id
+        entries.append(entry)
+    payload = json.dumps({"holders": entries}).encode("utf-8")
     _write_in_place(fd, payload)
-
-
-def _lock_ex_brief(fd: int) -> bool:
-    """Brief exclusive acquire with bounded retry for micro-contentions.
-
-    The retry covers the (sub-millisecond, by contract) window where a
-    store mutation or a sibling registry update holds the flock. It is a
-    bounded recovery, not a polling loop: three attempts, 10ms apart, then
-    fail closed.
-    """
-    for attempt in range(_MAX_LOCK_ATTEMPTS):
-        if _try_lock_fd(fd):
-            return True
-        time.sleep(0.01)
-    return False
 
 
 def _lock_read_brief(fd: int) -> bool:
@@ -384,6 +444,64 @@ def _lock_read_brief(fd: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def lease_registry_state_issue(store, name: str) -> Optional[str]:
+    """Read-only validation shared by doctor and lease recovery policy."""
+    path = lock_path(store, name)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"cannot inspect {path} ({exc})"
+    if not stat.S_ISREG(info.st_mode) or platforms.is_link(path, strict=True):
+        return f"{path} is not a regular file"
+    flags = os.O_RDWR if platforms.is_windows() else os.O_RDONLY
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        return f"cannot open {path} ({exc})"
+    locked = False
+    try:
+        locked = _lock_read_brief(fd)
+        if not locked:
+            return f"{path} is busy during validation"
+        if not _same_file(fd, path):
+            return f"{path} changed during validation"
+        try:
+            parsed = _parse_holders(_read_all(fd))
+        except OSError as exc:
+            return f"cannot read {path} ({exc})"
+        if parsed is None:
+            return f"{path} has an unreadable registry"
+        return None
+    finally:
+        if locked:
+            _unlock_fd(fd)
+        os.close(fd)
+
+
+def repair_unreadable_registry(store, name: str, path: Path, fd: int) -> bool:
+    """Quarantine and reset an unreadable registry while its flock is held."""
+    path = Path(path)
+    if path != lock_path(store, name) or not _same_file(fd, path):
+        return False
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or platforms.is_link(path, strict=True):
+            return False
+        raw = _read_all(fd)
+    except OSError as exc:
+        raise LockError(f"cannot inspect lease registry {path} ({exc})") from exc
+    if _parse_holders(raw) is not None:
+        return False
+    try:
+        store.quarantine_state_bytes(path, raw)
+    except Exception as exc:
+        raise LockError(f"cannot preserve unreadable lease registry {path} ({exc})") from exc
+    _write_holders(fd, [])
+    return True
 
 
 def lease_holders(store, name: str) -> Optional[List[Holder]]:
@@ -405,7 +523,9 @@ def lease_holders(store, name: str) -> Optional[List[Holder]]:
     except OSError:
         return None
     try:
-        if not _lock_read_brief(fd) or not _same_file(fd, path):
+        if not _lock_read_brief(fd):
+            return None
+        if not _same_file(fd, path):
             _unlock_fd(fd)
             return None
         try:
@@ -416,7 +536,7 @@ def lease_holders(store, name: str) -> Optional[List[Holder]]:
         os.close(fd)
     if parsed is None:
         return None
-    return _prune_holders(parsed)
+    return [holder for holder in _prune_holders(parsed) if not holder.is_reader]
 
 
 def lease_keychain_holders(store, name: str) -> Optional[List[Holder]]:
@@ -425,8 +545,7 @@ def lease_keychain_holders(store, name: str) -> Optional[List[Holder]]:
     return None if holders is None else [holder for holder in holders if holder.keychain]
 
 
-_LEASE_POLL_INTERVAL_S = 0.05
-POLL_INTERVAL_S = _LEASE_POLL_INTERVAL_S
+POLL_INTERVAL_S = 0.05
 LEASE_PATIENCE_S = 2.0
 """Bounded polling interval for ``acquire_lease`` patience.
 
@@ -434,6 +553,21 @@ A launch waiting out a rare, brief store-mutation flock checks back this
 often: cheap enough not to spin, slow enough that a multi-second mutation
 makes only a handful of probes before the patience budget runs out.
 """
+
+
+def wait_for(
+    probe: Callable[[], Optional[_WaitResult]], patience_s: float
+) -> Optional[_WaitResult]:
+    """Repeat a nonblocking operation until it succeeds or patience expires."""
+    deadline = time.monotonic() + max(0.0, patience_s)
+    while True:
+        result = probe()
+        if result is not None:
+            return result
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(POLL_INTERVAL_S, remaining))
 
 
 def _open_lease_fd(store, name: str) -> int:
@@ -457,7 +591,7 @@ def acquire_lease(
     would swap the inode out from under concurrent flock holders.
 
     ``patience_s`` bounds how long a store-mutation flock on the same
-    inode is waited out (polling at :data:`_LEASE_POLL_INTERVAL_S` — a
+    inode is waited out (polling at :data:`POLL_INTERVAL_S` — a
     bounded recovery for a rare, brief maintenance window, not a spin).
     Raises LockError when the exclusive lock cannot be taken within the
     patience budget: the caller surfaces that as a busy failure, the same
@@ -477,39 +611,68 @@ def acquire_lease(
     if keychain is not None and not isinstance(keychain, bool):
         raise LockError("invalid lease authentication membership")
     path = lock_path(store, name)
-    deadline = time.monotonic() + patience_s
-    while True:
+
+    def join() -> Optional[int]:
         fd = _open_lease_fd(store, name)
         try:
             if platforms.is_windows() and os.fstat(fd).st_size == 0:
                 os.write(fd, b"\0")
-            if _lock_ex_brief(fd) and _same_file(fd, path):
-                try:
-                    parsed = _parse_holders(_read_all(fd))
-                    if parsed is None:
-                        raise LockError(f"cannot decode live lease registry {path}")
-                    holders = _prune_holders(parsed)
-                    previous = next((h for h in holders if h.pid == os.getpid()), None)
-                    membership = keychain if keychain is not None else (
-                        previous.keychain if previous is not None else True
+            if not _try_lock_fd(fd):
+                return None
+            try:
+                if not _same_file(fd, path):
+                    return None
+                parsed = _parse_holders(_read_all(fd))
+                if parsed is None:
+                    raise LockError(f"cannot decode live lease registry {path}")
+                holders = _prune_holders(parsed)
+                sessions = [holder for holder in holders if not holder.is_reader]
+                previous = next(
+                    (
+                        holder for holder in sessions
+                        if holder.pid == os.getpid()
+                    ),
+                    None,
+                )
+                membership = keychain if keychain is not None else (
+                    previous.keychain if previous is not None else True
+                )
+                membership_explicit = (
+                    keychain is not None
+                    or previous is None
+                    or previous.keychain_explicit
+                )
+                entry = Holder(
+                    os.getpid(),
+                    _own_start_token(),
+                    membership,
+                    "session",
+                    None,
+                    membership_explicit,
+                    True,
+                )
+                merged = [
+                    holder for holder in holders
+                    if holder.is_reader or holder.pid != entry.pid
+                ]
+                session_count = sum(not holder.is_reader for holder in merged)
+                if max_holders is not None and session_count >= max_holders:
+                    raise LeaseLimitError(
+                        f"profile {name!r} already has {session_count} live "
+                        f"session(s) (limit of {max_holders})"
                     )
-                    entry = Holder(os.getpid(), _own_start_token(), membership)
-                    merged = [h for h in holders if h.pid != entry.pid]
-                    if max_holders is not None and len(merged) >= max_holders:
-                        raise LeaseLimitError(
-                            f"profile {name!r} already has {len(merged)} live "
-                            f"session(s) (limit of {max_holders})"
-                        )
-                    merged.append(entry)
-                    _write_holders(fd, merged)
-                    return len(holders)
-                finally:
-                    _unlock_fd(fd)
+                merged.append(entry)
+                _write_holders(fd, merged)
+                return len(sessions)
+            finally:
+                _unlock_fd(fd)
         finally:
             os.close(fd)
-        if time.monotonic() >= deadline:
-            raise LockError(f"cannot acquire lease lock {path}")
-        time.sleep(_LEASE_POLL_INTERVAL_S)
+
+    joined = wait_for(join, patience_s)
+    if joined is None:
+        raise LockError(f"cannot acquire lease lock {path}")
+    return joined
 
 
 def release_lease(store, name: str, patience_s: float = 0.0) -> None:
@@ -524,32 +687,121 @@ def release_lease(store, name: str, patience_s: float = 0.0) -> None:
     is expected to treat an exception here as informational, not fatal.
     """
     path = lock_path(store, name)
-    try:
-        fd = os.open(path, os.O_RDWR)
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise LockError(f"cannot open lease {path} ({exc})") from exc
-    deadline = time.monotonic() + patience_s
-    while True:
+
+    def leave() -> Optional[bool]:
         try:
-            if _lock_ex_brief(fd):
-                try:
-                    parsed = _parse_holders(_read_all(fd))
-                    if parsed is None:
-                        raise LockError(f"cannot decode live lease registry {path}")
-                    holders = _prune_holders(parsed)
-                    remaining = [h for h in holders if h.pid != os.getpid()]
-                    _write_holders(fd, remaining)
-                    return
-                finally:
-                    _unlock_fd(fd)
+            fd = os.open(path, os.O_RDWR)
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            raise LockError(f"cannot open lease {path} ({exc})") from exc
+        try:
+            if not _try_lock_fd(fd):
+                return None
+            try:
+                if not _same_file(fd, path):
+                    return None
+                parsed = _parse_holders(_read_all(fd))
+                if parsed is None:
+                    raise LockError(f"cannot decode live lease registry {path}")
+                holders = _prune_holders(parsed)
+                remaining = [
+                    holder for holder in holders
+                    if holder.is_reader or holder.pid != os.getpid()
+                ]
+                _write_holders(fd, remaining)
+                return True
+            finally:
+                _unlock_fd(fd)
         finally:
             os.close(fd)
-        if time.monotonic() >= deadline:
-            raise LockError(f"cannot acquire lease lock {path}")
-        time.sleep(_LEASE_POLL_INTERVAL_S)
-        fd = os.open(path, os.O_RDWR)
+
+    if wait_for(leave, patience_s) is None:
+        raise LockError(f"cannot acquire lease lock {path}")
+
+
+def acquire_read_lease(
+    store, name: str, patience_s: float = 0.0
+) -> Optional[str]:
+    path = lock_path(store, name)
+
+    def join_reader() -> Optional[str]:
+        fd = _open_lease_fd(store, name)
+        try:
+            if platforms.is_windows() and os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            if not _try_lock_fd(fd):
+                return None
+            try:
+                if not _same_file(fd, path):
+                    return None
+                parsed = _parse_holders(_read_all(fd))
+                if parsed is None:
+                    raise LockError(f"cannot decode live lease registry {path}")
+                holders = _prune_holders(parsed)
+                reader_id = str(uuid.uuid4())
+                holders.append(
+                    Holder(
+                        os.getpid(),
+                        _own_start_token(),
+                        False,
+                        "reader",
+                        reader_id,
+                        True,
+                        True,
+                    )
+                )
+                _write_holders(fd, holders)
+                return reader_id
+            finally:
+                _unlock_fd(fd)
+        finally:
+            os.close(fd)
+
+    reader_id = wait_for(join_reader, patience_s)
+    return reader_id
+
+
+def release_read_lease(
+    store, name: str, reader_id: str, patience_s: float = LEASE_PATIENCE_S
+) -> None:
+    path = lock_path(store, name)
+
+    def leave_reader() -> Optional[bool]:
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            raise LockError(f"cannot open lease {path} ({exc})") from exc
+        try:
+            if not _try_lock_fd(fd):
+                return None
+            try:
+                if not _same_file(fd, path):
+                    return None
+                parsed = _parse_holders(_read_all(fd))
+                if parsed is None:
+                    raise LockError(f"cannot decode live lease registry {path}")
+                holders = _prune_holders(parsed)
+                remaining = [
+                    holder
+                    for holder in holders
+                    if not (
+                        holder.is_reader
+                        and holder.pid == os.getpid()
+                        and holder.reader_id == reader_id
+                    )
+                ]
+                _write_holders(fd, remaining)
+                return True
+            finally:
+                _unlock_fd(fd)
+        finally:
+            os.close(fd)
+
+    if wait_for(leave_reader, patience_s) is None:
+        raise LockError(f"cannot release profile read lease {path}")
 
 
 def normalize_usage_session_id(session_id: object) -> str:
@@ -674,25 +926,27 @@ def try_lock(store, name: str) -> Optional[LockHandle]:
     return _try_lock_path(lock_path(store, name), "session lock", True)
 
 
-def try_read_lock(store, name: str, patience_s: float = 0.0) -> Optional[LockHandle]:
-    """Take ``name``'s lock for a read-only operation (blocks mutations).
+def try_read_lock(
+    store, name: str, patience_s: float = 0.0
+) -> Optional[object]:
+    """Register a read-only operation without holding the session lock.
 
-    Unlike ``try_mutation_lock``, this does not check for registered live
-    holders, because live sessions only hold the flock briefly during
-    lease acquire/release and a read-only operation (such as export or
-    reading configuration to share) can safely coexist with a live session.
-    Holding this flock prevents concurrent mutations (delete, rename, or
-    destructive writes) from modifying the profile during the read.
+    An undecodable registry already blocks mutations. In that state the
+    reader holds the kernel lock for its lifetime so registry repair and
+    other mutations cannot race its snapshot.
     """
-    path = lock_path(store, name)
-    deadline = time.monotonic() + max(0.0, patience_s)
-    while True:
-        handle = _try_lock_path(path, "profile read lock", False)
-        if handle is not None:
-            return handle
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(POLL_INTERVAL_S)
+    try:
+        reader_id = acquire_read_lease(store, name, patience_s=patience_s)
+    except LockError:
+        return wait_for(
+            lambda: _try_lock_path(
+                lock_path(store, name), "profile read lock", False
+            ),
+            patience_s,
+        )
+    if reader_id is None:
+        return None
+    return ReadLeaseHandle(lambda: release_read_lease(store, name, reader_id))
 
 
 MUTATION_LOCK_PATIENCE_S = 2.0
@@ -703,34 +957,65 @@ def try_mutation_lock(
 ) -> Optional[LockHandle]:
     """Take ``name``'s lock for a store mutation, refusing live leased sessions.
 
-    Sessions join through the holders registry and only hold the flock
-    briefly, so a free flock does not prove the profile is idle. This takes
+    Sessions and readers join through the holders registry and only hold the
+    flock briefly, so a free flock does not prove the profile is idle. This takes
     the same flock as ``try_lock`` (waiting up to ``patience_s`` if flock-busy)
     but never inherits it and never truncates the file (that would wipe the
     registry), then reads the registry through the SAME locked fd: a joiner
     either registered before this read (seen here) or has to wait for the
     flock this handle holds, so there is no check-then-act gap. Returns None
-    immediately when a live holder is registered or the registry cannot be
-    decoded or read (fail closed). Returns None if the flock remains busy after
+    immediately when a live session or reader is registered or the registry
+    cannot be decoded or read (fail closed). Returns None if the flock remains busy after
     patience expires. Raises LockError only when the lock cannot be managed.
     """
-    path = lock_path(store, name)
-    deadline = time.monotonic() + max(0.0, patience_s)
-    while True:
+    def inspect() -> Optional[object]:
+        path = lock_path(store, name)
         handle = _try_lock_path(path, "session lock", False)
-        if handle is not None:
-            try:
-                parsed = _parse_holders(_read_all(handle._fd))
-                if parsed is None or _prune_holders(parsed):
-                    handle.release()
-                    return None
-            except OSError:
-                handle.release()
-                return None
-            return handle
-        if time.monotonic() >= deadline:
+        if handle is None:
             return None
-        time.sleep(POLL_INTERVAL_S)
+        try:
+            parsed = _parse_holders(_read_all(handle._fd))
+            if parsed is None or _prune_holders(parsed):
+                handle.release()
+                return False
+            return handle
+        except OSError:
+            handle.release()
+            return False
+
+    result = wait_for(inspect, patience_s)
+    return result if isinstance(result, LockHandle) else None
+
+
+def reset_unreadable_registry(
+    store, name: str, *, dry_run: bool = False
+) -> bool:
+    """Check or clear an unreadable registry after rechecking it under lock."""
+    path = lock_path(store, name)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise LockError(f"cannot inspect lease registry {path} ({exc})") from exc
+    handle = _try_lock_path(path, "lease registry repair lock", False)
+    if handle is None:
+        return False
+    try:
+        if not _same_file(handle._fd, path):
+            return False
+        try:
+            parsed = _parse_holders(_read_all(handle._fd))
+        except OSError as exc:
+            raise LockError(f"cannot read lease registry {path} ({exc})") from exc
+        if parsed is not None:
+            return False
+        if not dry_run:
+            if not store.repair_persistent_state(path, locked_fd=handle._fd):
+                return False
+        return True
+    finally:
+        handle.release()
 
 
 def try_sequence_lock(store) -> Optional[LockHandle]:

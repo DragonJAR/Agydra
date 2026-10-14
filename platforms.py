@@ -143,15 +143,51 @@ def _probe_pathext(p: Path) -> Optional[Path]:
     return None
 
 
+def normalize_path_entry(entry: str) -> str:
+    """Normalize a PATH directory entry, stripping whitespace and surrounding quotes."""
+    cleaned = entry.strip().strip('"\'')
+    if not cleaned:
+        return ""
+    if is_windows():
+        import ntpath
+
+        return ntpath.normcase(ntpath.normpath(cleaned))
+    return os.path.normpath(os.path.expanduser(cleaned))
+
+
+def _sanitized_path_env() -> Optional[str]:
+    raw = os.environ.get("PATH")
+    if raw is None or not is_windows():
+        return raw
+    entries = []
+    for part in raw.split(";"):
+        cleaned = part.strip().strip('"\'')
+        if cleaned:
+            entries.append(cleaned)
+    return ";".join(entries)
+
+
 def _is_executable_file(p: Path) -> bool:
-    return p.is_file() and (is_windows() or os.access(p, os.X_OK))
+    if not p.is_file():
+        return False
+    if is_windows():
+        pathext = os.environ.get("PATHEXT") or _DEFAULT_PATHEXT
+        valid_exts = {e.lower() for e in pathext.split(";") if e}
+        return p.suffix.lower() in valid_exts
+    return os.access(p, os.X_OK)
+
+
+is_executable_file = _is_executable_file
 
 
 def _validate_binary_candidate(candidate: str) -> Optional[Path]:
-    p = Path(candidate).expanduser()
+    candidate_clean = candidate.strip().strip('"\'')
+    if not candidate_clean:
+        return None
+    p = Path(candidate_clean).expanduser()
     if _is_executable_file(p):
         return p
-    which_p = shutil.which(str(p))
+    which_p = shutil.which(str(p), path=_sanitized_path_env())
     if which_p:
         return Path(which_p)
     if is_windows():
@@ -187,10 +223,18 @@ def resolve_binary(
         cand = _validate_binary_candidate(config_val)
         if cand:
             return cand
+        import i18n
         import ui
         key_name = config_key or f"{binary_name}_binary"
-        ui.warn(f"invalid {key_name} {config_val!r}; falling through to PATH")
-    found = shutil.which(binary_name)
+        ui.warn(
+            i18n.t(
+                "platforms.invalid_config_binary",
+                cfg_key=key_name,
+                val=config_val,
+                default=f"invalid {key_name} {config_val!r}; falling through to PATH",
+            )
+        )
+    found = shutil.which(binary_name, path=_sanitized_path_env())
     return Path(found) if found else None
 
 
@@ -836,24 +880,10 @@ def process_alive(pid: int) -> bool:
     return True
 
 
-def process_start_token(pid: int) -> Optional[str]:
-    """Opaque identity token for ``pid``, stable for one process lifetime.
+_OWN_PROCESS_START_TOKEN: Optional[Tuple[int, Optional[str]]] = None
 
-    Used to distinguish a reused pid from the original holder: two calls on
-    the same live process return equal strings; a recycled pid yields a
-    different token (or None). Linux reads ``/proc`` (no subprocess), macOS
-    shells out to ``ps -o lstart=`` (rare path, bounded timeout, run with
-    ``LC_ALL=C`` and ``TZ=UTC`` so every Agydra process formats the token
-    identically), Windows
-    reads ``GetProcessTimes`` via ctypes. None means "cannot identify" —
-    callers must treat that conservatively (keep the holder) rather than
-    pruning it. Granularity differs per OS (Linux: kernel jiffies; Windows:
-    100ns FILETIME; macOS: minutes — two processes started inside the same
-    minute share a token there, so a same-minute pid reuse on macOS is
-    pruned only when the recycled process itself dies).
-    """
-    if not _process_id_is_representable(pid):
-        return None
+
+def _compute_process_start_token(pid: int) -> Optional[str]:
     if is_windows():
         import ctypes
         import ctypes.wintypes
@@ -907,3 +937,35 @@ def process_start_token(pid: int) -> Optional[str]:
         return None
     token = result.stdout.strip()
     return token or None
+
+
+def process_start_token(pid: int) -> Optional[str]:
+    """Opaque identity token for ``pid``, stable for one process lifetime.
+
+    Used to distinguish a reused pid from the original holder: two calls on
+    the same live process return equal strings; a recycled pid yields a
+    different token (or None). Linux reads ``/proc`` (no subprocess), macOS
+    shells out to ``ps -o lstart=`` (rare path, bounded timeout, run with
+    ``LC_ALL=C`` and ``TZ=UTC`` so every Agydra process formats the token
+    identically), Windows
+    reads ``GetProcessTimes`` via ctypes. None means "cannot identify" —
+    callers must treat that conservatively (keep the holder) rather than
+    pruning it. Granularity differs per OS (Linux: kernel jiffies; Windows:
+    100ns FILETIME; macOS: minutes — two processes started inside the same
+    minute share a token there, so a same-minute pid reuse on macOS is
+    pruned only when the recycled process itself dies).
+    """
+    global _OWN_PROCESS_START_TOKEN
+    if not _process_id_is_representable(pid):
+        return None
+    own_pid = os.getpid()
+    if (
+        pid == own_pid
+        and _OWN_PROCESS_START_TOKEN is not None
+        and _OWN_PROCESS_START_TOKEN[0] == own_pid
+    ):
+        return _OWN_PROCESS_START_TOKEN[1]
+    token = _compute_process_start_token(pid)
+    if pid == own_pid and token is not None:
+        _OWN_PROCESS_START_TOKEN = (own_pid, token)
+    return token

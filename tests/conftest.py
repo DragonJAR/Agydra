@@ -398,8 +398,12 @@ class BaseCase(unittest.TestCase):
 
         self.agy_bin = write_fake_agy(self.bin_dir / "agy")
         os.environ["AGYDRA_AGY_BIN"] = str(self.agy_bin)
+        import i18n
+        i18n._set_active("en")
 
     def tearDown(self) -> None:
+        import i18n
+        i18n._set_active("en")
         os.environ.clear()
         os.environ.update(self._old_env)
         shutil.rmtree(self._tmp, ignore_errors=True)

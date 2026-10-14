@@ -31,9 +31,9 @@ class TestI18nModule(unittest.TestCase):
 
     def test_translation_en_and_es(self):
         i18n._set_active("en")
-        self.assertEqual(i18n.t("cmd.create.ok", name="test"), "Profile 'test' created.")
+        self.assertEqual(i18n.t("cmd.create.ok", name="test"), "created profile: test")
         i18n._set_active("es")
-        self.assertEqual(i18n.t("cmd.create.ok", name="test"), "Perfil 'test' creado.")
+        self.assertEqual(i18n.t("cmd.create.ok", name="test"), "perfil creado: test")
 
     def test_catalogs_have_identical_keys_and_placeholders(self):
         import string
@@ -54,9 +54,7 @@ class TestI18nModule(unittest.TestCase):
 
     def test_fallback_cascade(self):
         i18n._set_active("es")
-        # Clave inexistente en es pero sí en default
         self.assertEqual(i18n.t("non.existent.key", default="fallback"), "fallback")
-        # Clave inexistente en todos lados devuelve la clave
         self.assertEqual(i18n.t("non.existent.key"), "non.existent.key")
 
     def test_affirmative_answers(self):
@@ -68,11 +66,9 @@ class TestI18nModule(unittest.TestCase):
                 self.assertFalse(i18n.is_affirmative(ans))
 
     def test_resolve_language_cascade(self):
-        # 1. flag_lang
         self.assertEqual(i18n.resolve_language(flag_lang="es"), "es")
         self.assertEqual(i18n._get_active(), "es")
 
-        # 2. env var
         os.environ["AGYDRA_LANG"] = "en"
         self.assertEqual(i18n.resolve_language(), "en")
         self.assertEqual(i18n._get_active(), "en")
@@ -220,6 +216,98 @@ class TestI18nCli(BaseCase):
                 with contextlib.redirect_stdout(buf_en):
                     self.assertEqual(cli.cmd_list(store, None), 0)
             self.assertIn("unknown", buf_en.getvalue())
+
+    def test_top_level_help_localized(self):
+        res_es = self._run_cli("--lang=es", "--help")
+        self.assertEqual(res_es.returncode, 0)
+        self.assertIn("Lanzador multiperfil y despachador de carga para CLIs de IA", res_es.stdout)
+        self.assertIn("opciones:", res_es.stdout)
+        self.assertIn("gestión:", res_es.stdout)
+        self.assertIn("ejemplos:", res_es.stdout)
+        self.assertIn("autor y mantenedor:", res_es.stdout)
+        self.assertIn("muestra este mensaje de ayuda y sale", res_es.stdout)
+
+        res_en = self._run_cli("--lang=en", "--help")
+        self.assertEqual(res_en.returncode, 0)
+        self.assertIn("Multi-profile launcher and workload dispatcher for AI developer CLIs", res_en.stdout)
+        self.assertTrue("options:" in res_en.stdout or "optional arguments:" in res_en.stdout)
+        self.assertIn("management:", res_en.stdout)
+        self.assertIn("examples:", res_en.stdout)
+        self.assertIn("show this help message and exit", res_en.stdout)
+
+    def test_subcommand_help_localized(self):
+        os.environ["AGYDRA_LANG"] = "es"
+        try:
+            res_create_es = self._run_cli("create", "--help")
+            self.assertEqual(res_create_es.returncode, 0)
+            self.assertIn("uso: agydra create", res_create_es.stdout)
+            self.assertIn("opciones:", res_create_es.stdout)
+            self.assertIn("argumentos posicionales:", res_create_es.stdout)
+            self.assertIn("nombre del perfil: letras minúsculas", res_create_es.stdout)
+            self.assertIn("motor para este perfil:", res_create_es.stdout)
+            self.assertIn("muestra este mensaje de ayuda y sale", res_create_es.stdout)
+
+            res_delete_es = self._run_cli("delete", "--help")
+            self.assertEqual(res_delete_es.returncode, 0)
+            self.assertIn("uso: agydra delete", res_delete_es.stdout)
+            self.assertIn("nombre de perfil o número base 1", res_delete_es.stdout)
+            self.assertIn("omitir el zip de respaldo de seguridad", res_delete_es.stdout)
+
+            res_login_es = self._run_cli("login", "--help")
+            self.assertEqual(res_login_es.returncode, 0)
+            self.assertIn("uso: agydra login", res_login_es.stdout)
+            self.assertIn("nombre o número de perfil (por defecto: perfil resuelto)", res_login_es.stdout)
+            self.assertIn("volver a iniciar sesión sin pedir confirmación", res_login_es.stdout)
+        finally:
+            os.environ.pop("AGYDRA_LANG", None)
+
+        res_create_en = self._run_cli("create", "--help")
+        self.assertEqual(res_create_en.returncode, 0)
+        self.assertIn("usage: agydra create", res_create_en.stdout)
+        self.assertTrue("options:" in res_create_en.stdout or "optional arguments:" in res_create_en.stdout)
+        self.assertIn("positional arguments:", res_create_en.stdout)
+        self.assertIn("profile name: lowercase, digits", res_create_en.stdout)
+        self.assertIn("engine for this profile:", res_create_en.stdout)
+        self.assertIn("show this help message and exit", res_create_en.stdout)
+
+    def test_cmd_create_and_delete_localized_output(self):
+        os.environ["AGYDRA_LANG"] = "es"
+        try:
+            res_create = self._run_cli("create", "perfil_es")
+            self.assertEqual(res_create.returncode, 0)
+            self.assertIn("perfil creado: perfil_es", res_create.stdout)
+
+            res_delete = self._run_cli("delete", "perfil_es", "--force", "--no-backup")
+            self.assertEqual(res_delete.returncode, 0)
+            self.assertIn("perfil eliminado: perfil_es", res_delete.stdout)
+        finally:
+            os.environ.pop("AGYDRA_LANG", None)
+
+        res_create_en = self._run_cli("create", "perfil_en")
+        self.assertEqual(res_create_en.returncode, 0)
+        self.assertIn("created profile: perfil_en", res_create_en.stdout)
+
+        res_delete_en = self._run_cli("delete", "perfil_en", "--force", "--no-backup")
+        self.assertEqual(res_delete_en.returncode, 0)
+        self.assertIn("deleted profile: perfil_en", res_delete_en.stdout)
+
+    def test_cmd_rename_and_default_localized_output(self):
+        self._run_cli("create", "orig")
+        os.environ["AGYDRA_LANG"] = "es"
+        try:
+            res_rename = self._run_cli("rename", "orig", "renombrado")
+            self.assertEqual(res_rename.returncode, 0)
+            self.assertIn("renombrado 'orig' -> 'renombrado'", res_rename.stdout)
+
+            res_def = self._run_cli("default", "renombrado")
+            self.assertEqual(res_def.returncode, 0)
+            self.assertIn("perfil predeterminado: renombrado", res_def.stdout)
+        finally:
+            os.environ.pop("AGYDRA_LANG", None)
+
+        res_def_en = self._run_cli("default", "renombrado")
+        self.assertEqual(res_def_en.returncode, 0)
+        self.assertIn("default profile: renombrado", res_def_en.stdout)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ in the end-to-end shell smoke test, not here.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -249,7 +250,8 @@ class RuntimeModuleDrift(unittest.TestCase):
             self.assertFalse(bootstrap._dir_on_path(Path("/bin")))
 
     def test_dir_on_path_windows_normalization(self):
-        with mock.patch("bootstrap.platforms.is_windows", return_value=True):
+        with mock.patch("bootstrap.os.pathsep", ";"), \
+                mock.patch("bootstrap.platforms.is_windows", return_value=True):
             with mock.patch.dict(
                 os.environ,
                 {"PATH": r"C:\Windows\System32;C:\Users\User\.venv\Scripts\;D:\Tools"},
@@ -467,19 +469,24 @@ class InstallEditableFailure(unittest.TestCase):
             self.assertIn("pip is too old", str(ctx.exception))
 
     def test_raises_when_install_editable_fails(self):
-        """With pip floor satisfied, install_editable must surface pip's stderr."""
+        """With the pip floor satisfied, install_editable must surface pip's stderr.
+
+        The probes that gate the install (pip version, setuptools floor) succeed;
+        only the editable install itself fails, so the raised error is pip's
+        ``pip install -e . failed`` message, not a gate message.
+        """
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=False)
             real_run = bootstrap._run
             real_pip = bootstrap._pip_supports_pep660
 
             def fake_fail(argv):
-                class _R:
-                    returncode = 1
-                    stdout = ""
-                    stderr = "ERROR: build failure"
-
-                return _R()
+                argv = [str(a) for a in argv]
+                if "-e" in argv:
+                    return subprocess.CompletedProcess(argv, 1, stdout="", stderr="ERROR: build failure")
+                if "--version" in argv:
+                    return subprocess.CompletedProcess(argv, 0, stdout="pip 99.0 from /x (python 3.12)\n", stderr="")
+                return subprocess.CompletedProcess(argv, 0, stdout="99.0.0\n", stderr="")
 
             bootstrap._run = fake_fail
             bootstrap._pip_supports_pep660 = lambda _vpy: True
@@ -619,21 +626,23 @@ class ShimInstall(unittest.TestCase):
                 self.assertIn("(or use --force)", str(ctx.exception))
                 self.assertIn("refusing to overwrite foreign file", str(ctx.exception))
 
-    def test_refuses_to_overwrite_dangling_symlink(self):
+    def test_replaces_dangling_symlink_at_shim_path(self):
         if sys.platform.startswith("win"):
             self.skipTest("POSIX shim semantics")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
-            with _sandbox_home(Path(td)):
+            with _sandbox_home(Path(td)) as expected:
                 shim = bootstrap.shim_path()
                 shim.parent.mkdir(parents=True, exist_ok=True)
                 destination = Path(td) / "foreign-destination"
                 shim.symlink_to(destination)
-                with self.assertRaises(bootstrap.BootstrapError):
-                    bootstrap.ensure_path_shim(proj, lambda _line: None)
-                self.assertTrue(shim.is_symlink())
-                self.assertEqual(shim.readlink(), destination)
-                self.assertEqual(bootstrap.check_state(proj)["shim_state"], "foreign")
+                self.assertEqual(bootstrap.check_state(proj)["shim_state"], "dead")
+                result = bootstrap.ensure_path_shim(proj, lambda _line: None)
+                self.assertEqual(result, expected)
+                self.assertFalse(shim.is_symlink())
+                self.assertIn(bootstrap.SHIM_MARKER, expected.read_text(encoding="utf-8"))
+                self.assertIn(str(bootstrap.console_script(proj)), expected.read_text(encoding="utf-8"))
+                self.assertEqual(bootstrap.check_state(proj)["shim_state"], "ok")
 
     def test_shim_quotes_shell_metacharacters_in_target_path(self):
         if sys.platform.startswith("win"):
@@ -664,7 +673,11 @@ class ShimInstall(unittest.TestCase):
             with _sandbox_home(Path(td)):
                 shim = bootstrap.shim_path()
                 shim.parent.mkdir(parents=True, exist_ok=True)
-                shim.write_text("broken", encoding="utf-8")
+                shim.write_text(
+                    f"#!/bin/sh\n# {bootstrap.SHIM_MARKER}\n"
+                    f'exec "{bootstrap.console_script(proj)}" "$@"\n',
+                    encoding="utf-8",
+                )
                 calls = []
 
                 def fake_run(argv):
@@ -679,6 +692,40 @@ class ShimInstall(unittest.TestCase):
                 with mock.patch.object(bootstrap, "_run", side_effect=fake_run):
                     self.assertTrue(bootstrap.verify_install(proj, lambda _line: None))
                 self.assertEqual(calls, [shim, bootstrap.console_script(proj)])
+
+    def test_verify_install_ignores_another_checkouts_shim(self):
+        """A managed shim delegating elsewhere must not verify this install.
+
+        Regression (FYH6-5): verify_install used to try the global shim
+        FIRST regardless of where it points, so checkout B could report
+        "verified" through checkout A's shim while B's own console script
+        was missing or broken.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = _make_fake_project(base, with_console=True)
+            with _sandbox_home(base):
+                shim = bootstrap.shim_path()
+                shim.parent.mkdir(parents=True, exist_ok=True)
+                other_root = base / "other"
+                other_root.mkdir()
+                foreign_console = bootstrap.console_script(
+                    _make_fake_project(other_root, with_console=True)
+                )
+                shim.write_text(bootstrap._shim_content(foreign_console), encoding="utf-8")
+                shim.chmod(0o755)
+                calls = []
+
+                def fake_run(argv):
+                    calls.append(Path(argv[0]))
+                    return type(
+                        "Completed", (),
+                        {"returncode": 0, "stdout": "agydra 9.9.9\n"},
+                    )()
+
+                with mock.patch.object(bootstrap, "_run", side_effect=fake_run):
+                    self.assertTrue(bootstrap.verify_install(proj, lambda _line: None))
+                self.assertEqual(calls, [bootstrap.console_script(proj)])
 
     def test_windows_ensure_path_shim_ignores_force_and_returns_none(self):
         """On Windows, ensure_path_shim returns None regardless of force."""
@@ -896,11 +943,17 @@ class RootEntryForceContract(unittest.TestCase):
             installed.append(True)
             return 0
 
+        def fake_perform(out=None, root=None, force=False, explicit=False, **_kw):
+            forced.append(force)
+            installed.append(True)
+            return bootstrap.InstallResult(code=0, essential_ok=True, console=None)
+
         with tempfile.TemporaryDirectory() as td:
             with _sandbox_home(Path(td)), \
                     mock.patch.object(sys, "argv", ["agydra.py", *argv]), \
                     mock.patch.object(agydra.os.path, "isfile", side_effect=_isfile_hiding_console_script(installed)), \
                     mock.patch.object(bootstrap, "run", side_effect=fake_run), \
+                    mock.patch.object(bootstrap, "perform_install", side_effect=fake_perform), \
                     mock.patch("platforms.launch_argv", return_value=0):
                 self.assertEqual(agydra.main(), 0)
         return forced
@@ -1126,6 +1179,17 @@ class TestBootstrapFixes(unittest.TestCase):
 
             mock_run.return_value = mock.Mock(returncode=0, stdout="pip 23.3.dev0 from /path (python 3.12)\n")
             self.assertEqual(bootstrap._pip_version(vpy), (23, 3))
+
+    def test_setuptools_floor_matches_pyproject_backend_requirement(self):
+        """bootstrap.SETUPTOOLS_FLOOR is a hand-maintained mirror of
+        pyproject.toml's [build-system] setuptools floor (Python 3.9 has no
+        stdlib tomllib, so bootstrap.py cannot read the requirement at
+        runtime); this test keeps the two copies from drifting apart."""
+        pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+        match = re.search(r"requires\s*=\s*\[\"setuptools>=([\d.]+)\"", pyproject.read_text(encoding="utf-8"))
+        self.assertIsNotNone(match, "pyproject.toml must declare a setuptools floor")
+        declared = tuple(int(part) for part in match.group(1).split(".")[:2])
+        self.assertEqual(declared, bootstrap.SETUPTOOLS_FLOOR)
 
 
 if __name__ == "__main__":

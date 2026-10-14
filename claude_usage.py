@@ -27,7 +27,7 @@ LIVE_MIN_INTERVAL_SECONDS = 300
 LIVE_TIMEOUT_SECONDS = 25.0
 LIVE_COMMAND = ("-p", "/usage", "--no-session-persistence", "--safe-mode")
 LIVE_REASON_TEXT = {
-    "live_binary_missing": "live quota unavailable: claude executable not found (set AGYDRA_CLAUDE_BIN or pass -b)",
+    "live_binary_missing": "live quota unavailable: claude executable not found (set AGYDRA_CLAUDE_BIN or configure claude_binary)",
     "live_timeout": "live quota unavailable: claude /usage timed out",
     "live_failed": "live quota unavailable: claude /usage could not be run",
     "live_no_usage": "live quota unavailable: claude reported no subscription usage for this profile (not logged in, or an API-key login)",
@@ -133,36 +133,21 @@ def _safe_directory_chain(store: Any, directory: Path) -> None:
 
 
 def _read_json_object(path: Path, limit: int) -> dict:
-    fd = None
+    import store as store_module
+
     try:
         metadata = path.lstat()
         if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
             raise UsageCacheError("usage cache entry is not a regular file")
         if metadata.st_size > limit:
             raise UsageCacheError("usage cache entry exceeds its size limit")
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags)
-        if not locks._same_file(fd, path):
-            raise UsageCacheError("usage cache entry changed while opening")
-        with os.fdopen(fd, "rb") as stream:
-            fd = None
-            raw = stream.read(limit + 1)
-        if len(raw) > limit:
-            raise UsageCacheError("usage cache entry exceeds its size limit")
+        return store_module.read_json_object(path)
     except UsageCacheError:
         raise
     except OSError as exc:
         raise UsageCacheError(f"cannot read usage cache entry ({exc})") from exc
-    finally:
-        if fd is not None:
-            os.close(fd)
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+    except (ValueError, RecursionError) as exc:
         raise UsageCacheError("usage cache entry is invalid JSON") from exc
-    if not isinstance(payload, dict):
-        raise UsageCacheError("usage cache entry must be a JSON object")
-    return payload
 
 
 def _parse_utc_time(raw: object) -> Optional[datetime]:
@@ -725,7 +710,7 @@ def query_claude_usage(
             profile = _read_profile_without_recovery(store, name)
         if profile.engine != "claude":
             return _result(name, ok=False, error=f"unsupported usage engine: {profile.engine}")
-        if usage._has_pending_profile_rename(store):
+        if usage._has_pending_profile_rename(store, name):
             return _result(name, error="profile rename recovery pending")
         if type(ttl_seconds) is not int or ttl_seconds <= 0:
             return _result(name, ok=False, error="invalid local usage cache TTL", quality="corrupt")
@@ -1011,11 +996,17 @@ def query_claude_usage_live(
     if profile is None:
         profile = _read_profile_without_recovery(store, name)
     reason = None
-    if profile.engine == "claude" and not _usage_module()._has_pending_profile_rename(store):
+    if profile.engine == "claude" and not _usage_module()._has_pending_profile_rename(store, name):
         reason = refresh_live_usage(store, profile, now=now, runner=runner)
     result = query_claude_usage(store, name, profile=profile, now=now, ttl_seconds=ttl_seconds)
     if reason and result.ok and not result.groups and result.error is None:
-        result.error = LIVE_REASON_TEXT.get(reason)
+        import i18n
+        default_text = LIVE_REASON_TEXT.get(reason)
+        result.error = (
+            i18n.t(f"claude.live_reason.{reason}", default=default_text)
+            if default_text is not None
+            else None
+        )
     return result
 
 
@@ -1097,7 +1088,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
         if len(raw) > MAX_INPUT_BYTES:
             return 0
-        payload = json.loads(raw.decode("utf-8"))
+        payload = locks.json_loads_utf8(raw)
         if not isinstance(payload, dict):
             return 0
         import store as store_module

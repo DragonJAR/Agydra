@@ -10,23 +10,24 @@ import tempfile
 import unittest
 from unittest import mock
 
+import conftest
 import isolation
 import platforms
 
 
 @unittest.skipUnless(sys.platform == "win32", "requires native Windows cmd.exe, NTFS and WinAPI")
 @unittest.skipIf(
-    os.environ.get("AGYDRA_SKIP_WIN32_BATCH"),
-    "GitHub Actions Windows-2022 returns a \\\\?\\ UNC-prefixed path from "
-    "tempfile.TemporaryDirectory and uses PowerShell by default; this CI "
-    "run does not exercise the cmd.exe contracts the class pins. Set "
-    "AGYDRA_SKIP_WIN32_BATCH=0 on a real Windows runner to enable the tests.",
+    os.environ.get("AGYDRA_SKIP_WIN32_BATCH") in ("1", "true", "True", "yes", "YES"),
+    "Native Windows batch tests disabled via AGYDRA_SKIP_WIN32_BATCH",
 )
 class TestNativeWindows(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="agydra native audit ")
+        temporary = tempfile.TemporaryDirectory(prefix="agydra-native-audit-")
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        raw_name = str(Path(temporary.name))
+        if raw_name.startswith("\\\\?\\"):
+            raw_name = raw_name[4:]
+        self.root = Path(raw_name)
         home = self.root / "home"
         home.mkdir()
         patch = mock.patch.dict(os.environ, {
@@ -86,7 +87,16 @@ class TestNativeWindows(unittest.TestCase):
 
     def _unlink_junction(self, link):
         if os.path.lexists(link) and platforms.is_link(link, strict=True):
-            link.unlink()
+            try:
+                link.unlink()
+            except OSError:
+                if sys.platform == "win32":
+                    try:
+                        os.rmdir(link)
+                    except OSError:
+                        pass
+                else:
+                    raise
 
     def test_mklink_junction_roundtrip_preserves_literal_paths_and_target(self):
         for suffix in ("plain", "two words", "用户", "a&b", "%USERNAME%"):
@@ -101,7 +111,7 @@ class TestNativeWindows(unittest.TestCase):
                 self.assertTrue(platforms.is_link(link, strict=True))
                 self.assertTrue(isolation.link_points_to(link, target))
                 self.assertEqual(json.loads((link / "sentinel.json").read_text(encoding="utf-8")), payload)
-                link.unlink()
+                self._unlink_junction(link)
                 self.assertFalse(os.path.lexists(link))
                 self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), payload)
 
@@ -112,7 +122,7 @@ class TestNativeWindows(unittest.TestCase):
         target.rmdir()
         self.assertTrue(platforms.is_link(link, strict=True))
         self.assertFalse(link.exists())
-        link.unlink()
+        self._unlink_junction(link)
         self.assertFalse(os.path.lexists(link))
 
     def test_winapi_enables_vt_on_a_private_console_buffer(self):

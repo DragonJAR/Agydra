@@ -154,7 +154,9 @@ class TestDriverAndConfig(ClaudeBase):
         for name in ("agy", "codex", "grok"):
             driver = engines.get_engine(name)
             self.assertTrue(driver.uses_overlay)
-            self.assertEqual(driver.foreign_auth_env, ())
+        self.assertEqual(engines.get_engine("agy").foreign_auth_env, ())
+        self.assertEqual(engines.get_engine("codex").foreign_auth_env, ("OPENAI_API_KEY",))
+        self.assertEqual(engines.get_engine("grok").foreign_auth_env, ("XAI_API_KEY",))
 
     def test_config_backwards_compatible(self):
         self.assertNotIn("claude_binary", models.Config().to_dict())

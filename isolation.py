@@ -247,7 +247,7 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
         if next_identity is not None and identity == next_identity:
             if _is_link(link):
                 try:
-                    link.unlink()
+                    store.rmtree(link)
                 except OSError as exc:
                     raise IsolationError(
                         f"could not remove stale overlay link {link} to "
@@ -278,7 +278,7 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
             if link.exists():
                 continue
             try:
-                link.unlink()
+                store.rmtree(link)
             except OSError:
                 continue
         elif link.exists():
@@ -601,7 +601,7 @@ def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "ag
 
     data_link = overlay / driver.data_dir_name
     if _is_link(data_link) and not link_points_to(data_link, data_dir):
-        data_link.unlink()
+        store.rmtree(data_link)
     if data_link.exists() and not _is_link(data_link):
         raise IsolationError(
             f"overlay entry {data_link} is a real directory/file, not the "
@@ -651,8 +651,13 @@ def _prepare_agy_file_auth(
     import locks
 
     def ready(current: Profile) -> Tuple[Optional[Path], bytes]:
-        path = account.agy_token_path(data_dir)
-        raw = account.scoped_agy_token_bytes(profile_store, current, data_dir)
+        try:
+            path = account.agy_token_path(data_dir)
+            raw = account.usable_agy_credential(profile_store, current, data_dir)
+        except store.StoreError:
+            raise AgyCredentialUntrustedError(
+                f"unsafe private Antigravity credential path for profile {current.name!r} at {data_dir}"
+            ) from None
         if raw is None:
             raise AgyCredentialUntrustedError(
                 f"no trusted Antigravity credential for profile {current.name!r} "
@@ -692,9 +697,7 @@ def _prepare_agy_file_auth(
                     path, 0o600, metadata.st_dev, metadata.st_ino
                 )
             else:
-                platforms.ensure_dir(path.parent)
-                account.agy_token_path(data_dir)
-                store.atomic_write_bytes(path, raw)
+                account.write_agy_token(data_dir, raw)
             checked, _raw = ready(current)
             if checked is None:
                 raise AgyCredentialUntrustedError(
@@ -1199,6 +1202,7 @@ def isolated_env(
         _pin_store_root(env, store_root)
         return env
     env.update(extra)
+    driver.scrub_env(env)
     real_home = platforms.real_home()
     env["AGYDRA_REAL_HOME"] = str(real_home)
     env[platforms.home_redirect_var()] = str(overlay)

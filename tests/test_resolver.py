@@ -376,7 +376,10 @@ class TestPickFreeProfileLazyProbing(BaseCase):
             probed.append(name)
             return states.get(name, "not-authenticated")
 
-        with mock.patch.object(resolver.account, "auth_state", side_effect=fake_auth_state):
+        with mock.patch.object(resolver.account, "auth_state", side_effect=fake_auth_state), \
+                mock.patch.object(
+                    resolver.account, "usable_agy_credential", return_value=b"credential"
+                ):
             try:
                 res = resolver.pick_free_profile(self.store, **kwargs)
             except StoreError as exc:

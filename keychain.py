@@ -66,11 +66,13 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Dict, Iterator, List, NamedTuple, Optional
 
+from models import Profile
 import platforms
-from store import atomic_write_bytes
+from store import StoreError, atomic_write_bytes
 from ui import note, warn
 
 try:
@@ -89,6 +91,10 @@ KEYCHAIN_FILE_MAGIC = b"kych"
 KEYCHAIN_FILE_SUFFIXES = (".keychain-db", ".keychain")
 
 _SKIP_MARKER_NAME = ".setup-skipped"
+_DEFER_LOGIN_EMAIL_RECORDING = ContextVar("defer_login_email_recording", default=False)
+_PROFILE_SNAPSHOT: ContextVar[Optional[Profile]] = ContextVar(
+    "keychain_profile_snapshot", default=None
+)
 
 SECRET_SUFFIX = ".secret"
 """Filename suffix of a profile's keychain slot backup: ``<name>.secret``."""
@@ -483,8 +489,12 @@ def save_profile_slot(store, name: str, data: bytes) -> None:
 def load_profile_slot(store, name: str) -> Optional[bytes]:
     path = slot_backup_path(store, name)
     try:
+        import account
+
+        account._require_private_credential_path(path.parent, directory=True)
+        account._require_private_credential_path(path)
         return path.read_bytes()
-    except OSError:
+    except (OSError, StoreError):
         return None
 
 
@@ -588,53 +598,22 @@ def _secret_identity(data: Optional[bytes]) -> Optional[str]:
     return account.email_from_raw(decoded)
 
 
-def _known_identity(store, name: str, *, include_secret: bool = True) -> Optional[str]:
-    """Best-effort email this profile is already known to belong to.
-
-    Checked, in order: the cached ``profile.email``, the profile's own
-    on-disk token file, then (unless ``include_secret`` is False) its
-    existing `.secret` backup. None means "no known identity yet" -- a
-    genuine first login, trusted as-is. Every lookup degrades to None on
-    error (missing methods on a test double, a corrupt file, ...) rather
-    than raising, since this only gates whether a fresh credential gets
-    persisted or swapped in, never a launch itself.
-
-    ``include_secret=False`` is for the entry-time self-repair check
-    (``launch_guard.__enter__``): comparing the `.secret` against its own
-    decoded identity would be circular, so that caller only trusts the
-    cached email and the on-disk token file.
-    """
-    import account
-
+@contextmanager
+def defer_login_email_recording():
+    token = _DEFER_LOGIN_EMAIL_RECORDING.set(True)
     try:
-        profile = store.get(name)
-    except Exception:
-        profile = None
-    if profile is not None:
-        cached = account.normalize_email(getattr(profile, "email", None))
-        if cached:
-            return cached
+        yield
+    finally:
+        _DEFER_LOGIN_EMAIL_RECORDING.reset(token)
+
+
+@contextmanager
+def scoped_profile_snapshot(profile: Profile) -> Iterator[None]:
+    token = _PROFILE_SNAPSHOT.set(profile)
     try:
-        data_dir = store.profile_data_dir(name)
-    except Exception:
-        data_dir = None
-    if data_dir is not None:
-        try:
-            email = account.detect_email(data_dir)
-            if email:
-                return email
-        except OSError:
-            pass
-    if not include_secret:
-        return None
-    try:
-        existing = load_profile_slot(store, name)
-    except OSError:
-        existing = None
-    email = _secret_identity(existing)
-    if email:
-        return email
-    return None
+        yield
+    finally:
+        _PROFILE_SNAPSHOT.reset(token)
 
 
 def _quarantine_profile_slot(store, name: str) -> Optional[Path]:
@@ -664,7 +643,12 @@ def _quarantine_profile_slot(store, name: str) -> Optional[Path]:
         return None
 
 
-def _persist_if_trusted(store, name: str, data: bytes) -> None:
+def _persist_if_trusted(
+    store,
+    name: str,
+    data: bytes,
+    profile_snapshot: Optional[Profile] = None,
+) -> None:
     """Save ``data`` as ``name``'s private slot backup, unless it is
     identifiably a DIFFERENT known identity's credential.
 
@@ -674,8 +658,8 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
     value left by another profile's exec-path launch (see the module
     docstring's known limit), or an account switch performed inside agy
     could otherwise be captured as this profile's own secret. A profile
-    with no known identity yet is a genuine first login: nothing to
-    compare against, so it is trusted.
+    with no known identity yet trusts the first credential that carries a
+    nonblank identity claim.
 
     The shared keychain slot normally carries plain JSON (see
     :func:`token_payload_for_slot`), but a value already in envelope form
@@ -697,13 +681,10 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
     """
     import account
 
-    known = _known_identity(store, name)
+    known = account.anchor_for(store, profile_snapshot or name)
     serialized = _as_envelope(data)
-    if known is None:
-        save_profile_slot(store, name, serialized)
-        return
     candidate = _secret_identity(serialized)
-    if account.same_email(candidate, known):
+    if account.trusted_identity(known, candidate):
         save_profile_slot(store, name, serialized)
         return
     if candidate is None and decode_go_keyring_secret(serialized) is not None:
@@ -721,14 +702,19 @@ def _persist_if_trusted(store, name: str, data: bytes) -> None:
 
 
 def adopt_login_credential(
-    store, name: str, data_dir: Path, plain_json_bytes: bytes
+    store,
+    name: str,
+    data_dir: Path,
+    plain_json_bytes: bytes,
+    *,
+    record_email: Optional[bool] = None,
 ) -> None:
     """Adopt a fresh login credential across private slot and disk stores.
 
     Explicit user-confirmed identity choice: validates the payload as a usable
     Antigravity token, quarantines any existing private slot backup with a
     different identity, saves the new envelope backup, atomically writes the
-    disk token with 0600 permissions, and re-anchors profile metadata email.
+    disk token with 0600 permissions, and updates the profile identity.
     """
     import account
 
@@ -753,35 +739,26 @@ def adopt_login_credential(
         return
 
     candidate = account.email_from_raw(decoded)
+    if not account.trusted_identity(None, candidate):
+        warn(f"could not adopt invalid login credential for profile {name!r}")
+        return
     existing_slot = load_profile_slot(store, name)
     if existing_slot is not None and candidate is not None:
         existing_candidate = _secret_identity(existing_slot)
-        if existing_candidate is not None and not account.same_email(
+        if existing_candidate is not None and not account.trusted_identity(
             existing_candidate, candidate
         ):
             _quarantine_profile_slot(store, name)
 
     save_profile_slot(store, name, envelope)
-
-    token_path = data_dir / account.AGY_CLI_DIR / account.TOKEN_FILE
-    platforms.ensure_dir(token_path.parent)
-    verified_path = account.agy_token_path(data_dir)
-    atomic_write_bytes(verified_path, raw_bytes)
-
-    account.record_profile_email(store, name)
-
-
-def save_file_credential(store, name: str, data: bytes) -> None:
-    """Back up a private file credential as ``name``'s slot."""
-    try:
-        data_dir = store.profile_data_dir(name, engine="agy")
-    except Exception:
-        data_dir = None
-    if data_dir is not None:
-        adopt_login_credential(store, name, data_dir, data)
-    else:
-        with _launch_section(store):
-            _persist_if_trusted(store, name, data)
+    account.write_agy_token(data_dir, raw_bytes)
+    should_record_email = (
+        not _DEFER_LOGIN_EMAIL_RECORDING.get()
+        if record_email is None
+        else record_email
+    )
+    if should_record_email:
+        account.record_profile_email(store, name)
 
 
 LAUNCH_SECTION_PATIENCE_S = 3.0
@@ -798,20 +775,16 @@ def _acquire_swap_lock(
     if timeout_s is None:
         timeout_s = LAUNCH_SECTION_PATIENCE_S
     path = swap_lock_path(store)
-    handle = None
-    deadline = time.monotonic() + timeout_s
-    while True:
+    def acquire():
         try:
-            handle = locks_module.try_lock_path(
+            return locks_module.try_lock_path(
                 path, description="keychain swap lock", inherit_on_exec=False
             )
         except OSError as exc:
             raise on_os_error(
                 f"cannot acquire keychain swap lock ({exc})"
             ) from exc
-        if handle is not None or time.monotonic() >= deadline:
-            break
-        time.sleep(locks_module.POLL_INTERVAL_S)
+    handle = locks_module.wait_for(acquire, timeout_s)
     if handle is None:
         raise _swap_lock_busy_error(store)
     return handle
@@ -975,9 +948,11 @@ def _load_slot_lease(store) -> SlotLeaseState:
         raw = path.read_bytes()
     except OSError:
         return SlotLeaseState(owner=None, had_shared=None)
+    import locks as locks_module
+
     try:
-        data = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+        data = locks_module.json_loads_utf8(raw)
+    except (RecursionError, ValueError, UnicodeDecodeError):
         return SlotLeaseState(owner=None, had_shared=None)
     if not isinstance(data, dict):
         return SlotLeaseState(owner=None, had_shared=None)
@@ -985,8 +960,6 @@ def _load_slot_lease(store) -> SlotLeaseState:
     had_shared = data.get("had_shared")
     if not isinstance(owner, str) or not owner:
         return SlotLeaseState(owner=None, had_shared=None)
-    import locks as locks_module
-
     if not isinstance(had_shared, str) or not had_shared:
         had_shared = None
     credential = _parse_owner_credential(data.get("owner_credential"))
@@ -1092,8 +1065,12 @@ def _ensure_target_keychain(store, create: bool = True) -> Optional[Path]:
         return None
 
 
-def launch_guard(store, profile: str, capture: bool = False,
-                 persist_on_exit: bool = True):
+def launch_guard(
+    store,
+    profile: str,
+    capture: bool = False,
+    profile_snapshot: Optional[Profile] = None,
+):
     """Guard the shared keychain slot for a session of ``profile``.
 
     Returns a null-context manager on platforms without a keychain bridge.
@@ -1134,10 +1111,6 @@ def launch_guard(store, profile: str, capture: bool = False,
     and the shared slot keeps pointing at it. Use only around an
     interactive ``agydra login`` run.
 
-    ``persist_on_exit=False`` keeps read-only commands from rewriting the
-    profile's ``.secret`` backup; the authentication swap and restore still
-    happen, but exit-time credential capture is skipped.
-
     Every persist onto ``profile``'s private slot is identity-guarded by
     ``_persist_if_trusted``: whatever the shared slot holds at exit is only
     trusted as this profile's own credential when its email claim matches
@@ -1155,17 +1128,17 @@ def launch_guard(store, profile: str, capture: bool = False,
     or nothing, in which case the shared slot is cleared like any other
     profile with no usable private slot).
     """
+    if profile_snapshot is None:
+        profile_snapshot = _PROFILE_SNAPSHOT.get()
     if not supported():
         import contextlib
 
         return contextlib.nullcontext()
 
     class _Guard:
-        def __init__(self, persist_on_exit: bool) -> None:
-            self._persist_on_exit = persist_on_exit
+        def __init__(self) -> None:
             self._keychain_path: Optional[Path] = None
-            self._wrote_payload = False
-            self._joined = False
+            self._profile_snapshot = profile_snapshot
 
         def _abandon_membership(self) -> None:
             import locks as locks_module
@@ -1174,29 +1147,6 @@ def launch_guard(store, profile: str, capture: bool = False,
                 locks_module.release_lease(store, profile)
             except OSError:
                 pass
-
-        @property
-        def _swapped(self) -> bool:
-            """Compatibility read for legacy tests: True when this entry
-            performed the ownership swap (wrote the profile payload into the
-            shared slot). Derived, not stored."""
-            return self._wrote_payload
-
-        @property
-        def _already_current(self) -> bool:
-            """Compatibility read for legacy tests: True when entry JOINED a
-            live owner of the same profile (the no-op path of the old
-            model). Derived, not stored."""
-            return self._joined
-
-        @property
-        def _had_shared(self) -> Optional[bytes]:
-            """Compatibility read for legacy tests: the pre-ownership shared
-            slot content this ownership must restore, decoded from the slot
-            lease state. Derived, not stored."""
-            if self._keychain_path is None:
-                return None
-            return _decode_shared(_load_slot_lease(store).had_shared)
 
         def __enter__(self):
             import locks as locks_module
@@ -1211,7 +1161,6 @@ def launch_guard(store, profile: str, capture: bool = False,
                         return self
                     state = _load_slot_lease(store)
                     if state.owner == profile:
-                        self._joined = True
                         return self
                     if state.owner is not None:
                         raise KeychainBusyError(
@@ -1250,26 +1199,38 @@ def launch_guard(store, profile: str, capture: bool = False,
                 had_shared = self._recover_baseline(inherited, shared_now)
             else:
                 had_shared = shared_now
+            try:
+                profile_obj = store.get(profile, profile=self._profile_snapshot)
+                data_dir = store.profile_data_dir(
+                    profile, engine="agy", profile=profile_obj
+                )
+            except (StoreError, OSError, AttributeError):
+                profile_obj = None
+                data_dir = None
             slot = load_profile_slot(store, profile)
             payload: Optional[bytes] = None
             if slot is not None:
-                known = _known_identity(store, profile, include_secret=False)
-                if known is not None:
-                    candidate = _secret_identity(slot)
-                    if not account.same_email(candidate, known):
-                        seen = repr(candidate) if candidate else "undecodable"
-                        quarantined = _quarantine_profile_slot(store, profile)
-                        action = (
-                            f"quarantined to {quarantined}"
-                            if quarantined is not None
-                            else "quarantine failed"
-                        )
-                        warn(
-                            f"keychain slot for profile {profile!r} looks "
-                            f"like a different account ({seen} vs "
-                            f"{known!r}); {action}, not swapped in"
-                        )
-                        slot = None
+                known = account.anchor_for(
+                    store,
+                    profile_obj or profile,
+                    data_dir,
+                    include_secret=False,
+                )
+                candidate = _secret_identity(slot)
+                if not account.trusted_identity(known, candidate):
+                    seen = repr(candidate) if candidate else "undecodable"
+                    quarantined = _quarantine_profile_slot(store, profile)
+                    action = (
+                        f"quarantined to {quarantined}"
+                        if quarantined is not None
+                        else "quarantine failed"
+                    )
+                    warn(
+                        f"keychain slot for profile {profile!r} looks "
+                        f"like a different account ({seen} vs "
+                        f"{known!r}); {action}, not swapped in"
+                    )
+                    slot = None
             if slot is not None:
                 try:
                     payload = token_payload_for_slot(slot)
@@ -1279,22 +1240,13 @@ def launch_guard(store, profile: str, capture: bool = False,
                         "per-profile credential swap"
                     )
                     slot = None
-                else:
-                    write_slot(
-                        shared_slot(),
-                        payload,
-                        self._keychain_path,
-                    )
-                    self._wrote_payload = True
             if slot is None:
-                try:
-                    profile_obj = store.get(profile)
-                    data_dir = store.profile_data_dir(profile, engine="agy")
-                    disk_bytes = account.scoped_agy_token_bytes(
+                if profile_obj is None or data_dir is None:
+                    disk_bytes = None
+                else:
+                    disk_bytes = account.usable_agy_credential(
                         store, profile_obj, data_dir
                     )
-                except Exception:
-                    disk_bytes = None
                 if disk_bytes is not None:
                     try:
                         payload = token_payload_for_slot(_as_envelope(disk_bytes))
@@ -1303,21 +1255,16 @@ def launch_guard(store, profile: str, capture: bool = False,
                             f"keychain swap skipped ({exc}); continuing without "
                             "per-profile credential swap"
                         )
-                    else:
-                        write_slot(
-                            shared_slot(),
-                            payload,
-                            self._keychain_path,
-                        )
-                        self._wrote_payload = True
-            if not self._wrote_payload and shared_now is not None:
-                delete_slot(shared_slot(), self._keychain_path)
             _save_slot_lease(
                 store,
                 profile,
                 had_shared,
-                _owner_credential_of(payload if self._wrote_payload else None),
+                _owner_credential_of(payload),
             )
+            if payload is not None:
+                write_slot(shared_slot(), payload, self._keychain_path)
+            elif shared_now is not None:
+                delete_slot(shared_slot(), self._keychain_path)
 
         def _recover_baseline(
             self, stale: SlotLeaseState, shared_now: Optional[bytes]
@@ -1336,10 +1283,17 @@ def launch_guard(store, profile: str, capture: bool = False,
             if shared_now is not None and stale.stale_owner is not None:
                 try:
                     store.get(stale.stale_owner)
-                except Exception:
+                except (StoreError, OSError, AttributeError):
                     pass
                 else:
-                    _persist_if_trusted(store, stale.stale_owner, shared_now)
+                    _persist_if_trusted(
+                        store,
+                        stale.stale_owner,
+                        shared_now,
+                        self._profile_snapshot
+                        if stale.stale_owner == profile
+                        else None,
+                    )
             return _decode_shared(stale.had_shared)
 
         def __exit__(self, *exc_info):
@@ -1368,24 +1322,16 @@ def launch_guard(store, profile: str, capture: bool = False,
             had_shared = _decode_shared(state.had_shared)
             current: Optional[bytes] = None
             if not capture:
-                read_once = self._persist_on_exit or had_shared is not None
-                if read_once:
-                    current = read_slot(shared_slot(), self._keychain_path)
-                if self._persist_on_exit and current is not None:
-                    _persist_if_trusted(store, profile, current)
+                current = read_slot(shared_slot(), self._keychain_path)
+                if current is not None:
+                    _persist_if_trusted(
+                        store, profile, current, self._profile_snapshot
+                    )
             if had_shared is not None:
                 if capture or current != had_shared:
                     write_slot(shared_slot(), had_shared, self._keychain_path)
             else:
-                has_content = (
-                    True
-                    if capture
-                    else (
-                        current
-                        if self._persist_on_exit
-                        else read_slot(shared_slot(), self._keychain_path)
-                    )
-                )
+                has_content = True if capture else current
                 if has_content is not None:
                     try:
                         delete_slot(shared_slot(), self._keychain_path)
@@ -1397,15 +1343,21 @@ def launch_guard(store, profile: str, capture: bool = False,
             data = read_slot(shared_slot(), self._keychain_path)
             if data is not None:
                 try:
-                    data_dir = store.profile_data_dir(profile, engine="agy")
-                except Exception:
+                    data_dir = store.profile_data_dir(
+                        profile,
+                        engine="agy",
+                        profile=self._profile_snapshot,
+                    )
+                except (StoreError, OSError, AttributeError):
                     data_dir = None
                 if data_dir is not None:
                     adopt_login_credential(store, profile, data_dir, data)
                 else:
-                    _persist_if_trusted(store, profile, data)
+                    _persist_if_trusted(
+                        store, profile, data, self._profile_snapshot
+                    )
 
-    return _Guard(persist_on_exit)
+    return _Guard()
 
 
 def rename_profile_slot(
@@ -1638,7 +1590,7 @@ def capture_shared_slot_for_import(store, name: str, data_dir: Path) -> None:
     imported_email = account.detect_email(data_dir)
     if imported_email is not None:
         candidate = _secret_identity(current)
-        if account.same_email(candidate, imported_email):
+        if account.trusted_identity(imported_email, candidate):
             save_profile_slot(store, name, current)
         else:
             seen = repr(candidate) if candidate else "undecodable"

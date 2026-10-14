@@ -295,7 +295,6 @@ class TestLaunchGuardRestore(unittest.TestCase):
             )
             guard = keychain.launch_guard(store, "alpha")
             state = guard.__enter__()
-            self.assertTrue(state._swapped)
             # Simulate agy refreshing the token mid-session: the shared slot
             # is plain JSON, with the same identity claim so the identity
             # guard keeps it.
@@ -405,9 +404,8 @@ class TestLaunchGuardRestore(unittest.TestCase):
             guard = keychain.launch_guard(store, "alpha")
             # ``add-generic-password`` returns NOT_FOUND via exploding_run, so
             # the swap path raises inside KeychainError; the swallowed-failure
-            # branch in __enter__ leaves ``_swapped=False`` and slot=None.
+            # branch in __enter__ leaves the shared slot empty.
             state = guard.__enter__()
-            self.assertFalse(state._swapped)
             state.__exit__(None, None, None)
         # Fail-open: the pre-existing envelope is preserved untouched.
         self.assertEqual(keychain.load_profile_slot(store, "alpha"), pre_existing_envelope)
@@ -417,9 +415,8 @@ class TestLaunchGuardExitReadSlotDedup(unittest.TestCase):
     """``__exit__``'s restore branch must not read the shared slot twice for
     the exact same value: the ``_persist_if_trusted`` read (``current``) and
     the ``elif``'s own ``read_slot`` call cover the identical condition
-    (``self._swapped`` and ``self._had_shared is None``), with nothing
-    touching the keychain in between -- the second read is a pure repeat of
-    the first."""
+    with no prior shared value, with nothing touching the keychain between
+    the first read and restore -- a second read would be a pure repeat."""
 
     def test_exit_reads_shared_slot_at_most_once(self):
         tmp = tempfile.TemporaryDirectory()
@@ -437,8 +434,6 @@ class TestLaunchGuardExitReadSlotDedup(unittest.TestCase):
                 ):
             guard = keychain.launch_guard(store, "alpha")
             state = guard.__enter__()
-            self.assertTrue(state._swapped)
-            self.assertIsNone(state._had_shared)
 
             original_read_slot = keychain.read_slot
             read_calls = []
@@ -505,7 +500,6 @@ class TestLaunchGuardIdentityGuard(unittest.TestCase):
                     ):
                 guard = keychain.launch_guard(store, "alpha")
                 state = guard.__enter__()
-                self.assertTrue(state._swapped)
                 kc.shared = foreign_secret
                 state.__exit__(None, None, None)
 
@@ -566,7 +560,6 @@ class TestLaunchGuardEntrySelfRepair(unittest.TestCase):
                 guard = keychain.launch_guard(store, "alpha")
                 state = guard.__enter__()
 
-            self.assertFalse(state._swapped)
             self.assertIsNone(kc.shared)
             self.assertIn(("delete", None), kc.calls)
             self.assertIsNone(keychain.load_profile_slot(store, "alpha"))
@@ -594,7 +587,6 @@ class TestLaunchGuardEntrySelfRepair(unittest.TestCase):
                 guard = keychain.launch_guard(store, "alpha")
                 state = guard.__enter__()
 
-            self.assertTrue(state._swapped)
             # The shared keychain slot stores plain JSON (agy reads it as
             # JSON; see ``token_payload_for_slot``). The ``.secret`` file
             # backup keeps the envelope for the identity guard's decode.
@@ -620,7 +612,6 @@ class TestLaunchGuardEntrySelfRepair(unittest.TestCase):
                 guard = keychain.launch_guard(store, "alpha")
                 state = guard.__enter__()
 
-            self.assertTrue(state._swapped)
             self.assertEqual(
                 kc.shared, keychain.token_payload_for_slot(unverified_secret)
             )
@@ -660,8 +651,6 @@ class TestLaunchGuardAlreadyCurrent(unittest.TestCase):
                 )
                 guard = keychain.launch_guard(store, "alpha", capture=False)
                 state = guard.__enter__()
-                self.assertTrue(state._already_current)
-                self.assertFalse(state._swapped)
                 # Nothing swapped in on entry.
                 self.assertEqual(kc.calls, [])
                 state.__exit__(None, None, None)
@@ -696,8 +685,6 @@ class TestLaunchGuardAlreadyCurrent(unittest.TestCase):
                     ):
                 guard = keychain.launch_guard(store, "alpha", capture=False)
                 state = guard.__enter__()
-                self.assertFalse(state._already_current)
-                self.assertTrue(state._swapped)
                 self.assertEqual(kc.shared, keychain.token_payload_for_slot(own_secret))
                 state.__exit__(None, None, None)
             # Restored to the pre-call snapshot on exit, exactly as before
@@ -710,7 +697,7 @@ class TestLaunchGuardRecoversHexCorruptedSharedSlot(unittest.TestCase):
     shared slot value that has already been hex-wrapped twice (as if from
     two prior corrupted read/write round-trips) must still let
     ``launch_guard`` recover the real identity underneath -- both the
-    ``_already_current`` no-op path and the existing mismatch/quarantine
+    no-op path and the existing mismatch/quarantine
     path -- instead of erroring out or misfiring on what looks like
     garbage."""
 
@@ -739,8 +726,6 @@ class TestLaunchGuardRecoversHexCorruptedSharedSlot(unittest.TestCase):
                 keychain._save_slot_lease(store, "alpha", corrupted_shared)
                 guard = keychain.launch_guard(store, "alpha", capture=False)
                 state = guard.__enter__()
-                self.assertTrue(state._already_current)
-                self.assertFalse(state._swapped)
                 self.assertEqual(kc.calls, [])
                 state.__exit__(None, None, None)
             # The still-corrupted value is left byte-identical in the shared
@@ -757,7 +742,7 @@ class TestLaunchGuardRecoversHexCorruptedSharedSlot(unittest.TestCase):
         """A DIFFERENT profile's identity, hidden under the same double-hex
         corruption, must still be recognized as different -- the guard
         falls through to its normal swap-and-restore path, not a false
-        ``_already_current``. The restore at exit writes back the
+        no-op path. The restore at exit writes back the
         NORMALIZED value, so this round-trip self-heals the corruption
         instead of adding another hex layer to it."""
         with isolated_store_env():
@@ -779,8 +764,6 @@ class TestLaunchGuardRecoversHexCorruptedSharedSlot(unittest.TestCase):
                     ):
                 guard = keychain.launch_guard(store, "alpha", capture=False)
                 state = guard.__enter__()
-                self.assertFalse(state._already_current)
-                self.assertTrue(state._swapped)
                 self.assertEqual(kc.shared, keychain.token_payload_for_slot(own_secret))
                 state.__exit__(None, None, None)
             self.assertEqual(kc.shared, foreign_shared)
@@ -1267,8 +1250,6 @@ class TestKeychainSlotFormat(BaseCase):
         super().setUp()
         self.store = _StoreStub(Path(self._tmp) / "store")
         # Realistic shape: a captured login produces this exact envelope.
-        import base64 as _b64
-
         payload = {
             "token": {
                 "access_token": "ya29.aa",
@@ -1277,13 +1258,11 @@ class TestKeychainSlotFormat(BaseCase):
                 "expiry": "2099-01-01T00:00:00Z",
             },
             "auth_method": "consumer",
-            "id_token": "id",
+            "id_token": _make_jwt({"email": "work@example.com"}),
         }
         self._payload = payload
-        self._envelope = b"go-keyring-base64:" + _b64.b64encode(
-            (b'{"token":{"access_token":"ya29.aa","refresh_token":"rt",'
-             b'"token_type":"Bearer","expiry":"2099-01-01T00:00:00Z"},'
-             b'"auth_method":"consumer","id_token":"id"}')
+        self._envelope = keychain.envelope_token_bytes(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
         )
 
     def test_token_payload_for_slot_unwraps_envelope_to_json(self):
@@ -1369,12 +1348,11 @@ class TestKeychainSlotFormat(BaseCase):
                     return_value=_FAKE_KEYCHAIN,
                 ), \
                 mock.patch.object(keychain, "_serialize_lock", return_value=None):
-            with keychain.launch_guard(self.store, "work") as guard:
+            with keychain.launch_guard(self.store, "work"):
                 # Shared slot starts empty (security returns b'' on missing).
-                self.assertFalse(guard._had_shared)
+                self.assertIsNone(keychain._load_slot_lease(self.store).had_shared)
         # Find the write to the shared slot whose payload is the swap
-        # (the guard's exit-time restore also writes, but with the empty
-        # `_had_shared` value, not the profile's token).
+        # (the guard's exit-time restore also writes the empty baseline).
         swaps = [
             args for args in write_calls
             if args[0] == "add-generic-password"
@@ -1492,12 +1470,8 @@ class TestDescribeSharedFormat(unittest.TestCase):
         self.assertNotIn("shared_format", report)
 
 
-class TestKnownIdentityOnDiskToken(unittest.TestCase):
-    """``_known_identity``'s on-disk-token branch must behave exactly like
-    ``account.detect_email(data_dir)`` (no ``store``/``name``, so it only
-    ever walks the on-disk token file, never the keychain fallback) --
-    pinned directly through the ``data_dir`` argument since this was
-    previously a hand-rolled reimplementation of that same lookup."""
+class TestIdentityAnchorOnDiskToken(unittest.TestCase):
+    """The profile identity anchor prefers metadata and then token evidence."""
 
     def test_email_from_on_disk_token_is_found(self):
         import json as _json
@@ -1519,14 +1493,16 @@ class TestKnownIdentityOnDiskToken(unittest.TestCase):
                 _json.dumps(payload), encoding="utf-8"
             )
 
-            email = keychain._known_identity(store, "alpha")
+            email = _account.anchor_for(store, "alpha")
         self.assertEqual(email, "alpha@example.com")
 
     def test_no_on_disk_token_returns_none(self):
+        import account as _account
+
         with isolated_store_env():
             store = Store()
             store.create("alpha")
-            email = keychain._known_identity(store, "alpha")
+            email = _account.anchor_for(store, "alpha")
         self.assertIsNone(email)
 
 
@@ -1542,9 +1518,7 @@ class TestLaunchGuardFailOpenOnForeignSecret(unittest.TestCase):
         with isolated_store_env():
             store = Store()
             store.create("alpha")
-            # No known identity (no email, no on-disk token) → the identity
-            # guard does not quarantine; the strict unwrap is the first
-            # thing to reject the payload.
+            # The unidentifiable backup is refused before payload conversion.
             keychain.save_profile_slot(store, "alpha", b'{"not":"envelope"}')
 
             kc = _MemoryKeychain(None)
@@ -1556,7 +1530,6 @@ class TestLaunchGuardFailOpenOnForeignSecret(unittest.TestCase):
                     mock.patch.object(keychain, "_serialize_lock", return_value=None):
                 guard = keychain.launch_guard(store, "alpha")
                 state = guard.__enter__()
-            self.assertFalse(state._swapped, "undecodable slot must not be swapped")
 
     def test_swap_failure_retains_lease_with_downgraded_membership(self):
         import locks
@@ -1659,12 +1632,13 @@ class TestPersistClassification(unittest.TestCase):
             keychain._persist_if_trusted(self.store, "work", data)
         return note_buf.getvalue(), warn_buf.getvalue()
 
-    def _known_identity_side_effect(self):
+    def _anchor_side_effect(self):
         """Provide a deterministic known identity for the stub store."""
         from unittest import mock
+        import account
 
         return mock.patch.object(
-            keychain, "_known_identity",
+            account, "anchor_for",
             lambda *a, **k: self.known_email,
         )
 
@@ -1672,7 +1646,7 @@ class TestPersistClassification(unittest.TestCase):
         # .secret baseline must survive: refreshed token has no id_token,
         # so the identity cannot be confirmed and the backup is kept.
         before = self.backup.read_bytes()
-        with self._known_identity_side_effect():
+        with self._anchor_side_effect():
             note_out, warn_out = self._persist(self.refresh_payload)
         self.assertTrue(note_out.strip(), "expected a discrete note")
         self.assertNotIn("different account", note_out)
@@ -1682,58 +1656,17 @@ class TestPersistClassification(unittest.TestCase):
 
     def test_garbage_payload_still_warns(self):
 
-        with self._known_identity_side_effect():
+        with self._anchor_side_effect():
             note_out, warn_out = self._persist(b"\x00\x01total-garbage")
         self.assertIn("different account", warn_out)
         self.assertEqual(note_out, "")
 
     def test_different_email_still_warns(self):
 
-        with self._known_identity_side_effect():
+        with self._anchor_side_effect():
             note_out, warn_out = self._persist(self.different_payload)
         self.assertIn("different account", warn_out)
         self.assertEqual(note_out, "")
-
-
-class TestLaunchGuardPersistOnExit(unittest.TestCase):
-    """``launch_guard(persist_on_exit=False)`` is the query mode: the exit
-    path must not attempt a credential persist at all (usage is read-only —
-    it observes the slot, never rewrites the profile's backup)."""
-
-    def test_persist_block_skipped_and_restore_intact(self):
-        from unittest import mock
-
-        with tempfile.TemporaryDirectory() as tmp:
-            store = _StoreStub(Path(tmp) / "store")
-            had = b'{"token":{"access_token":"prior"}}'
-            kc = _MemoryKeychain(had)
-
-            def fake_run(args, input_bytes=None):
-                args = _as_direct_args(args, input_bytes)
-                return _rc(0)
-
-            # A .secret so the swap happens (non-empty slot → swapped).
-            slots = keychain._slots_dir(store)
-            slots.mkdir(parents=True, exist_ok=True)
-            keychain.slot_backup_path(store, "work").write_bytes(
-                keychain.envelope_token_bytes(had)
-            )
-
-            with mock.patch.object(keychain, "supported", return_value=True), \
-                    mock.patch.object(keychain, "_run", fake_run), \
-                    mock.patch.object(
-                        keychain, "_ensure_target_keychain",
-                        return_value=Path("/fake")), \
-                    mock.patch.object(keychain, "_serialize_lock",
-                                      return_value=None), \
-                    mock.patch.object(
-                        keychain, "_persist_if_trusted") as persist:
-                with keychain.launch_guard(store, "work",
-                                           persist_on_exit=False):
-                    pass
-            persist.assert_not_called()
-            # Restore semantics untouched: shared slot back to had_shared.
-            self.assertEqual(kc.shared, had)
 
 
 class TestLaunchGuardClearsSharedOnUndecodableSecret(unittest.TestCase):
@@ -1760,7 +1693,6 @@ class TestLaunchGuardClearsSharedOnUndecodableSecret(unittest.TestCase):
                     ):
                 guard = keychain.launch_guard(store, "beta", capture=False)
                 state = guard.__enter__()
-                self.assertFalse(state._swapped)
                 self.assertIsNone(kc.shared)
                 self.assertIn(("delete", None), kc.calls)
                 state.__exit__(None, None, None)
@@ -1851,9 +1783,9 @@ class TestSerializeLock(unittest.TestCase):
 
 
 class TestLaunchGuardExitRedundantRead(unittest.TestCase):
-    """Exit must not read the shared slot twice when swapped and had_shared is None."""
+    """Exit reads the shared slot at most once when restoring the baseline."""
 
-    def test_exit_reads_slot_only_once_when_persist_on_exit(self):
+    def test_exit_reads_slot_only_once(self):
         with isolated_store_env():
             store = Store()
             store.create("alpha")
@@ -1875,42 +1807,8 @@ class TestLaunchGuardExitRedundantRead(unittest.TestCase):
                         keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
                     ), \
                     mock.patch.object(keychain, "_serialize_lock", return_value=None):
-                guard = keychain.launch_guard(store, "alpha", persist_on_exit=True)
+                guard = keychain.launch_guard(store, "alpha")
                 state = guard.__enter__()
-                self.assertTrue(state._swapped)
-                self.assertIsNone(state._had_shared)
-
-                with mock.patch.object(keychain, "read_slot", side_effect=counting_read_slot):
-                    state.__exit__(None, None, None)
-
-            self.assertEqual(read_count, 1)
-
-    def test_exit_reads_slot_at_most_once_when_persist_on_exit_false(self):
-        with isolated_store_env():
-            store = Store()
-            store.create("alpha")
-            secret = _go_keyring_secret("alpha@example.com")
-            keychain.save_profile_slot(store, "alpha", secret)
-
-            kc = _MemoryKeychain(None)
-            read_count = 0
-            orig_read_slot = keychain.read_slot
-
-            def counting_read_slot(service, keychain_path=None):
-                nonlocal read_count
-                read_count += 1
-                return orig_read_slot(service, keychain_path)
-
-            with mock.patch.object(keychain, "_run", kc.run), \
-                    mock.patch.object(keychain, "supported", return_value=True), \
-                    mock.patch.object(
-                        keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN
-                    ), \
-                    mock.patch.object(keychain, "_serialize_lock", return_value=None):
-                guard = keychain.launch_guard(store, "alpha", persist_on_exit=False)
-                state = guard.__enter__()
-                self.assertTrue(state._swapped)
-                self.assertIsNone(state._had_shared)
 
                 with mock.patch.object(keychain, "read_slot", side_effect=counting_read_slot):
                     state.__exit__(None, None, None)
@@ -2834,7 +2732,7 @@ class TestSlotLeaseOwnerCrash(unittest.TestCase):
             self.assertEqual(kc.shared, self.ORIGINAL)
 
 
-class TestKnownIdentityWhitespaceEmail(unittest.TestCase):
+class TestIdentityAnchorWhitespaceEmail(unittest.TestCase):
     """A whitespace-only cached email is not an identity."""
 
     def _store_with_blank_email(self):
@@ -2852,8 +2750,9 @@ class TestKnownIdentityWhitespaceEmail(unittest.TestCase):
     def test_blank_cached_email_falls_through_to_the_saved_secret(self):
         store = self._store_with_blank_email()
 
-        self.assertIsNone(keychain._known_identity(store, "a", include_secret=False))
-        self.assertEqual(keychain._known_identity(store, "a"), "a@example.com")
+        import account
+
+        self.assertEqual(account.anchor_for(store, "a"), "a@example.com")
 
     def test_blank_cached_email_does_not_authenticate_an_unrelated_slot(self):
         store = self._store_with_blank_email()
@@ -2869,7 +2768,9 @@ class TestKnownIdentityWhitespaceEmail(unittest.TestCase):
         profile.email = "  a@example.com "
         store.save(profile)
 
-        self.assertEqual(keychain._known_identity(store, "a"), "a@example.com")
+        import account
+
+        self.assertEqual(account.anchor_for(store, "a"), "a@example.com")
 
 
 class TestKeychainRunPipeCleanup(unittest.TestCase):

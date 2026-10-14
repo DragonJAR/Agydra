@@ -229,14 +229,6 @@ class TestLockHolderPid(BaseCase):
         self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    "Windows file-handle semantics are fundamentally different (e.g. "
-    "symlink metadata via FILE_ATTRIBUTE_REPARSE_POINT vs lstat's st_mode). "
-    "The test's POSIX assumptions (lstat st_mode, os.path.realpath "
-    "behavior) do not translate to the Windows runner's filesystem "
-    "layer; a Windows counterpart would need WinAPI mocks.",
-)
 class TestLockInodeConsistency(BaseCase):
     """The TOCTOU-at-acquire/probe-time guard (``locks._same_file``) and its
     documented boundary — see locks.py's module docstring for the exact
@@ -250,6 +242,8 @@ class TestLockInodeConsistency(BaseCase):
         self.store.create("work")
 
     def test_same_file_detects_a_replaced_path(self):
+        if sys.platform.startswith("win"):
+            self.skipTest("Windows refuses unlinking open files")
         path = locks.lock_path(self.store, "work")
         locks.lock_dir(self.store).mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"")
@@ -263,6 +257,8 @@ class TestLockInodeConsistency(BaseCase):
             os.close(fd)
 
     def test_same_file_false_when_path_now_missing(self):
+        if sys.platform.startswith("win"):
+            self.skipTest("Windows refuses unlinking open files")
         path = locks.lock_path(self.store, "work")
         locks.lock_dir(self.store).mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"")
@@ -349,6 +345,8 @@ class TestLockInodeConsistency(BaseCase):
         is the reasoned, documented boundary of what path-based probing can
         ever detect. Kept as a regression test so nobody "fixes" this test
         into asserting something the module cannot actually guarantee."""
+        if sys.platform.startswith("win"):
+            self.skipTest("Windows refuses unlinking open files")
         handle = locks.try_lock(self.store, "work")
         path = locks.lock_path(self.store, "work")
         path.unlink()

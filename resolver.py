@@ -37,11 +37,20 @@ MARKER_FILE = ".agydra"
 class NoEligibleProfileError(StoreError):
     """Raised when rotation candidate pool is empty or completely exhausted."""
 
+    def __init__(self, message: str, *, formatted_exhaustion: bool = False) -> None:
+        super().__init__(message)
+        self.formatted_exhaustion = formatted_exhaustion
+
+
+class RotationCycleExhaustedError(NoEligibleProfileError):
+    """Every authenticated unused profile was excluded during preparation."""
+
 
 @dataclass
 class Resolution:
     name: str
     reason: str
+    profile: Optional[Profile] = None
 
 
 def _find_marker(start: Path) -> Optional[Path]:
@@ -167,10 +176,13 @@ def resolve(
 _NO_PROFILES = (
     "no profiles exist yet; create one with: agydra create <name>"
 )
+SESSION_LIMIT_GUIDANCE = (
+    "wait for one to finish, raise settings.max_sessions_per_profile "
+    "in agydra.json, or bypass with -f/--force"
+)
 _AT_LIMIT = (
     "every authenticated profile has reached the limit of {limit} live "
-    "session(s); wait for one to finish, raise settings.max_sessions_per_profile "
-    "in agydra.json, or bypass with -f/--force"
+    f"session(s); {SESSION_LIMIT_GUIDANCE}"
 )
 _NOT_AUTHENTICATED = (
     "no authenticated profile available; authenticate one with: "
@@ -186,6 +198,7 @@ def pick_free_profile(
     exclude: Optional[set] = None,
     read_only: bool = False,
     rotation: Optional[profile_rotation.Rotation] = None,
+    causes: Optional[Dict[str, str]] = None,
 ) -> Resolution:
     """Preview or select an unused identity ordered by saved quota for ``-r``.
 
@@ -199,7 +212,11 @@ def pick_free_profile(
     probe (Claude Code) stays unprobed and eligible. Failed retry exclusions
     never finish the persistent cycle.
     """
-    profiles = store.list_readonly() if read_only else store.list()
+    profiles = (
+        rotation.profiles()
+        if rotation is not None and not read_only
+        else (store.list_readonly() if read_only else store.list())
+    )
     target_engine = engine.strip().lower() if engine is not None else None
     if target_engine is not None:
         profiles = [p for p in profiles if p.engine == target_engine]
@@ -211,14 +228,20 @@ def pick_free_profile(
             )
         raise NoEligibleProfileError(_NO_PROFILES)
 
-    limit = None if force else store.load_config().session_limit()
+    config = rotation.config() if rotation is not None else store.load_config()
+    limit = None if force else config.session_limit()
     busy: Dict[str, bool] = {}
+    holders_cache: Dict[str, Optional[list]] = {}
     saturated = False
     auth_states = rotation.auth_states if rotation is not None else {}
+    auth_causes = rotation.auth_causes if rotation is not None else {}
     probe_auth = account.passive_auth_state if read_only else account.auth_state
     unprobed: set = set()
+    eligibility: Dict[tuple, bool] = {}
 
     def session_priority(profile: Profile) -> tuple:
+        if rotation is not None:
+            return (rotation.session_state(profile)[0],)
         if profile.name not in busy:
             busy[profile.name] = locks.is_locked(store, profile.name)
         return (busy[profile.name],)
@@ -227,46 +250,81 @@ def pick_free_profile(
         nonlocal saturated
         identity = (profile.engine, profile.seq, profile.name)
         if identity not in auth_states:
-            auth_states[identity] = probe_auth(
-                store.profile_data_dir(profile.name, engine=profile.engine),
-                store,
-                profile.name,
-                engine=profile.engine,
-            )
+            data_dir = store.profile_data_dir(profile.name, engine=profile.engine)
+            if profile.engine == "agy" and not read_only:
+                observed = probe_auth(
+                    data_dir, store, profile.name, engine=profile.engine
+                )
+                if observed == "authenticated":
+                    try:
+                        credential = account.usable_agy_credential(
+                            store, profile, data_dir
+                        )
+                    except StoreError:
+                        credential = None
+                    if credential is None:
+                        reason = (
+                            f"no trusted Antigravity credential for profile "
+                            f"{profile.name!r}"
+                        )
+                        auth_causes[identity] = reason
+                        auth_states[identity] = "not-authenticated"
+                    else:
+                        auth_states[identity] = "authenticated"
+                else:
+                    auth_states[identity] = observed
+            else:
+                auth_states[identity] = probe_auth(
+                    data_dir, store, profile.name, engine=profile.engine
+                )
+        if identity in auth_causes:
+            if causes is not None:
+                causes[profile.name] = auth_causes[identity]
+            if exclude is not None:
+                exclude.add(profile.name)
         if auth_states[identity] is None:
             unprobed.add(identity)
         elif auth_states[identity] != "authenticated":
             return False
         if limit is not None and session_priority(profile)[0]:
-            holders = locks.lease_holders(store, profile.name)
+            if rotation is not None:
+                holders = rotation.session_state(profile)[1]
+            else:
+                if profile.name not in holders_cache:
+                    holders_cache[profile.name] = locks.lease_holders(store, profile.name)
+                holders = holders_cache[profile.name]
             if holders is not None and len(holders) >= limit:
                 saturated = True
                 return False
         return True
 
+    def cached_eligible(profile: Profile) -> bool:
+        identity = (profile.engine, profile.seq, profile.name)
+        if identity not in eligibility:
+            eligibility[identity] = eligible(profile)
+        return eligibility[identity]
+
     try:
         candidate = (
-            rotation.select(profiles, exclude, eligible, session_priority)
+            rotation.select(profiles, exclude, cached_eligible, session_priority)
             if rotation is not None
             else profile_rotation.preview(
                 store,
                 profiles,
                 exclude,
-                eligible,
+                cached_eligible,
                 session_priority,
                 engine=target_engine,
             )
         )
+    except profile_rotation.RotationCycleExhaustedError as exc:
+        if saturated:
+            raise NoEligibleProfileError(_AT_LIMIT.format(limit=limit)) from exc
+        raise RotationCycleExhaustedError(_NOT_AUTHENTICATED) from exc
     except profile_rotation.NoEligibleProfileError as exc:
         if saturated:
             raise NoEligibleProfileError(_AT_LIMIT.format(limit=limit)) from exc
         raise NoEligibleProfileError(_NOT_AUTHENTICATED) from exc
-    except StoreError as exc:
-        if "rotation scope" in str(exc):
-            if saturated:
-                raise NoEligibleProfileError(_AT_LIMIT.format(limit=limit)) from exc
-            raise NoEligibleProfileError(str(exc)) from exc
-        raise
     scope = target_engine or "all engines"
     reason = f"profile selected from {scope} rotation; session state, saved quota, LRU and stable identity order (-r)"
     session = "joining busy profile" if session_priority(candidate)[0] else "free profile"
@@ -279,4 +337,4 @@ def pick_free_profile(
         reason = f"read-only random plan candidate (-r; {reason}; {session}{unprobed_note})"
     else:
         reason = f"{session} (-r; {reason})"
-    return Resolution(candidate.name, reason)
+    return Resolution(candidate.name, reason, candidate)

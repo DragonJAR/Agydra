@@ -1362,8 +1362,8 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
         with mock.patch("account.update_grok_tokens", side_effect=OSError("disk full")):
             res = usage.query_grok_usage(data_dir, "grok_pf")
 
-        self.assertTrue(res.ok, res.error)
-        self.assertEqual(mock_billing.call_args_list[1][0][0], "fresh")
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error, "failed to persist refreshed tokens")
 
 
 class TestRecordUsageSnapshotPreservesCachedReading(BaseCase):

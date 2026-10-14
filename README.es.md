@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/Licencia-MIT-yellow.svg" alt="Licencia: MIT"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/Licencia-MIT-blue.svg" alt="Licencia: MIT"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/Versi%C3%B3n-1.1.0-blue.svg" alt="Versión"></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white" alt="Python"></a>
   <img src="https://img.shields.io/badge/Plataformas-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey.svg" alt="Plataformas">
@@ -180,10 +180,10 @@ Los comandos de gestión también aceptan `--NOMBRE` o `-NOMBRE` (`agydra --list
 | Comando | Alias | Descripción |
 |---|---|---|
 | `list` | `ls`, `l` | Índice, correo, default, auth, ocupado, motor, último uso. |
-| `create NOMBRE [-d DESC] [-e MOTOR]` | `c` | Almacén nuevo. `-e` es `agy` (por defecto), `codex`, `grok` o `claude`. |
+| `create NOMBRE [-d DESC] [-e MOTOR]` | `c` | Almacén nuevo. `-e` es `agy` (por defecto), `codex`, `grok` o `claude`. Para `agy`, hereda automáticamente `settings.json`, `mcp.json` y `config.toml` del perfil por defecto si `copy_settings_on_create` está habilitado (por defecto `true`). |
 | `login [NOMBRE\|#] [-f] [-n]` | `in` | Login aislado del motor de ese perfil. `-f` vuelve a autenticar. |
 | `import NOMBRE\|# [-s DIR]` | `imp` | **Copia** `~/.gemini`, `~/.codex` o `~/.grok` al perfil mientras mantiene el lock de ese perfil. Los perfiles Claude se rechazan. |
-| `export NOMBRE\|# [-o RUTA]` | `exp` | **Escribe** un ZIP portable del perfil (excluye secretos OAuth/API key/Keychain por la política R4; Claude se rechaza). Destino por defecto: `~/agydra-export-<nombre>-<ts>.zip`. |
+| `export NOMBRE\|# [-o RUTA]` | `exp` | **Escribe** un ZIP portable del perfil (excluye secretos OAuth/API key/Keychain por política de seguridad; Claude se rechaza). Destino por defecto: `~/agydra-export-<nombre>-<ts>.zip`. |
 | `rename A B` | `mv` | Renombra el perfil y actualiza el default. Rechaza un perfil ocupado. |
 | `delete NOMBRE\|# [-f] [--no-backup]` | `rm` | Escribe un ZIP en `backups/` y luego borra. Rechaza un perfil ocupado. |
 | `default [NOMBRE\|#]` | `d` | Muestra o fija el perfil de respaldo. |
@@ -231,7 +231,7 @@ Sin `-p`, gana la primera coincidencia:
                └── 5. Primer perfil por número (orden de creación; primero los de `agy`)
 ```
 
-**Códigos de salida:** `0` éxito · `1` error · `2` `-p` con `-r` · `126` binario no ejecutable · `127` binario no encontrado · `130` Ctrl-C.
+**Códigos de salida:** `0` éxito · `1` error · `2` error de uso de CLI (ej. `-p` con `-r`, flag inválido) · `126` binario no ejecutable · `127` binario no encontrado · `130` Ctrl-C.
 
 ---
 
@@ -257,11 +257,11 @@ Los locks de sesión usan `<store>/locks/<perfil>.lock`; el archivo marcador per
 
 `create` prepara `data/` y `profile.json` en un directorio temporal hermano, del mismo sistema de archivos, dentro de `<store>/profiles/`, con el nombre `.agydra-stage-<nombre>-<token>`, y publica el perfil completo con un único cambio de nombre de directorio. Los listados ignoran una etapa que quedó tras una interrupción; un `create` posterior para ese mismo nombre la elimina mientras mantiene ambos locks. El número de secuencia reservado sigue consumido.
 
-Antes de mover el directorio de un perfil, `rename` escribe atómicamente su intención en `<store>/profile-rename.json`, que incluye una acción de recuperación para migrar el slot de Keychain y la instantánea `source_present` para Antigravity; el rename de Claude no añade esta acción. Una lectura pública o mutación posterior de perfiles recupera ese journal mientras mantiene, en orden ascendente por nombre, los locks de los perfiles anterior y nuevo, seguidos por el lock de secuencia. Si solo existe el directorio anterior, la recuperación restaura el default anterior cuando hace falta y elimina el journal; si solo existe el nuevo, completa el cambio: corrige los metadatos y el default cuando hace falta, elimina el overlay anterior y luego ejecuta la acción de Keychain registrada antes de borrar el journal. La recuperación forward ejecuta esa acción mientras mantiene los locks de perfil ordenados, el lock de secuencia y `swap.lock`; si falla, conserva el journal para reintentar en la siguiente operación del almacén. En el camino normal de rename, el callback se ejecuta con los locks de perfil mantenidos, después de liberar el lock de secuencia. Si existen ambos directorios o ninguno, el journal o los metadatos están dañados, o algún lock requerido está ocupado, la recuperación falla de forma segura y conserva el journal y los datos de perfil.
+Antes de mover el directorio de un perfil, `rename` escribe atómicamente su intención en `<store>/profile-rename.json`, que incluye una acción de recuperación para migrar el slot de Keychain y la instantánea `source_present` para Antigravity; el rename de Claude no añade esta acción. Los comandos comunes de mutación (`create`, `delete`, `rename`, `default <nombre>`, ...), así como los lanzamientos del motor (`-p`, `-r`) y `login`, completan automáticamente la recuperación de un rename pendiente válido mientras mantienen, en orden ascendente por nombre, los locks de los perfiles anterior y nuevo, seguidos por el lock de secuencia. Las operaciones de solo lectura (`list`, `status`, `-n`/`--dry-run`, `usage`) nunca realizan mutaciones; solo las lecturas que involucran el nombre de perfil anterior o nuevo piden reintentar, mientras que las lecturas de perfiles no relacionados funcionan normalmente. Si solo existe el directorio anterior, la recuperación restaura el default anterior cuando hace falta y elimina el journal; si solo existe el nuevo, completa el cambio: corrige los metadatos y el default cuando hace falta, elimina el overlay anterior y luego ejecuta la acción de Keychain registrada antes de borrar el journal. La recuperación forward ejecuta esa acción mientras mantiene los locks de perfil ordenados, el lock de secuencia y `swap.lock`; si falla, conserva el journal para reintentar en la siguiente operación del almacén. En el camino normal de rename, el callback se ejecuta con los locks de perfil mantenidos, después de liberar el lock de secuencia. Si el journal está mal formado, los lanzamientos rechazan la ejecución sin tocarlo; el siguiente comando ordinario de mutación lo pone en cuarentena automáticamente en un archivo hermano (`profile-rename.json.corrupt-<timestamp>`) y continúa sin requerir un paso manual de doctor. Si existen ambos directorios o ninguno, la recuperación conserva el journal y ambos directorios en su sitio; se rechaza el lanzamiento del nombre anterior o nuevo, mientras que lanzar cualquier otro perfil (de forma explícita o mediante `-r`) funciona sin impedimentos y `-r` nunca elige los nombres ambiguos. Si los metadatos están mal formados o algún lock requerido está ocupado, la recuperación falla de forma segura y conserva el journal y los datos de perfil.
 
 Cuando está activado (por defecto; `--no-backup` lo desactiva), `delete` crea y verifica el ZIP de respaldo antes de borrar los datos del perfil: el respaldo se escribe y verifica manteniendo el lock de perfil, y la fase de confirmación vuelve a tomar el lock de secuencia, revalida la identidad y las rutas del perfil y solo entonces borra. Se conservan como máximo los últimos 5 ZIP por perfil. Para Antigravity, la CLI conserva el lock de perfil durante la purga de llavero posterior al borrado, después de liberar el lock de secuencia; en macOS, la purga usa `swap.lock` para serializar la limpieza del slot guardado y de la entrada del Llavero del sistema con los cambios de credenciales. Si falla la purga, se informa una advertencia después del borrado. `import` mantiene el lock del perfil de destino durante la copia (más `swap.lock` en macOS para Antigravity, para que la credencial importada no compita con un intercambio en curso) y `share-config` mantiene el lock de lectura del origen y los locks de destino hasta terminar todas las copias. `doctor --fix` mantiene el lock del perfil mientras migra y vuelve a enlazar los datos del overlay.
 
-Las rutas del almacén están blindadas: un symlink o junction en la raíz de perfiles, un directorio de perfil, `profile.json`, `data/`, la raíz de overlays o la ruta de configuración de Claude falla de forma segura en lugar de redirigir una escritura fuera del almacén, y dos perfiles que reclamen la misma secuencia se rechazan en vez de aliasar una configuración de Claude. En macOS, la contención del puente del llavero informa un error limpio para selección explícita/login; la rotación `agy` nunca toma ese lock de intercambio.
+Las rutas del almacén están blindadas: un symlink o junction en la raíz de perfiles, un directorio de perfil, `profile.json`, `data/`, la raíz de overlays o la ruta de configuración de Claude falla de forma segura en lugar de redirigir una escritura fuera del almacén, y dos perfiles que reclamen la misma secuencia se rechazan en vez de aliasar una configuración de Claude. En macOS, una breve contención de `swap.lock` en el puente compartido del Llavero informa un error limpio de ocupado para selección explícita/login (un slot en propiedad de la sesión de otro perfil cambia a autenticación por archivo); las sesiones aleatorias de `agy` nunca toman ese lock de intercambio.
 
 | Plataforma | Mecanismo |
 |---|---|
@@ -291,6 +291,7 @@ La configuración global está en `<store>/agydra.json`. Otro almacén se indica
 {
   "default_profile": "trabajo",
   "settings": {
+    "lang": "auto",
     "use_linux_sandbox": false,
     "copy_settings_on_create": true,
     "windows_redirect_home": false
@@ -309,6 +310,7 @@ Todas las claves de binarios (`agy_binary`, `codex_binary`, `grok_binary` y `cla
 | `AGYDRA_PROFILE` | Perfil de respaldo, definido dentro de las sesiones de agydra. Gana `-p`; se omite cuando `-e` pide otro motor y se ignora con advertencia si ya no existe. |
 | `AGYDRA_LANG` | `en` o `es` para un proceso. |
 | `AGYDRA_HOME` | Almacén y overlays. |
+| `AGYDRA_REAL_HOME` | Directorio home auténtico inyectado en los overlays para evitar redirección anidada. |
 | `AGYDRA_AGY_BIN` / `AGYDRA_CODEX_BIN` / `AGYDRA_GROK_BIN` / `AGYDRA_CLAUDE_BIN` | Binario alternativo. |
 | `AGYDRA_NO_KEYCHAIN` | Omite el puente de llavero de macOS. |
 | `NO_COLOR` / `FORCE_COLOR` | Estilo ANSI. |

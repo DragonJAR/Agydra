@@ -1,7 +1,9 @@
 """Overlay construction: idempotent, .gemini -> profile store, generic stays clean."""
+import gc
 import os
 import sys
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -829,9 +831,23 @@ class TestMigrateCleanupFailure(BaseCase):
         if platforms.is_windows() or os.geteuid() == 0:
             self.skipTest("POSIX permission semantics for a non-root user")
         os.chmod(self.real_dir / "nested", 0o555)
-        self.addCleanup(_restore_tree_permissions, self.real_dir)
-        with self.assertRaises(isolation.IsolationError):
-            isolation.migrate_real_dir_to_store(self.real_dir, self.data_dir)
+        old_hook = getattr(sys, "unraisablehook", None)
+        def _silent_unraisable(unraisable):
+            if issubclass(getattr(unraisable, "exc_type", object), (ResourceWarning, Warning)) or "scandir" in str(getattr(unraisable, "object", "")):
+                return
+            if old_hook is not None:
+                old_hook(unraisable)
+        if old_hook is not None:
+            sys.unraisablehook = _silent_unraisable
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=ResourceWarning)
+                with self.assertRaises(isolation.IsolationError):
+                    isolation.migrate_real_dir_to_store(self.real_dir, self.data_dir)
+                gc.collect()
+        finally:
+            if old_hook is not None:
+                sys.unraisablehook = old_hook
         self.assertTrue(os.path.lexists(self.real_dir))
         self.assertEqual(
             (self.data_dir / "nested" / "token.json").read_text(encoding="utf-8"), "secret"

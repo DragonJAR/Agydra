@@ -18,7 +18,7 @@ import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Mapping, Optional, Tuple
+from typing import Iterator, Mapping, Optional, Tuple, Union
 
 import platforms
 import store
@@ -206,14 +206,72 @@ def _require_private_credential_path(path: Path, *, directory: bool = False) -> 
         raise store.StoreError(f"credential path must be a private real entry: {path}")
 
 
-def agy_token_path(data_dir: Path) -> Path:
-    """Validate the native credential path below an already-guarded profile root."""
+def agy_token_path(data_dir: Path, *, create_parent: bool = False) -> Path:
+    """Validate the native credential path and optionally create its parent."""
     data_dir = Path(data_dir)
     _require_private_credential_path(data_dir, directory=True)
     cli_dir = data_dir / AGY_CLI_DIR
     _require_private_credential_path(cli_dir, directory=True)
+    if create_parent:
+        platforms.ensure_dir(cli_dir)
+        _require_private_credential_path(cli_dir, directory=True)
     path = cli_dir / TOKEN_FILE
     _require_private_credential_path(path)
+    return path
+
+
+def anchor_for(
+    profile_store: store.Store,
+    name: Union[str, Profile],
+    data_dir: Optional[Path] = None,
+    *,
+    include_secret: bool = True,
+) -> Optional[str]:
+    """Return identity evidence in metadata, disk credentials, then backup."""
+    scanned_profile = name if isinstance(name, Profile) else None
+    profile_name = scanned_profile.name if scanned_profile is not None else name
+    try:
+        profile = (
+            profile_store.get(profile_name, profile=scanned_profile)
+            if scanned_profile is not None
+            else profile_store.get(profile_name)
+        )
+    except (store.StoreError, OSError, AttributeError):
+        return None
+    cached = normalize_email(getattr(profile, "email", None))
+    if cached is not None:
+        return cached
+    if data_dir is None:
+        try:
+            data_dir = profile_store.profile_data_dir(profile_name, engine="agy")
+        except (store.StoreError, OSError, AttributeError):
+            data_dir = None
+    if data_dir is not None:
+        try:
+            path = agy_token_path(data_dir)
+            raw = store.read_json_object(path, tolerant=True)
+        except (OSError, RecursionError, ValueError, store.StoreError):
+            raw = None
+        if isinstance(raw, dict):
+            identity = email_from_raw(raw)
+            if identity is not None:
+                return identity
+    if not include_secret:
+        return None
+    try:
+        import keychain
+
+        secret = keychain.load_profile_slot(profile_store, profile_name)
+        decoded = keychain.decode_go_keyring_secret(secret)
+    except (store.StoreError, OSError, AttributeError, ValueError):
+        return None
+    return email_from_raw(decoded) if isinstance(decoded, dict) else None
+
+
+def write_agy_token(data_dir: Path, raw: bytes) -> Path:
+    """Atomically publish a private native Antigravity token file."""
+    path = agy_token_path(Path(data_dir), create_parent=True)
+    store.atomic_write_bytes(path, raw)
     return path
 
 
@@ -230,7 +288,7 @@ def _usable_agy_token(raw: object) -> bool:
     return _has_credential(token.get("access_token")) or _has_credential(token.get("refresh_token"))
 
 
-def scoped_agy_token_bytes(
+def usable_agy_credential(
     profile_store: store.Store, profile: Profile, data_dir: Path
 ) -> Optional[bytes]:
     """Validated private disk bytes, or an identity-trusted backup.
@@ -251,13 +309,19 @@ def scoped_agy_token_bytes(
         return None
     if raw is not None:
         try:
-            decoded = json.loads(raw.decode("utf-8"))
-        except (RecursionError, ValueError, UnicodeDecodeError):
+            import locks
+
+            decoded = locks.json_loads_utf8(raw)
+        except (RecursionError, ValueError):
+            return None
+        if not isinstance(decoded, dict):
             return None
         if not _usable_agy_token(decoded):
             return None
         identity = email_from_raw(decoded)
-        if identity is not None and not trusted_identity(profile.email, identity):
+        if identity is not None and not trusted_identity(
+            anchor_for(profile_store, profile, data_dir), identity
+        ):
             return None
         return raw
     import keychain
@@ -270,9 +334,18 @@ def scoped_agy_token_bytes(
         decoded = keychain.decode_go_keyring_secret(secret)
     except RecursionError:
         return None
-    if not _usable_agy_token(decoded) or not trusted_identity(profile.email, email_from_raw(decoded)):
+    if not _usable_agy_token(decoded) or not trusted_identity(
+        anchor_for(profile_store, profile, data_dir), email_from_raw(decoded)
+    ):
         return None
     return json.dumps(decoded, separators=(",", ":")).encode("utf-8")
+
+
+def scoped_agy_token_bytes(
+    profile_store: store.Store, profile: Profile, data_dir: Path
+) -> Optional[bytes]:
+    """Compatibility name for the shared usable-credential reader."""
+    return usable_agy_credential(profile_store, profile, data_dir)
 
 
 CODEX_AUTH_FILE = "auth.json"
@@ -704,7 +777,7 @@ def claude_cli_context(data_dir: Path, store=None) -> Tuple[Optional[Path], Opti
         return None, None, str(exc)
     driver = engines.get_engine("claude")
     config = store.load_config() if store is not None else None
-    binary = driver.resolve_binary(getattr(config, "claude_binary", None))
+    binary = driver.resolve_configured_binary(config)
     store_root = store.root if store is not None else None
     env = isolation.isolated_env(Path(data_dir), {}, engine="claude", store_root=store_root)
     return binary, env, None
@@ -853,8 +926,8 @@ def sync_profile_email(store, name: str) -> Optional[str]:
     than a real completed agy session writing its own token file, and
     trusting it here would let a corrupted `.secret` (e.g. profile
     ``alice``'s slot swapped to hold ``bob``'s credential) launder itself
-    into ``alice.email`` on a passive `agydra list` scan -- which would
-    also poison ``keychain._known_identity``'s trust anchor for every
+       into ``alice.email`` on a passive `agydra list` scan -- which would
+    also poison ``anchor_for``'s trust anchor for every
     guard downstream of it. Still bootstraps a brand-new keychain-only
     profile's email on its first sync (``profile.email`` was unset --
     nothing to compare against, the correct first-detection case), and
@@ -894,5 +967,5 @@ def record_profile_email(profile_store, name: str) -> Optional[str]:
     """Best-effort :func:`sync_profile_email`: a metadata failure never fails the caller."""
     try:
         return sync_profile_email(profile_store, name)
-    except (store.StoreError, OSError):
+    except Exception:
         return None

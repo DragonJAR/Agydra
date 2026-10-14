@@ -21,6 +21,7 @@ import locks
 import platforms
 import runner
 import usage
+import account
 from conftest import BaseCase, _make_jwt
 from store import Store, StoreError
 
@@ -188,6 +189,10 @@ class TestMacosUsageContention(BaseCase):
         finally:
             if proc.stdin:
                 proc.stdin.close()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
             proc.terminate()
             proc.wait(timeout=5)
 
@@ -229,6 +234,10 @@ class TestMacosUsageContention(BaseCase):
         finally:
             if proc.stdin:
                 proc.stdin.close()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
             proc.terminate()
             proc.wait(timeout=5)
 
@@ -276,6 +285,10 @@ class TestMacosUsageContention(BaseCase):
         finally:
             if proc.stdin:
                 proc.stdin.close()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
             proc.terminate()
             proc.wait(timeout=5)
 
@@ -314,6 +327,10 @@ class TestMacosUsageContention(BaseCase):
         finally:
             if proc.stdin:
                 proc.stdin.close()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
             proc.terminate()
             proc.wait(timeout=5)
 
@@ -334,27 +351,56 @@ class TestMacosUsageRestoration(BaseCase):
         profile.email = "alpha@example.com"
         self.store.save(profile)
 
-    def test_launch_guard_restores_shared_slot_and_releases_lock(self):
-        if keychain.fcntl is None:
-            self.skipTest("POSIX flock required")
+    def test_usage_stages_file_auth_without_touching_shared_slot(self):
+        data_dir = self.store.profile_data_dir("alpha", engine="agy")
+        token_path = account.agy_token_path(data_dir)
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_bytes = _slot_payload_json("alpha@example.com")
+        token_path.write_bytes(token_bytes)
+        token_path.chmod(0o600)
 
         initial_shared = _slot_payload_json("prior@example.com")
-        alpha_secret = _go_keyring_secret("alpha@example.com")
-        keychain.save_profile_slot(self.store, "alpha", alpha_secret)
-
         kc = _MemoryKeychain(initial_shared)
+        fake_proc = mock.Mock(spec=subprocess.CompletedProcess)
+        fake_proc.returncode = 0
+        fake_proc.stdout = json.dumps(REAL_USAGE_JSON)
+        fake_proc.stderr = ""
+        captured = {}
+
+        def run_scoped(argv, env, **kwargs):
+            home = Path(env[platforms.home_redirect_var()])
+            staged_token = home / ".gemini" / account.AGY_CLI_DIR / account.TOKEN_FILE
+            captured["home"] = home
+            captured["token"] = staged_token.read_bytes()
+            captured["mode"] = staged_token.stat().st_mode & 0o777
+            captured["argv"] = argv
+            captured["ssh_tty"] = env.get(account.AGY_FILE_AUTH_ENV)
+            return fake_proc
+
         with mock.patch.object(keychain, "supported", return_value=True), \
-                mock.patch.object(keychain, "_run", kc.run), \
-                mock.patch.object(keychain, "_ensure_target_keychain", return_value=_FAKE_KEYCHAIN):
-            with keychain.launch_guard(self.store, "alpha", persist_on_exit=False):
-                self.assertIsNotNone(kc.shared)
-                self.assertIn(("write", mock.ANY), kc.calls)
+                mock.patch.object(keychain, "_run", side_effect=kc.run) as keychain_run, \
+                mock.patch.object(
+                    keychain, "launch_guard",
+                    side_effect=AssertionError("read-only usage must not enter the Keychain bridge"),
+                ) as launch_guard, \
+                mock.patch.object(
+                    platforms, "run_with_group_kill", side_effect=run_scoped
+                ) as run_query:
+            result = usage.query_profile_usage(self.store, "alpha", timeout=5)
 
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(captured["token"], token_bytes)
+        if os.name == "posix":
+            self.assertEqual(captured["mode"], 0o600)
+        self.assertEqual(captured["ssh_tty"], "agydra-profile")
+        self.assertEqual(captured["argv"][1:], ["--print", "/usage", "--output-format", "json"])
+        self.assertNotEqual(captured["home"], Path(os.environ[platforms.home_redirect_var()]))
+        self.assertFalse(captured["home"].exists())
         self.assertEqual(kc.shared, initial_shared)
-
-        after_lock = keychain._serialize_lock(self.store)
-        self.assertIsNotNone(after_lock)
-        after_lock.release()
+        self.assertEqual(kc.calls, [])
+        keychain_run.assert_not_called()
+        launch_guard.assert_not_called()
+        run_query.assert_called_once()
 
 
 class TestUsageAuth004PendingRenameJournal(BaseCase):

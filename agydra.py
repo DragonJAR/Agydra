@@ -4,8 +4,11 @@
 This single file is the repo-root entry point AND the package identity:
 
 - ``python3 agydra.py`` (any Python >= 3.9, stdlib-only) installs the
-  project: venv + editable package + PATH shim, then re-executes the
-  installed ``agydra`` command with the remaining arguments. An explicit
+  project: venv + editable package, a best-effort PATH shim, then
+  re-executes the installed ``agydra`` command with the remaining
+  arguments. Only the essential steps (venv, package) can stop the
+  launch; a shim or verification problem is reported and the launch
+  proceeds through the venv console script. An explicit
   non-dry-run ``setup`` request never re-executes: it runs ``bootstrap``
   directly, so the installer can always repair a stale installation whose
   console script no longer imports.
@@ -124,9 +127,13 @@ def main() -> int:
             else ("broken venv interpreter" if not vpy.exists() else "unimportable runtime modules")
         )
         print(f"agydra.py: {reason} — running setup...")
-        code = bootstrap.run(root=repo, force=False, explicit=False)
-        if code != 0:
-            return code
+        result = bootstrap.perform_install(
+            lambda line: print(line), root=repo, explicit=False
+        )
+        if not result.essential_ok:
+            return result.code
+        if result.console is not None:
+            script = str(result.console)
         if not os.path.isfile(script):
             return _fail(
                 "setup finished but the console script is missing",

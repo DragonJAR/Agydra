@@ -32,7 +32,18 @@ import vocab
 import agydra
 from bootstrap import BootstrapError
 from isolation import IsolationError
-from store import Store, StoreError, _unreadable_metadata_message, atomic_copy, atomic_write_bytes, atomic_write_text, rename_dir_with_retry
+from store import (
+    ProfileBusyError,
+    Store,
+    StoreError,
+    _unreadable_metadata_message,
+    atomic_copy,
+    atomic_write_bytes,
+    atomic_write_text,
+    cannot_safely_proceed_message,
+    read_json_object,
+    rename_dir_with_retry,
+)
 from ui import bar as _bar, error as _error, note as _note, pad, paint, paint_each, warn as _warn
 from ui import console_print as print
 
@@ -62,6 +73,8 @@ class ColoredHelpFormatter(argparse.HelpFormatter):
             super()._set_color(False)
 
     def _format_usage(self, usage, actions, groups, prefix) -> str:
+        if prefix is None and i18n._get_active() == "es":
+            prefix = "uso: "
         rendered = super()._format_usage(usage, actions, groups, prefix)
         head, sep, tail = rendered.partition(" ")
         if not sep:
@@ -69,6 +82,16 @@ class ColoredHelpFormatter(argparse.HelpFormatter):
         return paint(head, "cyan", "bold") + sep + tail
 
     def start_section(self, heading: str) -> None:
+        if i18n._get_active() == "es":
+            translations = {
+                "options:": "opciones:",
+                "options": "opciones",
+                "positional arguments:": "argumentos posicionales:",
+                "positional arguments": "argumentos posicionales",
+                "optional arguments:": "opciones:",
+                "optional arguments": "opciones",
+            }
+            heading = translations.get(heading.lower(), heading)
         super().start_section(paint(heading, "cyan", "bold"))
 
     def _format_action_invocation(self, action):
@@ -241,23 +264,22 @@ def _resolve_subcommand(token: str) -> Optional[str]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agydra",
-        description=(
-            "Multi-profile launcher and workload dispatcher for AI developer CLIs "
-            "(Google Antigravity 'agy', OpenAI Codex 'codex', xAI Grok 'grok', and Anthropic Claude Code 'claude').\n"
-            "'agydra -p <profile> <args...>' runs the engine with that profile's "
-            "isolated data store and native authentication."
+        description=i18n.t("launcher.description"),
+        epilog=i18n.t(
+            "launcher.epilog",
+            default="Created by Jaime Andrés Restrepo (DragonJAR.org) — https://www.dragonjar.org",
         ),
-        epilog="Created by Jaime Andrés Restrepo (DragonJAR.org) — https://www.dragonjar.org",
         formatter_class=ColoredHelpFormatter,
     )
     parser.add_argument(
         "--version",
         action="version",
         version=f"agydra {__version__} — Jaime Andrés Restrepo (DragonJAR.org)",
+        help=i18n.t("help.version_flag", default="show program's version number and exit"),
     )
     for _key, (short, long_, takes_value, metavar, help_text) in _LAUNCH_FLAGS.items():
-        if _key == "random":
-            help_text = i18n.t("launcher.random_help", default=help_text)
+        help_key = f"launcher.{_key.replace('-', '_')}_help"
+        help_text = i18n.t(help_key, default=help_text)
         aliases = (short, long_, *_LAUNCH_LONG_ALIASES.get(_key, ()))
         if takes_value:
             parser.add_argument(*aliases, metavar=metavar, help=help_text)
@@ -265,8 +287,15 @@ def build_parser() -> argparse.ArgumentParser:
             parser.add_argument(*aliases, action="store_true", help=help_text)
     parser.add_argument(
         "--lang", metavar="CODE",
-        help=f"set and persist the display language ({', '.join(i18n.SUPPORTED_LANGS)})",
+        help=i18n.t(
+            "launcher.lang_help",
+            supported=", ".join(i18n.SUPPORTED_LANGS),
+            default=f"set and persist the display language ({', '.join(i18n.SUPPORTED_LANGS)})",
+        ),
     )
+    for action in parser._actions:
+        if action.dest == "help":
+            action.help = i18n.t("help.help_flag", default=action.help)
     return parser
 
 
@@ -445,10 +474,6 @@ def _warn_late_flags(
             return
 
 
-class ProfileBusyError(StoreError):
-    """A profile mutation lock is unavailable because a session may be using it."""
-
-
 def _assert_free(store: Store, name: str, action: str = "modifying the profile") -> None:
     """Refuse to mutate a profile that a live session is using.
 
@@ -498,7 +523,7 @@ def _acquire_profile_lock(
         handle = locks.try_mutation_lock(store, name)
     except locks.LockError as exc:
         raise StoreError(
-            f"cannot safely proceed with {action} profile {name!r}: {exc}"
+            cannot_safely_proceed_message(action, f"profile {name!r}", exc)
         ) from exc
     if handle is None:
         _assert_free(store, name, action)
@@ -517,7 +542,7 @@ def _acquire_profile_read_lock(
         )
     except locks.LockError as exc:
         raise StoreError(
-            f"cannot safely proceed with {action} profile {name!r}: {exc}"
+            cannot_safely_proceed_message(action, f"profile {name!r}", exc)
         ) from exc
     if handle is None:
         raise ProfileBusyError(
@@ -571,6 +596,45 @@ def _table_headers() -> Dict[str, str]:
     }
 
 
+def _auth_state_label(raw_state: str) -> str:
+    norm = (raw_state or "").lower().replace("-", "_").replace(" ", "_")
+    mapping = {
+        "authenticated": i18n.t("cmd.list.state_authenticated", default="authenticated"),
+        "not_authenticated": i18n.t("cmd.list.state_not_authenticated", default="not-authenticated"),
+        "unauthenticated": i18n.t("cmd.list.state_not_authenticated", default="not-authenticated"),
+        "unknown": i18n.t("auth.unknown", default="unknown"),
+        "busy": i18n.t("cmd.list.state_busy", default="busy"),
+    }
+    if norm in mapping:
+        return mapping[norm]
+    return i18n.t(f"cmd.list.state_{norm}", default=i18n.t(f"auth.{norm}", default=raw_state))
+
+
+def _resolve_profile_auth_and_email(
+    store: Store,
+    profile: Profile,
+    *,
+    sync_email: bool = True,
+    data_dir: Optional[Path] = None,
+) -> Tuple[str, Optional[str], Any]:
+    engine = profile.engine
+    name = profile.name
+    if data_dir is None:
+        data_dir = store.profile_data_dir(name, engine=engine, profile=profile)
+    if engine == "claude":
+        native = account.claude_auth_status(data_dir, store)
+        email = account.normalize_email(profile.email) or native.email
+        state = native.auth_state_label
+        return state, email, native
+    if sync_email and not locks.is_locked(store, name):
+        synced = account.record_profile_email(store, name)
+        if synced and not profile.email:
+            profile.email = synced
+    email = account.display_email(store, profile)
+    state = account.auth_state(data_dir, store, name, engine=engine)
+    return state, email, None
+
+
 def cmd_list(store: Store, _args) -> int:
     profiles, unreadable = store.scan()
     if not profiles and not unreadable:
@@ -594,44 +658,19 @@ def cmd_list(store: Store, _args) -> int:
         )
         print(paint(header, "bold"))
 
-        def _auth_state_label(raw_state: str) -> str:
-            norm = (raw_state or "").lower().replace("-", "_")
-            mapping = {
-                "authenticated": i18n.t("cmd.list.state_authenticated", default="authenticated"),
-                "not_authenticated": i18n.t("cmd.list.state_not_authenticated", default="not-authenticated"),
-                "unauthenticated": i18n.t("cmd.list.state_not_authenticated", default="not-authenticated"),
-                "unknown": i18n.t("auth.unknown", default="unknown"),
-            }
-            if norm in mapping:
-                return mapping[norm]
-            return i18n.t(f"cmd.list.state_{norm}", default=i18n.t(f"auth.{norm}", default=raw_state))
-
         for idx, profile in enumerate(profiles, start=1):
             busy = locks.is_locked(store, profile.name)
-            engine = profile.engine
-            if engine == "claude":
-                native = account.claude_auth_status(store.profile_data_dir(profile.name, engine=engine), store)
-                email = native.email or account.display_email(store, profile) or "-"
-                state = native.auth_state_label
-            else:
-                if not busy:
-                    synced = account.record_profile_email(store, profile.name)
-                    if synced and not profile.email:
-                        profile.email = synced
-                email = account.display_email(store, profile) or "-"
-                state = account.auth_state(
-                    store.profile_data_dir(profile.name, engine=engine), store, profile.name, engine=engine,
-                )
+            state, email, _native = _resolve_profile_auth_and_email(store, profile, sync_email=True)
             state_label = _auth_state_label(state)
             is_default = paint("*", "green", "bold") if profile.name == default else ""
             state_color = "green" if state == "authenticated" else None
             state_shown = paint(state_label, state_color) if state_color else state_label
             busy_shown = paint(busy_yes, "yellow", "bold") if busy else "-"
             last = paint(profile.last_used or "-", "dim")
-            email = ui.console_text(email)
+            email_text = ui.console_text(email or "-")
             print(
-                f"{idx:<3}{profile.name:<{width + 2}}{email:<{_EMAIL_COL_WIDTH}}"
-                f"{pad(state_shown, auth_w)}{pad(is_default, def_w)}{pad(busy_shown, busy_w)}{pad(engine, eng_w)}{last}"
+                f"{idx:<3}{profile.name:<{width + 2}}{email_text:<{_EMAIL_COL_WIDTH}}"
+                f"{pad(state_shown, auth_w)}{pad(is_default, def_w)}{pad(busy_shown, busy_w)}{pad(profile.engine, eng_w)}{last}"
             )
     if unreadable:
         for name in sorted(unreadable):
@@ -650,8 +689,12 @@ def cmd_create(store: Store, args) -> int:
                 default_profile = store.get(default)
             except StoreError as exc:
                 _note(
-                    f"settings not copied from unavailable default profile "
-                    f"{default!r} ({exc})"
+                    i18n.t(
+                        "cmd.create.settings_not_copied_unavailable",
+                        default_name=default,
+                        exc=exc,
+                        default=f"settings not copied from unavailable default profile {default!r} ({exc})",
+                    )
                 )
             else:
                 if default_profile.engine == "agy":
@@ -659,15 +702,27 @@ def cmd_create(store: Store, args) -> int:
                         _share_config(store, default, [profile.name])
                     except (ProfileBusyError, StoreError, OSError) as exc:
                         _note(
-                            f"settings not copied from default profile "
-                            f"{default!r} ({exc})"
+                            i18n.t(
+                                "cmd.create.settings_not_copied",
+                                default_name=default,
+                                exc=exc,
+                                default=f"settings not copied from default profile {default!r} ({exc})",
+                            )
                         )
-    print(f"created profile: {profile.name}")
-    print(f"authenticate it with: agydra login {profile.name}")
+    print(i18n.t("cmd.create.ok", name=profile.name, default=f"created profile: {profile.name}"))
+    print(i18n.t("cmd.create.authenticate", name=profile.name, default=f"authenticate it with: agydra login {profile.name}"))
     return 0
 
 
 def cmd_login(store: Store, args) -> int:
+    dry_run = bool(getattr(args, "dry_run", False))
+    if dry_run:
+        return _cmd_login_in_recovery_scope(store, args)
+    with store.launch_recovery_scope(target_name=args.ref):
+        return _cmd_login_in_recovery_scope(store, args)
+
+
+def _cmd_login_in_recovery_scope(store: Store, args) -> int:
     dry_run = bool(getattr(args, "dry_run", False))
     if args.ref is None:
         name = resolver.resolve(store, read_only=dry_run).name
@@ -676,16 +731,12 @@ def cmd_login(store: Store, args) -> int:
         name = resolve_ref(args.ref)
     profile = store.get_readonly(name) if dry_run else store.get(name)
     engine = profile.engine
-    data_dir = store.profile_data_dir(name, engine=engine)
-    native = None
+    data_dir = store.profile_data_dir(name, engine=engine, profile=profile)
     state = None
+    email = None
     if not dry_run:
-        native = account.claude_auth_status(data_dir, store) if engine == "claude" else None
-        state = native.auth_state_label if native else account.auth_state(
-            data_dir, store, name, engine=engine
-        )
+        state, email, _native = _resolve_profile_auth_and_email(store, profile, sync_email=True, data_dir=data_dir)
     if state == "authenticated" and not dry_run and not getattr(args, "force", False):
-        email = native.email if native else account.detect_email(data_dir, store, name, engine=engine)
         prompt = i18n.t(
             "cmd.login.confirm_relogin",
             name=name,
@@ -702,19 +753,23 @@ def cmd_login(store: Store, args) -> int:
         plan_kwargs["read_only"] = True
     plan = runner.build_plan(store, login_args, **plan_kwargs)
     if not dry_run:
-        print(f"launching {driver.binary_name} for login under profile {plan.profile!r}...")
+        print(
+            i18n.t(
+                "cmd.login.launching_login",
+                binary=driver.binary_name,
+                profile=plan.profile,
+                default=f"launching {driver.binary_name} for login under profile {plan.profile!r}...",
+            )
+        )
         if engine == "codex":
-            print("complete the Codex authentication flow; tokens land in the profile store")
+            print(i18n.t("cmd.login.instructions_codex", default="complete the Codex authentication flow; tokens land in the profile store"))
         elif engine == "grok":
-            print("complete the Grok authentication flow; tokens land in the profile store")
+            print(i18n.t("cmd.login.instructions_grok", default="complete the Grok authentication flow; tokens land in the profile store"))
         elif engine == "claude":
             print(i18n.t("claude.login_native"))
         else:
-            print("complete the OAuth flow in the browser; tokens land in the profile store")
-    code = runner.run(plan, store=store, dry_run=dry_run)
-    if code == 0 and not dry_run and engine == "agy":
-        account.record_profile_email(store, plan.profile)
-    return code
+            print(i18n.t("cmd.login.instructions_agy", default="complete the OAuth flow in the browser; tokens land in the profile store"))
+    return runner.run(plan, store=store, dry_run=dry_run)
 
 
 def _status_target(store: Store, ref: Optional[str], engine: Optional[str]):
@@ -724,10 +779,11 @@ def _status_target(store: Store, ref: Optional[str], engine: Optional[str]):
     existing profile must work before (or without) installing the CLI.
     """
     resolution = resolver.resolve(store, flag_ref=ref, engine=engine)
-    profile = store.get(resolution.name)
+    profile = resolution.profile if getattr(resolution, "profile", None) is not None else store.get(resolution.name)
     driver = engines.get_engine(profile.engine)
     config = store.load_config()
-    binary = driver.resolve_binary(getattr(config, driver.config_binary_attr, None))
+    binary = driver.resolve_configured_binary(config)
+    resolution.profile = profile
     return resolution, binary, driver
 
 
@@ -749,22 +805,16 @@ def cmd_status(store: Store, args) -> int:
     binary_text = str(binary) if binary is not None else (
         f"(not found; install {driver.binary_name} or set {driver.env_bin_var})"
     )
-    profile = store.get(name)
+    profile = resolution.profile if getattr(resolution, "profile", None) is not None else store.get(name)
     engine = profile.engine
-    data_dir = store.profile_data_dir(name, engine=engine)
-    native = account.claude_auth_status(data_dir, store) if engine == "claude" else None
-    if native:
-        email = native.email or account.display_email(store, profile) or "-"
-        state = native.auth_state_label
-    else:
-        email = account.display_email(store, profile) or "-"
-        state = account.auth_state(data_dir, store, name, engine=engine)
+    data_dir = store.profile_data_dir(name, engine=engine, profile=profile)
+    state, email, native = _resolve_profile_auth_and_email(store, profile, sync_email=False, data_dir=data_dir)
     print(i18n.t("cmd.status.profile", name=name))
     print(i18n.t("cmd.status.engine", engine=engine))
     print(i18n.t("cmd.status.reason", reason=resolution.reason))
     print(i18n.t("cmd.status.binary", path=binary_text))
-    print(i18n.t("cmd.status.email", email=email))
-    print(i18n.t("cmd.status.auth", state=state))
+    print(i18n.t("cmd.status.email", email=email or "-"))
+    print(i18n.t("cmd.status.auth", state=_auth_state_label(state)))
     holders = locks.lease_holders(store, name)
     limit = store.load_config().session_limit()
     if holders is None:
@@ -879,16 +929,12 @@ def _enable_claude_capture(store: Store, profile) -> str:
         existing: dict = {}
         if settings_path.is_file():
             try:
-                raw = json.loads(settings_path.read_text(encoding="utf-8"))
+                raw = read_json_object(settings_path)
             except (ValueError, OSError) as exc:
                 raise StoreError(
                     f"cannot enable capture: {settings_path} is not valid JSON "
                     f"({exc}); fix it manually, then retry"
                 ) from exc
-            if not isinstance(raw, dict):
-                raise StoreError(
-                    f"cannot enable capture: {settings_path} is not a JSON object"
-                )
             existing = raw
             current_status = raw.get("statusLine")
             if current_status == payload["statusLine"]:
@@ -1040,11 +1086,13 @@ def _record_usage_snapshot(
     the previous document in place instead of turning a successful quota
     inspection into an error.
     """
+    if store.has_pending_rename():
+        return list(results)
     previous = usage_snapshot.read_snapshot(store)
     updated_results = list(results)
     if isinstance(previous, dict) and previous.get("profiles"):
         for idx, (p, r) in enumerate(zip(profiles, results)):
-            if not r.ok and r.error != "not authenticated" and r.authentication_state != "unauthenticated":
+            if not r.ok and getattr(r, "authentication_state", None) != "unauthenticated":
                 prev_entry = _find_previous_entry(previous, p)
                 if prev_entry:
                     cached_groups = _restore_cached_groups(prev_entry.get("groups"))
@@ -1060,7 +1108,7 @@ def _record_usage_snapshot(
                         )
     results = updated_results
     usage_snapshot.write_snapshot(
-        store, profiles=profiles, results=results, scope=scope, now=now
+        store, profiles=profiles, results=results, scope=scope, previous=previous, now=now
     )
     return results
 
@@ -1098,10 +1146,11 @@ def _plan_separated(cell: str, width: int) -> str:
     return pad(cell, width) + (" " if ui.visible_width(cell) >= width else "")
 
 
-def _usage_error_cell(error: Optional[str]) -> str:
-    if error == "not authenticated":
+def _usage_error_cell(result: Any) -> str:
+    if getattr(result, "authentication_state", None) == "unauthenticated":
         return paint(i18n.t("auth.not_authenticated", default="not authenticated"), "dim")
-    return paint(f"({error})", "dim")
+    err = getattr(result, "error", None) if hasattr(result, "error") else str(result)
+    return paint(f"({err})", "dim")
 
 
 def _usage_account_cell(email: str, mode: str, width: int) -> str:
@@ -1147,7 +1196,7 @@ def _claude_usage_lines(result: "usage.UsageResult", bar_width: int) -> List[str
     if not result.groups:
         lines.append(i18n.t("usage.snapshot_unavailable"))
     if result.error:
-        lines.append(_usage_error_cell(result.error))
+        lines.append(_usage_error_cell(result))
     return lines
 
 
@@ -1306,7 +1355,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                 not_el = paint(i18n.t("usage.not_eligible", default="✗ not eligible"), "red")
                 print(row_pfx + pad(not_el, gem_col_w) + not_el)
             elif not result.ok:
-                if result.error == "not authenticated":
+                if getattr(result, "authentication_state", None) == "unauthenticated":
                     not_auth = paint(i18n.t("auth.not_authenticated", default="not authenticated"), "dim")
                     print(row_pfx + pad(not_auth, gem_col_w) + not_auth)
                 else:
@@ -1377,7 +1426,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                     tag = f"cached {age}" if age else "cached"
                     err_cell = paint(f"({result.error} · {tag})", "dim")
                 else:
-                    err_cell = _usage_error_cell(result.error)
+                    err_cell = _usage_error_cell(result)
                 print(row + _plan_separated(err_cell, quota_width) + plan)
             elif not result.groups:
                 if result.error == usage.PLAN_WITHOUT_QUOTA:
@@ -1489,30 +1538,37 @@ def _cmd_usage_detail(store: Store, args) -> int:
             else i18n.t("auth.not_authenticated", default="not authenticated")
         )
         print(f"status    : {state_str}")
-        print(f"data dir  : {store.profile_data_dir(name, engine=profile.engine)}")
+        print(f"data dir  : {store.profile_data_dir(name, engine=profile.engine, profile=profile)}")
         if not result.ok:
             if not result.groups:
-                if result.error and result.error != "not authenticated":
-                    _error(f"usage unavailable: {result.error}")
+                if result.error and result.error.strip().lower() not in ("not authenticated", "not-authenticated", "unauthenticated"):
+                    _error(i18n.t("usage.unavailable_with_error", error=result.error, default=f"usage unavailable: {result.error}"))
                 return 1
             age = _format_age(result.observed_at)
-            tag = f"from {age}" if age else "cached"
-            _warn(f"{result.error} (showing cached reading {tag})")
-            print(paint(f"warning   : {result.error} (showing cached reading {tag})", "yellow"))
+            tag = (
+                i18n.t("usage.cached_age", age=age, default=f"from {age}")
+                if age
+                else i18n.t("usage.cached_tag", default="cached")
+            )
+            msg = i18n.t(
+                "usage.showing_cached",
+                error=result.error,
+                tag=tag,
+                default=f"{result.error} (showing cached reading {tag})",
+            )
+            _warn(msg)
+            print(paint(f"warning   : {msg}", "yellow"))
         elif result.error == usage.PLAN_WITHOUT_QUOTA:
             print(f"usage     : {i18n.t('usage.plan_no_quota')}")
         elif result.error:
-            _error(f"usage unavailable: {result.error}")
+            _error(i18n.t("usage.unavailable_with_error", error=result.error, default=f"usage unavailable: {result.error}"))
             return 1
         if not result.groups:
             return 0
 
     if not result.ok and not result.groups:
         if result.error and result.error != usage.PLAN_WITHOUT_QUOTA:
-            _error(f"usage unavailable: {result.error}")
-        return 1
-    if result.error and result.error != usage.PLAN_WITHOUT_QUOTA and not result.groups:
-        _error(f"usage unavailable: {result.error}")
+            _error(i18n.t("usage.unavailable_with_error", error=result.error, default=f"usage unavailable: {result.error}"))
         return 1
     for group in result.groups:
         print()
@@ -1529,11 +1585,12 @@ def _cmd_usage_detail(store: Store, args) -> int:
 def cmd_default(store: Store, args) -> int:
     if args.ref is None:
         current = store.default_name()
-        print(current if current else "no default profile set")
+        print(current if current else i18n.t("cmd.default.none", default="no default profile set"))
         return 0
+    store.recover_pending_rename()
     name = store.resolve_ref(args.ref)
     store.set_default(name)
-    print(f"default profile: {name}")
+    print(i18n.t("cmd.default.set_ok", name=name, default=f"default profile: {name}"))
     return 0
 
 
@@ -1553,7 +1610,7 @@ def cmd_rename(store: Store, args) -> int:
     if not engines.get_engine(current.engine).needs_keychain:
         profile = store.rename(old, args.new)
         locks.forget(store, old)
-        print(f"renamed {old!r} -> {profile.name!r}")
+        print(i18n.t("cmd.rename.ok", old=old, new=profile.name, default=f"renamed {old!r} -> {profile.name!r}"))
         return 0
 
     recovery_data = {}
@@ -1581,7 +1638,7 @@ def cmd_rename(store: Store, args) -> int:
         recovery_data_provider=prepare_recovery_data,
     )
     locks.forget(store, old)
-    print(f"renamed {old!r} -> {profile.name!r}")
+    print(i18n.t("cmd.rename.ok", old=old, new=profile.name, default=f"renamed {old!r} -> {profile.name!r}"))
     return 0
 
 
@@ -1624,12 +1681,16 @@ def _finish_delete(store: Store, name: str, no_backup: bool) -> int:
     )
     locks.forget(store, name)
     if backup:
-        print(f"backup saved: {backup}")
-    print(f"deleted profile: {name}")
+        print(i18n.t("cmd.delete.backup_saved", path=backup, default=f"backup saved: {backup}"))
+    print(i18n.t("cmd.delete.ok", name=name, default=f"deleted profile: {name}"))
     if purge_errors:
         _warn(
-            f"profile {name!r} was deleted, but keychain purge failed "
-            f"({purge_errors[0]})"
+            i18n.t(
+                "cmd.delete.purge_failed",
+                name=name,
+                error=purge_errors[0],
+                default=f"profile {name!r} was deleted, but keychain purge failed ({purge_errors[0]})",
+            )
         )
         return 1
     return 0
@@ -1699,7 +1760,7 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
                 f"cannot safely share config from {src!r}: profile metadata "
                 f"names a different owner ({src_profile.name!r})"
             )
-        src_dir = store.profile_data_dir(src, engine=src_profile.engine)
+        src_dir = store.profile_data_dir(src, engine=src_profile.engine, profile=src_profile)
         target_profiles = {name: store.get(name) for name in resolved}
         if any(profile.name != name for name, profile in target_profiles.items()):
             raise StoreError("cannot safely share config: target profile owner changed")
@@ -1718,7 +1779,7 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
                     continue
                 if name.endswith(".json"):
                     try:
-                        json.loads(raw)
+                        locks.json_loads_utf8(raw)
                     except (ValueError, UnicodeDecodeError) as exc:
                         _note(f"skipping invalid JSON {name} in {src}: {exc}")
                         continue
@@ -1726,7 +1787,7 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
         copied: List[str] = []
         for target_name in resolved:
             target_profile = target_profiles[target_name]
-            target_dir = store.profile_data_dir(target_name, engine=target_profile.engine)
+            target_dir = store.profile_data_dir(target_name, engine=target_profile.engine, profile=target_profile)
             for name, payload in source_payloads.items():
                 atomic_write_bytes(target_dir / name, payload)
                 copied.append(f"{target_name}/{name}")
@@ -1739,13 +1800,13 @@ def cmd_share_config(store: Store, args) -> int:
         t for t in args.targets if store.resolve_ref(t) == src
     ]
     if self_targets:
-        print(f"skipped: {src} is both source and target (nothing to copy)")
+        print(i18n.t("cmd.share_config.self_target_skipped", src=src, default=f"skipped: {src} is both source and target (nothing to copy)"))
     copied = _share_config(store, src, args.targets)
     if copied:
         for entry in copied:
-            print(f"copied: {entry}")
+            print(i18n.t("cmd.share_config.entry_copied", entry=entry, default=f"copied: {entry}"))
     elif not self_targets:
-        print("nothing to copy (missing settings.json/mcp.json/config.toml in source)")
+        print(i18n.t("cmd.share_config.nothing_to_copy", default="nothing to copy (missing settings.json/mcp.json/config.toml in source)"))
     return 0
 
 
@@ -1767,15 +1828,23 @@ def _summarize_import_failure(exc: "shutil.Error", source: Path) -> str:
 
 def cmd_import(store: Store, args) -> int:
     ref = args.ref
-    looks_like_path = ref.startswith(("/", "~", ".", "\\")) or re.match(
-        r"^[a-zA-Z]:[\\/]", ref
+    looks_like_path = (
+        "/" in ref
+        or "\\" in ref
+        or ref.startswith((".", "~"))
+        or bool(re.match(r"^[a-zA-Z]:", ref))
     )
     if looks_like_path:
         raise StoreError(
-            f"import takes the TARGET profile name, not a path: {ref!r}. "
-            f"The generic agy data dir is auto-detected "
-            f"({platforms.agy_data_dir()}). "
-            f"Usage: agydra import <profile-name>   (use -s DIR to override the source)."
+            i18n.t(
+                "cmd.import.takes_profile_not_path",
+                ref=ref,
+                default=(
+                    f"import takes the TARGET profile name, not a path: {ref!r}. "
+                    "The generic data directory is auto-detected from the target profile engine (or use -s DIR to override). "
+                    "Usage: agydra import <profile-name> [-s DIR]"
+                ),
+            )
         )
     name = store.resolve_ref(ref)
     with _acquire_profile_lock(store, name, "importing into it"), ExitStack() as guards:
@@ -1801,7 +1870,7 @@ def cmd_import(store: Store, args) -> int:
                 f"no generic {driver.binary_name} data directory found at {real} — log in once with "
                 f"plain `{driver.binary_name}` to create it, then retry: agydra import " + name
             )
-        data_dir = store.profile_data_dir(name, engine=engine)
+        data_dir = store.profile_data_dir(name, engine=engine, profile=profile)
         if data_dir.exists():
             unexpected = [
                 p.name for p in data_dir.iterdir() if p.name not in SHARED_CONFIG_FILES
@@ -1813,8 +1882,6 @@ def cmd_import(store: Store, args) -> int:
                 )
         if driver.needs_keychain:
             guards.enter_context(keychain.serialized_access(store))
-        if data_dir.exists():
-            shutil.rmtree(data_dir)
         platforms.ensure_dir(data_dir.parent)
         tmp = Path(tempfile.mkdtemp(prefix=f".import-{name}.", dir=data_dir.parent))
         try:
@@ -1825,6 +1892,8 @@ def cmd_import(store: Store, args) -> int:
                 )
             except shutil.Error as exc:
                 raise StoreError(_summarize_import_failure(exc, real)) from exc
+            if data_dir.exists():
+                shutil.rmtree(data_dir)
             rename_dir_with_retry(tmp, data_dir)
         except BaseException:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -1839,7 +1908,7 @@ def cmd_import(store: Store, args) -> int:
                     f"keychain import capture skipped ({exc}); "
                     "continuing without it"
                 )
-        print(f"imported generic data into profile {name!r}: {data_dir}")
+        print(i18n.t("cmd.import.ok", name=name, path=data_dir, default=f"imported generic data into profile {name!r}: {data_dir}"))
         return 0
 
 
@@ -1849,8 +1918,8 @@ def cmd_use(store: Store, args) -> int:
     profile = store.get(name)
     marker = Path.cwd() / resolver.MARKER_FILE
     atomic_write_bytes(marker, (name + "\n").encode("utf-8"))
-    print(f"pinned {marker} -> profile {name!r}")
-    print(f"{profile.engine} launches in this directory will use {name!r} automatically")
+    print(i18n.t("cmd.use.pinned", marker=marker, name=name, default=f"pinned {marker} -> profile {name!r}"))
+    print(i18n.t("cmd.use.auto_launch", engine=profile.engine, name=name, default=f"{profile.engine} launches in this directory will use {name!r} automatically"))
     return 0
 
 
@@ -1881,9 +1950,13 @@ def cmd_export(store: Store, args) -> int:
     excluded_relpaths: List[str] = [f"data/{p}" for p in engine_excluded]
     excluded_relpaths.append("_keychain/")
     with _acquire_profile_read_lock(store, name, "exporting it"):
-        if locks.is_locked(store, name):
+        if locks.lease_holders(store, name):
             _note(
-                f"exporting live profile {name!r}; the archive is a best-effort snapshot"
+                i18n.t(
+                    "cmd.export.live_note",
+                    name=name,
+                    default=f"exporting live profile {name!r}; the archive is a best-effort snapshot",
+                )
             )
         _ensure_ref_unchanged(store, args.ref, name, "export")
         dest = Path(args.output) if args.output is not None else _default_export_path(name)
@@ -1903,16 +1976,23 @@ def cmd_export(store: Store, args) -> int:
             manifest=manifest,
             exclude_root_relpaths=excluded_relpaths,
         )
-    print(f"exported {name!r}: {archive}")
+    print(i18n.t("cmd.export.ok", name=name, path=archive, default=f"exported {name!r}: {archive}"))
     print(
-        f"included: profile.json, data/ (minus {len(excluded_relpaths)} excluded path(s))"
+        i18n.t(
+            "cmd.export.included",
+            count=len(excluded_relpaths),
+            default=f"included: profile.json, data/ (minus {len(excluded_relpaths)} excluded path(s))",
+        )
     )
-    print("excluded (by policy):")
+    print(i18n.t("cmd.export.excluded_header", default="excluded (by policy):"))
     for entry in excluded_relpaths:
         print(f"  - {entry}")
     print(
-        f"on the destination machine, run: agydra login {name}   "
-        "(the archive does not carry credentials, by R4 design)"
+        i18n.t(
+            "cmd.export.post_hint",
+            name=name,
+            default=f"on the destination machine, run: agydra login {name}   (the archive does not carry credentials, by R4 design)",
+        )
     )
     return 0
 
@@ -2024,8 +2104,8 @@ _SUBCOMMAND_GROUPS: List[Tuple[str, List[str]]] = [
 
 
 def _management_help() -> str:
-    lines = [paint("management:", "cyan", "bold")]
-    lines.append("  (any name/alias below also works as --NAME or -NAME, e.g. --list/-list)")
+    lines = [paint(i18n.t("help.management_header", default="management:"), "cyan", "bold")]
+    lines.append(i18n.t("help.management_note", default="  (any name/alias below also works as --NAME or -NAME, e.g. --list/-list)"))
     col_width = max(
         len("/".join((can, *vocab.SUBCOMMAND_ALIASES.get(can, ()))))
         for can in _SUBCOMMAND_HELP
@@ -2034,15 +2114,17 @@ def _management_help() -> str:
 
     for group_title, commands in _SUBCOMMAND_GROUPS:
         lines.append("")
-        lines.append(paint(f"  {group_title}:", "bold"))
+        group_key = f"help.group.{group_title.replace(' & ', '_').replace(' ', '_')}"
+        lines.append(paint(f"  {i18n.t(group_key, default=group_title)}:", "bold"))
         for canonical in commands:
             aliases = vocab.SUBCOMMAND_ALIASES.get(canonical, ())
             spellings = "/".join((canonical, *aliases))
+            desc_key = f"cmd.{canonical.replace('-', '_')}.help"
             lines.append(
                 paint_each(
                     [
                         (f"    {spellings:<{col_width}}", ("bold",)),
-                        (_SUBCOMMAND_HELP.get(canonical, ""), ()),
+                        (i18n.t(desc_key, default=_SUBCOMMAND_HELP.get(canonical, "")), ()),
                     ],
                     separator="",
                 )
@@ -2100,7 +2182,7 @@ _EXAMPLES: list[tuple[str, list[tuple[str, str]]]] = [
 def _report_error(exc: BaseException) -> int:
     """Single error-mapping table shared by both dispatch paths."""
     if isinstance(exc, EOFError):
-        _error("no input available to confirm; re-run with --force")
+        _error(i18n.t("error.no_input_available", default="no input available to confirm; re-run with --force"))
         return 1
     if isinstance(exc, KeyboardInterrupt):
         _print_cancelled(file=sys.stderr)
@@ -2111,9 +2193,6 @@ def _report_error(exc: BaseException) -> int:
     if isinstance(exc, _CLI_REPORTABLE_ERRORS):
         _error(str(exc))
         return 1
-    if isinstance(exc, OSError):
-        _error(str(exc))
-        return 1
     raise exc
 
 
@@ -2122,6 +2201,7 @@ _CLI_REPORTABLE_ERRORS: Tuple[type, ...] = (
     IsolationError,
     BootstrapError,
     EOFError,
+    KeyboardInterrupt,
     keychain.KeychainError,
     OSError,
     ValueError,
@@ -2133,20 +2213,22 @@ def _print_top_level_help() -> None:
     print()
     print(_management_help())
     print()
-    print(paint("examples:", "cyan", "bold"))
-    for group, entries in _EXAMPLES:
-        print(f"  {group}:")
-        for command, comment in entries:
+    print(paint(i18n.t("help.examples_header", default="examples:"), "cyan", "bold"))
+    for group_idx, (group, entries) in enumerate(_EXAMPLES):
+        group_title = i18n.t(f"help.example_group.{group_idx}", default=group)
+        print(f"  {group_title}:")
+        for entry_idx, (command, comment) in enumerate(entries):
+            comment_text = i18n.t(f"help.example_comment.{group_idx}.{entry_idx}", default=comment)
             print(
                 paint_each(
                     [
                         (f"    {command}", ("bold",)),
-                        (f"  # {comment}", ("dim",)),
+                        (f"  # {comment_text}", ("dim",)),
                     ]
                 )
             )
     print()
-    print(paint("author & maintainer:", "cyan", "bold"))
+    print(paint(i18n.t("help.author_header", default="author & maintainer:"), "cyan", "bold"))
     print("  Jaime Andrés Restrepo — DragonJAR.org (contacto@dragonjar.org)")
     print("  https://www.dragonjar.org  ·  https://github.com/DragonJAR/agydra")
 
@@ -2174,7 +2256,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 i += 2
                 continue
             else:
-                _error("--lang requires a value")
+                _error(i18n.t("cli.error_lang_requires_value", default="--lang requires a value"))
                 return 2
         elif token.startswith("--lang="):
             lang_val = token.split("=", 1)[1]
@@ -2220,6 +2302,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sub = _resolve_subcommand(raw[0])
 
     if sub == "help":
+        if len(raw) > 1:
+            query = raw[1]
+            if query in ("-h", "--help", "help"):
+                _print_top_level_help()
+                return 0
+            target_sub = _resolve_subcommand(query)
+            if target_sub is not None and target_sub != "help":
+                try:
+                    return main([target_sub, "--help"])
+                except SystemExit as exc:
+                    return int(exc.code) if exc.code is not None else 0
+            _error(
+                i18n.t(
+                    "cli.error_unknown_command",
+                    cmd=query,
+                    default=f"unknown command {query!r}; see 'agydra --help'",
+                )
+            )
+            return 2
         _print_top_level_help()
         return 0
 
@@ -2230,131 +2331,178 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if sub is not None:
         rest = raw[1:]
         parser = argparse.ArgumentParser(
-            prog=f"agydra {sub}", formatter_class=ColoredHelpFormatter,
-            description=_SUBCOMMAND_HELP[sub] if sub in ("create", "login", "import") else None,
+            prog=f"agydra {sub}",
+            formatter_class=ColoredHelpFormatter,
+            description=i18n.t(f"cmd.{sub.replace('-', '_')}.help", default=_SUBCOMMAND_HELP[sub])
+            if sub in ("create", "login", "import")
+            else None,
         )
         if sub == "list":
             parser.set_defaults(func=cmd_list)
         elif sub == "create":
             parser.add_argument(
-                "name", help="profile name: lowercase, digits, '-' and '_' (max 64)"
+                "name",
+                help=i18n.t("arg.create.name", default="profile name: lowercase, digits, '-' and '_' (max 64)"),
             )
             parser.add_argument(
-                "-d", "--description", help="free-form note stored with the profile"
+                "-d", "--description",
+                help=i18n.t("arg.create.description", default="free-form note stored with the profile"),
             )
             parser.add_argument(
                 "-e", "--engine", choices=engines.SUPPORTED_ENGINES, default="agy",
-                help=f"engine for this profile: {', '.join(engines.SUPPORTED_ENGINES)} (default: agy)",
+                help=i18n.t(
+                    "arg.create.engine",
+                    default=f"engine for this profile: {', '.join(engines.SUPPORTED_ENGINES)} (default: agy)",
+                ),
             )
             parser.set_defaults(func=cmd_create)
         elif sub == "login":
             parser.add_argument(
-                "ref", nargs="?", help="profile name or number (default: resolved profile)"
+                "ref", nargs="?",
+                help=i18n.t("arg.login.ref", default="profile name or number (default: resolved profile)"),
             )
             parser.add_argument(
                 "-f", "--force", action="store_true",
-                help="re-login without asking for confirmation",
+                help=i18n.t("arg.login.force", default="re-login without asking for confirmation"),
             )
             parser.add_argument(
                 "-n", "--dry-run", action="store_true",
-                help="show the launch plan without running the engine",
+                help=i18n.t("arg.login.dry_run", default="show the launch plan without running the engine"),
             )
             parser.set_defaults(func=cmd_login)
         elif sub == "status":
             parser.add_argument(
                 "ref", nargs="?",
-                help="profile name or number to inspect (default: resolved profile)",
+                help=i18n.t("arg.status.ref", default="profile name or number to inspect (default: resolved profile)"),
             )
             parser.add_argument(
                 "-p", "--profile", dest="profile",
-                help="profile name or number to inspect",
+                help=i18n.t("arg.status.profile", default="profile name or number to inspect"),
             )
             parser.add_argument(
                 "-e", "--engine", choices=engines.SUPPORTED_ENGINES,
-                help=f"target engine: {', '.join(engines.SUPPORTED_ENGINES)}",
+                help=i18n.t(
+                    "arg.status.engine",
+                    default=f"target engine: {', '.join(engines.SUPPORTED_ENGINES)}",
+                ),
             )
             parser.add_argument(
                 "-n", "--dry-run", action="store_true",
-                help="print the launch plan (profile, binary, env) as-is",
+                help=i18n.t("arg.status.dry_run", default="print the launch plan (profile, binary, env) as-is"),
             )
             parser.set_defaults(func=cmd_status)
         elif sub == "default":
             parser.add_argument(
-                "ref", nargs="?", help="profile to set as default (omit to print current)"
+                "ref", nargs="?",
+                help=i18n.t("arg.default.ref", default="profile to set as default (omit to print current)"),
             )
             parser.set_defaults(func=cmd_default)
         elif sub == "rename":
-            parser.add_argument("old", help="current profile name or number")
             parser.add_argument(
-                "new", help="new name: lowercase, digits, '-' and '_' (max 64)"
+                "old",
+                help=i18n.t("arg.rename.old", default="current profile name or number"),
+            )
+            parser.add_argument(
+                "new",
+                help=i18n.t("arg.rename.new", default="new name: lowercase, digits, '-' and '_' (max 64)"),
             )
             parser.set_defaults(func=cmd_rename)
         elif sub == "delete":
-            parser.add_argument("ref", help="profile name or 1-based number")
+            parser.add_argument(
+                "ref",
+                help=i18n.t("arg.delete.ref", default="profile name or 1-based number"),
+            )
             parser.add_argument(
                 "-f", "--force", action="store_true",
-                help="skip the confirmation prompt only; never bypasses a "
-                "live session (delete still refuses a busy profile)"
+                help=i18n.t(
+                    "arg.delete.force",
+                    default=(
+                        "skip the confirmation prompt only; never bypasses a "
+                        "live session (delete still refuses a busy profile)"
+                    ),
+                ),
             )
             parser.add_argument(
                 "--no-backup", action="store_true",
-                help="skip the safety backup zip of the profile data"
+                help=i18n.t("arg.delete.no_backup", default="skip the safety backup zip of the profile data"),
             )
             parser.set_defaults(func=cmd_delete)
         elif sub == "export":
             parser.add_argument(
-                "ref", help="profile name or 1-based number to export",
+                "ref",
+                help=i18n.t("arg.export.ref", default="profile name or 1-based number to export"),
             )
             parser.add_argument(
                 "-o", "--output",
                 metavar="PATH",
-                help="destination zip path (default: ~/agydra-export-<name>-<ts>.zip)",
+                help=i18n.t("arg.export.output", default="destination zip path (default: ~/agydra-export-<name>-<ts>.zip)"),
             )
             parser.set_defaults(func=cmd_export)
         elif sub == "import":
             parser.add_argument(
                 "ref",
-                help="TARGET profile name or 1-based number (source is auto-detected)",
+                help=i18n.t("arg.import.ref", default="TARGET profile name or 1-based number (source is auto-detected)"),
             )
             parser.add_argument(
                 "-s", "--source",
                 metavar="DIR",
-                help="generic data dir to copy from (default: target engine's data dir; Claude Code import unsupported)",
+                help=i18n.t(
+                    "arg.import.source",
+                    default="generic data dir to copy from (default: target engine's data dir; Claude Code import unsupported)",
+                ),
             )
             parser.set_defaults(func=cmd_import)
         elif sub == "share-config":
-            parser.add_argument("src", help="source profile name or 1-based number")
+            parser.add_argument(
+                "src",
+                help=i18n.t("arg.share_config.src", default="source profile name or 1-based number"),
+            )
             parser.add_argument(
                 "targets", nargs="+", metavar="TARGET",
-                help="target profile name(s) or 1-based number(s)",
+                help=i18n.t("arg.share_config.targets", default="target profile name(s) or 1-based number(s)"),
             )
             parser.set_defaults(func=cmd_share_config)
         elif sub == "use":
-            parser.add_argument("ref", help="profile name or 1-based number to pin here")
+            parser.add_argument(
+                "ref",
+                help=i18n.t("arg.use.ref", default="profile name or 1-based number to pin here"),
+            )
             parser.set_defaults(func=cmd_use)
         elif sub == "doctor":
             parser.add_argument(
                 "--fix", action="store_true",
-                help="repair what the checks found: migrate a real-dir "
-                "overlay into the profile store and relink, clear a "
-                "dangling default profile, purge orphaned macOS-keychain "
-                "slots, and remove orphaned store artifacts "
-                "(overlays and keychain files) left behind by a "
-                "manually deleted profile; backup ZIPs are never scanned "
-                "or deleted; asks for confirmation unless -f/--force",
+                help=i18n.t(
+                    "arg.doctor.fix",
+                    default=(
+                        "repair what the checks found: migrate a real-dir "
+                        "overlay into the profile store and relink, clear a "
+                        "dangling default profile, purge orphaned macOS-keychain "
+                        "slots, and remove orphaned store artifacts "
+                        "(overlays and keychain files) left behind by a "
+                        "manually deleted profile; backup ZIPs are never scanned "
+                        "or deleted; asks for confirmation unless -f/--force"
+                    ),
+                ),
             )
             parser.add_argument(
                 "-f", "--force", action="store_true",
-                help="skip the --fix confirmation prompt only; never "
-                "removes a live lock or anything a current profile owns",
+                help=i18n.t(
+                    "arg.doctor.force",
+                    default=(
+                        "skip the --fix confirmation prompt only; never "
+                        "removes a live lock or anything a current profile owns"
+                    ),
+                ),
             )
             parser.set_defaults(func=cmd_doctor)
         elif sub == "usage":
             usage_mode = parser.add_mutually_exclusive_group()
             usage_mode.add_argument(
                 "ref", nargs="?",
-                help="profile name or number for a detailed view "
-                "(omit for a compact table of every profile)",
+                help=i18n.t(
+                    "arg.usage.ref",
+                    default="profile name or number for a detailed view (omit for a compact table of every profile)",
+                ),
             )
             usage_mode.add_argument(
                 "--claude-settings", metavar="PROFILE",
@@ -2369,26 +2517,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif sub == "setup":
             parser.add_argument(
                 "-n", "--dry-run", action="store_true",
-                help="print what setup would do without touching anything",
+                help=i18n.t("arg.setup.dry_run", default="print what setup would do without touching anything"),
             )
             parser.add_argument(
                 "-f", "--force", action="store_true",
-                help="force overwrite of foreign or existing shim at ~/.local/bin/agydra",
+                help=i18n.t("arg.setup.force", default="force overwrite of foreign or existing shim at ~/.local/bin/agydra"),
             )
             parser.set_defaults(func=cmd_setup)
         elif sub == "language":
             parser.add_argument(
                 "code", nargs="?", choices=["en", "es"],
-                help="language code: en or es (omit to show current)",
+                help=i18n.t("arg.language.code", default="language code: en or es (omit to show current)"),
             )
             parser.set_defaults(func=cmd_language)
+        for action in parser._actions:
+            if action.dest == "help":
+                action.help = i18n.t("help.help_flag", default=action.help)
         args = parser.parse_args(rest)
         if sub == "doctor" and args.force and not args.fix:
-            parser.error("-f/--force only applies together with --fix")
+            parser.error(i18n.t("cli.error_force_requires_fix", default="-f/--force only applies together with --fix"))
         if sub == "setup" and args.dry_run and args.force:
-            parser.error("-f/--force has no effect with -n/--dry-run (nothing is written)")
+            parser.error(i18n.t("cli.error_force_no_effect_dry_run", default="-f/--force has no effect with -n/--dry-run (nothing is written)"))
         if sub == "usage" and args.claude_settings_apply and not args.claude_settings:
-            parser.error("--apply requires --claude-settings PROFILE")
+            parser.error(i18n.t("cli.error_apply_requires_claude_settings", default="--apply requires --claude-settings PROFILE"))
         try:
             return args.func(store, args)
         except _CLI_REPORTABLE_ERRORS as exc:
@@ -2399,8 +2550,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         values, agy_args = flags
         if values["profile"] is not None and values["random"]:
             _error(
-                "-p/--profile and -r/--random are mutually exclusive; to pass -r "
-                f"to the engine, put it after --: agydra -p {values['profile']} -- -r"
+                i18n.t(
+                    "cli.error_profile_and_random_exclusive",
+                    profile=values["profile"],
+                    default=(
+                        "-p/--profile and -r/--random are mutually exclusive; to pass -r "
+                        f"to the engine, put it after --: agydra -p {values['profile']} -- -r"
+                    ),
+                )
             )
             return 2
         if not flags.swallowed:
@@ -2409,7 +2566,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if engine_opt is not None:
             engine_str = str(engine_opt).strip().lower()
             if engine_str not in engines.SUPPORTED_ENGINES:
-                _error(f"unsupported engine {engine_str!r}; choose from {', '.join(engines.SUPPORTED_ENGINES)}")
+                _error(
+                    i18n.t(
+                        "cli.error_unsupported_engine",
+                        engine=engine_str,
+                        choices=", ".join(engines.SUPPORTED_ENGINES),
+                        default=f"unsupported engine {engine_str!r}; choose from {', '.join(engines.SUPPORTED_ENGINES)}",
+                    )
+                )
                 return 2
         else:
             engine_str = None
@@ -2422,8 +2586,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         }
         if values["dry-run"]:
             plan_kwargs["read_only"] = True
-        plan = runner.build_plan(store, agy_args, **plan_kwargs)
-        return runner.run(plan, store=store, dry_run=bool(values["dry-run"]))
+            plan = runner.build_plan(store, agy_args, **plan_kwargs)
+            return runner.run(plan, store=store, dry_run=True)
+        with store.launch_recovery_scope(target_name=values["profile"]):
+            plan = runner.build_plan(store, agy_args, **plan_kwargs)
+            return runner.run(plan, store=store, dry_run=False)
     except _CLI_REPORTABLE_ERRORS as exc:
         return _report_error(exc)
 

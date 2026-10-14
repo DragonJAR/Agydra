@@ -6,11 +6,11 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
-  <img src="https://img.shields.io/badge/version-1.1.0-green" alt="Version">
-  <img src="https://img.shields.io/badge/python-3.9%2B-blue" alt="Python">
-  <img src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey" alt="Platforms">
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-1.1.0-blue.svg" alt="Version"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white" alt="Python"></a>
+  <img src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-lightgrey.svg" alt="Platforms">
   <a href="https://www.DragonJAR.org"><img src="https://img.shields.io/badge/author-DragonJAR.org-orange" alt="Author: DragonJAR.org"></a>
-  <a href="README.es.md"><img src="https://img.shields.io/badge/Read_in-Español-blue" alt="Read in Español"></a>
+  <a href="README.es.md"><img src="https://img.shields.io/badge/Read_in-Español-0078D4?logo=readme&logoColor=white" alt="Read in Español"></a>
 </p>
 
 > **One installation. Four engines. Isolated accounts.** **Agydra** 1.1.0 is a multi-profile manager and workload dispatcher for **Google Antigravity (`agy`)**, **OpenAI Codex (`codex`)**, **xAI Grok (`grok`)**, and **Anthropic Claude Code (`claude`)**. Each profile keeps its own configuration and native authentication; Claude Code snapshots are informational. Claude Code preserves the real HOME and manages native authentication, including the macOS Keychain; Agydra does not extract, exchange or refresh its tokens itself. Python ≥ 3.9, standard library only.
@@ -180,10 +180,10 @@ Management commands also accept `--NAME` or `-NAME` (`agydra --list` == `agydra 
 | Command | Aliases | Description |
 |---|---|---|
 | `list` | `ls`, `l` | Index, email, default, auth, busy, engine, last use. |
-| `create NAME [-d DESC] [-e ENGINE]` | `c` | New store. `-e` is `agy` (default), `codex`, `grok`, or `claude`. |
+| `create NAME [-d DESC] [-e ENGINE]` | `c` | New store. `-e` is `agy` (default), `codex`, `grok`, or `claude`. For `agy`, automatically inherits `settings.json`, `mcp.json`, and `config.toml` from the default profile when `copy_settings_on_create` is enabled (default `true`). |
 | `login [NAME\|#] [-f] [-n]` | `in` | Isolated login for that profile's engine. `-f` re-authenticates. |
 | `import NAME\|# [-s DIR]` | `imp` | **Copies** `~/.gemini`, `~/.codex`, or `~/.grok` into the profile while holding its profile lock. Claude profiles are rejected. |
-| `export NAME\|# [-o PATH]` | `exp` | **Writes** a portable ZIP of the profile (excludes OAuth/API key/Keychain secrets by R4 policy; Claude is rejected). Default destination: `~/agydra-export-<name>-<ts>.zip`. |
+| `export NAME\|# [-o PATH]` | `exp` | **Writes** a portable ZIP of the profile (excludes OAuth/API key/Keychain secrets by security policy; Claude is rejected). Default destination: `~/agydra-export-<name>-<ts>.zip`. |
 | `rename A B` | `mv` | Renames the profile and updates the default. Refuses a busy profile. |
 | `delete NAME\|# [-f] [--no-backup]` | `rm` | Writes a ZIP under `backups/`, then deletes. Refuses a busy profile. |
 | `default [NAME\|#]` | `d` | Show or set the fallback profile. |
@@ -231,7 +231,7 @@ Without `-p`, the first match wins:
                └── 5. First profile by number (creation order; `agy` profiles first)
 ```
 
-**Exit codes:** `0` success · `1` error · `2` `-p` with `-r` · `126` binary not executable · `127` binary not found · `130` Ctrl-C.
+**Exit codes:** `0` success · `1` error · `2` CLI usage error (e.g. `-p` with `-r`, invalid flag) · `126` binary not executable · `127` binary not found · `130` Ctrl-C.
 
 ---
 
@@ -257,7 +257,7 @@ Session locks use `<store>/locks/<profile>.lock`; the sentinel file persists, wh
 
 `create` builds `data/` and `profile.json` in a same-filesystem temporary sibling directory under `<store>/profiles/`, named `.agydra-stage-<name>-<token>`, then publishes the complete profile with one directory rename. A stage left by an interruption is ignored by profile scans and removed by a later create for that exact name under both locks; the reserved sequence remains consumed.
 
-Before moving a profile directory, `rename` atomically writes its intent to `<store>/profile-rename.json`, including a Keychain slot migration recovery action and the `source_present` snapshot for Antigravity; Claude rename does not add this action. A later public profile read or mutation recovers that journal while holding the old and new profile locks in sorted order, followed by the sequence lock. If only the old directory exists, recovery restores the old default when needed and removes the journal; if only the new directory exists, recovery finishes forward by fixing profile metadata and the default when needed, removing the old overlay, then running the recorded Keychain action before removing the journal. Forward recovery runs that action while holding the sorted profile locks, the sequence lock, and `swap.lock`; if it fails, the journal remains for retry on the next store operation. On the normal rename path, the callback runs with the profile locks held after the sequence lock is released. If both or neither directory exists, the journal or metadata is malformed, or a required lock is busy, recovery fails closed and retains the journal and profile data.
+Before moving a profile directory, `rename` atomically writes its intent to `<store>/profile-rename.json`, including a Keychain slot migration recovery action and the `source_present` snapshot for Antigravity; Claude rename does not add this action. Ordinary mutating commands (`create`, `delete`, `rename`, `default <name>`, ...) as well as engine launches (`-p`, `-r`) and `login` automatically finish a valid pending profile rename while holding the old and new profile locks in sorted order, followed by the sequence lock. Read-only commands (`list`, `status`, `-n`/`--dry-run`, `usage`) never perform mutations; only reads that involve the old or new profile name ask to retry, while reads of unrelated profiles work normally. If only the old directory exists, recovery restores the old default when needed and removes the journal; if only the new directory exists, recovery finishes forward by fixing profile metadata and the default when needed, removing the old overlay, then running the recorded Keychain action before removing the journal. Forward recovery runs that action while holding the sorted profile locks, the sequence lock, and `swap.lock`; if it fails, the journal remains for retry on the next store operation. On the normal rename path, the callback runs with the profile locks held after the sequence lock is released. If the journal is malformed, launches refuse execution without touching it; the next ordinary mutating command automatically quarantines it to a sibling file (`profile-rename.json.corrupt-<timestamp>`) and continues without requiring a manual doctor step. If both or neither directory exists, recovery keeps the journal and both directories in place; launching the old or new name is refused, while launching any other profile (explicitly or via `-r`) works unimpeded and `-r` never picks the ambiguous names. If metadata is malformed or a required lock is busy, recovery fails closed and retains the journal and profile data.
 
 When enabled (the default; `--no-backup` disables it), `delete` writes and verifies its ZIP backup before removing profile data: the backup is written and verified while holding the profile lock, then the commit phase re-acquires the sequence lock, re-checks the profile's identity and paths, and only then purges. At most the last 5 backup ZIPs per profile are kept. For Antigravity, the CLI keeps the profile lock through its post-delete keychain purge, after releasing the sequence lock; on macOS, that purge uses `swap.lock` to serialize cleanup of the profile's saved slot and system Keychain entry with keychain swaps. A purge failure is reported as a warning after deletion. `import` holds its target profile lock through the copy (plus `swap.lock` on macOS for Antigravity so the imported credential cannot race a live swap), and `share-config` holds the source read lock and target profile locks until all copies finish. `doctor --fix` holds the profile lock while migrating and relinking overlay data.
 
@@ -291,6 +291,7 @@ Global config is `<store>/agydra.json`. Point the store elsewhere with `AGYDRA_H
 {
   "default_profile": "work",
   "settings": {
+    "lang": "auto",
     "use_linux_sandbox": false,
     "copy_settings_on_create": true,
     "windows_redirect_home": false
@@ -309,6 +310,7 @@ All binary keys (`agy_binary`, `codex_binary`, `grok_binary`, and `claude_binary
 | `AGYDRA_PROFILE` | Fallback profile, set inside agydra sessions. `-p` wins; skipped when `-e` asks for another engine, and ignored with a warning when stale. |
 | `AGYDRA_LANG` | `en` or `es` for one process. |
 | `AGYDRA_HOME` | Store and overlays. |
+| `AGYDRA_REAL_HOME` | Authentic home directory injected into overlays to prevent nested redirection. |
 | `AGYDRA_AGY_BIN` / `AGYDRA_CODEX_BIN` / `AGYDRA_GROK_BIN` / `AGYDRA_CLAUDE_BIN` | Binary override. |
 | `AGYDRA_NO_KEYCHAIN` | Skip the macOS keychain bridge. |
 | `NO_COLOR` / `FORCE_COLOR` | ANSI styling. |

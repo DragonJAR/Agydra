@@ -36,7 +36,7 @@ class TestExportCredentialIgnore(unittest.TestCase):
     def test_grok_excludes_auth_json(self):
         self.assertEqual(
             engines.get_engine("grok").export_credential_ignore(),
-            ("auth.json",),
+            ("auth.json", "config.toml"),
         )
 
     def test_claude_export_raises_explicit_policy_error(self):

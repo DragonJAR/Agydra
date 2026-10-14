@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import conftest
 import platforms
 
 
@@ -61,7 +62,7 @@ class TestProcessStartToken(unittest.TestCase):
     def test_token_of_alive_child_is_non_none_and_stable(self) -> None:
         proc = subprocess.Popen(
             [sys.executable, "-c", "import sys, time; time.sleep(0.3)"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
             first = platforms.process_start_token(proc.pid)

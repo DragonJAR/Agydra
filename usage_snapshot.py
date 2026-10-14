@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
+import os
 from models import profile_identity
 import store as store_module
 import usage
@@ -332,6 +333,7 @@ def write_snapshot(
     profiles: Sequence[Any],
     results: Sequence[Any],
     scope: Optional[str] = None,
+    previous: Optional[Mapping[str, Any]] = None,
     now: Optional[datetime] = None,
 ) -> Optional[Dict[str, Any]]:
     """Replace the store's usage snapshot with this run's readings.
@@ -340,19 +342,36 @@ def write_snapshot(
     failed; the caller never sees the failure as an error because a quota
     report must stay usable even when its snapshot could not be stored.
     """
-    document = build_snapshot(
-        store,
-        profiles=profiles,
-        results=results,
-        scope=scope,
-        previous=read_snapshot(store),
-        now=now,
-    )
+    import locks
+    lock_path = locks.lock_dir(store) / f".usage-snapshot{locks.LOCK_SUFFIX}"
+    handle = None
     try:
-        store_module._atomic_write_json(snapshot_path(store), document)
-    except OSError:
+        handle = locks.try_lock_path(lock_path, description="usage snapshot lock")
+    except Exception:
+        handle = None
+
+    if handle is None:
         return None
-    return document
+
+    def _do_write() -> Optional[Dict[str, Any]]:
+        disk_prev = read_snapshot(store)
+        prev_to_use = disk_prev if disk_prev is not None else previous
+        document = build_snapshot(
+            store,
+            profiles=profiles,
+            results=results,
+            scope=scope,
+            previous=prev_to_use,
+            now=now,
+        )
+        try:
+            store_module._atomic_write_json(snapshot_path(store), document)
+        except OSError:
+            return None
+        return document
+
+    with handle:
+        return _do_write()
 
 
 def _aware_utc(value: Optional[datetime]) -> datetime:
@@ -397,26 +416,12 @@ def _matching_entry(
     entries = document.get("profiles")
     if not isinstance(entries, list):
         return None
-    if seq > 0:
-        matches = [
-            entry
-            for entry in entries
-            if isinstance(entry, dict)
-            and type(entry.get("seq")) is int
-            and entry["seq"] == seq
-        ]
-    else:
-        wanted = _normalized_engine(name)
-        if wanted is None:
-            return None
-        matches = [
-            entry
-            for entry in entries
-            if isinstance(entry, dict)
-            and type(entry.get("seq")) is int
-            and entry["seq"] == 0
-            and _normalized_engine(entry.get("name")) == wanted
-        ]
+    target_id = profile_identity(seq, engine, name)
+    matches = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict) and _entry_identity(entry) == target_id
+    ]
     if len(matches) != 1:
         return None
     entry = matches[0]

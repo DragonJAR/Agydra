@@ -18,8 +18,11 @@ import sys
 import tempfile
 import time
 import zipfile
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import AbstractSet, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
+from typing import AbstractSet, Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar, Union
 
 import platforms
 import vocab
@@ -87,6 +90,21 @@ _RENAME_ACTION_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}\Z")
 
 class StoreError(Exception):
     pass
+
+
+class ProfileBusyError(StoreError):
+    """A profile cannot be mutated while its lock may be in use."""
+
+
+@dataclass(frozen=True)
+class PersistentStateDeclaration:
+    """One state file's validation rule and shared recovery action."""
+
+    name: str
+    path: Path
+    recovery: str
+    validate: Callable[[], Optional[str]]
+    repair: Callable[[Optional[int], Optional[Any]], bool]
 
 
 class _RenameRecoveryRequired(Exception):
@@ -197,7 +215,9 @@ def read_json_object(path: Path, *, tolerant: bool = False):
     dict" semantics so tolerant and strict call sites can never diverge.
     """
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        import locks
+
+        data = locks.json_loads_utf8(path.read_bytes())
     except (OSError, ValueError):
         if tolerant:
             return None
@@ -330,12 +350,16 @@ def _rmtree_readonly_ok(
         writable_mode = mode | stat.S_IWRITE
         if stat.S_ISDIR(original.st_mode):
             writable_mode |= stat.S_IXUSR
-        if not stat.S_ISLNK(original.st_mode) and writable_mode != mode:
+        linked = platforms.is_link(path, strict=True)
+        if not linked and writable_mode != mode:
             changes.append((path, original.st_dev, original.st_ino, mode))
             _chmod_path_without_following(
                 path, writable_mode, original.st_dev, original.st_ino
             )
-        function(path)
+        if linked:
+            _remove_link(path)
+        else:
+            function(path)
     except FileNotFoundError:
         pass
     except BaseException as exc:
@@ -499,9 +523,28 @@ def _unreadable_metadata_message(name: str) -> str:
     ``resolve_ref`` and ``Store.get`` must never drift apart here: both
     point at ``agydra delete``, since ``agydra create`` on a name whose
     directory still exists always fails with "already exists"."""
-    return (
-        f"profile {name!r} has unreadable metadata; remove it with: "
-        f"agydra delete {name}"
+    return _store_text("store.profile.metadata_unreadable", name=name)
+
+
+def _profile_missing_message(name: str) -> str:
+    return _store_text("store.profile.missing", name=name)
+
+
+def _store_text(key: str, **values: object) -> str:
+    import i18n
+
+    return i18n.t(key, **values)
+
+
+def cannot_safely_proceed_message(
+    action: str, subject: str, cause: BaseException
+) -> str:
+    """Format lock-management failures consistently across Store callers."""
+    return _store_text(
+        "store.error.cannot_safely_proceed",
+        action=action,
+        subject=subject,
+        cause=cause,
     )
 
 
@@ -519,14 +562,8 @@ def rmtree(path: Path) -> None:
         metadata = path.lstat()
     except FileNotFoundError:
         return
-    if platforms.is_link(path):
-        try:
-            path.unlink()
-        except OSError:
-            if platforms.is_windows() and path.is_dir():
-                os.rmdir(path)
-            else:
-                raise
+    if platforms.is_link(path, strict=True):
+        _remove_link(path)
     elif not stat.S_ISDIR(metadata.st_mode):
         try:
             path.unlink()
@@ -564,6 +601,38 @@ def rmtree(path: Path) -> None:
     raise OSError(f"could not fully remove {path}")
 
 
+def _is_junction(path: Path, metadata) -> bool:
+    if not platforms.is_windows():
+        return False
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction):
+        try:
+            if is_junction():
+                return True
+        except OSError:
+            pass
+    mount_point_tag = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+    return getattr(metadata, "st_reparse_tag", None) == mount_point_tag
+
+
+def _remove_link(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if not platforms.is_link(path, strict=True):
+        raise OSError(f"refusing to remove non-link as a link: {path}")
+    directory_attribute = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    is_directory_link = bool(attributes & directory_attribute) or stat.S_ISDIR(
+        metadata.st_mode
+    )
+    if _is_junction(path, metadata) or is_directory_link:
+        os.rmdir(path)
+    else:
+        path.unlink()
+
+
 class Store:
     _rename_recovery_handlers: Dict[
         str, Callable[["Store", str, str, dict], None]
@@ -577,6 +646,9 @@ class Store:
         self.backups_dir = self.root / "backups"
         self.claude_config_root = self.root / platforms.CLAUDE_CONFIG_DIRNAME
         self.usage_cache_root = self.root / platforms.USAGE_CACHE_DIRNAME
+        self._launch_rename_conflict: ContextVar[Optional[Tuple[str, str]]] = ContextVar(
+            f"agydra_store_launch_rename_conflict_{id(self)}", default=None
+        )
 
     @classmethod
     def register_rename_recovery_handler(
@@ -600,33 +672,362 @@ class Store:
     def rename_journal_path(self) -> Path:
         return self.root / _RENAME_JOURNAL_FILE
 
+    def persistent_state_declarations(self) -> List[PersistentStateDeclaration]:
+        """The shared validation and recovery rules for durable store state."""
+        declarations = [
+            PersistentStateDeclaration(
+                "profile rename",
+                self.rename_journal_path,
+                "quarantine an unreadable journal or preserve conflicting profile state",
+                self._rename_state_issue,
+                lambda _fd=None, _replacement=None: self._repair_rename_state(),
+            ),
+            PersistentStateDeclaration(
+                "configuration",
+                self.config_path,
+                "quarantine the old file and reset to defaults",
+                self._configuration_state_issue,
+                lambda _fd=None, replacement=None: self._repair_configuration_state(
+                    replacement
+                ),
+            ),
+            PersistentStateDeclaration(
+                "profile sequence",
+                self.sequence_state_path,
+                "quarantine the old file and rebuild from profile metadata",
+                self._sequence_state_issue,
+                lambda _fd=None, _replacement=None: self._repair_sequence_state(),
+            ),
+        ]
+        rotation_prefix = "profile-rotation-"
+        if self.root.is_dir():
+            for path in sorted(self.root.glob(f"{rotation_prefix}*.json")):
+                declarations.append(
+                    PersistentStateDeclaration(
+                        "profile rotation",
+                        path,
+                        "quarantine the old file and restart the cycle",
+                        lambda path=path: self._rotation_state_issue(path),
+                        lambda _fd=None, _replacement=None, path=path: self._repair_file_state(path),
+                    )
+                )
+        lock_root = self.root / "locks"
+        if lock_root.is_dir():
+            for path in sorted(lock_root.glob("*.lock")):
+                name = path.name[:-5]
+                try:
+                    self.validate_name(name)
+                except StoreError:
+                    continue
+                declarations.append(
+                    PersistentStateDeclaration(
+                        "lease registry",
+                        path,
+                        "quarantine unreadable bytes and reset under the kernel lock",
+                        lambda name=name: self._lease_registry_state_issue(name),
+                        lambda fd=None, _replacement=None, name=name, path=path: self._repair_lease_registry_state(
+                            name, path, fd
+                        ),
+                    )
+                )
+        return declarations
+
+    def _state_declaration(self, path: Path) -> PersistentStateDeclaration:
+        target = Path(path)
+        for declaration in self.persistent_state_declarations():
+            if declaration.path == target:
+                return declaration
+        raise StoreError(_store_text("store.state.policy_missing", path=target))
+
+    def persistent_state_issues(self) -> List[Tuple[PersistentStateDeclaration, str]]:
+        issues = []
+        for declaration in self.persistent_state_declarations():
+            issue = declaration.validate()
+            if issue is not None:
+                issues.append((declaration, issue))
+        return issues
+
+    def repair_persistent_state(
+        self,
+        path: Path,
+        *,
+        locked_fd: Optional[int] = None,
+        replacement: Optional[Any] = None,
+        sequence_locked: bool = False,
+        lock_held: bool = False,
+    ) -> bool:
+        declaration = self._state_declaration(path)
+        if locked_fd is not None:
+            return declaration.repair(locked_fd, replacement)
+        if declaration.name in ("configuration", "profile sequence") and not sequence_locked:
+            return self._with_sequence_lock(
+                f"repairing {declaration.name}",
+                lambda: declaration.repair(None, replacement),
+            )
+        if declaration.name == "profile rotation" and not lock_held:
+            import locks
+            import profile_rotation
+
+            scope = Path(path).name[len("profile-rotation-"):-5]
+            handle = locks.try_lock_path(
+                profile_rotation.lock_path(self, scope),
+                f"{scope} profile rotation repair lock",
+            )
+            if handle is None:
+                raise StoreError(_store_text("store.rotation.busy", scope=scope))
+            try:
+                if declaration.validate() is None:
+                    return False
+                return declaration.repair(None, replacement)
+            finally:
+                handle.release()
+        if declaration.validate() is None:
+            return False
+        return declaration.repair(locked_fd, replacement)
+
+    def quarantine_state_bytes(self, path: Path, raw: bytes) -> Path:
+        """Preserve corrupt state before a policy resets its active file."""
+        path = Path(path)
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise StoreError(_store_text(
+                "store.state.inspect_failed", path=path, error=exc
+            )) from exc
+        if not stat.S_ISREG(info.st_mode) or platforms.is_link(path, strict=True):
+            raise StoreError(_store_text("store.state.not_regular", path=path))
+        stamp = _backup_stamp()
+        index = 0
+        while True:
+            suffix = f"{stamp}.{index}" if index else stamp
+            destination = path.with_name(f"{path.name}.corrupt-{suffix}")
+            try:
+                destination.lstat()
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                raise StoreError(_store_text(
+                    "store.state.quarantine_path_inspect_failed",
+                    path=destination,
+                    error=exc,
+                )) from exc
+            index += 1
+        try:
+            atomic_write_bytes(destination, raw)
+        except OSError as exc:
+            raise StoreError(_store_text(
+                "store.state.quarantine_preserve_failed",
+                path=path,
+                destination=destination,
+                error=exc,
+            )) from exc
+        return destination
+
+    def _quarantine_state_file(self, path: Path) -> Path:
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise StoreError(_store_text(
+                "store.state.quarantine_read_failed", path=path, error=exc
+            )) from exc
+        return self.quarantine_state_bytes(path, raw)
+
+    def _configuration_state_issue(self) -> Optional[str]:
+        path = self.config_path
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            return _store_text("store.config.issue_inspect", path=path, error=exc)
+        if not stat.S_ISREG(info.st_mode) or platforms.is_link(path, strict=True):
+            return _store_text("store.config.issue_not_regular", path=path)
+        try:
+            Config.from_dict(read_json_object(path))
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            return _store_text("store.config.issue_corrupt", path=path, error=exc)
+        return None
+
+    def _repair_configuration_state(self, replacement: Optional[Any] = None) -> bool:
+        issue = self._configuration_state_issue()
+        if issue is None:
+            return False
+        self._quarantine_state_file(self.config_path)
+        config = replacement if isinstance(replacement, Config) else Config()
+        self._write_config(config)
+        return True
+
+    def _sequence_state_issue(self) -> Optional[str]:
+        try:
+            self._read_sequence_state()
+        except StoreError as exc:
+            return str(exc)
+        return None
+
+    def _repair_sequence_state(self) -> bool:
+        issue = self._sequence_state_issue()
+        if issue is None:
+            return False
+        profiles, unreadable = self._scan(tolerant=True)
+        if unreadable:
+            return False
+        self._quarantine_state_file(self.sequence_state_path)
+        maximum = max((profile.seq for profile in profiles), default=0)
+        self._persist_sequence_state(maximum)
+        return True
+
+    def _rename_state_issue(self) -> Optional[str]:
+        try:
+            journal = self._read_rename_journal()
+        except StoreError as exc:
+            return str(exc)
+        if journal is None:
+            return None
+        if self._rename_paths_conflict(journal):
+            return _store_text(
+                "store.rename.conflict_issue",
+                old=journal["old"],
+                new=journal["new"],
+            )
+        return _store_text(
+            "store.rename.recovery_issue",
+            old=journal["old"],
+            new=journal["new"],
+        )
+
+    def _rename_profile_dir_exists(self, name: str) -> bool:
+        path = self.profile_dir(name)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise StoreError(_store_text(
+                "store.rename.profile_dir_inspect_failed",
+                path=path,
+                error=exc,
+            )) from exc
+        return True
+
+    def _rename_paths_conflict(self, journal: dict) -> bool:
+        return self._rename_profile_dir_exists(journal["old"]) == self._rename_profile_dir_exists(
+            journal["new"]
+        )
+
+    def _launch_target_is_conflicted(
+        self, target_name: Optional[str], journal: dict
+    ) -> bool:
+        conflicted = {journal["old"], journal["new"]}
+        if target_name is None:
+            return False
+        if target_name in conflicted:
+            return True
+        profiles, _unreadable = self._scan(tolerant=True)
+        by_name = {profile.name: profile for profile in profiles}
+        if target_name in by_name:
+            return target_name in conflicted
+        token = target_name.lstrip("#")
+        if not token.isascii() or not token.isdecimal():
+            return False
+        try:
+            index = int(token) - 1
+        except ValueError:
+            return False
+        if index < 0:
+            return False
+        if any(
+            self._rename_profile_dir_exists(name) and name not in by_name
+            for name in conflicted
+        ):
+            return True
+        return index < len(profiles) and profiles[index].name in conflicted
+
+    def _repair_rename_state(self) -> bool:
+        path = self.rename_journal_path
+        try:
+            journal = self._read_rename_journal()
+        except StoreError:
+            self._quarantine_state_file(path)
+            path.unlink()
+            return True
+        if journal is None:
+            return False
+        if self._rename_paths_conflict(journal):
+            return False
+        self.recover_pending_rename()
+        return not path.exists()
+
+    def _rotation_state_issue(self, path: Path) -> Optional[str]:
+        import profile_rotation
+
+        return profile_rotation.state_file_issue(self, path)
+
+    def _repair_file_state(self, path: Path) -> bool:
+        issue = None
+        if path.name.startswith("profile-rotation-"):
+            issue = self._rotation_state_issue(path)
+        if issue is None:
+            return False
+        self._quarantine_state_file(path)
+        path.unlink()
+        return True
+
+    def _lease_registry_state_issue(self, name: str) -> Optional[str]:
+        import locks
+
+        return locks.lease_registry_state_issue(self, name)
+
+    def _repair_lease_registry_state(
+        self, name: str, path: Path, locked_fd: Optional[int]
+    ) -> bool:
+        import locks
+
+        if locked_fd is not None:
+            return locks.repair_unreadable_registry(self, name, path, locked_fd)
+        return locks.reset_unreadable_registry(self, name)
+
     def load_config(self) -> Config:
+        issue = self._configuration_state_issue()
+        if issue is not None:
+            if not getattr(self, "_config_warned", False):
+                warn(_store_text(
+                    "store.config.corrupt_warning",
+                    path=self.config_path,
+                    error=issue,
+                ))
+                self._config_warned = True
+            return Config()
         if self.config_path.exists():
             try:
                 return Config.from_dict(read_json_object(self.config_path))
             except (OSError, ValueError, TypeError, AttributeError) as exc:
                 if not getattr(self, "_config_warned", False):
-                    warn(
-                        f"ignoring corrupt {self.config_path} ({exc}); using "
-                        f"defaults until it is fixed or deleted"
-                    )
+                    warn(_store_text(
+                        "store.config.corrupt_warning",
+                        path=self.config_path,
+                        error=exc,
+                    ))
                     self._config_warned = True
                 return Config()
         return Config()
 
     def save_config(self, config: Config) -> None:
         if not self._config_writable():
-            raise StoreError(
-                f"refusing to overwrite corrupt {self.config_path}; "
-                "fix or delete it first (it may hold profiles' settings)"
-            )
+            raise StoreError(_store_text(
+                "store.config.refuse_corrupt", path=self.config_path
+            ))
         self._write_config(config)
 
     def _write_config(self, config: Config) -> None:
         platforms.ensure_dir(self.root)
         _atomic_write_json(self.config_path, config.to_dict())
 
-    def update_config(self, mutator: Callable[[Config], None]) -> Config:
+    def update_config(
+        self,
+        mutator: Callable[[Config], None],
+        *,
+        sequence_locked: bool = False,
+    ) -> Config:
         """Load fresh config, mutate it in place, and atomically save under the
         nonblocking sequence lock. A mutator failure writes nothing and always
         releases the lock; a busy lock fails with ``StoreError`` once the
@@ -635,24 +1036,36 @@ class Store:
             raise StoreError("configuration mutator must be callable")
 
         def operation() -> Config:
-            try:
-                config = Config.from_dict(read_json_object(self.config_path))
-            except FileNotFoundError:
+            issue = self._configuration_state_issue()
+            if issue is None:
+                try:
+                    config = Config.from_dict(read_json_object(self.config_path))
+                except FileNotFoundError:
+                    config = Config()
+                except (OSError, ValueError, TypeError, AttributeError) as exc:
+                    raise StoreError(_store_text(
+                        "store.config.read_failed",
+                        path=self.config_path,
+                        error=exc,
+                    )) from exc
+            else:
                 config = Config()
-            except (OSError, ValueError, TypeError, AttributeError) as exc:
-                raise StoreError(
-                    f"refusing to update corrupt {self.config_path}; "
-                    "fix or delete it first (it may hold profiles' settings)"
-                ) from exc
             mutator(config)
             if not isinstance(config, Config):
                 raise StoreError("configuration mutator must leave a Config instance")
-            self._write_config(config)
+            if issue is None:
+                self._write_config(config)
+            else:
+                self.repair_persistent_state(
+                    self.config_path,
+                    replacement=config,
+                    sequence_locked=True,
+                )
             return config
 
-        return self._with_recoverable_sequence_lock(
-            "updating configuration", operation
-        )
+        if sequence_locked:
+            return operation()
+        return self._with_recoverable_sequence_lock("updating configuration", operation)
 
     def _config_parses(self) -> bool:
         """True iff load_config would accept this file as healthy.
@@ -661,15 +1074,11 @@ class Store:
         accepted/rejected set instead of a weaker json.loads-only probe, so
         the guard can never bless a file load_config degrades on.
         """
-        try:
-            Config.from_dict(read_json_object(self.config_path))
-            return True
-        except (OSError, ValueError, TypeError, AttributeError):
-            return False
+        return self._configuration_state_issue() is None
 
     def _config_writable(self) -> bool:
         """True iff save_config would allow writing to config_path."""
-        return not (self.config_path.exists() and not self._config_parses())
+        return self._config_parses()
 
     def profile_dir(self, name: str) -> Path:
         self.validate_name(name)
@@ -685,15 +1094,17 @@ class Store:
             linked = platforms.is_link(path, strict=True)
         except OSError as exc:
             subject = f"profile {profile_name!r} {label}" if profile_name else label
-            raise StoreError(
-                f"cannot safely inspect {subject} {path} ({exc}); refusing access"
-            ) from exc
+            raise StoreError(_store_text(
+                "store.path.inspect_failed",
+                subject=subject,
+                path=path,
+                error=exc,
+            )) from exc
         if linked:
             subject = f"profile {profile_name!r} {label}" if profile_name else label
-            raise StoreError(
-                f"{subject} {path} is a symlink or junction; refusing to access "
-                "data outside the profile store"
-            )
+            raise StoreError(_store_text(
+                "store.path.symlink_refused", subject=subject, path=path
+            ))
 
     def _require_profiles_root_is_real(self) -> None:
         self._require_real_filesystem_path(self.profiles_dir, "profiles root")
@@ -733,47 +1144,83 @@ class Store:
             raise ValueError("metadata name does not match its directory")
         return name
 
-    def profile_data_dir(self, name: str, engine: Optional[str] = None) -> Path:
+    def profile_data_dir(
+        self,
+        name: str,
+        engine: Optional[str] = None,
+        profile: Optional[Profile] = None,
+    ) -> Path:
         """Physical data directory of a profile.
 
         ``engine=None`` detects the engine from profile metadata (tolerantly,
         falling back to the ``agy`` layout). Claude profiles resolve to
         ``claude_config_dir`` so their data never moves when the profile is
-        renamed.
+        renamed. A profile from an existing store scan can be supplied to
+        avoid another whole-store lookup; its identity is revalidated first.
         """
         self._require_profile_paths_are_real(name)
-        if engine is None:
-            engine = self._engine_of(name)
-        if engine == "claude":
-            return self.claude_config_dir(name)
+        if profile is not None:
+            profile = self._require_profile_snapshot(name, profile)
+            if engine is not None and normalize_engine(engine) != profile.engine:
+                raise StoreError(_store_text(
+                    "store.profile.engine_mismatch", engine=engine, name=name
+                ))
+        elif engine is None:
+            profiles, unreadable = self._scan()
+            profile_dir = self.profile_dir(name)
+            profile = next((item for item in profiles if item.name == name), None)
+            if profile is None and (name in unreadable or profile_dir.is_dir()):
+                raise StoreError(_unreadable_metadata_message(name))
+            engine = profile.engine if profile is not None else "agy"
+        if engine is None and profile is not None:
+            engine = profile.engine
+        if normalize_engine(engine or "agy") == "claude":
+            if profile is None:
+                profile = self._get_unlocked(name)
+            if profile.engine != "claude":
+                raise StoreError(_store_text("store.profile.not_claude", name=name))
+            return self.claude_config_dir_for_seq(profile.seq)
         return self.profile_dir(name) / "data"
-
-    def _engine_of(self, name: str) -> str:
-        self._require_profile_paths_are_real(name)
-        profiles, _unreadable = self._scan()
-        for profile in profiles:
-            if profile.name == name:
-                return profile.engine
-        if name in _unreadable or self.profile_dir(name).is_dir():
-            raise StoreError(_unreadable_metadata_message(name))
-        return "agy"
 
     def claude_config_dir_for_seq(self, seq: int) -> Path:
         if type(seq) is not int or seq < 1:
-            raise StoreError(f"invalid claude profile seq {seq!r}")
+            raise StoreError(_store_text("store.claude.seq_invalid", seq=seq))
         return self.claude_config_root / str(seq)
 
-    def claude_config_dir(self, name: str) -> Path:
+    def claude_config_dir(
+        self, name: str, profile: Optional[Profile] = None
+    ) -> Path:
         """``<store>/claude-config/<seq>`` for a claude profile, keyed by its
         immutable ``seq`` so rename never relocates the config."""
-        profile = self._get_unlocked(name)
+        profile = (
+            self._get_unlocked(name)
+            if profile is None
+            else self._require_profile_snapshot(name, profile)
+        )
         if profile.engine != "claude":
-            raise StoreError(f"profile {name!r} is not a claude profile")
+            raise StoreError(_store_text("store.profile.not_claude", name=name))
         return self.claude_config_dir_for_seq(profile.seq)
+
+    def _require_profile_snapshot(self, name: str, profile: Profile) -> Profile:
+        if profile.name != name:
+            raise StoreError(_store_text("store.profile.snapshot_mismatch", name=name))
+        profile_dir = self._require_profile_paths_are_real(name)
+        metadata_path = profile_dir / "profile.json"
+        try:
+            current = self._read_profile_metadata(
+                metadata_path, expected_name=name
+            )
+        except FileNotFoundError as exc:
+            raise StoreError(_profile_missing_message(name)) from exc
+        except (OSError, ValueError, KeyError, TypeError, StoreError) as exc:
+            raise StoreError(_unreadable_metadata_message(name)) from exc
+        if current.seq != profile.seq or current.engine != profile.engine:
+            raise StoreError(_store_text("store.profile.changed_since_scan", name=name))
+        return current
 
     def usage_cache_dir(self, seq: int) -> Path:
         if type(seq) is not int or seq < 1:
-            raise StoreError(f"invalid profile seq {seq!r}")
+            raise StoreError(_store_text("store.profile.seq_invalid", seq=seq))
         return self.usage_cache_root / str(seq)
 
     def claude_config_orphans(self, profiles: Sequence[Profile]) -> List[str]:
@@ -796,30 +1243,21 @@ class Store:
     @staticmethod
     def validate_name(name: str) -> str:
         if not NAME_RE.match(name or ""):
-            raise StoreError(
-                f"invalid profile name {name!r}: use lowercase letters, digits, "
-                "'-' and '_', starting with a letter or digit (max 64 chars)"
-            )
+            raise StoreError(_store_text("store.profile.invalid_name", name=name))
         if name in _WINDOWS_RESERVED_NAMES:
-            raise StoreError(
-                f"invalid profile name {name!r}: it is a reserved Windows "
-                "device name and would break on Windows; pick another name"
-            )
+            raise StoreError(_store_text("store.profile.reserved_windows", name=name))
         if name not in vocab.RESERVED_NAMES:
             return name
-        raise StoreError(
-            f"reserved profile name {name!r}: it collides with an agydra "
-            "subcommand (see: agydra help); pick another name"
-        )
+        raise StoreError(_store_text("store.profile.reserved", name=name))
 
     def exists(self, name: str) -> bool:
         self.validate_name(name)
-        self._recover_pending_rename(target_name=name)
         return self._with_recoverable_sequence_lock(
             "checking a profile",
             lambda: self._exists_unlocked(name),
             allow_missing_store=True,
             target_name=name,
+            read_only=True,
         )
 
     def _exists_unlocked(self, name: str) -> bool:
@@ -831,11 +1269,15 @@ class Store:
         import engines
 
         self.validate_name(name)
-        self._recover_pending_rename()
+        self.recover_pending_rename()
         try:
             driver = engines.get_engine(engine)
         except ValueError as exc:
-            raise StoreError(str(exc)) from exc
+            raise StoreError(_store_text(
+                "store.engine.invalid",
+                engine=engine,
+                engines=", ".join(engines.SUPPORTED_ENGINES),
+            )) from exc
 
         def _create_under_locks() -> Profile:
             if driver.needs_keychain:
@@ -855,7 +1297,7 @@ class Store:
         config_writable = self._config_writable()
         self._cleanup_create_stages(name)
         if profile_dir.exists():
-            raise StoreError(f"profile {name!r} already exists")
+            raise StoreError(_store_text("store.profile.already_exists", name=name))
         seq = self._reserve_next_sequence()
         stage_dir: Optional[Path] = None
         config_dir: Optional[Path] = None
@@ -878,7 +1320,7 @@ class Store:
             stage_dir = None
         except FileExistsError:
             self._abort_create(stage_dir, config_dir)
-            raise StoreError(f"profile {name!r} already exists") from None
+            raise StoreError(_store_text("store.profile.already_exists", name=name)) from None
         except BaseException:
             self._abort_create(stage_dir, config_dir)
             raise
@@ -888,12 +1330,15 @@ class Store:
                 try:
                     self.save_config(config)
                 except (StoreError, OSError) as exc:
-                    warn(f"could not mark {name!r} as default profile ({exc})")
+                    warn(_store_text(
+                        "store.profile.default_create_failed", name=name, error=exc
+                    ))
             else:
-                warn(
-                    f"could not mark {name!r} as default profile: "
-                    f"{self.config_path} is corrupt"
-                )
+                warn(_store_text(
+                    "store.profile.default_create_corrupt",
+                    name=name,
+                    path=self.config_path,
+                ))
         return profile
 
     def _publish_claude_config(self, seq: int) -> Path:
@@ -911,10 +1356,7 @@ class Store:
         except FileNotFoundError:
             pass
         else:
-            raise StoreError(
-                f"claude config directory {target} already exists; refusing to adopt it "
-                "(inspect it, then remove it manually)"
-            )
+            raise StoreError(_store_text("store.claude.config_exists", path=target))
         stage = Path(
             tempfile.mkdtemp(dir=str(self.claude_config_root), prefix=_CREATE_STAGE_PREFIX)
         )
@@ -948,10 +1390,14 @@ class Store:
 
     def _remove_create_stage(self, stage_dir: Path) -> None:
         if platforms.is_link(stage_dir) or not stage_dir.is_dir():
-            raise StoreError(f"refusing to remove unexpected create stage {stage_dir}")
+            raise StoreError(_store_text(
+                "store.create.stage_unexpected", path=stage_dir
+            ))
         rmtree(stage_dir)
         if stage_dir.exists():
-            raise StoreError(f"could not remove incomplete create stage {stage_dir}")
+            raise StoreError(_store_text(
+                "store.create.stage_remove_failed", path=stage_dir
+            ))
 
     def _cleanup_create_stages(self, name: str) -> None:
         if not self.profiles_dir.is_dir():
@@ -984,36 +1430,70 @@ class Store:
         operation: Callable[[], _Result],
         patience_s: float = READ_LOCK_PATIENCE_S,
         target_name: Optional[str] = None,
+        read_only: bool = False,
+        fail_on_unreadable_journal: bool = False,
     ) -> _Result:
         import locks
 
-        deadline = time.monotonic() + patience_s
-        while True:
-            try:
-                handle = locks.try_sequence_lock(self)
-            except locks.LockError as exc:
-                raise StoreError(
-                    f"cannot safely proceed with {action} profile sequence: {exc}"
-                ) from exc
-            if handle is not None or time.monotonic() >= deadline:
-                break
-            time.sleep(locks.POLL_INTERVAL_S)
+        try:
+            handle = locks.wait_for(
+                lambda: locks.try_sequence_lock(self), patience_s
+            )
+        except locks.LockError as exc:
+            raise StoreError(
+                cannot_safely_proceed_message(action, "profile sequence", exc)
+            ) from exc
         if handle is None:
             if action == "creating":
                 message = "profile sequence allocation is busy; sequence lock is busy"
             else:
                 message = "profile sequence lock is busy"
-            raise StoreError(f"{message}; retry {action}")
+            raise StoreError(_store_text(
+                "store.sequence.lock_busy", message=message, action=action
+            ))
         try:
-            journal = self._read_rename_journal()
+            try:
+                journal = self._read_rename_journal()
+            except StoreError:
+                if not read_only or fail_on_unreadable_journal:
+                    raise
+                journal = None
+            if (
+                read_only
+                and journal is not None
+                and target_name is not None
+                and target_name not in (journal.get("old"), journal.get("new"))
+                and journal.get("recovery_action") is not None
+            ):
+                import i18n
+
+                warn(
+                    i18n.t(
+                        "store.rename.recovery_pending",
+                        default=(
+                            "rename recovery for {old!r} to {new!r} is pending; "
+                            "continuing read of {name!r}"
+                        ),
+                        old=journal["old"],
+                        new=journal["new"],
+                        name=target_name,
+                    )
+                )
+            launch_conflict_scope = (
+                read_only
+                and self._launch_conflict_allows_read(journal, target_name)
+            )
             if (
                 action != "recovering rename"
                 and journal is not None
+                and not launch_conflict_scope
                 and (
                     target_name is None
                     or target_name in (journal.get("old"), journal.get("new"))
                 )
             ):
+                if read_only:
+                    raise StoreError(_store_text("store.rename.pending"))
                 raise _RenameRecoveryRequired()
             return operation()
         finally:
@@ -1026,6 +1506,8 @@ class Store:
         *,
         allow_missing_store: bool = False,
         target_name: Optional[str] = None,
+        read_only: bool = False,
+        fail_on_unreadable_journal: bool = False,
     ) -> _Result:
         """Serialize a read when a store exists, with an empty-store fast path.
 
@@ -1053,10 +1535,14 @@ class Store:
                     operation,
                     patience_s=self.READ_LOCK_PATIENCE_S,
                     target_name=target_name,
+                    read_only=read_only,
+                    fail_on_unreadable_journal=fail_on_unreadable_journal,
                 )
             except _RenameRecoveryRequired:
-                self._recover_pending_rename(target_name=target_name)
-        raise StoreError("rename state changed repeatedly; retry the operation")
+                if read_only:
+                    raise StoreError(_store_text("store.rename.pending"))
+                self.recover_pending_rename(target_name=target_name)
+        raise StoreError(_store_text("store.rename.state_changed"))
 
     def _store_root_exists(self) -> bool:
         try:
@@ -1065,7 +1551,9 @@ class Store:
             return False
         except OSError as exc:
             raise StoreError(
-                f"cannot inspect profile store {self.root} ({exc})"
+                _store_text(
+                    "store.rename.store_inspect_failed", path=self.root, error=exc
+                )
             ) from exc
         return True
 
@@ -1076,19 +1564,25 @@ class Store:
         except FileNotFoundError:
             return None
         except OSError as exc:
-            raise StoreError(f"cannot inspect rename journal {path} ({exc})") from exc
+            raise StoreError(_store_text(
+                "store.rename.journal_inspect_failed", path=path, error=exc
+            )) from exc
         if not stat.S_ISREG(info.st_mode):
-            raise StoreError(f"rename journal {path} is not a regular file")
+            raise StoreError(_store_text("store.rename.journal_not_regular", path=path))
         try:
             data = read_json_object(path)
         except (OSError, ValueError) as exc:
-            raise StoreError(f"rename journal {path} is unreadable or malformed ({exc})") from exc
+            raise StoreError(_store_text(
+                "store.rename.journal_unreadable", path=path, error=exc
+            )) from exc
         version = data.get("version")
         if type(version) is not int or version not in (
             _LEGACY_RENAME_JOURNAL_VERSION,
             _RENAME_JOURNAL_VERSION,
         ):
-            raise StoreError(f"rename journal {path} has an unsupported version")
+            raise StoreError(_store_text(
+                "store.rename.journal_unsupported_version", path=path
+            ))
         expected_fields = {"version", "old", "new", "default_was_old"}
         if version == _RENAME_JOURNAL_VERSION:
             expected_fields.add("recovery_action")
@@ -1096,28 +1590,42 @@ class Store:
         if not expected_fields.issubset(set(data)) or not extra_fields.issubset(
             {"action_failed", "action_error"}
         ):
-            raise StoreError(f"rename journal {path} has an invalid schema")
+            raise StoreError(_store_text(
+                "store.rename.journal_invalid_schema", path=path
+            ))
         if not isinstance(data["old"], str) or not isinstance(data["new"], str):
-            raise StoreError(f"rename journal {path} has invalid profile names")
+            raise StoreError(_store_text(
+                "store.rename.journal_invalid_names", path=path
+            ))
         if type(data["default_was_old"]) is not bool:
-            raise StoreError(f"rename journal {path} has invalid default state")
+            raise StoreError(_store_text(
+                "store.rename.journal_invalid_default", path=path
+            ))
         if version == _RENAME_JOURNAL_VERSION:
             action = data["recovery_action"]
             if not isinstance(action, dict) or set(action) != {"name", "data"}:
-                raise StoreError(f"rename journal {path} has an invalid recovery action")
+                raise StoreError(_store_text(
+                    "store.rename.journal_invalid_action", path=path
+                ))
             if (
                 not isinstance(action["name"], str)
                 or not _RENAME_ACTION_RE.fullmatch(action["name"])
                 or not isinstance(action["data"], dict)
             ):
-                raise StoreError(f"rename journal {path} has an invalid recovery action")
+                raise StoreError(_store_text(
+                    "store.rename.journal_invalid_action", path=path
+                ))
         try:
             self.validate_name(data["old"])
             self.validate_name(data["new"])
         except StoreError as exc:
-            raise StoreError(f"rename journal {path} has invalid profile names ({exc})") from exc
+            raise StoreError(_store_text(
+                "store.rename.journal_invalid_names_detail", path=path, error=exc
+            )) from exc
         if data["old"] == data["new"]:
-            raise StoreError(f"rename journal {path} names the same profile twice")
+            raise StoreError(_store_text(
+                "store.rename.journal_same_profile", path=path
+            ))
         return data
 
     def _write_rename_journal(
@@ -1140,9 +1648,11 @@ class Store:
         }
         if recovery_action is not None:
             if not _RENAME_ACTION_RE.fullmatch(recovery_action):
-                raise StoreError(f"invalid rename recovery action {recovery_action!r}")
+                raise StoreError(_store_text(
+                    "store.rename.action_invalid", action=recovery_action
+                ))
             if not isinstance(recovery_data, dict):
-                raise StoreError("rename recovery action data must be an object")
+                raise StoreError(_store_text("store.rename.action_data_invalid"))
             journal["recovery_action"] = {
                 "name": recovery_action,
                 "data": recovery_data,
@@ -1156,21 +1666,53 @@ class Store:
         except FileNotFoundError:
             return
         except OSError as exc:
-            raise StoreError(
-                f"cannot remove completed rename journal {self.rename_journal_path} ({exc})"
-            ) from exc
+            raise StoreError(_store_text(
+                "store.rename.completed_journal_remove_failed",
+                path=self.rename_journal_path,
+                error=exc,
+            )) from exc
 
-    def _recover_pending_rename(self, target_name: Optional[str] = None) -> None:
-        journal = self._read_rename_journal()
+    def _recover_pending_rename(
+        self,
+        target_name: Optional[str] = None,
+        *,
+        for_launch: bool = False,
+    ) -> Optional[Tuple[str, str]]:
+        try:
+            journal = self._read_rename_journal()
+        except StoreError as exc:
+            if for_launch:
+                raise StoreError(_store_text(
+                    "store.rename.launch_unreadable",
+                    path=self.rename_journal_path,
+                )) from exc
+            if self.repair_persistent_state(self.rename_journal_path):
+                return None
+            raise
         if journal is None:
-            return
+            return None
+        paths_conflict = self._rename_paths_conflict(journal)
+        if paths_conflict:
+            if for_launch and not self._launch_target_is_conflicted(target_name, journal):
+                return journal["old"], journal["new"]
+            raise StoreError(_store_text(
+                "store.rename.conflict",
+                old=journal["old"],
+                new=journal["new"],
+            ))
+        if (
+            not for_launch
+            and target_name is not None
+            and target_name not in (journal["old"], journal["new"])
+        ):
+            return None
 
         def operation() -> None:
             current = self._read_rename_journal()
             if current is None:
                 return
             if current != journal:
-                raise StoreError("rename journal changed while recovery locks were acquired")
+                raise StoreError(_store_text("store.rename.journal_changed"))
             self._require_rename_recovery_handler(current)
             self._with_sequence_lock(
                 "recovering rename", lambda: self._recover_rename_locked(current)
@@ -1183,6 +1725,7 @@ class Store:
         except _RenameRecoveryActionFailed:
             if target_name is None or target_name in (journal["old"], journal["new"]):
                 raise
+        return None
 
     def _require_rename_recovery_handler(self, journal: dict) -> Optional[Callable]:
         descriptor = journal.get("recovery_action")
@@ -1190,10 +1733,10 @@ class Store:
             return None
         handler = self._rename_recovery_handlers.get(descriptor["name"])
         if handler is None:
-            raise StoreError(
-                f"no handler is registered for rename recovery action "
-                f"{descriptor['name']!r}; journal retained"
-            )
+            raise StoreError(_store_text(
+                "store.rename.action_unregistered",
+                action=descriptor["name"],
+            ))
         return handler
 
     def _run_rename_recovery_action(self, journal: dict) -> None:
@@ -1204,13 +1747,14 @@ class Store:
         try:
             handler(self, journal["old"], journal["new"], descriptor["data"])
         except Exception as exc:
-            warn(
-                f"rename recovery action {descriptor['name']!r} failed; "
-                f"journal retained ({exc})"
+            message = _store_text(
+                "store.rename.action_failed",
+                action=descriptor["name"],
+                error=exc,
             )
+            warn(message)
             raise _RenameRecoveryActionFailed(
-                f"rename recovery action {descriptor['name']!r} failed; "
-                f"journal retained ({exc})"
+                message
             ) from exc
 
     def _read_profile_for_rename(self, directory: Path) -> Profile:
@@ -1218,9 +1762,11 @@ class Store:
         try:
             profile = self._read_profile_metadata(profile_dir / "profile.json")
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise StoreError(
-                f"cannot recover rename: metadata in {directory} is unreadable ({exc})"
-            ) from exc
+            raise StoreError(_store_text(
+                "store.rename.metadata_unreadable",
+                directory=directory,
+                error=exc,
+            )) from exc
         profiles, _unreadable = self._scan()
         self._require_profile_sequence_available(
             profile, profiles, excluded_names=(directory.name, profile.name)
@@ -1231,8 +1777,14 @@ class Store:
         if not journal["default_was_old"]:
             return
         if not self._config_writable():
-            raise StoreError(
-                f"cannot recover rename because {self.config_path} is corrupt"
+            raise StoreError(_store_text(
+                "store.rename.config_corrupt", path=self.config_path
+            ))
+        config_issue = self._configuration_state_issue()
+        repaired_config = False
+        if config_issue is not None:
+            repaired_config = self.repair_persistent_state(
+                self.config_path, sequence_locked=True
             )
         config = self.load_config()
         old = journal["old"]
@@ -1241,11 +1793,14 @@ class Store:
         other = old if forward else new
         if config.default_profile == target:
             return
+        if repaired_config and config.default_profile is None:
+            return
         if config.default_profile != other:
-            raise StoreError(
-                f"cannot recover rename: default profile changed from {old!r} "
-                f"to {config.default_profile!r}"
-            )
+            raise StoreError(_store_text(
+                "store.rename.default_changed",
+                old=old,
+                current=config.default_profile,
+            ))
         config.default_profile = target
         self.save_config(config)
 
@@ -1259,23 +1814,27 @@ class Store:
         old_exists = old_dir.exists()
         new_exists = new_dir.exists()
         if old_exists == new_exists:
-            raise StoreError(
-                f"cannot recover rename {old!r} to {new!r}: conflicting profile directories"
-            )
+            raise StoreError(_store_text(
+                "store.rename.directories_conflict", old=old, new=new
+            ))
         if old_exists:
             profile = self._read_profile_for_rename(old_dir)
             if profile.name != old:
-                raise StoreError(
-                    f"cannot recover rename: {old_dir} contains profile {profile.name!r}"
-                )
+                raise StoreError(_store_text(
+                    "store.rename.target_contains_profile",
+                    directory=old_dir,
+                    name=profile.name,
+                ))
             self._sync_rename_default(journal, forward=False)
             self._remove_rename_journal()
             return
         profile = self._read_profile_for_rename(new_dir)
         if profile.name not in (old, new):
-            raise StoreError(
-                f"cannot recover rename: {new_dir} contains profile {profile.name!r}"
-            )
+            raise StoreError(_store_text(
+                "store.rename.target_contains_profile",
+                directory=new_dir,
+                name=profile.name,
+            ))
         if profile.name == old:
             profile.name = new
             _atomic_write_json(new_dir / "profile.json", profile.to_dict())
@@ -1294,18 +1853,18 @@ class Store:
         if old_exists and not new_exists:
             profile = self._read_profile_for_rename(old_dir)
             if profile.name != journal["old"]:
-                raise StoreError("cannot roll back rename: old profile metadata changed")
+                raise StoreError(_store_text("store.rename.rollback_old_changed"))
         elif new_exists and not old_exists:
             profile = self._read_profile_for_rename(new_dir)
             if profile.name not in (journal["old"], journal["new"]):
-                raise StoreError("cannot roll back rename: profile metadata changed")
+                raise StoreError(_store_text("store.rename.rollback_metadata_changed"))
             if profile.name == journal["new"]:
                 profile.name = journal["old"]
                 _atomic_write_json(new_dir / "profile.json", profile.to_dict())
             self._sync_rename_default(journal, forward=False)
             rename_dir_with_retry(new_dir, old_dir)
         else:
-            raise StoreError("cannot roll back rename: conflicting profile directories")
+            raise StoreError(_store_text("store.rename.rollback_directories_conflict"))
         self._sync_rename_default(journal, forward=False)
         self._remove_rename_journal()
 
@@ -1316,44 +1875,53 @@ class Store:
         except FileNotFoundError:
             return None
         except OSError as exc:
-            raise StoreError(
-                f"cannot read profile sequence state {path} ({exc})"
-            ) from exc
+            raise StoreError(_store_text(
+                "store.sequence.read_failed", path=path, error=exc
+            )) from exc
         if not stat.S_ISREG(info.st_mode):
-            raise StoreError(f"profile sequence state {path} is not a regular file")
+            raise StoreError(_store_text("store.sequence.not_regular", path=path))
         try:
             data = read_json_object(path)
         except (OSError, ValueError) as exc:
-            raise StoreError(
-                f"profile sequence state {path} is unreadable or corrupt ({exc})"
-            ) from exc
+            raise StoreError(_store_text(
+                "store.sequence.unreadable", path=path, error=exc
+            )) from exc
         if set(data) != {"last_seq"}:
-            raise StoreError(f"profile sequence state {path} has an invalid schema")
+            raise StoreError(_store_text("store.sequence.invalid_schema", path=path))
         last_seq = data["last_seq"]
         if type(last_seq) is not int or last_seq < 0:
-            raise StoreError(f"profile sequence state {path} has an invalid last_seq")
+            raise StoreError(_store_text("store.sequence.invalid_last_seq", path=path))
         return last_seq
 
     def _persist_sequence_state(self, last_seq: int) -> None:
         try:
             _atomic_write_json(self.sequence_state_path, {"last_seq": last_seq})
         except OSError as exc:
-            raise StoreError(
-                f"cannot persist profile sequence state {self.sequence_state_path} ({exc})"
-            ) from exc
+            raise StoreError(_store_text(
+                "store.sequence.persist_failed",
+                path=self.sequence_state_path,
+                error=exc,
+            )) from exc
 
     def _ensure_sequence_counter(
         self, deleting_name: Optional[str] = None
     ) -> int:
-        last_seq = self._read_sequence_state()
-        profiles, unreadable = self._scan()
+        try:
+            last_seq = self._read_sequence_state()
+        except StoreError:
+            self.repair_persistent_state(
+                self.sequence_state_path, sequence_locked=True
+            )
+            last_seq = self._read_sequence_state()
+        profiles, unreadable = (
+            self._scan(tolerant=True) if deleting_name is not None else self._scan()
+        )
         if last_seq is None and unreadable:
             if deleting_name is None or set(unreadable) != {deleting_name}:
                 names = ", ".join(unreadable)
-                raise StoreError(
-                    "cannot initialize profile sequence state while profile "
-                    f"metadata is unreadable: {names}"
-                )
+                raise StoreError(_store_text(
+                    "store.sequence.initialize_unreadable", names=names
+                ))
         maximum = max((profile.seq for profile in profiles), default=0)
         if last_seq is None or last_seq < maximum:
             last_seq = maximum
@@ -1365,17 +1933,26 @@ class Store:
         self._persist_sequence_state(next_seq)
         return next_seq
 
-    def get(self, name: str) -> Profile:
+    def get(self, name: str, profile: Optional[Profile] = None) -> Profile:
+        """Read one profile without recovering or mutating store state."""
         self.validate_name(name)
-        self._recover_pending_rename(target_name=name)
+        if profile is None:
+            operation = lambda: self._get_unlocked(name)
+        else:
+            operation = lambda: self._get_unlocked(name, profile=profile)
         return self._with_recoverable_sequence_lock(
             "reading a profile",
-            lambda: self._get_unlocked(name),
+            operation,
             allow_missing_store=True,
             target_name=name,
+            read_only=True,
         )
 
-    def _get_unlocked(self, name: str) -> Profile:
+    def _get_unlocked(
+        self, name: str, profile: Optional[Profile] = None
+    ) -> Profile:
+        if profile is not None:
+            return self._require_profile_snapshot(name, profile)
         profile_dir = self._require_profile_paths_are_real(name)
         profiles, unreadable = self._scan()
         for profile in profiles:
@@ -1383,9 +1960,7 @@ class Store:
                 return profile
         if name in unreadable or profile_dir.is_dir():
             raise StoreError(_unreadable_metadata_message(name))
-        raise StoreError(
-            f"profile {name!r} does not exist (create it with: agydra create {name})"
-        )
+        raise StoreError(_profile_missing_message(name))
 
     def _probe_rename_journal(self) -> Tuple[bool, Optional[OSError]]:
         try:
@@ -1401,28 +1976,84 @@ class Store:
         closed). Pure ``lstat``: no locks, recovery or writes."""
         return self._probe_rename_journal()[0]
 
+    def recover_pending_rename(
+        self,
+        target_name: Optional[str] = None,
+    ) -> None:
+        """Finish an interrupted rename through the Store recovery protocol."""
+        self._recover_pending_rename(
+            target_name=target_name,
+        )
+
+    @contextmanager
+    def launch_recovery_scope(self, target_name: Optional[str] = None) -> Iterator[None]:
+        token = self._launch_rename_conflict.set(None)
+        try:
+            conflict = self._recover_pending_rename(
+                target_name=target_name, for_launch=True
+            )
+            if conflict is not None:
+                self._launch_rename_conflict.set(conflict)
+            yield
+        finally:
+            self._launch_rename_conflict.reset(token)
+
+    def pending_rename_involves(self, name: str) -> bool:
+        """Whether a read-only rename journal names ``name``.
+
+        An unreadable journal is conservatively treated as involving every
+        profile; this probe never acquires locks or changes state.
+        """
+        self.validate_name(name)
+        pending, error = self._probe_rename_journal()
+        if not pending:
+            return False
+        if error is not None:
+            return True
+        try:
+            journal = self._read_rename_journal()
+        except StoreError:
+            return True
+        return journal is None or name in (journal["old"], journal["new"])
+
+    def _launch_conflict_allows_read(
+        self, journal: Optional[dict], target_name: Optional[str]
+    ) -> bool:
+        if journal is None:
+            return False
+        names = (journal.get("old"), journal.get("new"))
+        return (
+            self._launch_rename_conflict.get() == names
+            and self._rename_paths_conflict(journal)
+            and (target_name is None or target_name not in names)
+        )
+
     def _require_no_pending_rename(self, target_name: Optional[str] = None) -> None:
         pending, error = self._probe_rename_journal()
         if not pending:
             return
         if error is not None:
-            raise StoreError(
-                f"cannot inspect rename journal {self.rename_journal_path} ({error}); "
-                "refusing a read-only read"
-            ) from error
+            raise StoreError(_store_text(
+                "store.rename.readonly_inspection_failed",
+                path=self.rename_journal_path,
+                error=error,
+            )) from error
         try:
             journal = self._read_rename_journal()
-        except StoreError:
-            journal = None
+        except StoreError as exc:
+            raise StoreError(_store_text(
+                "store.rename.readonly_unreadable",
+                path=self.rename_journal_path,
+            )) from exc
+        if self._launch_conflict_allows_read(journal, target_name):
+            return
         if (
             journal is not None
             and target_name is not None
             and target_name not in (journal.get("old"), journal.get("new"))
         ):
             return
-        raise StoreError(
-            "profile rename recovery is pending; a profile rename is being finished; retry in a moment"
-        )
+        raise StoreError(_store_text("store.rename.pending"))
 
     def _readonly(
         self, operation: Callable[[], _Result], target_name: Optional[str] = None
@@ -1437,13 +2068,21 @@ class Store:
         try:
             result = operation()
         except OSError as exc:
-            raise StoreError(f"cannot read the profile store ({exc})") from exc
+            raise StoreError(_store_text("store.store.read_failed", error=exc)) from exc
         self._require_no_pending_rename(target_name=target_name)
         return result
 
-    def get_readonly(self, name: str) -> Profile:
+    def get_readonly(self, name: str, profile: Optional[Profile] = None) -> Profile:
+        """Read a profile without recovery, reusing a validated scan entry."""
         self.validate_name(name)
-        return self._readonly(lambda: self._get_unlocked(name), target_name=name)
+        if profile is None:
+            operation = lambda: self._get_unlocked(name)
+        else:
+            operation = lambda: self._get_unlocked(name, profile=profile)
+        return self._readonly(
+            operation,
+            target_name=name,
+        )
 
     def scan_readonly(self) -> tuple:
         return self._readonly(self._scan)
@@ -1482,12 +2121,11 @@ class Store:
     @staticmethod
     def _duplicate_profile_sequence_error(sequence: int, names: Sequence[str]) -> StoreError:
         ordered_names = sorted(set(names))
-        return StoreError(
-            f"duplicate positive profile sequence {sequence} is shared by "
-            f"{', '.join(repr(name) for name in ordered_names)}; refusing to use "
-            "sequence-keyed Claude configuration until the duplicate metadata is "
-            "resolved explicitly (profiles were not renumbered)"
-        )
+        return StoreError(_store_text(
+            "store.profile.duplicate_sequence",
+            sequence=sequence,
+            names=", ".join(repr(name) for name in ordered_names),
+        ))
 
     @staticmethod
     def _require_valid_profile_sequence(profile: Profile) -> None:
@@ -1496,9 +2134,11 @@ class Store:
             or profile.seq < 0
             or (normalize_engine(profile.engine) == "claude" and profile.seq < 1)
         ):
-            raise StoreError(
-                f"invalid profile sequence {profile.seq!r} for engine {profile.engine!r}"
-            )
+            raise StoreError(_store_text(
+                "store.profile.sequence_engine_invalid",
+                sequence=profile.seq,
+                engine=profile.engine,
+            ))
 
     def _require_profile_sequence_available(
         self,
@@ -1527,10 +2167,13 @@ class Store:
         profiles: List[Profile] = []
         unreadable: List[str] = []
         sequence_owners: Dict[int, List[str]] = {}
+        excluded = set(self._launch_rename_conflict.get() or ())
         self._require_profiles_root_is_real()
         if self.profiles_dir.is_dir():
             for pdir in sorted(self.profiles_dir.iterdir()):
                 if pdir.name.startswith(_CREATE_STAGE_PREFIX):
+                    continue
+                if pdir.name in excluded:
                     continue
                 if not (pdir.is_dir() or platforms.is_link(pdir)):
                     continue
@@ -1561,17 +2204,18 @@ class Store:
         return profiles, unreadable
 
     def scan(self, tolerant: bool = False) -> tuple:
-        """Public two-for-one: profiles + unreadable names in ONE pass.
+        """Read profiles and unreadable names in one side-effect-free pass.
 
         Callers needing both lists (doctor) must use this instead of
         list() + unreadable_profiles(), which re-glob and re-parse the
         whole store twice.
         """
-        self._recover_pending_rename()
         return self._with_recoverable_sequence_lock(
             "reading profiles",
-            lambda: self._scan(tolerant=tolerant) if tolerant else self._scan(),
+            lambda: self._scan(tolerant=True) if tolerant else self._scan(),
             allow_missing_store=True,
+            read_only=True,
+            fail_on_unreadable_journal=True,
         )
 
     def list(self) -> List[Profile]:
@@ -1591,17 +2235,19 @@ class Store:
         except FileNotFoundError:
             return
         except OSError as exc:
-            raise StoreError(
-                f"cannot inspect overlay {overlay} before cleanup ({exc})"
-            ) from exc
+            raise StoreError(_store_text(
+                "store.overlay.inspect_failed", path=overlay, error=exc
+            )) from exc
         try:
             rmtree(overlay)
         except OSError as exc:
-            if require_removed:
-                message = "could not fully remove overlay during rename recovery"
-            else:
-                message = "could not fully remove overlay during profile deletion"
-            raise StoreError(f"{message}: {overlay} ({exc})") from exc
+            key = (
+                "store.overlay.remove_recovery_failed"
+                if require_removed else "store.overlay.remove_delete_failed"
+            )
+            raise StoreError(_store_text(
+                key, path=overlay, error=exc
+            )) from exc
 
     def _with_profile_locks(
         self,
@@ -1626,10 +2272,12 @@ class Store:
                             )
                     except locks.LockError as exc:
                         raise StoreError(
-                            f"cannot safely proceed with {action} profile {name!r}: {exc}"
+                            cannot_safely_proceed_message(
+                                action, f"profile {name!r}", exc
+                            )
                         ) from exc
                     if handle is None:
-                        raise StoreError(
+                        raise ProfileBusyError(
                             f"profile {name!r} has a live session; end it before {action}"
                         )
                     handles.append(handle)
@@ -1641,8 +2289,8 @@ class Store:
                 for handle in reversed(handles):
                     handle.release()
             if recovery_required:
-                self._recover_pending_rename()
-        raise StoreError("rename state changed repeatedly; retry the operation")
+                self.recover_pending_rename()
+        raise StoreError(_store_text("store.rename.state_changed"))
 
     def rename(
         self,
@@ -1655,7 +2303,7 @@ class Store:
     ) -> Profile:
         """Rename while holding both profile locks through optional follow-up work."""
         if old == new:
-            raise StoreError(f"cannot rename profile {old!r} to itself")
+            raise StoreError(_store_text("store.rename.self", old=old))
         self.validate_name(old)
         self.validate_name(new)
         if recovery_action is not None:
@@ -1663,19 +2311,20 @@ class Store:
                 not isinstance(recovery_action, str)
                 or not _RENAME_ACTION_RE.fullmatch(recovery_action)
             ):
-                raise StoreError(f"invalid rename recovery action {recovery_action!r}")
+                raise StoreError(_store_text(
+                    "store.rename.action_invalid", action=recovery_action
+                ))
             if after_rename is None:
-                raise StoreError("a recoverable rename action requires a completion callback")
+                raise StoreError(_store_text("store.rename.action_callback_required"))
             if not callable(recovery_data_provider):
-                raise StoreError("a recoverable rename action requires a data provider")
+                raise StoreError(_store_text("store.rename.action_provider_required"))
             if recovery_action not in self._rename_recovery_handlers:
-                raise StoreError(
-                    f"no handler is registered for rename recovery action "
-                    f"{recovery_action!r}"
-                )
+                raise StoreError(_store_text(
+                    "store.rename.action_missing", action=recovery_action
+                ))
         elif recovery_data_provider is not None:
-            raise StoreError("rename recovery data requires a recovery action")
-        self._recover_pending_rename()
+            raise StoreError(_store_text("store.rename.action_requires_data"))
+        self.recover_pending_rename()
 
         def operation() -> Profile:
             self._require_profile_paths_are_real(old)
@@ -1685,12 +2334,13 @@ class Store:
                 try:
                     recovery_data = recovery_data_provider()
                 except Exception as exc:
-                    raise StoreError(
-                        f"cannot prepare rename recovery action "
-                        f"{recovery_action!r} ({exc})"
-                    ) from exc
+                    raise StoreError(_store_text(
+                        "store.rename.action_prepare_failed",
+                        action=recovery_action,
+                        error=exc,
+                    )) from exc
                 if not isinstance(recovery_data, dict):
-                    raise StoreError("rename recovery action data must be an object")
+                    raise StoreError(_store_text("store.rename.action_data_invalid"))
 
             def rename_with_sequence_lock() -> Profile:
                 self._ensure_sequence_counter()
@@ -1708,13 +2358,13 @@ class Store:
                 except Exception as exc:
                     if recovery_action is None:
                         raise
-                    raise StoreError(
-                        f"rename completion callback failed; journal retained ({exc})"
-                    ) from exc
+                    raise StoreError(_store_text(
+                        "store.rename.action_callback_failed", error=exc
+                    )) from exc
             if recovery_action is not None:
                 expected = self._read_rename_journal()
                 if expected is None:
-                    raise StoreError("rename recovery journal disappeared before completion")
+                    raise StoreError(_store_text("store.rename.action_journal_disappeared"))
                 self._with_sequence_lock(
                     "recovering rename",
                     lambda: self._complete_rename_action(expected),
@@ -1738,12 +2388,11 @@ class Store:
                 old, self.claude_config_dir_for_seq(profile.seq), action="renaming"
             )
         if self.profile_meta_path(new).exists():
-            raise StoreError(f"profile {new!r} already exists")
+            raise StoreError(_store_text("store.profile.already_exists", name=new))
         if self.profile_dir(new).exists():
-            raise StoreError(
-                f"refusing to rename: target {self.profile_dir(new)} already "
-                "exists (another profile may be creating it)"
-            )
+            raise StoreError(_store_text(
+                "store.rename.target_exists", path=self.profile_dir(new)
+            ))
         config = self.load_config()
         default_was_old = (
             self._config_writable() and config.default_profile == old
@@ -1764,19 +2413,20 @@ class Store:
             try:
                 self._rollback_rename_locked(journal)
             except BaseException as rollback_error:
-                raise StoreError(
-                    f"rename to {new!r} failed and could not be rolled back to {old!r} "
-                    f"({rollback_error}); recovery journal retained; "
-                    f"original failure: {rename_error}"
-                ) from rollback_error
+                raise StoreError(_store_text(
+                    "store.rename.rollback_failed",
+                    new=new,
+                    old=old,
+                    rollback_error=rollback_error,
+                    rename_error=rename_error,
+                )) from rollback_error
             if isinstance(rename_error, OSError) and getattr(rename_error, "errno", None) in (
                 errno.ENOTEMPTY,
                 errno.EEXIST,
             ):
-                raise StoreError(
-                    f"refusing to rename: target {self.profile_dir(new)} already exists "
-                    "(another profile may have just been created with that name)"
-                ) from rename_error
+                raise StoreError(_store_text(
+                    "store.rename.target_appeared", path=self.profile_dir(new)
+                )) from rename_error
             raise
         self._remove_overlay(old, require_removed=True)
         if recovery_action is None:
@@ -1786,7 +2436,7 @@ class Store:
     def _complete_rename_action(self, expected: dict) -> None:
         current = self._read_rename_journal()
         if current != expected:
-            raise StoreError("rename journal changed before recovery action completion")
+            raise StoreError(_store_text("store.rename.action_journal_changed"))
         self._remove_rename_journal()
 
     def delete(
@@ -1796,7 +2446,7 @@ class Store:
         after_delete: Optional[Callable[[], None]] = None,
     ) -> Optional[Path]:
         self.validate_name(name)
-        self._recover_pending_rename()
+        self.recover_pending_rename()
 
         def operation() -> Optional[Path]:
             def prepare_delete() -> Tuple[Path, Optional[Path]]:
@@ -1804,9 +2454,7 @@ class Store:
                 self._ensure_sequence_counter(deleting_name=name)
                 profile_dir = self.profile_dir(name)
                 if not profile_dir.exists():
-                    raise StoreError(
-                        f"profile {name!r} does not exist (see: agydra list)"
-                    )
+                    raise StoreError(_profile_missing_message(name))
                 config_dir = self._claude_config_of(name)
                 if config_dir is not None:
                     self._require_plain_claude_roots()
@@ -1824,10 +2472,9 @@ class Store:
                 self._require_profile_paths_are_real(name)
                 current_config_dir = self._claude_config_of(name)
                 if current_config_dir != config_dir:
-                    raise StoreError(
-                        f"profile {name!r} identity changed while preparing deletion; "
-                        "nothing was removed"
-                    )
+                    raise StoreError(_store_text(
+                        "store.profile.identity_changed", name=name
+                    ))
                 if config_dir is not None:
                     self._require_plain_claude_roots()
                 return self._delete_locked(
@@ -1875,27 +2522,28 @@ class Store:
     ) -> Optional[Path]:
         profile_dir = self._require_profile_paths_are_real(name)
         if not profile_dir.exists():
-            raise StoreError(
-                f"profile {name!r} does not exist (see: agydra list)"
-            )
+            raise StoreError(_profile_missing_message(name))
         if config_dir is not None:
             self._invalidate_claude_usage_for_delete(name)
             self._remove_claude_state(name, config_dir)
         rmtree(profile_dir)
         self._remove_overlay(name)
         if profile_dir.exists():
-            raise StoreError(
-                f"profile {name!r} could not be fully removed at {profile_dir}; "
-                "remove it manually and retry"
-            )
+            raise StoreError(_store_text(
+                "store.profile.delete_failed", name=name, path=profile_dir
+            ))
         config = self.load_config()
         if config.default_profile == name:
-            remaining = [profile.name for profile in self._scan()[0]]
+            remaining = [
+                profile.name for profile in self._scan(tolerant=True)[0]
+            ]
             config.default_profile = remaining[0] if remaining else None
             try:
                 self.save_config(config)
             except StoreError as exc:
-                warn(f"could not update default profile after deleting {name!r} ({exc})")
+                warn(_store_text(
+                    "store.profile.default_update_failed", name=name, error=exc
+                ))
         return backup_path
 
     def _claude_config_of(self, name: str) -> Optional[Path]:
@@ -1908,24 +2556,35 @@ class Store:
         recovery proceeds and the unattributable ``claude-config/<seq>``
         entries are only reported (``claude_config_orphans``), never touched.
         """
-        self._scan()
+        profiles, unreadable = self._scan(tolerant=True)
         raw = read_json_object(self.profile_meta_path(name), tolerant=True)
         if raw is None:
             if self.claude_config_root.is_dir():
-                warn(
-                    f"metadata of {name!r} is unreadable: any claude-config/<seq> data it "
-                    "owned is kept and reported by `agydra doctor`"
-                )
+                warn(_store_text(
+                    "store.claude.metadata_unreadable_warning", name=name
+                ))
             return None
         if normalize_engine(raw.get("engine")) != "claude":
             return None
         try:
-            return self.claude_config_dir_for_seq(Profile.from_dict(raw).seq)
+            profile = Profile.from_dict(raw)
+            if unreadable:
+                raise StoreError(_store_text(
+                    "store.claude.other_metadata_unreadable"
+                ))
+            owners = [
+                item.name for item in profiles
+                if item.name != name and item.seq == profile.seq
+            ]
+            if profile.seq > 0 and owners:
+                raise self._duplicate_profile_sequence_error(
+                    profile.seq, [name, *owners]
+                )
+            return self.claude_config_dir_for_seq(profile.seq)
         except (ValueError, TypeError, StoreError) as exc:
-            raise StoreError(
-                f"profile {name!r} is a claude profile but its metadata is damaged ({exc}); "
-                "refusing to delete it without knowing which claude-config entry it owns"
-            ) from exc
+            raise StoreError(_store_text(
+                "store.claude.metadata_damaged", name=name, error=exc
+            )) from exc
 
     CLAUDE_SUPERVISOR_PROBE_TIMEOUT = 5.0
     CLAUDE_BACKGROUND_EVIDENCE = ("daemon", "jobs", "daemon.log")
@@ -1933,13 +2592,17 @@ class Store:
     @staticmethod
     def _claude_roster_workers(roster: Path) -> int:
         try:
-            data = json.loads(roster.read_text(encoding="utf-8"))
+            import locks
+
+            data = locks.json_loads_utf8(roster.read_bytes())
         except (OSError, ValueError, RecursionError) as exc:
-            raise StoreError(f"cannot read claude background roster {roster} ({exc})") from exc
+            raise StoreError(_store_text(
+                "store.claude.roster_read_failed", path=roster, error=exc
+            )) from exc
         if isinstance(data, list):
             return len(data)
         if not isinstance(data, dict):
-            raise StoreError(f"claude background roster {roster} has an unexpected shape")
+            raise StoreError(_store_text("store.claude.roster_shape", path=roster))
         return sum(len(v) for v in data.values() if isinstance(v, (list, dict)))
 
     def _guard_claude_supervisor(self, name: str, config_dir: Path, action: str = "deleting") -> None:
@@ -1964,13 +2627,14 @@ class Store:
             return
         stop_hint = f"CLAUDE_CONFIG_DIR={config_dir} claude daemon stop --any"
         driver = engines.get_engine("claude")
-        binary = driver.resolve_binary(self.load_config().claude_binary)
+        binary = driver.resolve_configured_binary(self.load_config())
         if binary is None:
-            raise StoreError(
-                f"profile {name!r} has background-session state but the claude binary "
-                f"was not found to verify it is idle; install it or set "
-                f"{platforms.CLAUDE_BIN_ENV}, then retry {action}"
-            )
+            raise StoreError(_store_text(
+                "store.claude.binary_missing_for_verify",
+                name=name,
+                env_var=platforms.CLAUDE_BIN_ENV,
+                action=action,
+            ))
         try:
             env = isolation.isolated_env(
                 config_dir, {}, engine="claude", store_root=self.root
@@ -1984,26 +2648,29 @@ class Store:
                 errors="replace",
             )
         except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
-            raise StoreError(
-                f"could not verify background sessions of {name!r} ({exc}); refusing {action}"
-            ) from exc
+            raise StoreError(_store_text(
+                "store.claude.verify_sessions_failed",
+                name=name,
+                error=exc,
+                action=action,
+            )) from exc
         if proc.returncode == 0:
-            raise StoreError(
-                f"profile {name!r} has a running claude background supervisor; stop it "
-                f"first with: {stop_hint}"
-            )
+            raise StoreError(_store_text(
+                "store.claude.supervisor_running", name=name, stop_hint=stop_hint
+            ))
         first_line = (proc.stdout or "").strip().splitlines()[:1]
         if proc.returncode != 1 or not first_line or first_line[0].strip().lower() != "not running":
-            raise StoreError(
-                f"claude daemon status gave an unrecognised answer (exit {proc.returncode}) "
-                f"for {name!r}; refusing {action}"
-            )
+            raise StoreError(_store_text(
+                "store.claude.status_unrecognized",
+                exit_code=proc.returncode,
+                name=name,
+                action=action,
+            ))
         roster = config_dir / "daemon" / "roster.json"
         if os.path.lexists(roster) and self._claude_roster_workers(roster) > 0:
-            raise StoreError(
-                f"profile {name!r} still lists claude background workers; stop them "
-                f"first with: {stop_hint}"
-            )
+            raise StoreError(_store_text(
+                "store.claude.workers_running", name=name, stop_hint=stop_hint
+            ))
 
     def _invalidate_claude_usage_for_delete(self, name: str) -> None:
         """Tombstone the usage cache generation after the backup and before
@@ -2014,18 +2681,16 @@ class Store:
         try:
             claude_usage.invalidate_profile_usage(self, name, deleted=True)
         except Exception as exc:
-            raise StoreError(
-                f"could not invalidate the Claude usage cache of {name!r} ({exc}); "
-                "nothing was deleted"
-            ) from exc
+            raise StoreError(_store_text(
+                "store.claude.invalidate_cache_failed", name=name, error=exc
+            )) from exc
 
     def _require_plain_claude_roots(self) -> None:
         for root in (self.claude_config_root, self.usage_cache_root):
             if os.path.lexists(root) and (platforms.is_link(root) or not root.is_dir()):
-                raise StoreError(
-                    f"{root} must be a real directory, not a link or file; "
-                    "refusing to touch claude profile data through it"
-                )
+                raise StoreError(_store_text(
+                    "store.claude.config_root_invalid", path=root
+                ))
 
     def _remove_claude_state(self, name: str, config_dir: Path) -> None:
         """Remove only this profile's own physical config and usage cache."""
@@ -2035,10 +2700,12 @@ class Store:
             try:
                 rmtree(target)
             except OSError as exc:
-                raise StoreError(
-                    f"profile {name!r} could not be fully removed: {target} survived ({exc}); "
-                    "remove it manually and retry"
-                ) from exc
+                raise StoreError(_store_text(
+                    "store.profile.remove_survived",
+                    name=name,
+                    path=target,
+                    error=exc,
+                )) from exc
 
     BACKUP_RETENTION = 5
 
@@ -2072,9 +2739,9 @@ class Store:
         platforms.ensure_dir(dest.parent if dest is not None else self.backups_dir)
         if dest is not None:
             if dest.suffix != ".zip":
-                raise StoreError(
-                    f"export destination must end in .zip: {dest!r}"
-                )
+                raise StoreError(_store_text(
+                    "store.export.destination_zip", path=dest
+                ))
             backup_path = dest
             if backup_path.exists():
                 counter = 2
@@ -2125,7 +2792,9 @@ class Store:
             with zipfile.ZipFile(tmp) as zf:
                 bad = zf.testzip()
                 if bad is not None:
-                    raise StoreError(f"backup verification failed on {bad!r}")
+                    raise StoreError(_store_text(
+                        "store.profile.backup_verification_failed", name=bad
+                    ))
 
         _atomic_replace(backup_path, payload, verify)
         if prune and dest is None:
@@ -2161,22 +2830,24 @@ class Store:
                 pass
 
     def default_name(self) -> Optional[str]:
-        self._recover_pending_rename()
         return self._with_recoverable_sequence_lock(
             "reading the default profile",
             lambda: self.load_config().default_profile,
             allow_missing_store=True,
+            read_only=True,
+            fail_on_unreadable_journal=True,
         )
 
     def set_default(self, name: str) -> None:
         self.validate_name(name)
-        self._recover_pending_rename()
+        self.recover_pending_rename()
 
         def operation() -> None:
             self._get_unlocked(name)
-            config = self.load_config()
-            config.default_profile = name
-            self.save_config(config)
+            self.update_config(
+                lambda config: setattr(config, "default_profile", name),
+                sequence_locked=True,
+            )
 
         self._with_recoverable_sequence_lock("setting the default profile", operation)
 
@@ -2198,10 +2869,11 @@ class Store:
                 idx = len(names)
             if 0 <= idx < len(names):
                 return names[idx]
-            raise StoreError(
-                f"profile number {ref!r} out of range (have {len(names)} profile(s)); "
-                "see: agydra list"
-            )
+            raise StoreError(_store_text(
+                "store.profile.number_out_of_range",
+                ref=ref,
+                count=len(names),
+            ))
         if ref in unreadable:
             raise StoreError(_unreadable_metadata_message(ref))
         if token in unreadable:
@@ -2212,6 +2884,9 @@ class Store:
             and ref not in vocab.RESERVED_NAMES
         )
         hint = f" — create it with: agydra create {ref}" if can_create else ""
-        raise StoreError(
-            f"unknown profile {ref!r}; existing: {', '.join(names) or '(none)'}{hint}"
-        )
+        raise StoreError(_store_text(
+            "store.profile.unknown_ref",
+            ref=ref,
+            names=", ".join(names) or "(none)",
+            hint=hint,
+        ))

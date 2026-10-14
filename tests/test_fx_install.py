@@ -125,13 +125,14 @@ class TestD2BrokenVenvAutoRepair(unittest.TestCase):
             proj = _make_fake_project(base, "proj", with_console=True)
             vpy = bootstrap.venv_python(proj)
             vpy.unlink()
-            def fake_run(*_a, **_kw):
+
+            def fake_perform(out=None, root=None, force=False, explicit=False, **_kw):
                 vpy.touch(mode=0o755)
-                return 0
+                return bootstrap.InstallResult(code=0, essential_ok=True, console=None)
 
             with mock.patch("agydra.__file__", str(proj / "agydra.py")), \
                  mock.patch("sys.argv", ["agydra.py", "--version"]), \
-                 mock.patch("bootstrap.run", side_effect=fake_run) as mock_boot_run, \
+                 mock.patch("bootstrap.perform_install", side_effect=fake_perform) as mock_boot_run, \
                  mock.patch("platforms.launch_argv", return_value=0):
                 res = agydra.main()
                 self.assertEqual(res, 0)
@@ -145,11 +146,33 @@ class TestD2BrokenVenvAutoRepair(unittest.TestCase):
             with mock.patch("agydra.__file__", str(proj / "agydra.py")), \
                  mock.patch("sys.argv", ["agydra.py", "--version"]), \
                  mock.patch("bootstrap.unimportable_modules", return_value=["stale_mod"]), \
-                 mock.patch("bootstrap.run", return_value=0) as mock_boot_run, \
+                 mock.patch(
+                     "bootstrap.perform_install",
+                     return_value=bootstrap.InstallResult(code=0, essential_ok=True, console=None),
+                 ) as mock_boot_run, \
                  mock.patch("platforms.launch_argv", return_value=0):
                 res = agydra.main()
                 self.assertEqual(res, 0)
                 mock_boot_run.assert_called_once()
+
+    def test_agydra_main_aborts_when_essential_repair_fails(self):
+        """FYD: an essential-only failure (venv/pip install) must stop the launch."""
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            proj = _make_fake_project(base, "proj", with_console=True)
+            with mock.patch("agydra.__file__", str(proj / "agydra.py")), \
+                 mock.patch("sys.argv", ["agydra.py", "--version"]), \
+                 mock.patch("bootstrap.venv_python") as mock_vpy, \
+                 mock.patch(
+                     "bootstrap.perform_install",
+                     return_value=bootstrap.InstallResult(code=1, essential_ok=False, console=None),
+                 ) as mock_boot_run, \
+                 mock.patch("platforms.launch_argv", return_value=0) as mock_launch:
+                mock_vpy.return_value.exists.return_value = False
+                res = agydra.main()
+                self.assertEqual(res, 1)
+                mock_boot_run.assert_called_once()
+                mock_launch.assert_not_called()
 
 
 class TestD3BinaryResolutionOrder(BaseCase):

@@ -72,8 +72,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple
 
+import engines
 import platforms
 import usage_agy
+import account
 from account import CHATGPT_PLAN_NAMES, auth_state, normalize_email, _has_credential
 from models import Profile
 
@@ -121,6 +123,15 @@ class UsageResult:
     quality: Optional[str] = None
     identity_verified: Optional[bool] = None
     authentication_state: Optional[AuthenticationState] = None
+
+    def __post_init__(self) -> None:
+        if self.authentication_state is None:
+            if self.ok:
+                self.authentication_state = "authenticated"
+            elif self.error:
+                err = self.error.strip().lower()
+                if err in ("not authenticated", "not-authenticated", "unauthenticated"):
+                    self.authentication_state = "unauthenticated"
 
 
 class UsageResponseError(ValueError):
@@ -270,8 +281,10 @@ def _get_profile_readonly(store, name: str) -> Profile:
     return store.get_readonly(name)
 
 
-def _has_pending_profile_rename(store) -> bool:
-    return store.has_pending_rename()
+def _has_pending_profile_rename(store, name: Optional[str] = None) -> bool:
+    if name is not None and hasattr(store, "pending_rename_involves"):
+        return bool(store.pending_rename_involves(name))
+    return bool(store.has_pending_rename())
 
 
 def _close_http_error(exc: BaseException) -> None:
@@ -757,6 +770,77 @@ GROK_PLANS_WITHOUT_QUOTA = frozenset({"x premium"})
 PLAN_WITHOUT_QUOTA = "plan without usage quota"
 
 
+def _refresh_grok_profile_tokens(
+    auth_info: dict,
+    data_dir: Path,
+    store: Optional[Any],
+    name: str,
+    timeout: float,
+    used_previous: Optional[str],
+) -> Tuple[Optional[str], Optional[UsageResult]]:
+    import locks
+
+    active_store = store
+    if active_store is None:
+        try:
+            from store import Store
+
+            active_store = Store()
+        except Exception:
+            active_store = None
+    handle = None
+    if active_store is not None:
+        try:
+            handle = locks.try_mutation_lock(active_store, name)
+        except (locks.LockError, OSError):
+            handle = None
+    if handle is None:
+        return None, UsageResult(
+            name=name,
+            ok=False,
+            engine="grok",
+            email=account.detect_grok_email(data_dir),
+            plan=account.detect_grok_plan(data_dir),
+            error="session expired (401)",
+            authentication_state="authenticated",
+        )
+    with handle:
+        grant = _refresh_grok_safely(auth_info, timeout)
+        if grant and _has_credential(grant.get("access_token")):
+            new_access = grant["access_token"]
+            new_refresh = (
+                grant.get("refresh_token")
+                if _has_credential(grant.get("refresh_token"))
+                else None
+            )
+            persisted = False
+            try:
+                persisted = account.update_grok_tokens(
+                    data_dir,
+                    access_token=new_access,
+                    refresh_token=new_refresh,
+                    previous_access_token=used_previous,
+                )
+            except (OSError, ValueError):
+                persisted = False
+            if not persisted:
+                fresh_info = account.inspect_grok_auth(data_dir)
+                disk_access = (fresh_info or {}).get("token") or (fresh_info or {}).get("key")
+                if disk_access and disk_access != used_previous:
+                    return disk_access, None
+                return None, UsageResult(
+                    name=name,
+                    ok=False,
+                    engine="grok",
+                    email=account.detect_grok_email(data_dir),
+                    plan=account.detect_grok_plan(data_dir),
+                    error="failed to persist refreshed tokens",
+                    authentication_state="authenticated",
+                )
+            return new_access, None
+    return None, None
+
+
 def _grok_empty_usage_result(
     name: str, email: Optional[str], plan: Optional[str]
 ) -> "UsageResult":
@@ -815,7 +899,12 @@ def query_grok_usage(
         )
 
     token = auth_info.get("token") or auth_info.get("key")
-    if not token:
+    used_token = token
+    used_previous = auth_info.get("key") if auth_info else None
+
+    if not used_token:
+        state = account.auth_state(data_dir, engine="grok")
+        auth_state_val = "authenticated" if state == "authenticated" else "unauthenticated"
         return UsageResult(
             name=name,
             ok=False,
@@ -823,12 +912,10 @@ def query_grok_usage(
             email=detected_email,
             plan=detected_plan,
             error="missing access token",
-            authentication_state="unauthenticated",
+            authentication_state=auth_state_val,
         )
 
     billing_payload = None
-    used_token = token
-    used_previous = auth_info.get("key") if auth_info else None
     for attempt in (0, 1):
         try:
             billing_payload = fetch_grok_billing_payload(used_token, timeout=timeout)
@@ -846,50 +933,15 @@ def query_grok_usage(
                     authentication_state="authenticated",
                 )
             if attempt == 0 and (auth_info or {}).get("refresh_token"):
-                import locks
-                active_store = store
-                if active_store is None:
-                    try:
-                        from store import Store
-                        active_store = Store()
-                    except Exception:
-                        active_store = None
-                handle = (
-                    locks.try_mutation_lock(active_store, name)
-                    if active_store is not None
-                    else None
+                new_token, fail_res = _refresh_grok_profile_tokens(
+                    auth_info, data_dir, store, name, timeout, used_previous
                 )
-                if handle is None:
-                    return UsageResult(
-                        name=name,
-                        ok=False,
-                        engine="grok",
-                        email=detected_email,
-                        plan=detected_plan,
-                        error="session expired (401)",
-                        authentication_state="unauthenticated",
-                    )
-                with handle:
-                    grant = _refresh_grok_safely(auth_info, timeout)
-                    if grant and _has_credential(grant.get("access_token")):
-                        new_access = grant["access_token"]
-                        new_refresh = (
-                            grant.get("refresh_token")
-                            if _has_credential(grant.get("refresh_token"))
-                            else None
-                        )
-                        try:
-                            account.update_grok_tokens(
-                                data_dir,
-                                access_token=new_access,
-                                refresh_token=new_refresh,
-                                previous_access_token=used_previous,
-                            )
-                        except Exception:
-                            pass
-                        used_token = new_access
-                        used_previous = new_access
-                        continue
+                if fail_res is not None:
+                    return fail_res
+                if new_token:
+                    used_token = new_token
+                    used_previous = new_token
+                    continue
             return UsageResult(
                 name=name,
                 ok=False,
@@ -956,7 +1008,7 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     docstring), so skipping it shortens real elapsed time, not just log
     noise.
     """
-    if _has_pending_profile_rename(store):
+    if _has_pending_profile_rename(store, name):
         try:
             profile_metadata = _get_profile_readonly(store, name)
             engine = profile_metadata.engine if profile_metadata else None
@@ -1035,14 +1087,22 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     state = auth_state(data_dir, store, name, engine=engine)
 
     if state != "authenticated":
-        return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error="not authenticated")
+        return UsageResult(
+            name=name,
+            ok=False,
+            engine=engine,
+            email=profile.email,
+            error="not authenticated",
+            authentication_state="unauthenticated",
+        )
 
     config = store.load_config()
-    binary = platforms.resolve_agy_binary(config.agy_binary)
+    binary = engines.get_engine("agy").resolve_configured_binary(config)
     if binary is None:
         return UsageResult(
             name=name, ok=False, engine=engine, email=profile.email,
             error=f"agy binary not found (set {platforms.AGY_BIN_ENV} or PATH)",
+            authentication_state="authenticated",
         )
 
     token_bytes = usage_agy.scoped_token_bytes(store, name, profile, data_dir)
@@ -1050,6 +1110,7 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
         return UsageResult(
             name=name, ok=False, engine=engine, email=profile.email,
             error="credential not found or identity unverified in profile data/keychain backup (launch once or re-login to refresh)",
+            authentication_state="unauthenticated",
         )
 
     try:

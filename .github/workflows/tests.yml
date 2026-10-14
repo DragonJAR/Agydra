@@ -35,7 +35,6 @@ jobs:
             architecture: arm64
     env:
       AGYDRA_NO_KEYCHAIN: '1'
-      AGYDRA_SKIP_WIN32_BATCH: '1'
       NO_COLOR: '1'
       PYTHONUTF8: '1'
       PYTHONUNBUFFERED: '1'
@@ -58,9 +57,11 @@ jobs:
       - name: Native Windows contracts
         if: runner.os == 'Windows'
         timeout-minutes: 3
+        shell: cmd
         env:
-          AGYDRA_SKIP_WIN32_BATCH: '1'
-        run: python -m unittest discover -s tests -p test_windows_batch.py -v
+          TMP: C:\tmp
+          TEMP: C:\tmp
+        run: mkdir C:\tmp 2>nul & python -m unittest discover -s tests -p test_windows_batch.py -v
       - name: Full standard-library suite (Windows)
         if: ${{ !cancelled() && steps.python.outcome == 'success' && runner.os == 'Windows' }}
         timeout-minutes: 10

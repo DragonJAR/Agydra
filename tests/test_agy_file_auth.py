@@ -271,6 +271,7 @@ class TestAgyFileCredentials(BaseCase):
 
         def native_login(plan, store=None, dry_run=False):
             self._write_disk()
+            account.record_profile_email(store or self.store, plan.profile)
             return 0
 
         with mock.patch.object(cli.runner, "run", side_effect=native_login), \
@@ -286,9 +287,14 @@ class TestAgyFileCredentials(BaseCase):
         from types import SimpleNamespace
 
         self._unanchor()
+
+        def login_with_metadata_attempt(plan, store=None, dry_run=False):
+            account.record_profile_email(store or self.store, plan.profile)
+            return 0
+
         for failure in (StoreError("synthetic"), OSError("synthetic")):
             with self.subTest(failure=type(failure).__name__), \
-                    mock.patch.object(cli.runner, "run", return_value=0), \
+                    mock.patch.object(cli.runner, "run", side_effect=login_with_metadata_attempt), \
                     mock.patch.object(account, "sync_profile_email", side_effect=failure), \
                     contextlib.redirect_stdout(io.StringIO()):
                 code = cli.cmd_login(
@@ -301,7 +307,6 @@ class TestAgyFileCredentials(BaseCase):
         from types import SimpleNamespace
 
         self._unanchor()
-        self._write_disk()
         with mock.patch.object(cli.runner, "run", return_value=1), \
                 contextlib.redirect_stdout(io.StringIO()):
             code = cli.cmd_login(

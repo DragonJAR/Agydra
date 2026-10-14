@@ -17,10 +17,9 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
-import shutil
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import account
 import isolation
@@ -29,14 +28,71 @@ import locks
 import platforms
 import profile_rotation
 import resolver
+from models import Config, Profile
 from store import Store, StoreError
 from ui import note, warn
 
 
 class BinaryUnavailableError(StoreError):
-    def __init__(self, message: str, exit_code: int = 1):
+    def __init__(self, message: str, exit_code: int = 127):
         super().__init__(message)
         self.exit_code = exit_code
+
+
+def _existing_binary_candidate(value: str) -> Optional[Path]:
+    cleaned = value.strip().strip('"\'')
+    if not cleaned:
+        return None
+    try:
+        candidate = Path(cleaned).expanduser()
+        if candidate.exists():
+            return candidate
+        if platforms.is_windows() and not candidate.suffix:
+            return platforms._probe_pathext(candidate)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _path_binary_candidate(binary_name: str) -> Optional[Path]:
+    raw_path = platforms._sanitized_path_env()
+    search_path = os.defpath if raw_path is None else raw_path
+    for entry in search_path.split(os.pathsep):
+        if not entry and platforms.is_windows():
+            continue
+        directory = Path(entry) if entry else Path(os.curdir)
+        candidate = _existing_binary_candidate(str(directory / binary_name))
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _unavailable_binary_candidate(
+    driver: engines.EngineDriver, config: Config, explicit: Optional[str]
+) -> Optional[Path]:
+    if explicit:
+        candidate = _existing_binary_candidate(explicit)
+        if candidate is not None:
+            return candidate
+        cleaned = explicit.strip().strip('"\'')
+        if not os.path.dirname(cleaned):
+            return _path_binary_candidate(cleaned)
+        return None
+    env_value = os.environ.get(driver.env_bin_var) if driver.env_bin_var else None
+    if env_value:
+        candidate = _existing_binary_candidate(env_value)
+        if candidate is not None:
+            return candidate
+        cleaned = env_value.strip().strip('"\'')
+        if not os.path.dirname(cleaned):
+            return _path_binary_candidate(cleaned)
+        return None
+    config_value = getattr(config, driver.config_binary_attr, None)
+    if config_value:
+        candidate = _existing_binary_candidate(str(config_value))
+        if candidate is not None:
+            return candidate
+    return _path_binary_candidate(driver.binary_name)
 
 
 _PLAN_ENV_DISPLAY = (
@@ -54,6 +110,26 @@ _NATIVE_IDENTITY_COMMANDS = (("auth", "login"), ("auth", "logout"))
 
 def _changes_claude_identity(*argvs: Sequence[str]) -> bool:
     return any(tuple(argv[:2]) in _NATIVE_IDENTITY_COMMANDS for argv in argvs)
+
+
+def _candidate_exhaustion_error(
+    engine: Optional[str],
+    excluded: set,
+    causes: Dict[str, str],
+    fallback: Exception,
+) -> resolver.NoEligibleProfileError:
+    scope = f"{engine} engine" if engine else "any engine"
+    if len(causes) > 1:
+        cause_text = "; ".join(f"{name}: {causes[name]}" for name in sorted(causes))
+    elif causes:
+        cause_text = next(iter(causes.values()))
+    else:
+        cause_text = str(fallback)
+    message = (
+        f"{cause_text}; no other {scope} profile could be joined "
+        f"({', '.join(sorted(excluded))} already tried)"
+    )
+    return resolver.NoEligibleProfileError(message, formatted_exhaustion=True)
 
 
 @dataclass
@@ -113,6 +189,66 @@ class LaunchPlan:
         return "\n".join(lines)
 
 
+class _RotationContext:
+    def __init__(self, store: Store, rotation: profile_rotation.Rotation) -> None:
+        self.store = store
+        self.base = rotation
+        self.scope = rotation.scope
+        self.engine = rotation.engine
+        self.auth_states = rotation.auth_states
+        self.auth_causes: Dict[tuple, str] = {}
+        self._profiles: Optional[list] = None
+        self._config = None
+        self._session_states: Dict[tuple, tuple] = {}
+
+    def __enter__(self) -> "_RotationContext":
+        self.base.__enter__()
+        return self
+
+    def __exit__(self, *args) -> None:
+        return self.base.__exit__(*args)
+
+    def __getattr__(self, name: str):
+        return getattr(self.base, name)
+
+    def profiles(self) -> List[Profile]:
+        if self._profiles is None:
+            self._profiles = self.store.list()
+        return list(self._profiles)
+
+    def config(self) -> Config:
+        if self._config is None:
+            self._config = self.store.load_config()
+        return self._config
+
+    def session_state(
+        self, profile: Profile
+    ) -> Tuple[bool, Optional[List[locks.Holder]]]:
+        identity = (profile.engine, profile.seq, profile.name)
+        if identity not in self._session_states:
+            busy = locks.is_locked(self.store, profile.name)
+            holders = locks.lease_holders(self.store, profile.name) if busy else None
+            self._session_states[identity] = (busy, holders)
+        return self._session_states[identity]
+
+    def preload_slow_auth(self) -> None:
+        if self.scope not in ("all", "claude"):
+            return
+        for profile in self.profiles():
+            if profile.engine != "claude":
+                continue
+            identity = (profile.engine, profile.seq, profile.name)
+            self.auth_states[identity] = account.auth_state(
+                self.store.profile_data_dir(profile.name, engine=profile.engine),
+                self.store,
+                profile.name,
+                engine=profile.engine,
+            )
+
+    def commit(self, profile: Profile) -> None:
+        self.base.commit(profile)
+
+
 def build_plan(
     store: Store,
     agy_args: Sequence[str],
@@ -157,20 +293,13 @@ def build_plan(
                     exclude=excluded,
                     read_only=read_only,
                     rotation=rotation,
+                    causes=causes,
                 )
             except resolver.NoEligibleProfileError as exhausted:
                 if not excluded:
                     raise
-                scope = f"{engine} engine" if engine else "any engine"
-                if causes and len(causes) > 1:
-                    cause_str = "; ".join(f"{n}: {causes[n]}" for n in sorted(causes))
-                elif causes:
-                    cause_str = next(iter(causes.values()))
-                else:
-                    cause_str = str(exhausted)
-                raise resolver.NoEligibleProfileError(
-                    f"{cause_str}; no other {scope} profile could be joined "
-                    f"({', '.join(sorted(excluded))} already tried)"
+                raise _candidate_exhaustion_error(
+                    engine, excluded, causes, exhausted
                 ) from exhausted
         else:
             resolution = resolver.resolve(
@@ -180,29 +309,33 @@ def build_plan(
                 engine=engine,
                 read_only=read_only,
             )
-        profile = (store.get_readonly if read_only else store.get)(resolution.name)
+        profile_lookup = store.get_readonly if read_only else store.get
+        selected_profile = getattr(resolution, "profile", None)
+        if selected_profile is None:
+            profile = profile_lookup(resolution.name)
+        else:
+            profile = profile_lookup(resolution.name, profile=selected_profile)
         driver = engines.get_engine(profile.engine)
 
-        config = store.load_config()
-        config_bin = getattr(config, driver.config_binary_attr, None)
-        binary = driver.resolve_binary(binary_override, config_val=config_bin)
+        config = rotation.config() if rotation is not None else store.load_config()
+        binary = driver.resolve_configured_binary(config, binary_override)
         if binary is None:
-            if binary_override:
-                override_path = Path(binary_override).expanduser()
-                if not override_path.exists() and not shutil.which(binary_override):
-                    raise BinaryUnavailableError(
-                        f"could not find binary {binary_override!r}",
-                        exit_code=127,
-                    )
-                raise BinaryUnavailableError(
-                    f"binary {binary_override!r} is not executable",
-                    exit_code=126,
-                )
-            err = BinaryUnavailableError(
-                f"could not find the {driver.binary_name} binary; install {driver.binary_name} first, "
-                f"or point agydra to it with --binary <path> or the {driver.env_bin_var} env var",
-                exit_code=1,
+            unavailable_candidate = _unavailable_binary_candidate(
+                driver, config, binary_override
             )
+            if unavailable_candidate is not None:
+                message = f"binary {str(unavailable_candidate)!r} is not executable"
+                exit_code = 126
+            elif binary_override:
+                message = f"could not find binary {binary_override!r}"
+                exit_code = 127
+            else:
+                message = (
+                    f"could not find the {driver.binary_name} binary; install {driver.binary_name} first, "
+                    f"or point agydra to it with --binary <path> or the {driver.env_bin_var} env var"
+                )
+                exit_code = 127
+            err = BinaryUnavailableError(message, exit_code=exit_code)
             if not random_pick:
                 raise err
             excluded.add(profile.name)
@@ -334,18 +467,10 @@ def _next_random_plan(
             causes=causes,
         )
     except resolver.NoEligibleProfileError as exhausted:
-        if "already tried" in str(exhausted):
+        if exhausted.formatted_exhaustion:
             raise
-        scope = f"{plan.engine_filter} engine" if plan.engine_filter else "any engine"
-        if causes and len(causes) > 1:
-            cause_str = "; ".join(f"{n}: {causes[n]}" for n in sorted(causes))
-        elif causes:
-            cause_str = next(iter(causes.values()))
-        else:
-            cause_str = str(cause)
-        raise resolver.NoEligibleProfileError(
-            f"{cause_str}; no other {scope} profile could be joined "
-            f"({', '.join(sorted(excluded))} already tried)"
+        raise _candidate_exhaustion_error(
+            plan.engine_filter, excluded, causes or {}, cause
         ) from exhausted
 
 
@@ -357,7 +482,11 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
     store = store or Store()
     if not plan.random_pick:
         return _run_prepared(plan, store)
-    with profile_rotation.Rotation(store, plan.engine_filter) as rotation:
+    rotation = _RotationContext(
+        store, profile_rotation.Rotation(store, plan.engine_filter)
+    )
+    rotation.preload_slow_auth()
+    with rotation:
         selected = build_plan(
             store, plan.raw_args,
             binary_override=plan.binary_override, random_pick=True,
@@ -418,7 +547,8 @@ def _run_prepared(
     excluded: set = set()
     causes: Dict[str, str] = {}
     slot_busy: Optional[keychain.KeychainBusyError] = None
-    limit = None if plan.force else store.load_config().session_limit()
+    config = rotation.config() if rotation is not None else store.load_config()
+    limit = None if plan.force else config.session_limit()
     while True:
         driver = engines.get_engine(plan.engine)
         needs_keychain = driver.needs_keychain and not plan.agy_file_auth
@@ -439,9 +569,7 @@ def _run_prepared(
                     continue
                 if isinstance(exc, locks.LeaseLimitError):
                     raise StoreError(
-                        f"{exc}; wait for one to finish, raise "
-                        "settings.max_sessions_per_profile in agydra.json, or "
-                        "bypass with -f/--force"
+                        f"{exc}; {resolver.SESSION_LIMIT_GUIDANCE}"
                     ) from exc
                 if isinstance(exc, locks.LockError):
                     raise StoreError(
@@ -505,28 +633,30 @@ def _run_prepared(
                     argv = isolation.sandbox_wrap(argv)
 
                 if needs_keychain:
-                    guard = keychain.launch_guard(store, plan.profile, capture=plan.launch_as_child)
+                    with keychain.scoped_profile_snapshot(profile):
+                        guard = keychain.launch_guard(
+                            store, plan.profile, capture=plan.launch_as_child
+                        )
                 elif plan.agy_file_auth and plan.launch_as_child:
                     guard = _keep_file_login(store, plan.profile, data_dir)
                 else:
                     guard = contextlib.nullcontext()
                 try:
-                    with guard:
-                        started = True
-                        if rotation is not None:
-                            if plan.random_pick:
-                                rotation.commit(profile)
-                            else:
-                                rotation.release()
-                        if platforms.is_windows():
-                            rc = platforms.launch_argv(argv, env)
-                            platforms.drain_tty_input()
-                            return rc
-                        if plan.use_sandbox or plan.launch_as_child or keychain_needs_waited_child:
-                            rc = platforms.run_wait(argv, env)
-                            platforms.drain_tty_input()
-                            return rc
-                        return platforms.launch_argv(argv, env)
+                    with keychain.defer_login_email_recording():
+                        with guard:
+                            started = True
+                            if rotation is not None:
+                                if plan.random_pick:
+                                    rotation.commit(profile)
+                            if platforms.is_windows():
+                                rc = platforms.launch_argv(argv, env)
+                                platforms.drain_tty_input()
+                                return rc
+                            if plan.use_sandbox or plan.launch_as_child or keychain_needs_waited_child:
+                                rc = platforms.run_wait(argv, env)
+                                platforms.drain_tty_input()
+                                return rc
+                            return platforms.launch_argv(argv, env)
                 except keychain.KeychainBusyError as exc:
                     if exc.owner is None or plan.agy_file_auth:
                         raise StoreError(str(exc)) from exc
@@ -537,7 +667,7 @@ def _run_prepared(
                     )
                     slot_busy = exc
                     plan = replace(plan, agy_file_auth=True)
-            except (isolation.IsolationError, isolation.AgyCredentialUnavailableError, locks.LockError, BinaryUnavailableError) as prep_exc:
+            except (isolation.IsolationError, isolation.AgyCredentialUnavailableError, locks.LockError) as prep_exc:
                 if plan.random_pick and not started:
                     plan = _next_random_plan(store, plan, excluded, prep_exc, rotation, causes)
                     continue
@@ -553,7 +683,4 @@ def _run_prepared(
                         "launch"
                     )
             if leased and started:
-                try:
-                    account.record_profile_email(store, plan.profile)
-                except Exception:
-                    pass
+                account.record_profile_email(store, plan.profile)

@@ -64,6 +64,23 @@ class TestDoctor(BaseCase):
         exit_code = doctor.run_checks(self.store)
         self.assertEqual(exit_code, 0)
 
+    def test_report_messages_use_the_active_catalog_language(self):
+        import i18n
+
+        original = i18n._get_active()
+        try:
+            i18n._set_active("es")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                doctor.run_checks(self.store)
+            report = output.getvalue()
+        finally:
+            i18n._set_active(original)
+        self.assertIn("leyenda: [ok]=correcto", report)
+        self.assertIn("estado persistente: válido", report)
+        self.assertIn("aún no hay perfiles", report)
+        self.assertNotIn("persistent state: valid", report)
+
     def test_missing_binary_returns_one(self):
         self.store.create("work")
         os.environ["AGYDRA_AGY_BIN"] = str(self.bin_dir / "missing-agy")

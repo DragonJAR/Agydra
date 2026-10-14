@@ -14,6 +14,8 @@ import isolation
 import keychain
 import locks
 import platforms
+import engines
+import i18n
 from store import Store, StoreError
 from ui import console_print, paint, warn
 
@@ -47,48 +49,44 @@ class _DoctorContext:
 
 def _check_binary(store: Store, ctx: "_DoctorContext"):
     config = store.load_config()
-    agy_bin = platforms.resolve_agy_binary(config_val=config.agy_binary)
-    has_profiles = bool(ctx.scan[0])
-    has_agy_profile = any(getattr(p, "engine", "agy") == "agy" for p in ctx.scan[0]) if has_profiles else True
-    has_codex_profile = any(getattr(p, "engine", "agy") == "codex" for p in ctx.scan[0])
-    has_grok_profile = any(getattr(p, "engine", "agy") == "grok" for p in ctx.scan[0])
-    has_claude_profile = any(getattr(p, "engine", "agy") == "claude" for p in ctx.scan[0])
+    active_engines = {
+        getattr(profile, "engine", "agy") or "agy"
+        for profile in ctx.scan[0]
+    }
+    if not active_engines:
+        active_engines.add("agy")
+    active_engines.intersection_update(engines.SUPPORTED_ENGINES)
     lines = []
     status = OK
-    active_count = sum([has_agy_profile, has_codex_profile, has_grok_profile, has_claude_profile])
+    active_count = len(active_engines)
     if active_count > 1:
-        lines.append("binaries:")
+        lines.append(i18n.t("doctor.binary.list_header"))
         prefix = "  - "
     else:
         prefix = ""
 
-    if has_agy_profile:
-        if agy_bin is None:
+    for engine_name in engines.SUPPORTED_ENGINES:
+        if engine_name not in active_engines:
+            continue
+        driver = engines.get_engine(engine_name)
+        binary = driver.resolve_configured_binary(config)
+        if binary is None:
             status = FAIL
-            lines.append(f"{prefix}agy binary not found (install agy or set {platforms.AGY_BIN_ENV})")
+            key = (
+                "doctor.binary.codex_fail" if engine_name == "codex"
+                else "doctor.binary.claude_fail" if engine_name == "claude"
+                else "doctor.binary.grok_fail" if engine_name == "grok"
+                else "doctor.binary.fail"
+            )
+            lines.append(prefix + i18n.t(key, env_var=driver.env_bin_var))
         else:
-            lines.append(f"{prefix}agy binary: {agy_bin}")
-    if has_codex_profile:
-        codex_bin = platforms.resolve_codex_binary(config_val=config.codex_binary)
-        if codex_bin is None:
-            status = FAIL
-            lines.append(f"{prefix}codex binary not found (install codex or set {platforms.CODEX_BIN_ENV})")
-        else:
-            lines.append(f"{prefix}codex binary: {codex_bin}")
-    if has_grok_profile:
-        grok_bin = platforms.resolve_grok_binary(config_val=config.grok_binary)
-        if grok_bin is None:
-            status = FAIL
-            lines.append(f"{prefix}grok binary not found (install grok or set {platforms.GROK_BIN_ENV})")
-        else:
-            lines.append(f"{prefix}grok binary: {grok_bin}")
-    if has_claude_profile:
-        claude_bin = platforms.resolve_claude_binary(config_val=config.claude_binary)
-        if claude_bin is None:
-            status = FAIL
-            lines.append(f"{prefix}claude binary not found (install claude or set {platforms.CLAUDE_BIN_ENV})")
-        else:
-            lines.append(f"{prefix}claude binary: {claude_bin}")
+            key = (
+                "doctor.binary.codex_ok" if engine_name == "codex"
+                else "doctor.binary.claude_ok" if engine_name == "claude"
+                else "doctor.binary.grok_ok" if engine_name == "grok"
+                else "doctor.binary.ok"
+            )
+            lines.append(prefix + i18n.t(key, path=binary))
     return status, "\n".join(lines)
 
 
@@ -109,14 +107,45 @@ def _check_store(store: Store, _ctx: "_DoctorContext"):
             except OSError:
                 pass
     except OSError as exc:
-        return FAIL, f"store not writable: {store.root} ({exc})"
-    return OK, f"store writable: {store.root}"
+        return FAIL, i18n.t("doctor.store.fail", path=store.root, error=exc)
+    return OK, i18n.t("doctor.store.ok", path=store.root)
+
+
+def _persistent_state_name(name: str) -> str:
+    key = f"doctor.persistent.name.{name.replace(' ', '_')}"
+    return i18n.t(key, default=name)
+
+
+def _persistent_state_recovery(name: str, recovery: str) -> str:
+    key = f"doctor.persistent.recovery.{name.replace(' ', '_')}"
+    return i18n.t(key, default=recovery)
+
+
+def _check_persistent_state(store: Store, _ctx: "_DoctorContext"):
+    issues = store.persistent_state_issues()
+    if not issues:
+        return OK, i18n.t("doctor.persistent.valid")
+    lines = [i18n.t("doctor.persistent.heading")]
+    status = WARN
+    for declaration, issue in issues:
+        lines.append(i18n.t(
+            "doctor.persistent.issue",
+            name=_persistent_state_name(declaration.name),
+            path=declaration.path,
+            issue=issue,
+            recovery=_persistent_state_recovery(
+                declaration.name, declaration.recovery
+            ),
+        ))
+        if "busy during validation" not in issue:
+            status = FAIL
+    return status, "\n".join(lines)
 
 
 def _check_profiles(store: Store, ctx: "_DoctorContext"):
     profiles, unreadable = ctx.scan
     problems = []
-    lines = [f"profiles: {len(profiles)}"]
+    lines = [i18n.t("doctor.profiles.count", count=len(profiles))]
     sequence_owners: Dict[int, List[str]] = {}
     for p in profiles:
         if type(p.seq) is int and p.seq > 0:
@@ -127,33 +156,45 @@ def _check_profiles(store: Store, ctx: "_DoctorContext"):
             paths = ", ".join(str(store.profile_meta_path(name)) for name in sorted(names))
             err = store._duplicate_profile_sequence_error(sequence, names)
             duplicate_errors.append(f"{err} (files: {paths})")
-            lines.append(f"  - duplicate sequence {sequence}: {paths}")
+            lines.append(i18n.t(
+                "doctor.profiles.duplicate", sequence=sequence, paths=paths
+            ))
     if duplicate_errors:
         lines.insert(0, "; ".join(duplicate_errors))
         return FAIL, "\n".join(lines)
     for p in profiles:
+        if store.pending_rename_involves(p.name):
+            lines.append(i18n.t("doctor.profiles.pending_rename", name=p.name))
+            continue
         engine = getattr(p, "engine", "agy") or "agy"
-        data_dir = store.profile_data_dir(p.name, engine=engine)
+        data_dir = store.profile_data_dir(p.name, engine=engine, profile=p)
         if not data_dir.is_dir():
-            problems.append(f"{p.name}: data dir missing ({data_dir})")
-            lines.append(f"  - {p.name}: DATA DIR MISSING")
+            problems.append(i18n.t(
+                "doctor.profiles.missing_data_dir", name=p.name, path=data_dir
+            ))
+            lines.append(i18n.t("doctor.profiles.missing_data_label", name=p.name))
             continue
         state = account.auth_state(
             data_dir, store, p.name, engine=engine,
         )
-        lines.append(f"  - {p.name}: {state}")
-    default = store.default_name()
+        state_key = (
+            "doctor.profiles.authenticated"
+            if state == "authenticated"
+            else "doctor.profiles.not_authenticated"
+            if state == "not-authenticated"
+            else None
+        )
+        if state_key is not None:
+            state = i18n.t(state_key)
+        lines.append(i18n.t("doctor.profiles.state", name=p.name, state=state))
+    default = store.load_config().default_profile
     if default and default not in ctx.names and default not in unreadable:
-        problems.append(
-            f"default profile {default!r} does not exist "
-            "(fix with: agydra default <name>)"
-        )
-        lines.append(f"  - default: {default!r} MISSING (dangling)")
+        problems.append(i18n.t("doctor.profiles.default_missing", name=default))
+        lines.append(i18n.t("doctor.profiles.default_missing_line", name=default))
     if unreadable:
-        lines.append(
-            f"unreadable profile metadata: {', '.join(unreadable)} "
-            "(remove with: agydra delete <name>)"
-        )
+        lines.append(i18n.t(
+            "doctor.profiles.unreadable", names=", ".join(unreadable)
+        ))
     if duplicate_errors:
         lines.insert(0, "; ".join(duplicate_errors))
         return FAIL, "\n".join(lines)
@@ -161,11 +202,12 @@ def _check_profiles(store: Store, ctx: "_DoctorContext"):
         lines.insert(0, "; ".join(problems))
         return WARN, "\n".join(lines)
     if not profiles:
-        message = "no profiles yet (create one with: agydra create <name>)"
+        message = i18n.t("doctor.profiles.no_profiles")
         if unreadable:
             return WARN, (
-                f"{message}; unreadable profile metadata: {', '.join(unreadable)} "
-                "(remove with: agydra delete <name>)"
+                f"{message}; " + i18n.t(
+                    "doctor.profiles.unreadable", names=", ".join(unreadable)
+                )
             )
         return WARN, message
     if unreadable:
@@ -181,7 +223,7 @@ def _check_locks(store: Store, ctx: "_DoctorContext"):
     import locks
 
     if not ctx.names:
-        return WARN, "locks: no profiles to check"
+        return WARN, i18n.t("doctor.locks.no_profiles")
     try:
         busy = []
         unreadable = []
@@ -195,25 +237,23 @@ def _check_locks(store: Store, ctx: "_DoctorContext"):
             elif holders or locks.is_locked(store, name):
                 busy.append(name)
     except OSError as exc:
-        return WARN, f"locks: cannot inspect ({exc})"
+        return WARN, i18n.t("doctor.locks.error", error=exc)
     lines = []
     if unreadable:
         for p in unreadable:
-            lines.append(f"locks: unreadable lease registry {p}")
+            lines.append(i18n.t("doctor.locks.unreadable", path=p))
     if busy:
-        lines.append(f"locks: live sessions: {', '.join(busy)}")
+        lines.append(i18n.t("doctor.locks.live", names=", ".join(busy)))
     if lines:
         return WARN, "\n".join(lines)
-    return OK, "locks: no live sessions"
+    return OK, i18n.t("doctor.locks.none")
 
 
 def _check_isolation(store: Store, ctx: "_DoctorContext"):
     """Verify the overlay mechanism end-to-end for every profile."""
-    import engines
-
     profiles = ctx.names
     if not profiles:
-        return WARN, "isolation not checked (no profiles)"
+        return WARN, i18n.t("doctor.isolation.no_profiles")
     real_gemini = platforms.agy_data_dir()
     failures = []
     recoverable = []
@@ -223,15 +263,19 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
         p = profiles_by_name.get(name)
         engine_name = (getattr(p, "engine", "agy") or "agy") if p else "agy"
         driver = engines.get_engine(engine_name)
-        data_dir = store.profile_data_dir(name, engine=engine_name)
+        data_dir = store.profile_data_dir(
+            name, engine=engine_name, profile=profiles_by_name.get(name)
+        )
         if not data_dir.is_dir():
-            failures.append(f"{name}: data dir missing")
+            failures.append(i18n.t("doctor.isolation.data_dir_missing", name=name))
             continue
         if not driver.uses_overlay:
             try:
                 isolation.validate_claude_config_dir(data_dir)
             except isolation.IsolationError as exc:
-                failures.append(f"{name}: {exc}")
+                failures.append(i18n.t(
+                    "doctor.isolation.profile_error", name=name, error=exc
+                ))
             continue
         link_name = driver.data_dir_name
         overlay = store.overlays_dir / name
@@ -250,38 +294,42 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
             else:
                 real_data = real_gemini
             if data_link.resolve() == real_data.resolve():
-                failures.append(f"{name}: overlay {link_name} points to REAL store")
+                failures.append(i18n.t(
+                    "doctor.isolation.points_to_real", name=name, link=link_name
+                ))
             else:
-                failures.append(f"{name}: overlay {link_name} points elsewhere")
+                failures.append(i18n.t(
+                    "doctor.isolation.points_elsewhere", name=name, link=link_name
+                ))
     claude_orphans = store.claude_config_orphans(ctx.scan[0])
     if failures:
-        return FAIL, "isolation broken: " + "; ".join(failures)
+        return FAIL, i18n.t("doctor.isolation.broken", details="; ".join(failures))
     if claude_orphans:
-        return WARN, (
-            "claude-config entries without an owning profile: "
-            + ", ".join(f"claude-config/{n}" for n in claude_orphans)
-            + " (kept untouched: they may hold data of a profile with unreadable metadata)"
+        return WARN, i18n.t(
+            "doctor.isolation.claude_orphans",
+            entries=", ".join(f"claude-config/{n}" for n in claude_orphans),
         )
     if recoverable:
-        return WARN, (
-            "isolation recoverable: real directory instead of link in overlay for "
-            + ", ".join(recoverable)
-            + " (data intact — run `agydra doctor --fix` to migrate it "
-            "into the profile store and relink)"
+        return WARN, i18n.t(
+            "doctor.isolation.recoverable", names=", ".join(recoverable)
         )
     overlay_profiles = [
         n for n in profiles
         if getattr(profiles_by_name.get(n), "engine", "agy") != "claude"
     ]
     if not overlay_profiles:
-        return OK, f"isolation ok for {len(profiles)} claude profile(s) (CLAUDE_CONFIG_DIR, no overlay)"
+        return OK, i18n.t("doctor.isolation.claude_only", count=len(profiles))
     if pending and len(pending) == len(overlay_profiles):
-        return WARN, (
-            "isolation not yet verifiable (no profile launched): "
-            + ", ".join(pending)
+        return WARN, i18n.t(
+            "doctor.isolation.pending", names=", ".join(pending)
         )
-    note = f"; pending first launch: {', '.join(pending)}" if pending else ""
-    return OK, f"isolation ok for {len(profiles) - len(pending)} profile(s){note}"
+    note = (
+        i18n.t("doctor.isolation.pending_note", names=", ".join(pending))
+        if pending else ""
+    )
+    return OK, i18n.t(
+        "doctor.isolation.ok", count=len(profiles) - len(pending), note=note
+    )
 
 
 def _check_schema_canary(store: Store, ctx: "_DoctorContext"):
@@ -291,24 +339,28 @@ def _check_schema_canary(store: Store, ctx: "_DoctorContext"):
     file lives inside it), ``<data>/auth.json`` for codex, or ``<data>/auth.json``
     for grok. Consumes the doctor-wide scan.
     """
-    names = ctx.names
-    any_data = any(
-        (store.profile_data_dir(n) / account.CLAUDE_GLOBAL_CONFIG_FILE).exists()
-        or (store.profile_data_dir(n) / account.AGY_CLI_DIR).exists()
-        or (store.profile_data_dir(n) / account.CODEX_AUTH_FILE).exists()
-        or (store.profile_data_dir(n) / account.CODEX_CONFIG_FILE).exists()
-        or (store.profile_data_dir(n) / account.GROK_AUTH_FILE).exists()
-        or (store.profile_data_dir(n) / account.GROK_CONFIG_FILE).exists()
-        for n in names
+    profiles = ctx.scan[0]
+    if not profiles:
+        return WARN, i18n.t("doctor.schema.pending")
+
+    layout_files = (
+        account.CLAUDE_GLOBAL_CONFIG_FILE,
+        account.AGY_CLI_DIR,
+        account.CODEX_AUTH_FILE,
+        account.CODEX_CONFIG_FILE,
+        account.GROK_AUTH_FILE,
+        account.GROK_CONFIG_FILE,
     )
-    if not names:
-        return WARN, "schema canary pending (no profiles to inspect)"
-    if not any_data:
-        return WARN, (
-            "no session data layout found in profiles yet; run 'agydra login <profile>' "
-            "and re-run doctor to confirm tokens land in the profile store"
+    for profile in profiles:
+        engine_name = getattr(profile, "engine", "agy") or "agy"
+        data_dir = store.profile_data_dir(
+            profile.name, engine=engine_name, profile=profile
         )
-    return OK, "profile stores contain engine data layout (schema canary passed)"
+        if any((data_dir / entry).exists() for entry in layout_files):
+            break
+    else:
+        return WARN, i18n.t("doctor.schema.missing")
+    return OK, i18n.t("doctor.schema.ok")
 
 
 def _check_keychain(store: Store, ctx: "_DoctorContext"):
@@ -335,51 +387,65 @@ def _check_keychain(store: Store, ctx: "_DoctorContext"):
     has_skip_marker = skip_marker.exists()
     if not report.get("supported"):
         if os.environ.get("AGYDRA_NO_KEYCHAIN"):
-            msg = "keychain bridge: bridge disabled via AGYDRA_NO_KEYCHAIN"
+            msg = i18n.t("doctor.keychain.disabled_env")
             if has_skip_marker:
-                msg += (
-                    f"\nkeychain setup skipped ({skip_marker.name} marker present at {skip_marker}): "
-                    "automatic login keychain creation previously failed or was cancelled; "
-                    "delete this marker file to retry keychain initialization"
+                msg += "\n" + i18n.t(
+                    "doctor.keychain.skip_marker",
+                    marker=skip_marker.name,
+                    path=skip_marker,
                 )
             return WARN, msg
         if platforms.is_macos():
-            return WARN, "keychain bridge: `security` not found (swap disabled)"
-        return OK, "keychain bridge: n/a (file-backed credentials on this OS)"
+            return WARN, i18n.t("doctor.keychain.missing_security")
+        return OK, i18n.t("doctor.keychain.na")
     slots = report.get("profile_slots", {})
     with_slots = sorted(n for n, present in slots.items() if present)
     shared = report.get("shared")
-    shared_txt = "present" if shared else ("absent" if shared is False else "?")
+    shared_txt = (
+        i18n.t("doctor.keychain.present") if shared
+        else i18n.t("doctor.keychain.absent") if shared is False
+        else "?"
+    )
     mismatches = []
+    profiles_by_name = {profile.name: profile for profile in ctx.scan[0]}
     for name in with_slots:
-        known = keychain._known_identity(store, name, include_secret=False)
+        scanned_profile = profiles_by_name.get(name)
+        if scanned_profile is None:
+            continue
+        known = account.anchor_for(
+            store, scanned_profile, include_secret=False
+        )
         if known is None:
             continue
         secret = keychain.load_profile_slot(store, name)
         candidate = keychain._secret_identity(secret)
-        if candidate != known:
+        if not account.trusted_identity(known, candidate):
             seen = candidate if candidate else "undecodable"
-            mismatches.append(f"{name}: secret={seen} cached={known}")
+            mismatches.append(i18n.t(
+                "doctor.keychain.mismatch_entry",
+                name=name,
+                seen=seen,
+                known=known,
+            ))
     orphans = keychain.orphan_slots(store, ctx.names)
     ctx.keychain_orphans = orphans
-    lines = [
-        "keychain bridge: "
-        f"shared slot {shared_txt}; per-profile slots: "
-        f"{', '.join(with_slots) if with_slots else 'none yet'}"
-    ]
+    lines = [i18n.t(
+        "doctor.keychain.status",
+        shared=shared_txt,
+        slots=", ".join(with_slots) if with_slots else i18n.t("doctor.keychain.none_yet"),
+    )]
     if has_skip_marker:
-        lines.append(
-            f"keychain setup skipped ({skip_marker.name} marker present at {skip_marker}): "
-            "automatic login keychain creation previously failed or was cancelled; "
-            "delete this marker file to retry keychain initialization"
-        )
+        lines.append(i18n.t(
+            "doctor.keychain.skip_marker",
+            marker=skip_marker.name,
+            path=skip_marker,
+        ))
     if mismatches:
-        lines.append("identity mismatch: " + "; ".join(mismatches))
+        lines.append(i18n.t(
+            "doctor.keychain.mismatch", details="; ".join(mismatches)
+        ))
     if orphans:
-        lines.append(
-            "orphaned keychain slots: " + ", ".join(orphans)
-            + " (run `agydra doctor --fix` to purge)"
-        )
+        lines.append(i18n.t("doctor.keychain.orphans", names=", ".join(orphans)))
     swap_held = False
     swap_lock = keychain.swap_lock_path(store)
     if swap_lock.exists():
@@ -389,21 +455,15 @@ def _check_keychain(store: Store, ctx: "_DoctorContext"):
             probe = None
         if probe is None:
             swap_held = True
-            lines.append(
-                "keychain swap lock is held by another process (or not "
-                "inspectable right now); agy launches will fail with the "
-                f"shared-slot busy error -- {keychain.lock_holder_hint(swap_lock)}"
-            )
+            lines.append(i18n.t(
+                "doctor.keychain.swap_held",
+                hint=keychain.lock_holder_hint(swap_lock),
+            ))
         else:
             probe.release()
     shared_format = report.get("shared_format")
     if shared and shared_format not in (None, "json"):
-        lines.append(
-            "shared slot payload is not valid JSON "
-            f"(format: {shared_format!r}) — agy may ask you to log in "
-            "again; `agydra login <profile>` (or a plain `agy` login once) "
-            "rewrites the slot to a valid credential"
-        )
+        lines.append(i18n.t("doctor.keychain.bad_format", format=shared_format))
         return WARN, "\n".join(lines)
     if mismatches or orphans or has_skip_marker or swap_held:
         return WARN, "\n".join(lines)
@@ -426,18 +486,18 @@ def _check_orphans(store: Store, ctx: "_DoctorContext"):
     scan = orphans.find_orphans(store, ctx.names)
     ctx.orphan_scan = scan
     if scan.is_empty():
-        return OK, "orphans: none found"
-    lines = ["orphaned store artifacts found (see: agydra doctor --fix)"]
+        return OK, i18n.t("doctor.orphans.none")
+    lines = [i18n.t("doctor.orphans.found")]
     lines.extend(f"  - {line}" for line in scan.describe())
     return WARN, "\n".join(lines)
 
 
 def _check_sandbox(_store: Store, _ctx: "_DoctorContext"):
     if not platforms.is_linux():
-        return OK, "linux sandbox: n/a (not linux)"
+        return OK, i18n.t("doctor.sandbox.na")
     if isolation.use_bwrap():
-        return OK, "linux sandbox: bwrap available"
-    return WARN, "linux sandbox: bwrap not installed (optional hardening disabled)"
+        return OK, i18n.t("doctor.sandbox.ok")
+    return WARN, i18n.t("doctor.sandbox.missing")
 
 
 def _check_bootstrap(_store: Store, _ctx: "_DoctorContext"):
@@ -450,46 +510,52 @@ def _check_bootstrap(_store: Store, _ctx: "_DoctorContext"):
     status = OK
     if platforms.is_windows():
         if not state["venv"]:
-            return WARN, (
-                "install: venv missing — run `python3 agydra.py` (repo root) "
-                "or `agydra setup` to create it"
-            )
+            return WARN, i18n.t("doctor.install.venv_missing_repo")
         if not state["console"]:
-            return WARN, f"install: console script missing — re-run `agydra setup` ({bootstrap.console_script(root)})"
+            return WARN, i18n.t(
+                "doctor.install.console_script_path_missing",
+                path=bootstrap.console_script(root),
+            )
         if not state["on_path"]:
-            return WARN, f"install: venv Scripts dir not on PATH: {bootstrap.console_script(root).parent}"
-        return OK, f"install: {bootstrap.console_script(root)} on PATH"
+            return WARN, i18n.t(
+                "doctor.install.scripts_path_missing",
+                path=bootstrap.console_script(root).parent,
+            )
+        return OK, i18n.t(
+            "doctor.install.console_on_path", path=bootstrap.console_script(root)
+        )
     if not state["venv"]:
-        return WARN, "install: venv missing — run `python3 agydra.py` or `agydra setup`"
+        return WARN, i18n.t("doctor.install.venv_missing")
     if not state["console"]:
-        return WARN, "install: console script missing — re-run `agydra setup`"
+        return WARN, i18n.t("doctor.install.script_missing")
     shim_state = state["shim_state"]
     if shim_state == "pip-managed":
-        return OK, "install: pip-managed package (pip/pipx; no Agydra shim expected)"
+        return OK, i18n.t("doctor.install.pip_managed")
     if shim_state == "ok":
-        parts.append(f"shim ok ({bootstrap.shim_path()})")
+        parts.append(i18n.t("doctor.install.shim_ok", path=bootstrap.shim_path()))
     elif shim_state == "foreign":
-        return WARN, (
-            f"install: foreign file at {bootstrap.shim_path()} — inspect and "
-            "remove it, or re-run `agydra setup --force`"
+        return WARN, i18n.t(
+            "doctor.install.shim_foreign", path=bootstrap.shim_path()
         )
     elif shim_state == "stale":
-        parts.append("shim stale (venv moved?) — re-run `agydra setup`")
+        parts.append(i18n.t("doctor.install.shim_stale"))
+        status = WARN
+    elif shim_state == "dead":
+        parts.append(i18n.t("doctor.install.shim_dead"))
         status = WARN
     else:
-        parts.append("shim missing — re-run `agydra setup`")
+        parts.append(i18n.t("doctor.install.shim_missing"))
         status = WARN
     if not state["on_path"]:
-        parts.append(f"{bootstrap.user_bin_dir()} not on PATH")
+        parts.append(i18n.t("doctor.install.path_missing", path=bootstrap.user_bin_dir()))
         status = WARN
     stale = _editable_install_drift(root, bootstrap.venv_python(root))
     if stale:
         parts.append(
-            f"editable install is stale, missing {', '.join(stale)} — "
-            "re-run `agydra setup` (works from the repo now, fails elsewhere)"
+            i18n.t("doctor.install.editable_stale", modules=", ".join(stale))
         )
         status = WARN
-    return status, "install: " + "; ".join(parts)
+    return status, i18n.t("doctor.install.ok", details="; ".join(parts))
 
 
 def _editable_install_drift(root: Path, vpy: Path) -> List[str]:
@@ -511,6 +577,7 @@ def _editable_install_drift(root: Path, vpy: Path) -> List[str]:
 CHECKS = [
     ("binary", _check_binary),
     ("store", _check_store),
+    ("persistent state", _check_persistent_state),
     ("profiles", _check_profiles),
     ("locks", _check_locks),
     ("isolation", _check_isolation),
@@ -520,6 +587,12 @@ CHECKS = [
     ("sandbox", _check_sandbox),
     ("install", _check_bootstrap),
 ]
+
+
+def _fix_line(key: str, **values: Any) -> str:
+    message = i18n.t(key, **values)
+    marker, _, details = message.partition(" ")
+    return paint(marker, "cyan", "bold") + " " + details
 
 
 def _fix_orphans(store: Store, names: Sequence[str]) -> None:
@@ -544,14 +617,14 @@ def _fix_orphans(store: Store, names: Sequence[str]) -> None:
         return
     removed = orphans.remove_orphans(store, scan)
     for line in removed:
-        console_print(paint("[fix]", "cyan", "bold") + f" removed: {line}")
+        console_print(_fix_line("doctor.fix.removed", item=line))
 
 
 def _directory_identity(path: Path) -> Tuple[int, int]:
     stat_result = path.stat()
     inode = getattr(stat_result, "st_ino", 0)
     if not inode:
-        raise OSError(f"could not establish a stable directory identity for {path}")
+        raise OSError(i18n.t("doctor.fix.identity_error", path=path))
     return stat_result.st_dev, inode
 
 
@@ -559,12 +632,24 @@ def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
     """What ``doctor --fix`` would change, in human-readable form. Single
     source of truth so the confirmation gate and the live-apply step can
     never disagree about what is on the menu."""
-    import engines
-
     profiles_by_name = {p.name: p for p in ctx.scan[0]}
     lines: List[str] = []
+    for declaration, issue in store.persistent_state_issues():
+        if "busy during validation" in issue:
+            continue
+        if declaration.name == "lease registry":
+            lines.append(i18n.t(
+                "doctor.fix.preview_reset_lease", path=declaration.path
+            ))
+        else:
+            lines.append(i18n.t(
+                "doctor.fix.preview_state",
+                name=_persistent_state_name(declaration.name),
+                path=declaration.path,
+                issue=issue,
+            ))
     for name in ctx.names:
-        if not store.exists(name):
+        if name not in profiles_by_name or not store.profile_dir(name).is_dir():
             continue
         snapshot = profiles_by_name.get(name)
         if snapshot is None or snapshot.name != name:
@@ -578,18 +663,18 @@ def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
             continue
         link = store.overlays_dir / name / driver.data_dir_name
         if link.exists() and not isolation._is_link(link):
-            lines.append(
-                f"migrate overlay data for {name!r} into the profile store and relink {driver.data_dir_name}"
-            )
-    default = store.default_name()
+            lines.append(i18n.t(
+                "doctor.fix.preview_overlay", name=name, link=driver.data_dir_name
+            ))
+    default = store.load_config().default_profile
     unreadable = ctx.scan[1]
     if default and default not in ctx.names and default not in unreadable:
-        lines.append(f"clear dangling default profile {default!r}")
+        lines.append(i18n.t("doctor.fix.preview_default", name=default))
     keychain_orphans = ctx.keychain_orphans
     if keychain_orphans is None:
         keychain_orphans = keychain.orphan_slots(store, ctx.names)
     for orphan in keychain_orphans:
-        lines.append(f"purge orphan keychain slot {orphan!r}")
+        lines.append(i18n.t("doctor.fix.preview_keychain", name=orphan))
     scan = ctx.orphan_scan
     if scan is None:
         import orphans
@@ -597,14 +682,6 @@ def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
         scan = orphans.find_orphans(store, ctx.names)
     if not scan.is_empty():
         lines.extend(scan.describe_actions())
-    import locks
-    for name in ctx.names:
-        lock_p = locks.lock_path(store, name)
-        if lock_p.exists() and locks.lease_holders(store, name) is None:
-            handle = locks.try_read_lock(store, name)
-            if handle is not None:
-                handle.release()
-                lines.append(f"reset unreadable lease registry {lock_p}")
     return lines
 
 
@@ -615,26 +692,50 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
     orphan cleanup because the confirmation prompt can leave time for the
     store to change after ``ctx`` was built.
     """
-    import engines
     import locks
+
+    for declaration, issue in store.persistent_state_issues():
+        if "busy during validation" in issue:
+            continue
+        try:
+            repaired = store.repair_persistent_state(declaration.path)
+        except Exception as exc:
+            warn(i18n.t(
+                "doctor.fix.repair_failed",
+                name=_persistent_state_name(declaration.name),
+                path=declaration.path,
+                error=exc,
+            ))
+            continue
+        if repaired:
+            console_print(_fix_line(
+                "doctor.fix.repaired_state",
+                name=_persistent_state_name(declaration.name),
+                path=declaration.path,
+            ))
+
+    ctx.scan = store._scan(tolerant=True)
+    ctx.names = [profile.name for profile in ctx.scan[0]]
 
     profiles_by_name = {p.name: p for p in ctx.scan[0]}
     for name in ctx.names:
         snapshot = profiles_by_name.get(name)
         if snapshot is None or snapshot.name != name:
-            warn(
-                f"skipping overlay recovery for {name!r}: "
-                "cannot establish the profile owner"
-            )
+            warn(i18n.t(
+                "doctor.fix.skip_overlay",
+                name=name,
+                reason=i18n.t("doctor.fix.reason.profile_owner"),
+            ))
             continue
         engine_name = getattr(snapshot, "engine", "agy") or "agy"
         try:
             driver = engines.get_engine(engine_name)
         except ValueError as exc:
-            warn(
-                f"skipping overlay recovery for {name!r}: "
-                f"cannot establish the profile engine ({exc})"
-            )
+            warn(i18n.t(
+                "doctor.fix.skip_overlay",
+                name=name,
+                reason=i18n.t("doctor.fix.reason.profile_engine", error=exc),
+            ))
             continue
         if not driver.uses_overlay:
             continue
@@ -653,38 +754,42 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
                 or isolation._is_link(overlay)
                 or not overlay.is_dir()
             ):
-                warn(
-                    f"skipping overlay recovery for {name!r}: "
-                    "cannot safely establish the profile or overlay owner"
-                )
+                warn(i18n.t(
+                    "doctor.fix.skip_overlay",
+                    name=name,
+                    reason=i18n.t("doctor.fix.reason.safe_owner"),
+                ))
                 continue
             if not link.exists() or isolation._is_link(link):
                 continue
             if not link.is_dir():
-                warn(
-                    f"skipping overlay recovery for {name!r}: "
-                    "overlay data owner is not a real directory"
-                )
+                warn(i18n.t(
+                    "doctor.fix.skip_overlay",
+                    name=name,
+                    reason=i18n.t("doctor.fix.reason.not_real_directory"),
+                ))
                 continue
             profile_identity = _directory_identity(profile_dir)
             overlay_identity = _directory_identity(overlay)
             link_identity = _directory_identity(link)
         except OSError as exc:
-            warn(
-                f"skipping overlay recovery for {name!r}: "
-                f"cannot safely establish the profile or overlay owner ({exc})"
-            )
+            warn(i18n.t(
+                "doctor.fix.skip_overlay",
+                name=name,
+                reason=i18n.t("doctor.fix.reason.safe_owner_error", error=exc),
+            ))
             continue
         try:
             handle = locks.try_mutation_lock(store, name)
         except OSError as exc:
-            warn(f"could not lock profile {name!r} for overlay recovery ({exc})")
+            warn(i18n.t("doctor.fix.lock_profile_failed", name=name, error=exc))
             continue
         if handle is None:
-            warn(
-                f"skipping overlay recovery for {name!r}: "
-                "profile lock is held by an active session"
-            )
+            warn(i18n.t(
+                "doctor.fix.skip_overlay",
+                name=name,
+                reason=i18n.t("doctor.fix.reason.active_session"),
+            ))
             continue
         try:
             try:
@@ -695,10 +800,11 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
                     or current.created != snapshot.created
                     or current.engine != engine_name
                 ):
-                    warn(
-                        f"skipping overlay recovery for {name!r}: "
-                        "profile or overlay owner changed since the check"
-                    )
+                    warn(i18n.t(
+                        "doctor.fix.skip_overlay",
+                        name=name,
+                        reason=i18n.t("doctor.fix.reason.owner_changed"),
+                    ))
                     continue
                 if (
                     isolation._is_link(profile_dir)
@@ -715,47 +821,53 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
                     or _directory_identity(overlay) != overlay_identity
                     or _directory_identity(link) != link_identity
                 ):
-                    warn(
-                        f"skipping overlay recovery for {name!r}: "
-                        "profile or overlay owner changed while acquiring its lock"
-                    )
+                    warn(i18n.t(
+                        "doctor.fix.skip_overlay",
+                        name=name,
+                        reason=i18n.t("doctor.fix.reason.changed_during_lock"),
+                    ))
                     continue
                 current_driver = engines.get_engine(current.engine)
                 link = overlay / current_driver.data_dir_name
                 if not link.exists() or isolation._is_link(link):
                     continue
                 if not link.is_dir():
-                    warn(
-                        f"skipping overlay recovery for {name!r}: "
-                        "overlay data owner is not a real directory"
-                    )
+                    warn(i18n.t(
+                        "doctor.fix.skip_overlay",
+                        name=name,
+                        reason=i18n.t("doctor.fix.reason.not_real_directory"),
+                    ))
                     continue
-                data_dir = store.profile_data_dir(name, engine=current.engine)
-            except (StoreError, OSError, ValueError) as exc:
-                warn(
-                    f"skipping overlay recovery for {name!r}: "
-                    f"cannot safely establish the profile or overlay owner ({exc})"
+                data_dir = store.profile_data_dir(
+                    name, engine=current.engine, profile=current
                 )
+            except (StoreError, OSError, ValueError) as exc:
+                warn(i18n.t(
+                    "doctor.fix.skip_overlay",
+                    name=name,
+                    reason=i18n.t("doctor.fix.reason.safe_owner_error", error=exc),
+                ))
                 continue
             try:
                 isolation.migrate_real_dir_to_store(link, data_dir)
             except (isolation.IsolationError, OSError) as exc:
-                warn(f"could not migrate overlay data for {name!r} ({exc})")
+                warn(i18n.t("doctor.fix.migrate_failed", name=name, error=exc))
                 continue
             try:
                 isolation.build_overlay(name, data_dir, store.root, engine=engine_name)
             except (isolation.IsolationError, OSError) as exc:
-                warn(f"could not relink overlay for {name!r} ({exc})")
+                warn(i18n.t("doctor.fix.relink_failed", name=name, error=exc))
                 continue
-            console_print(
-                paint("[fix]", "cyan", "bold")
-                + f" migrated overlay data for {name!r} and relinked {driver.data_dir_name}"
-            )
+            console_print(_fix_line(
+                "doctor.fix.migrated_overlay",
+                name=name,
+                link=driver.data_dir_name,
+            ))
         finally:
             handle.release()
-    current_names = store.names()
-    unreadable_names = store.unreadable_profiles()
-    default = store.default_name()
+    current_profiles, unreadable_names = store._scan(tolerant=True)
+    current_names = [profile.name for profile in current_profiles]
+    default = store.load_config().default_profile
     if default and default not in current_names and default not in unreadable_names:
         def clear_observed_default(config) -> None:
             if config.default_profile == default:
@@ -763,75 +875,57 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
 
         try:
             store.update_config(clear_observed_default)
-            console_print(
-                paint("[fix]", "cyan", "bold")
-                + f" cleared dangling default profile {default!r}"
-            )
+            console_print(_fix_line("doctor.fix.cleared_default", name=default))
         except (StoreError, OSError) as exc:
-            warn(f"could not clear dangling default profile {default!r} ({exc})")
+            warn(i18n.t(
+                "doctor.fix.clear_default_failed", name=default, error=exc
+            ))
     keychain_path = keychain._ensure_target_keychain(store) if keychain.supported() else None
     for orphan in keychain.orphan_slots(store, current_names, keychain_path=keychain_path):
         try:
             profile_dir = store.profile_dir(orphan)
         except StoreError as exc:
-            warn(f"could not safely purge orphan keychain slot {orphan!r} ({exc})")
+            warn(i18n.t("doctor.fix.safe_purge_failed", name=orphan, error=exc))
             continue
         if profile_dir.exists() or profile_dir.is_symlink():
-            warn(
-                f"skipping orphan keychain slot for {orphan!r}: "
-                "profile directory still exists"
-            )
+            warn(i18n.t(
+                "doctor.fix.skip_keychain",
+                name=orphan,
+                reason=i18n.t("doctor.fix.reason.profile_directory_exists"),
+            ))
             continue
         try:
             handle = locks.try_mutation_lock(store, orphan)
         except OSError as exc:
-            warn(f"could not lock orphan profile {orphan!r} before purge ({exc})")
+            warn(i18n.t("doctor.fix.lock_orphan_failed", name=orphan, error=exc))
             continue
         if handle is None:
-            warn(
-                f"skipping orphan keychain slot for {orphan!r}: "
-                "profile lock is held"
-            )
+            warn(i18n.t(
+                "doctor.fix.skip_keychain",
+                name=orphan,
+                reason=i18n.t("doctor.fix.reason.profile_lock_held"),
+            ))
             continue
         try:
             if profile_dir.exists() or profile_dir.is_symlink():
-                warn(
-                    f"skipping orphan keychain slot for {orphan!r}: "
-                    "profile directory appeared during purge"
-                )
+                warn(i18n.t(
+                    "doctor.fix.skip_keychain",
+                    name=orphan,
+                    reason=i18n.t("doctor.fix.reason.profile_appeared"),
+                ))
                 continue
             try:
                 with keychain.serialized_access(store):
                     keychain.delete_slot(keychain.profile_slot(orphan), keychain_path)
             except (keychain.KeychainError, OSError, AttributeError) as exc:
-                warn(f"could not purge orphan keychain slot {orphan!r} ({exc})")
+                warn(i18n.t("doctor.fix.purge_keychain_failed", name=orphan, error=exc))
                 continue
-            console_print(
-                paint("[fix]", "cyan", "bold")
-                + f" purged orphan keychain slot for {orphan!r}"
-            )
+            console_print(_fix_line("doctor.fix.purged_keychain", name=orphan))
         finally:
             handle.release()
     _fix_orphans(store, current_names)
-    for name in current_names:
-        lock_p = locks.lock_path(store, name)
-        if lock_p.exists() and locks.lease_holders(store, name) is None:
-            handle = locks.try_lock(store, name)
-            if handle is not None:
-                try:
-                    os.lseek(handle._fd, 0, os.SEEK_SET)
-                    os.ftruncate(handle._fd, 0)
-                    os.write(handle._fd, b'{"holders": []}\n')
-                    console_print(
-                        paint("[fix]", "cyan", "bold")
-                        + f" reset unreadable lease registry for {name!r}"
-                    )
-                finally:
-                    handle.release()
-
-
 def _build_ctx(store: Store) -> "_DoctorContext":
-    scan = store.scan(tolerant=True)
+    scan = store._scan(tolerant=True)
     return _DoctorContext(
         scan=scan, names=[p.name for p in scan[0]],
     )
@@ -845,10 +939,14 @@ def _run_check_pass(store: Store, ctx: "_DoctorContext") -> List[Tuple[str, str,
     ``_check_exit_code`` on the result without printing anything."""
     results = []
     for label, check in CHECKS:
+        label_key = f"doctor.check.name.{label.replace(' ', '_')}"
+        display_label = i18n.t(label_key, default=label)
         try:
             status, message = check(store, ctx)
         except Exception as exc:
-            status, message = FAIL, f"{label}: unexpected error: {exc}"
+            status, message = FAIL, i18n.t(
+                "doctor.check.unexpected", name=display_label, error=exc
+            )
         results.append((label, status, message))
     return results
 
@@ -888,16 +986,20 @@ def run_checks(store: Store, fix: bool = False, ctx: Optional["_DoctorContext"] 
     use ``cmd_doctor`` which calls ``_apply_fixes`` directly after user
     confirmation.
     """
-    console_print(
-        paint("agydra doctor", "cyan", "bold")
-        + f" — agydra {__version__} on {sys.platform}"
-    )
-    console_print(
-        paint("legend: ", "dim")
-        + paint("[ok]", "green", "bold") + paint("=pass ", "dim")
-        + paint("[!!]", "yellow", "bold") + paint("=warn ", "dim")
-        + paint("[XX]", "red", "bold") + paint("=fail", "dim")
-    )
+    console_print(paint(
+        i18n.t(
+            "doctor.report.header", version=__version__, platform=sys.platform
+        ),
+        "cyan",
+        "bold",
+    ))
+    legend = " ".join((
+        i18n.t("cmd.doctor.legend"),
+        i18n.t("cmd.doctor.legend_ok"),
+        i18n.t("cmd.doctor.legend_warn"),
+        i18n.t("cmd.doctor.legend_fail"),
+    ))
+    console_print(paint(legend, "dim"))
     if ctx is None:
         ctx = _build_ctx(store)
     results = _run_check_pass(store, ctx)
@@ -909,11 +1011,8 @@ def run_checks(store: Store, fix: bool = False, ctx: Optional["_DoctorContext"] 
         exit_code = _check_exit_code(results)
     if exit_code:
         console_print()
-        console_print(
-            paint("result: ", "red", "bold")
-            + paint("FAIL — fix the [XX] items above", "red")
-        )
+        console_print(paint(i18n.t("cmd.doctor.result_fail"), "red", "bold"))
     else:
         console_print()
-        console_print(paint("result: healthy", "green", "bold"))
+        console_print(paint(i18n.t("cmd.doctor.result_ok"), "green", "bold"))
     return exit_code

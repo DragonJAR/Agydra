@@ -46,6 +46,14 @@ CLAUDE_FOREIGN_AUTH_ENV = (
     "ANTHROPIC_CONFIG_DIR",
 )
 
+CODEX_FOREIGN_AUTH_ENV = (
+    "OPENAI_API_KEY",
+)
+
+GROK_FOREIGN_AUTH_ENV = (
+    "XAI_API_KEY",
+)
+
 CLAUDE_INHERITED_STATE_ENV = (
     platforms.CLAUDE_USAGE_SEQ_ENV,
     platforms.CLAUDE_USAGE_GENERATION_ENV,
@@ -124,6 +132,16 @@ class EngineDriver:
             config_key=self.config_binary_attr,
         )
 
+    def resolve_configured_binary(
+        self,
+        config,
+        explicit: Optional[str] = None,
+    ) -> Optional[Path]:
+        return self.resolve_binary(
+            explicit,
+            config_val=getattr(config, self.config_binary_attr, None) if config is not None else None,
+        )
+
     def prepare_args(self, args: Sequence[str]) -> List[str]:
         return self.translate_universal_flags(args)
 
@@ -198,9 +216,9 @@ class AgyEngine(EngineDriver):
         every quarantined variant the bridge produces when a foreign
         credential is refused at launch."""
         return (
-            "antigravity-cli/antigravity-oauth-token",
-            "antigravity-cli/.secret",
-            "antigravity-cli/.secret.corrupt-*",
+            f"{account.AGY_CLI_DIR}/{account.TOKEN_FILE}",
+            f"{account.AGY_CLI_DIR}/.secret",
+            f"{account.AGY_CLI_DIR}/.secret.corrupt-*",
         )
 
 
@@ -223,6 +241,7 @@ class CodexEngine(EngineDriver):
             needs_keychain=False,
             config_binary_attr="codex_binary",
             login_args=("login",),
+            foreign_auth_env=CODEX_FOREIGN_AUTH_ENV,
             import_ignore=(
                 ".DS_Store", "*.sock", "*.socket", "ipc", "tmp", "app-server-daemon",
             ),
@@ -239,7 +258,7 @@ class CodexEngine(EngineDriver):
         either an OAuth refresh token or an ``OPENAI_API_KEY``, both tied
         to the destination account. We do not promise portable credentials;
         the user re-runs ``agydra login`` on the destination machine."""
-        return ("auth.json",)
+        return (account.CODEX_AUTH_FILE,)
 
 
 class GrokEngine(EngineDriver):
@@ -259,13 +278,15 @@ class GrokEngine(EngineDriver):
             needs_keychain=False,
             config_binary_attr="grok_binary",
             login_args=("login",),
+            foreign_auth_env=GROK_FOREIGN_AUTH_ENV,
         )
 
     def export_credential_ignore(self) -> Tuple[str, ...]:
-        """R4: Grok bypasses the Antigravity bridge; ``auth.json`` holds the
-        xAI OIDC refresh token and the JWT API key. The destination
-        machine must authenticate again with ``agydra login``."""
-        return ("auth.json",)
+        """R4: Grok bypasses the Antigravity bridge; ``auth.json`` and
+        ``config.toml`` hold the xAI OIDC refresh token, JWT API key, or
+        configured api_key. The destination machine must authenticate again
+        with ``agydra login``."""
+        return (account.GROK_AUTH_FILE, account.GROK_CONFIG_FILE)
 
 
 class ClaudeEngine(EngineDriver):
@@ -294,11 +315,17 @@ class ClaudeEngine(EngineDriver):
         would reject. We surface the policy at the call site (the export
         command) so the user gets one consistent reason across both
         directions, not a half-built archive plus a later rejection."""
+        import i18n
         raise EngineExportError(
-            "claude profiles cannot be exported: AGENTS.md R4 forbids "
-            "portable Claude Code backups until a safe selective "
-            "configuration contract exists; recreate the profile on the "
-            "destination machine and run `agydra login claude`"
+            i18n.t(
+                "engines.claude_export_refused",
+                default=(
+                    "claude profiles cannot be exported: AGENTS.md R4 forbids "
+                    "portable Claude Code backups until a safe selective "
+                    "configuration contract exists; recreate the profile on the "
+                    "destination machine and run `agydra login <profile>`"
+                ),
+            )
         )
 
     def inspect_auth(

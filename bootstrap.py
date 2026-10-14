@@ -14,11 +14,15 @@ Design invariants (see AGENTS.md):
 - Idempotent: every step checks its own precondition and no-ops when already
   satisfied; re-running never destroys a working install.
 - Never requires sudo/admin: everything lives under the user directory.
+- Essential steps (venv, editable install) may stop a launch; optional steps
+  (PATH shim, verification) never do — see ``InstallResult`` and
+  ``perform_install``.
 - No network for the install itself: ``pip install -e .`` resolves from
-  local metadata only. The one documented exception is ``install_editable``
-  upgrading the venv's own pip from PyPI when it is older than
-  ``PIP_FLOOR`` (needed for PEP 660 editable installs); that step runs at
-  most once per venv and only on a pip old enough to lack the feature.
+  local metadata only (the venv builds with ``--no-build-isolation`` once
+  its own backend is in place). The documented exceptions are two one-time
+  bootstrap dependencies fetched like the venv's own tooling: upgrading the
+  venv's pip when it is older than ``PIP_FLOOR``, and installing the
+  ``setuptools`` build backend when the venv lacks it.
 """
 from __future__ import annotations
 
@@ -29,6 +33,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
@@ -37,6 +42,11 @@ import platforms
 MIN_PYTHON = (3, 9)
 VENV_DIRNAME = ".venv"
 PIP_FLOOR = (21, 3)
+"""Deliberately duplicated from pyproject.toml's build-system requirement
+(the floor setuptools version the project builds with): reading pyproject
+would need tomllib, which is Python 3.11+, above the project floor. Keep in
+sync by hand, exactly like agydra.MIN_PYTHON."""
+SETUPTOOLS_FLOOR = (77, 0)
 BOOTSTRAP_TIMEOUT_S = 600.0
 SHIM_MARKER = "Managed by agydra setup"
 INSTALLED_NOTICE = (
@@ -48,6 +58,24 @@ INSTALLED_NOTICE = (
 
 class BootstrapError(Exception):
     """A bootstrap step cannot proceed (never raised for existing state)."""
+
+
+@dataclass(frozen=True)
+class InstallResult:
+    """Outcome of one bootstrap attempt, split by what may stop a launch.
+
+    ``code`` is the SETUP exit code: nonzero unless every step, including
+    the optional ones, succeeded. ``essential_ok`` covers only the
+    launch-critical steps (venv creation, editable install) and is the
+    signal the repo-root entrypoint launches on: a shim or verification
+    failure never turns it false, so a launch degrades to a warning
+    instead of dying on an optional step. ``console`` is the installed
+    console script path once the essential steps succeeded.
+    """
+
+    code: int
+    essential_ok: bool
+    console: Optional[Path] = None
 
 
 
@@ -117,7 +145,7 @@ def runtime_modules(root: Path) -> List[str]:
 
 
 def unimportable_modules(root: Path, vpy: Path) -> List[str]:
-    """Runtime modules that the venv's active install cannot import.
+    """Runtime modules the venv's active install cannot use from THIS root.
 
     An editable install resolves top-level modules through a generated finder
     rather than copying the files, so adding a module to the repo leaves the
@@ -127,10 +155,15 @@ def unimportable_modules(root: Path, vpy: Path) -> List[str]:
     asymmetry is the whole failure mode, and it is invisible to every check
     that imports in-process.
 
-    Detection therefore has to interrogate the venv the way the shim does:
-    a subprocess whose cwd is somewhere other than the project root, importing
-    each module by name. Returns the names that failed; empty means the
-    install matches the checkout. Never raises -- an unusable interpreter is
+    A copied or moved checkout has the inverse failure: its venv's finder
+    still maps module names to the ORIGINAL directory, so every import
+    succeeds -- from another checkout's files. Detection therefore
+    interrogates the venv the way the shim does (a subprocess whose cwd is
+    somewhere other than the project root, importing each module by name)
+    and additionally requires each imported module to resolve to THIS
+    root's own file; an import resolved anywhere else is reported as
+    unusable. Returns the names that failed; empty means the install
+    matches the checkout. Never raises -- an unusable interpreter is
     reported as "everything is broken" only insofar as the probe itself
     fails, which callers read as a WARN, not a correctness claim.
     """
@@ -140,12 +173,17 @@ def unimportable_modules(root: Path, vpy: Path) -> List[str]:
     with tempfile.TemporaryDirectory(prefix="agydra-probe-") as tmp:
         probe = ", ".join(repr(m) for m in modules)
         code = (
-            "import importlib, sys\n"
-            f"bad = []\n"
+            "import importlib, os, sys\n"
+            "bad = []\n"
             f"for name in [{probe}]:\n"
             "    try:\n"
-            "        importlib.import_module(name)\n"
+            "        module = importlib.import_module(name)\n"
             "    except Exception:\n"
+            "        bad.append(name)\n"
+            "        continue\n"
+            "    location = os.path.realpath(getattr(module, '__file__', '') or '')\n"
+            f"    expected = os.path.realpath(os.path.join({str(root)!r}, name + '.py'))\n"
+            "    if os.path.normcase(location) != os.path.normcase(expected):\n"
             "        bad.append(name)\n"
             "sys.stdout.write('\\n'.join(bad))\n"
         )
@@ -164,23 +202,30 @@ def shim_path() -> Path:
 
 def _dir_on_path(d: Path) -> bool:
     """Exact PATH membership (split, not substring — avoids prefix false hits)."""
-    if platforms.is_windows():
-        import ntpath
-
-        target = ntpath.normcase(ntpath.normpath(str(d)))
-        for part in os.environ.get("PATH", "").split(";"):
-            if part and ntpath.normcase(ntpath.normpath(part)) == target:
-                return True
+    target = platforms.normalize_path_entry(str(d))
+    if not target:
         return False
-    target = os.path.normpath(str(d))
     for part in os.environ.get("PATH", "").split(os.pathsep):
-        if part and os.path.normpath(os.path.expanduser(part)) == target:
+        if not part:
+            continue
+        norm = platforms.normalize_path_entry(part)
+        if norm and norm == target:
             return True
     return False
 
 
 def _shim_entry_exists(path: Path) -> bool:
     return path.exists() or path.is_symlink()
+
+
+def _is_dangling_link(path: Path) -> bool:
+    """True for a symlink/junction whose target is gone.
+
+    A dangling link carries no foreign data, so the foreign-file guard
+    that protects real content does not apply to it: it is the shim
+    equivalent of the "dead" state and is replaced without --force.
+    """
+    return platforms.is_link(path) and not path.exists()
 
 
 def _shim_content(target: Path) -> str:
@@ -245,16 +290,18 @@ def _tail(proc: subprocess.CompletedProcess) -> str:
 def ensure_venv(root: Path, out: Callable[[str], None]) -> Path:
     """Create ``<root>/.venv`` when missing; return the venv python path.
 
-    A venv directory without its interpreter is broken beyond reliable
-    in-place repair and holds no user data, so it is recreated.
+    A venv directory without its interpreter, or without pip at all, is
+    broken beyond reliable in-place repair and holds no user data, so it
+    is recreated (the two states share one rule: a usable venv needs both).
     """
     vpy = venv_python(root)
-    if vpy.exists():
+    has_interpreter = vpy.exists()
+    if has_interpreter and not _pip_missing(vpy):
         out(f"venv already present: {venv_dir(root)}")
         return vpy
     target = venv_dir(root)
     if os.path.lexists(target):
-        out(f"removing broken venv (no interpreter): {target}")
+        out(f"removing broken venv ({'no interpreter' if not has_interpreter else 'no pip'}): {target}")
         import store as _store
 
         try:
@@ -269,12 +316,17 @@ def ensure_venv(root: Path, out: Callable[[str], None]) -> Path:
         )
     if not vpy.exists():
         raise BootstrapError(f"venv created but interpreter missing: {vpy}")
+    if _pip_missing(vpy):
+        raise BootstrapError(
+            f"venv created but pip is unavailable: {vpy}; this python cannot "
+            "bootstrap a venv (ensurepip missing?)"
+        )
     return vpy
 
 
 def _pip_version(vpy: Path) -> Optional[tuple]:
     """Parse the venv's pip version as a tuple, or None when unparsable."""
-    proc = _run([str(vpy), "-m", "pip", "--version"])
+    proc = _pip_probe(vpy)
     if proc.returncode != 0:
         return None
     for tok in (proc.stdout or "").split():
@@ -289,8 +341,73 @@ def _pip_version(vpy: Path) -> Optional[tuple]:
     return None
 
 
+def _pip_probe(vpy: Path) -> subprocess.CompletedProcess:
+    """One ``vpy -m pip --version`` invocation, degraded to a failed probe.
+
+    An interpreter that cannot run at all (garbage or unreadable binary)
+    reports as a failed probe instead of raising, so callers treat it
+    like an old/absent pip and the venv-level repair rules decide.
+    """
+    try:
+        return _run([str(vpy), "-m", "pip", "--version"])
+    except BootstrapError as exc:
+        return subprocess.CompletedProcess([str(vpy)], 1, stdout="", stderr=str(exc))
+
+
+def _pip_missing(vpy: Path) -> bool:
+    """True when the venv has no pip at all (not merely an old one)."""
+    proc = _pip_probe(vpy)
+    if proc.returncode == 0:
+        return False
+    tail = (proc.stderr or proc.stdout or "").lower()
+    return "no module named pip" in tail or not tail
+
+
 def _pip_supports_pep660(vpy: Path) -> bool:
     return (_pip_version(vpy) or (0, 0)) >= PIP_FLOOR
+
+
+def _setuptools_floor_ok(vpy: Path) -> bool:
+    proc = _run(
+        [str(vpy), "-c", "import setuptools; print(setuptools.__version__)"]
+    )
+    if proc.returncode != 0:
+        return False
+    version = proc.stdout or ""
+    pieces = version.strip().split(".")
+    if len(pieces) < 2 or not all(piece.isdigit() for piece in pieces[:2]):
+        return False
+    return (int(pieces[0]), int(pieces[1])) >= SETUPTOOLS_FLOOR
+
+
+def ensure_build_backend(vpy: Path, out: Callable[[str], None]) -> None:
+    """Make the venv able to build the project from local metadata alone.
+
+    PEP 517 build isolation would fetch setuptools from PyPI on every
+    install, so a fresh venv could not be installed without network.
+    Installing the backend into the venv once (and building with
+    ``--no-build-isolation``) is the same class of one-time bootstrap
+    dependency as the pip upgrade beside it: needed only when the venv
+    lacks the requirement, and classified identically on failure.
+    """
+    if _setuptools_floor_ok(vpy):
+        return
+    floor = ".".join(map(str, SETUPTOOLS_FLOOR))
+    out(f"installing the setuptools build backend into the venv (needs >= {floor})")
+    proc = _run(
+        [
+            str(vpy), "-m", "pip", "install", "--quiet", "--no-input",
+            f"setuptools>={floor}",
+        ]
+    )
+    if proc.returncode != 0:
+        note = _tail(proc)
+        if _is_network_failure(note):
+            raise BootstrapError(f"network failure during install: {note}")
+        raise BootstrapError(
+            f"could not install the setuptools build backend "
+            f"(exit {proc.returncode}): {note}"
+        )
 
 
 def _is_network_failure(tail: str) -> bool:
@@ -311,7 +428,16 @@ def _is_network_failure(tail: str) -> bool:
 
 
 def install_editable(root: Path, vpy: Path, out: Callable[[str], None]) -> None:
-    """``pip install -e <root>`` inside the venv (local metadata, no index)."""
+    """``pip install -e <root>`` inside the venv, from local metadata only.
+
+    The venv builds with ``--no-build-isolation`` once
+    :func:`ensure_build_backend` put setuptools in place, so the install
+    itself never needs the network.
+    """
+    if _pip_missing(vpy):
+        raise BootstrapError(
+            f"the venv at {venv_dir(root)} has no pip; run `agydra setup` to recreate it"
+        )
     if not _pip_supports_pep660(vpy):
         out(f"upgrading pip inside the venv (needs >= {'.'.join(map(str, PIP_FLOOR))} for editable installs)")
         proc = _run([str(vpy), "-m", "pip", "install", "--quiet", "--no-input", "--upgrade", "pip"])
@@ -325,9 +451,13 @@ def install_editable(root: Path, vpy: Path, out: Callable[[str], None]) -> None:
                 f"pip is too old for editable installs and its upgrade failed "
                 f"(exit {proc.returncode}): {upgrade_note}"
             )
+    ensure_build_backend(vpy, out)
     out(f"installing agydra (editable) into {venv_dir(root)}")
     proc = _run(
-        [str(vpy), "-m", "pip", "install", "--quiet", "--no-input", "-e", str(root)]
+        [
+            str(vpy), "-m", "pip", "install", "--quiet", "--no-input",
+            "--no-build-isolation", "-e", str(root),
+        ]
     )
     if proc.returncode != 0:
         tail = _tail(proc)
@@ -395,7 +525,9 @@ def ensure_path_shim(
     content = _shim_content(target)
     try:
         platforms.ensure_dir(shim.parent)
-        if _shim_entry_exists(shim):
+        if _is_dangling_link(shim):
+            out(f"replacing dangling shim link: {shim}")
+        elif _shim_entry_exists(shim):
             try:
                 body = shim.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
@@ -427,13 +559,32 @@ def ensure_path_shim(
     return shim
 
 
+def _same_install(left: Path, right: Path) -> bool:
+    """True when two paths name the same install location, case-insensitively."""
+    try:
+        return os.path.normcase(str(platforms.canonical_path(left))) == os.path.normcase(
+            str(platforms.canonical_path(right))
+        )
+    except OSError:
+        return False
+
+
 def verify_install(root: Path, out: Callable[[str], None]) -> bool:
     """Run ``agydra --version`` via shim/console script and check the output.
 
-    Returns True when a candidate resolves and reports the installed
-    version. Never raises; unavailability is just a False return.
+    The PATH shim counts as a candidate only when it delegates to THIS
+    root's console script: another checkout's live shim must never verify
+    (or claim readiness for) this install. Returns True when a candidate
+    resolves and reports the installed version. Never raises;
+    unavailability is just a False return.
     """
-    candidates = [shim_path(), console_script(root)]
+    own = console_script(root)
+    candidates: List[Path] = []
+    shim = shim_path()
+    target = shim_target(shim)
+    if target is not None and _same_install(target, own):
+        candidates.append(shim)
+    candidates.append(own)
     for cand in candidates:
         if not cand.exists():
             continue
@@ -456,7 +607,7 @@ def check_state(root: Path) -> dict:
     """Doctor-style status of every bootstrap precondition (no mutations).
 
     Keys: ``venv`` (bool), ``console`` (bool), ``shim_ok`` (bool),
-    ``shim_state`` (``ok|stale|foreign|missing``), ``on_path`` (bool). A
+    ``shim_state`` (``ok|stale|dead|foreign|missing``), ``on_path`` (bool). A
     package installation (no sources next to the module) reports
     ``shim_state == "pip-managed"`` and ``installed == True``: pip owns it.
     """
@@ -484,22 +635,25 @@ def check_state(root: Path) -> dict:
         return state
     shim = shim_path()
     if _shim_entry_exists(shim):
-        try:
-            body = shim.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            state["shim_state"] = "foreign"
+        if _is_dangling_link(shim):
+            state["shim_state"] = "dead"
         else:
-            if body == _shim_content(script) and os.access(shim, os.X_OK):
-                state["shim_ok"] = True
-                state["shim_state"] = "ok"
-            elif SHIM_MARKER in body:
-                target = shim_target(shim)
-                if target is not None and not target.exists():
-                    state["shim_state"] = "dead"
-                else:
-                    state["shim_state"] = "stale"
-            else:
+            try:
+                body = shim.read_text(encoding="utf-8", errors="replace")
+            except OSError:
                 state["shim_state"] = "foreign"
+            else:
+                if body == _shim_content(script) and os.access(shim, os.X_OK):
+                    state["shim_ok"] = True
+                    state["shim_state"] = "ok"
+                elif SHIM_MARKER in body:
+                    target = shim_target(shim)
+                    if target is not None and not target.exists():
+                        state["shim_state"] = "dead"
+                    else:
+                        state["shim_state"] = "stale"
+                else:
+                    state["shim_state"] = "foreign"
     return state
 
 
@@ -547,6 +701,49 @@ def report_state(root: Optional[Path] = None) -> None:
     console_print("run `agydra setup` to create or repair anything marked [--]/[!!]")
 
 
+def perform_install(
+    out: Callable[[str], None],
+    root: Path,
+    force: bool = False,
+    explicit: bool = False,
+) -> InstallResult:
+    """Run the bootstrap steps and report essential vs optional outcome.
+
+    One rule for every caller: venv and editable install are essential and
+    their failure stops a launch; the PATH shim and verification are
+    optional and their failure only lowers ``code`` (the SETUP exit code)
+    while ``essential_ok`` stays true. The entrypoint therefore launches
+    through ``console`` whenever the essential steps succeeded, whatever
+    happened to the shim.
+    """
+    try:
+        if not python_ok(sys.version_info):
+            raise BootstrapError(
+                f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required, found "
+                f"{sys.version_info[0]}.{sys.version_info[1]}"
+            )
+        vpy = ensure_venv(root, out)
+        install_editable(root, vpy, out)
+    except BootstrapError as exc:
+        out(f"setup: {exc}")
+        return InstallResult(code=1, essential_ok=False, console=None)
+    console = console_script(root)
+    shim_note = ""
+    try:
+        ensure_path_shim(root, out, force=force, explicit=explicit)
+    except BootstrapError as exc:
+        shim_note = str(exc)
+        out(
+            f"setup: {exc} — the launch still runs via the venv console "
+            f"script; re-run `agydra setup` once {shim_path().parent} is writable"
+        )
+    verified = verify_install(root, out)
+    code = 0 if not shim_note and verified else 1
+    if not verified:
+        out("setup: verification failed — see the lines above")
+    return InstallResult(code=code, essential_ok=True, console=console)
+
+
 def run(
     out: Optional[Callable[[str], None]] = None,
     root: Optional[Path] = None,
@@ -555,8 +752,9 @@ def run(
 ) -> int:
     """Full bootstrap: venv -> editable install -> shim -> verify.
 
-    Idempotent: safe to re-run at any time (``agydra setup``). Returns a
-    process exit code: 0 ok, 1 on any BootstrapError. Without project sources
+    SETUP semantics on top of :func:`perform_install`: the exit code is 0
+    only when every step, optional ones included, succeeded. Idempotent:
+    safe to re-run at any time (``agydra setup``). Without project sources
     (pip/pipx installation) nothing is written: the notice is printed and 0
     is returned.
     """
@@ -565,21 +763,15 @@ def run(
     if not is_source_checkout(target_root):
         say(INSTALLED_NOTICE)
         return 0
-    try:
-        if not python_ok(sys.version_info):
-            raise BootstrapError(
-                f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required, found "
-                f"{sys.version_info[0]}.{sys.version_info[1]}"
+    result = perform_install(say, target_root, force=force, explicit=explicit)
+    if result.code != 0:
+        if result.essential_ok:
+            say(
+                "setup: finished with warnings — agydra is installed and usable; "
+                "exit 1 reports the non-essential failures above (PATH shim, "
+                "verification), not a broken install"
             )
-        vpy = ensure_venv(target_root, say)
-        install_editable(target_root, vpy, say)
-        ensure_path_shim(target_root, say, force=force, explicit=explicit)
-        if not verify_install(target_root, say):
-            say("setup: verification failed — see the lines above")
-            return 1
-    except BootstrapError as exc:
-        say(f"setup: {exc}")
-        return 1
+        return result.code
     state = check_state(target_root)
     if not state["on_path"]:
         bindir = console_script(target_root).parent if platforms.is_windows() else user_bin_dir()
