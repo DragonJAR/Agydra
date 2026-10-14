@@ -676,14 +676,14 @@ class TestIsolationAncestorMirroring(BaseCase):
         isolation._link(self.fake_home / "Library", stale_link)
         self.assertTrue(isolation._is_link(stale_link))
 
-        real_unlink = Path.unlink
+        real_rmtree = isolation.store.rmtree
 
-        def fake_unlink(path_self, *args, **kwargs):
-            if path_self == stale_link:
+        def fail_removal(path):
+            if path == stale_link:
                 raise PermissionError("mocked: cannot remove stale link")
-            return real_unlink(path_self, *args, **kwargs)
+            return real_rmtree(path)
 
-        with mock.patch.object(Path, "unlink", fake_unlink):
+        with mock.patch.object(isolation.store, "rmtree", side_effect=fail_removal):
             with self.assertRaises(isolation.IsolationError):
                 isolation.build_overlay("alpha", data_dir, store_root)
 

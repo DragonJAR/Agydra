@@ -319,6 +319,8 @@ def build_plan(
 
         config = rotation.config() if rotation is not None else store.load_config()
         binary = driver.resolve_configured_binary(config, binary_override)
+        if binary is not None and not platforms.is_executable_file(binary):
+            binary = None
         if binary is None:
             unavailable_candidate = _unavailable_binary_candidate(
                 driver, config, binary_override

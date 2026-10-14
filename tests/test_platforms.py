@@ -345,18 +345,26 @@ class TestWaitedInterrupt(unittest.TestCase):
     def _assert_child_cleanup_survives(self, group_interrupt):
         with tempfile.TemporaryDirectory(prefix="agydra-interrupt-") as directory:
             root = Path(directory)
+            cleaning = root / "cleaning"
+            release = root / "release"
             completed = root / "cleanup-complete"
             child = root / "child.py"
             child.write_text(
                 "import signal, sys, time\n"
                 "from pathlib import Path\n"
+                "completed = Path(sys.argv[1])\n"
+                "mode = sys.argv[2]\n"
+                "cleaning = Path(sys.argv[3])\n"
+                "release = Path(sys.argv[4])\n"
                 "def cleanup(signum, frame):\n"
-                "    time.sleep(1.5)\n"
-                "    Path(sys.argv[1]).write_text('complete', encoding='utf-8')\n"
+                "    cleaning.write_text('cleaning', encoding='utf-8')\n"
+                "    while not release.exists():\n"
+                "        time.sleep(0.01)\n"
+                "    completed.write_text('complete', encoding='utf-8')\n"
                 "    raise SystemExit(0)\n"
                 "signal.signal(signal.SIGINT, cleanup)\n"
                 "print('ready', flush=True)\n"
-                "if sys.argv[2] == 'parent-only':\n"
+                "if mode == 'parent-only':\n"
                 "    cleanup(None, None)\n"
                 "while True:\n"
                 "    signal.pause()\n",
@@ -370,22 +378,31 @@ class TestWaitedInterrupt(unittest.TestCase):
             )
             proc = subprocess.Popen(
                 [sys.executable, "-c", parent_code, sys.executable, str(child), str(completed),
-                 "group" if group_interrupt else "parent-only"],
+                 "group" if group_interrupt else "parent-only", str(cleaning), str(release)],
                 cwd=root, start_new_session=True, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True,
             )
             try:
                 self.assertEqual(proc.stdout.readline().strip(), "ready")
-                started = time.monotonic()
                 if group_interrupt:
                     os.killpg(proc.pid, signal.SIGINT)
                 else:
+                    deadline = time.monotonic() + 10.0
+                    while not cleaning.exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(cleaning.exists(), "child did not enter cleanup")
                     os.kill(proc.pid, signal.SIGINT)
+                deadline = time.monotonic() + 10.0
+                while not cleaning.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(cleaning.exists(), "child did not enter cleanup")
+                time.sleep(0.05)
+                self.assertIsNone(proc.poll(), "parent exited before child cleanup finished")
+                self.assertFalse(completed.exists(), "child finished cleanup prematurely")
+                release.write_text("go", encoding="utf-8")
                 _out, err = proc.communicate(timeout=10)
-                elapsed = time.monotonic() - started
                 self.assertEqual(proc.returncode, 130, err)
                 self.assertTrue(completed.exists(), "parent killed child before cleanup completed")
-                self.assertGreaterEqual(elapsed, 1.2)
             finally:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)

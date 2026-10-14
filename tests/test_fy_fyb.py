@@ -342,10 +342,11 @@ class TestFybBinaryUnavailableExitCodes(BaseCase):
         self.store.create("work")
 
     def _assert_exit_code(self, expected, binary_override=None):
-        with self.assertRaises(runner.BinaryUnavailableError) as ctx:
-            runner.build_plan(
-                self.store, [], flag_ref="work", binary_override=binary_override
-            )
+        with mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}):
+            with self.assertRaises(runner.BinaryUnavailableError) as ctx:
+                runner.build_plan(
+                    self.store, [], flag_ref="work", binary_override=binary_override
+                )
         self.assertEqual(ctx.exception.exit_code, expected)
 
     def _write_non_executable(self, path):
@@ -397,4 +398,18 @@ class TestFybBinaryUnavailableExitCodes(BaseCase):
         binary = self._write_non_executable(self._tmp / "configured-non-executable.txt")
         self.store.update_config(lambda config: setattr(config, "agy_binary", str(binary)))
         with mock.patch.dict(os.environ, {"PATH": str(self._tmp), "AGYDRA_AGY_BIN": ""}):
+            self._assert_exit_code(126)
+
+    def test_resolved_path_is_checked_with_platform_executable_rules(self):
+        import engines
+
+        binary = self._write_non_executable(self._tmp / "resolved-non-executable.txt")
+        driver = engines.get_engine("agy")
+        with mock.patch.object(
+            driver, "resolve_configured_binary", return_value=binary
+        ), mock.patch("engines.get_engine", return_value=driver), mock.patch.object(
+            platforms, "is_executable_file", return_value=False
+        ), mock.patch.dict(
+            os.environ, {"AGYDRA_AGY_BIN": str(binary)}
+        ):
             self._assert_exit_code(126)

@@ -54,10 +54,10 @@ class TestFyaLockRepairs(BaseCase):
         self.assertIsNotNone(handle)
         try:
             self.assertFalse(locks.reset_unreadable_registry(self.store, "work"))
-            self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
         finally:
             handle.release()
 
+        self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
         self.assertTrue(locks.reset_unreadable_registry(self.store, "work"))
         self.assertEqual(locks.lease_holders(self.store, "work"), [])
         quarantined = list(path.parent.glob(path.name + ".corrupt-*"))
@@ -189,12 +189,13 @@ class TestFyaStoreAndDoctor(BaseCase):
     def test_binary_check_uses_each_driver_configured_resolver_in_one_pass(self):
         drivers = {}
         for engine_name in engines.SUPPORTED_ENGINES:
+            binary_path = Path("/bin") / engine_name
             drivers[engine_name] = SimpleNamespace(
                 name=engine_name,
                 binary_name=engine_name,
                 env_bin_var=f"{engine_name.upper()}_BIN",
                 resolve_configured_binary=mock.Mock(
-                    return_value=Path(f"/bin/{engine_name}")
+                    return_value=binary_path
                 ),
             )
         profiles = [SimpleNamespace(name=name, engine=name) for name in drivers]
@@ -216,7 +217,9 @@ class TestFyaStoreAndDoctor(BaseCase):
         self.assertEqual(status, doctor.OK)
         for engine_name, driver in drivers.items():
             driver.resolve_configured_binary.assert_called_once()
-            self.assertIn(f"{engine_name} binary: /bin/{engine_name}", message)
+            self.assertIn(
+                f"{engine_name} binary: {Path('/bin') / engine_name}", message
+            )
 
     def test_dead_shim_is_reported_as_dead(self):
         state = {
@@ -225,13 +228,30 @@ class TestFyaStoreAndDoctor(BaseCase):
             "on_path": True,
             "shim_state": "dead",
         }
-        with mock.patch("bootstrap.project_root", return_value=self._tmp), mock.patch(
-            "bootstrap.check_state", return_value=state
-        ), mock.patch("doctor._editable_install_drift", return_value=[]):
+        with mock.patch("doctor.platforms.is_windows", return_value=False), mock.patch(
+            "bootstrap.project_root", return_value=self._tmp
+        ), mock.patch("bootstrap.check_state", return_value=state), mock.patch(
+            "doctor._editable_install_drift", return_value=[]
+        ):
             status, message = doctor._check_bootstrap(self.store, None)
 
         self.assertEqual(status, doctor.WARN)
         self.assertIn("shim dead", message)
+
+    def test_windows_bootstrap_check_uses_console_path_without_posix_shim(self):
+        state = {
+            "venv": True,
+            "console": True,
+            "on_path": True,
+            "shim_state": "n/a",
+        }
+        with mock.patch("doctor.platforms.is_windows", return_value=True), mock.patch(
+            "bootstrap.project_root", return_value=self._tmp
+        ), mock.patch("bootstrap.check_state", return_value=state):
+            status, message = doctor._check_bootstrap(self.store, None)
+
+        self.assertEqual(status, doctor.OK)
+        self.assertNotIn("shim dead", message)
 
     def test_store_has_one_cannot_safely_proceed_message_format(self):
         message = cannot_safely_proceed_message(

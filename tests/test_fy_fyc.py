@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -22,7 +23,10 @@ import usage
 import usage_snapshot
 import claude_usage
 import store
-from conftest import BaseCase
+try:
+    from conftest import BaseCase
+except ImportError:
+    from tests.conftest import BaseCase
 from store import Store, StoreError
 
 
@@ -246,9 +250,11 @@ class TestFYCBugFixes(BaseCase):
         with mock.patch("platforms.is_windows", return_value=True), mock.patch("os.pathsep", ";"):
             with mock.patch.dict(os.environ, {"PATH": f"C:\\Windows;{quoted};C:\\bin"}):
                 self.assertTrue(bootstrap._dir_on_path(target))
+        posix_target = Path("/custom/bin")
+        posix_quoted = f'"{posix_target}"'
         with mock.patch("platforms.is_windows", return_value=False), mock.patch("os.pathsep", ":"):
-            with mock.patch.dict(os.environ, {"PATH": f"/usr/bin:{quoted}:/bin"}):
-                self.assertTrue(bootstrap._dir_on_path(target))
+            with mock.patch.dict(os.environ, {"PATH": f"/usr/bin:{posix_quoted}:/bin"}):
+                self.assertTrue(bootstrap._dir_on_path(posix_target))
 
     def test_h2_4_is_executable_file_checks_pathext_on_windows(self):
         doc_file = self._tmp / "script.txt"
@@ -368,8 +374,15 @@ class TestFYCBugFixes(BaseCase):
             ref = "work"
             source = str(source_dir)
 
+        if platforms.is_windows():
+            copy_patch = mock.patch(
+                "shutil.copytree",
+                side_effect=shutil.Error([(str(unreadable_file), "dst", "Permission denied")]),
+            )
+        else:
+            copy_patch = contextlib.nullcontext()
         try:
-            with self.assertRaises(StoreError):
+            with copy_patch, self.assertRaises(StoreError):
                 cli.cmd_import(self.store, Args)
             self.assertTrue(data_dir.exists())
             self.assertTrue(settings_file.exists())
@@ -550,11 +563,24 @@ class TestFYCBugFixes(BaseCase):
             candidate_win = runner._path_binary_candidate("engine_bin")
             self.assertEqual(candidate_win, target)
 
-        path_posix = f"{dir_a}:{dir_b}"
-        with mock.patch("platforms.is_windows", return_value=False), \
-             mock.patch("os.pathsep", ":"), \
-             mock.patch.dict(os.environ, {"PATH": path_posix}):
-            candidate_posix = runner._path_binary_candidate("engine_bin")
-            self.assertEqual(candidate_posix, target)
+        if os.name == "nt":
+            posix_target = Path("/custom/bin/engine_bin")
+            with mock.patch("platforms.is_windows", return_value=False), \
+                 mock.patch("os.pathsep", ":"), \
+                 mock.patch.dict(os.environ, {"PATH": "/other/bin:/custom/bin"}), \
+                 mock.patch.object(
+                     runner,
+                     "_existing_binary_candidate",
+                     side_effect=lambda p: posix_target if p == str(Path("/custom/bin") / "engine_bin") else None,
+                 ):
+                candidate_posix = runner._path_binary_candidate("engine_bin")
+                self.assertEqual(candidate_posix, posix_target)
+        else:
+            path_posix = f"{dir_a}:{dir_b}"
+            with mock.patch("platforms.is_windows", return_value=False), \
+                 mock.patch("os.pathsep", ":"), \
+                 mock.patch.dict(os.environ, {"PATH": path_posix}):
+                candidate_posix = runner._path_binary_candidate("engine_bin")
+                self.assertEqual(candidate_posix, target)
 
 

@@ -539,6 +539,9 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
         import locks
         import platforms
 
+        if platforms.is_windows():
+            self.skipTest("Windows waits on a child instead of replacing the process")
+
         captured = {}
 
         def fake_launch_argv(*args, **kwargs):
@@ -551,10 +554,9 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
             store = Store()
             store.create("work")
             plan = runner.build_plan(store, [], flag_ref="work")
-            with mock.patch.object(platforms, "is_windows", return_value=False), \
-                    mock.patch.object(
-                        platforms, "launch_argv", side_effect=fake_launch_argv
-                    ) as launch_argv:
+            with mock.patch.object(
+                platforms, "launch_argv", side_effect=fake_launch_argv
+            ) as launch_argv:
                 rc = runner.run(plan, store=store)
             self.assertEqual(rc, 0)
             launch_argv.assert_called_once()
@@ -631,20 +633,22 @@ class TestRunnerReleasesLockOnExecFailure(unittest.TestCase):
         import locks
         import platforms
 
+        if platforms.is_windows():
+            self.skipTest("the plain exec failure path is POSIX-only")
+
         with isolated_store_env(), mock.patch.dict(
             os.environ, {"AGYDRA_AGY_BIN": sys.executable}
         ):
             store = Store()
             store.create("work")
             plan = runner.build_plan(store, [], flag_ref="work")
-            with mock.patch.object(platforms, "is_windows", return_value=False), \
-                    mock.patch.object(
-                        platforms, "process_alive",
-                        side_effect=lambda pid: pid == os.getpid(),
-                    ), \
-                    mock.patch.object(
-                        platforms, "launch_argv", return_value=126
-                    ) as launch_argv:
+            with mock.patch.object(
+                platforms,
+                "process_alive",
+                side_effect=lambda pid: pid == os.getpid(),
+            ), mock.patch.object(
+                platforms, "launch_argv", return_value=126
+            ) as launch_argv:
                 rc = runner.run(plan, store=store)
             self.assertEqual(rc, 126)
             launch_argv.assert_called_once()

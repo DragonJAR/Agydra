@@ -278,6 +278,8 @@ class TestRunnerForce(BaseCase):
         self.assertFalse(locks.is_locked(self.store, "work"))
 
     def test_agy_keychain_launch_waits_for_guard_restoration(self):
+        if not platforms.is_macos():
+            self.skipTest("the Antigravity Keychain bridge is macOS-only")
         plan = runner.build_plan(self.store, ["chat"], flag_ref="work")
 
         with mock.patch("keychain.supported", return_value=True), \

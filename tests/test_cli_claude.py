@@ -16,7 +16,10 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
-from conftest import BaseCase
+try:
+    from conftest import BaseCase
+except ImportError:
+    from tests.conftest import BaseCase
 import account
 import cli
 import locks
@@ -390,7 +393,7 @@ class TestClaudeCli(BaseCase):
 
         live.assert_called_once()
         self.assertEqual(live.call_args.args[1], "cc")
-        snapshot_lock = f"locks/.usage-snapshot{locks.LOCK_SUFFIX}"
+        snapshot_lock = str(Path("locks") / f".usage-snapshot{locks.LOCK_SUFFIX}")
         changed = {
             name
             for name in before.keys() | after.keys()
