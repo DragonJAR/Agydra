@@ -16,7 +16,7 @@ import platforms
 import profile_rotation
 import resolver
 import runner
-from conftest import BaseCase, _make_jwt
+from conftest import BaseCase, _make_jwt, make_dir_link, write_fake_binary
 from store import Store
 
 
@@ -169,7 +169,7 @@ class TestFybAuthLaunch(BaseCase):
         stale_target = self._tmp / "stale-gemini"
         stale_target.mkdir()
         link.unlink()
-        link.symlink_to(stale_target, target_is_directory=True)
+        make_dir_link(link, stale_target)
 
         with mock.patch.object(isolation.store, "rmtree", wraps=isolation.store.rmtree) as remove:
             isolation.build_overlay("alpha", data_dir, self.store.root)
@@ -291,10 +291,7 @@ class TestFybAuthLaunch(BaseCase):
         outside = self._tmp / "outside-data"
         outside.mkdir()
         linked_data = self._tmp / "linked-data"
-        try:
-            linked_data.symlink_to(outside, target_is_directory=True)
-        except (NotImplementedError, OSError):
-            self.skipTest("directory symlinks are unavailable")
+        make_dir_link(linked_data, outside)
 
         with self.assertRaises(account.store.StoreError):
             account.write_agy_token(linked_data, self._token("alpha@example.com"))
@@ -350,10 +347,13 @@ class TestFybBinaryUnavailableExitCodes(BaseCase):
         self.assertEqual(ctx.exception.exit_code, expected)
 
     def _write_non_executable(self, path):
-        path.write_text("not executable", encoding="utf-8")
-        if not platforms.is_windows():
-            path.chmod(0o644)
-        return path
+        return write_fake_binary(
+            path.parent,
+            path.name,
+            body="not executable",
+            executable=False,
+            extension=path.suffix if platforms.is_windows() else None,
+        )
 
     def test_missing_binary_from_path_exits_127(self):
         path = self._tmp / "empty-path"
@@ -401,11 +401,19 @@ class TestFybBinaryUnavailableExitCodes(BaseCase):
             self._assert_exit_code(126)
 
     def test_windows_extensionless_explicit_binary_uses_pathext(self):
-        candidate = self._tmp / "codex"
-        candidate.write_text("not a Windows executable", encoding="utf-8")
-        candidate.chmod(0o755)
-        expected = self._tmp / "codex.CMD"
-        expected.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
+        candidate = write_fake_binary(
+            self._tmp,
+            "codex",
+            body="not a Windows executable",
+            executable=False,
+            extension="",
+        )
+        expected = write_fake_binary(
+            self._tmp,
+            "codex",
+            extension=".CMD",
+            windows_body="@echo off\r\nexit /b 0\r\n",
+        )
 
         with mock.patch.object(platforms, "is_windows", return_value=True), mock.patch.dict(
             os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}
@@ -415,9 +423,13 @@ class TestFybBinaryUnavailableExitCodes(BaseCase):
         self.assertEqual(resolved, expected)
 
     def test_windows_explicit_path_rejects_suffix_outside_pathext(self):
-        candidate = self._tmp / "codex.txt"
-        candidate.write_text("not a Windows executable", encoding="utf-8")
-        candidate.chmod(0o755)
+        candidate = write_fake_binary(
+            self._tmp,
+            "codex",
+            body="not a Windows executable",
+            executable=False,
+            extension=".txt",
+        )
 
         with mock.patch.object(platforms, "is_windows", return_value=True), mock.patch.dict(
             os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}

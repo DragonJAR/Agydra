@@ -22,7 +22,7 @@ import platforms
 import ui
 from store import Store
 
-from conftest import BaseCase, _make_jwt
+from conftest import BaseCase, _make_jwt, make_dir_link, posix_only
 
 
 class TestDoctor(BaseCase):
@@ -119,6 +119,7 @@ class TestDoctor(BaseCase):
         exit_code = doctor.run_checks(self.store)
         self.assertEqual(exit_code, 0)
 
+    @posix_only(reason="checks a POSIX executable permission bit")
     def test_fake_binary_is_executable_and_resolvable(self):
         self.assertTrue(Path(self.agy_bin).exists())
         st = Path(self.agy_bin).stat()
@@ -298,6 +299,7 @@ class TestDoctor(BaseCase):
         self.assertIn("ghost", message)
         self.assertIn("doctor --fix", message)
 
+    @posix_only("swap.lock contention requires POSIX fcntl")
     def test_keychain_check_warns_when_swap_lock_is_held(self):
         """A wedged swap.lock (leftover or pre-upgrade session holding it
         for its whole lifetime) must be visible on a plain ``agydra
@@ -305,8 +307,6 @@ class TestDoctor(BaseCase):
         busy error."""
         import locks
 
-        if keychain.fcntl is None:
-            self.skipTest("swap.lock contention requires POSIX fcntl")
         lock_path = keychain.swap_lock_path(self.store)
         platforms.ensure_dir(lock_path.parent)
         holder = locks.try_lock_path(lock_path, "test holder")
@@ -471,10 +471,7 @@ class TestClaudeIsolationCheck(BaseCase):
         target = self.store.root / "elsewhere"
         target.mkdir()
         config.rmdir()
-        try:
-            config.symlink_to(target, target_is_directory=True)
-        except (OSError, NotImplementedError):
-            self.skipTest("symlinks unavailable")
+        make_dir_link(config, target)
         status, message = self._check()
         self.assertEqual(status, doctor.FAIL)
         self.assertIn("cc:", message)
@@ -485,10 +482,7 @@ class TestClaudeIsolationCheck(BaseCase):
         real.mkdir(parents=True)
         config = self.store.claude_config_dir("cc")
         config.rmdir()
-        try:
-            config.symlink_to(real, target_is_directory=True)
-        except (OSError, NotImplementedError):
-            self.skipTest("symlinks unavailable")
+        make_dir_link(config, real)
         status, message = self._check()
         self.assertEqual(status, doctor.FAIL)
         self.assertIn("cc:", message)
@@ -919,7 +913,9 @@ class TestIsolationRecovery(BaseCase):
         """Preview of fixable items must describe action + resource type + path."""
         (self.store.overlays_dir / "ghost").mkdir(parents=True, exist_ok=True)
         preview = doctor._preview_fixables(self.store, self._ctx())
-        self.assertIn("remove orphan overlay directory overlays/ghost", preview)
+        self.assertIn(
+            f"remove orphan overlay directory {Path('overlays') / 'ghost'}", preview
+        )
 
     def test_preview_omits_non_overlay_engines_apply_skips(self):
         """The confirmed preview must never offer an action ``--fix``

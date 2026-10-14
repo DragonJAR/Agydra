@@ -332,51 +332,187 @@ def write_fake_agy(path: Path) -> Path:
     if sys.platform.startswith("win"):
         program = path.with_name("agy-fake.py")
         program.write_text(_FAKE_AGY_SOURCE, encoding="utf-8")
-        launcher = path.with_suffix(".cmd")
-        launcher.write_text(
-            "@echo off\r\n"
-            f'"{sys.executable}" "{program}" %*\r\n'
-            "exit /b %ERRORLEVEL%\r\n",
-            encoding="utf-8",
+        return write_fake_binary(
+            path.parent,
+            path.name,
+            extension=".cmd",
+            windows_body=(
+                "@echo off\r\n"
+                f'"{sys.executable}" "{program}" %*\r\n'
+                "exit /b %ERRORLEVEL%\r\n"
+            ),
         )
-        return launcher
-    path.write_text("#!/usr/bin/env python3\n" + _FAKE_AGY_SOURCE, encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return path
+    return write_fake_binary(
+        path.parent,
+        path.name,
+        body="#!/usr/bin/env python3\n" + _FAKE_AGY_SOURCE,
+    )
 
 
-def write_fake_binary(directory: Path, name: str) -> Path:
-    """Create a trivial executable using the active platform's executable rules."""
+def write_fake_binary(
+    directory: Path,
+    name: str,
+    *,
+    body: str | None = None,
+    windows_body: str | None = None,
+    executable: bool = True,
+    extension: str | None = None,
+) -> Path:
+    """Create an executable using the active platform's executable rules."""
     import platforms
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / name
-    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    if not sys.platform.startswith("win"):
+    if sys.platform.startswith("win"):
+        pathext = os.environ.get("PATHEXT") or platforms._DEFAULT_PATHEXT
+        suffix = Path(name).suffix
+        if extension is not None:
+            suffix = extension
+        elif suffix.lower() not in {item.lower() for item in pathext.split(";")}:
+            suffix = next(
+                (
+                    item.lower()
+                    for item in pathext.split(";")
+                    if item.lower() in (".cmd", ".bat")
+                ),
+                "",
+            )
+        if not suffix and executable:
+            raise AssertionError("PATHEXT has no batch extension for a fake executable")
+        if suffix and Path(name).suffix.lower() != suffix.lower():
+            name = f"{name}{suffix}"
+        path = directory / name
+        path.write_text(
+            windows_body if windows_body is not None else "@echo off\r\nexit /b 0\r\n",
+            encoding="utf-8",
+        )
+    else:
+        if extension and Path(name).suffix.lower() != extension.lower():
+            name = f"{name}{extension}"
+        path = directory / name
+        path.write_text(
+            body if body is not None else "#!/bin/sh\nexit 0\n",
+            encoding="utf-8",
+        )
+    if executable and not sys.platform.startswith("win"):
         path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     if platforms.is_executable_file(path):
         return path
-    path.unlink()
+    if not executable:
+        return path
+    raise AssertionError(f"fake executable {path} is not executable on this platform")
 
-    pathext = os.environ.get("PATHEXT") or platforms._DEFAULT_PATHEXT
-    batch_extension = next(
-        (
-            extension.lower()
-            for extension in pathext.split(";")
-            if extension.lower() in (".cmd", ".bat")
-        ),
-        None,
-    )
-    if batch_extension is None:
-        raise AssertionError("PATHEXT has no batch extension for a fake executable")
-    path = directory / f"{name}{batch_extension}"
-    path.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
-    if not sys.platform.startswith("win"):
-        path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    if not platforms.is_executable_file(path):
-        raise AssertionError(f"fake executable {path} is not executable on this platform")
-    return path
+
+def posix_only(
+    reason_or_func=None, *, reason: str = "requires POSIX permission semantics"
+):
+    """Skip test on Windows platforms."""
+    if callable(reason_or_func):
+        return unittest.skipIf(sys.platform.startswith("win"), reason)(reason_or_func)
+    r = reason_or_func if isinstance(reason_or_func, str) else reason
+    return unittest.skipIf(sys.platform.startswith("win"), r)
+
+
+def macos_only(
+    reason_or_func=None, *, reason: str = "requires the macOS Keychain bridge"
+):
+    """Skip test on non-macOS platforms."""
+    if callable(reason_or_func):
+        return unittest.skipIf(sys.platform != "darwin", reason)(reason_or_func)
+    r = reason_or_func if isinstance(reason_or_func, str) else reason
+    return unittest.skipIf(sys.platform != "darwin", r)
+
+
+def snapshot_tree(
+    root: Path | str,
+    *,
+    contents: bool = True,
+    files_only: bool = False,
+    exclude: tuple | list | set = (),
+    metadata: bool = False,
+) -> dict[str, tuple]:
+    """Capture a deterministic tree snapshot of files, directories, and symlinks.
+
+    Keys are POSIX-normalized relative paths (``relative.as_posix()``).
+    Lock sentinels under the root's ``locks/`` directory are skipped because
+    they carry no durable profile data and Windows msvcrt mandatory byte-range
+    locking forbids concurrent reads while held.
+    """
+    root = Path(root)
+    result = {}
+    if not root.exists():
+        return result
+
+    excluded = tuple(Path(path).absolute() for path in exclude)
+
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if "locks" in relative.parts or path.name.endswith(".lock"):
+            continue
+        absolute = path.absolute()
+        if any(item == absolute or item in absolute.parents for item in excluded):
+            continue
+
+        try:
+            st = path.lstat()
+        except FileNotFoundError:
+            continue
+
+        if files_only:
+            if stat.S_ISREG(st.st_mode):
+                record = ("file", path.read_bytes() if contents else None)
+            elif stat.S_ISLNK(st.st_mode) and path.is_file():
+                record = ("file", path.read_bytes() if contents else None)
+            else:
+                continue
+        elif stat.S_ISLNK(st.st_mode):
+            record = ("link", os.readlink(path))
+        elif stat.S_ISDIR(st.st_mode):
+            record = ("dir", None)
+        elif stat.S_ISREG(st.st_mode):
+            data = path.read_bytes() if contents else None
+            record = ("file", data)
+        else:
+            record = ("other", None)
+
+        if metadata:
+            record += ((st.st_dev, st.st_ino, stat.S_IMODE(st.st_mode), st.st_mtime_ns),)
+        result[relative.as_posix()] = record
+
+    return result
+
+
+def make_dir_link(link: Path | str, target: Path | str) -> Path:
+    """Create a directory symlink, falling back to an NTFS junction on Windows.
+
+    If directory link creation is not supported by the environment, raises
+    unittest.SkipTest.
+    """
+    link = Path(link)
+    target = Path(target)
+    try:
+        link.parent.mkdir(parents=True, exist_ok=True)
+    except (OSError, NotImplementedError) as exc:
+        raise unittest.SkipTest(f"directory link parent is unavailable: {exc}") from exc
+    if os.path.lexists(link):
+        raise AssertionError(f"directory link path already exists: {link}")
+    if sys.platform.startswith("win"):
+        try:
+            link.symlink_to(target, target_is_directory=True)
+            return link
+        except (OSError, NotImplementedError):
+            try:
+                import _winapi
+
+                _winapi.CreateJunction(str(target), str(link))
+                return link
+            except (OSError, NotImplementedError) as exc:
+                raise unittest.SkipTest(f"directory links unavailable: {exc}") from exc
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return link
+    except (OSError, NotImplementedError) as exc:
+        raise unittest.SkipTest(f"directory links unavailable: {exc}") from exc
 
 
 class BaseCase(unittest.TestCase):
@@ -445,6 +581,9 @@ class BaseCase(unittest.TestCase):
     def _run_cli(self, *args, cwd=None):
         """Run agydra's CLI in a subprocess (execvpe replaces the process)."""
         return run_cli(*args, cwd=cwd or self._tmp)
+
+    snapshot_tree = staticmethod(snapshot_tree)
+    make_dir_link = staticmethod(make_dir_link)
 
 
 @contextlib.contextmanager

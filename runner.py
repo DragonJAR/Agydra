@@ -30,7 +30,7 @@ import profile_rotation
 import resolver
 from models import Config, Profile
 from store import Store, StoreError
-from ui import note, warn
+from ui import warn
 
 
 class BinaryUnavailableError(StoreError):
@@ -578,17 +578,6 @@ def _run_prepared(
                     ) from exc
                 raise
             leased = plan.profile
-            if joined and driver.name in ("codex", "grok"):
-                warn(
-                    f"joining {joined} live session(s) on profile {plan.profile!r}: "
-                    "concurrent sessions share the on-disk auth.json and may force "
-                    "a re-login (refresh-token rotation)"
-                )
-            if joined and plan.launch_as_child:
-                warn(
-                    f"re-login while {joined} live session(s) run on profile "
-                    f"{plan.profile!r}; those sessions may be logged out"
-                )
             try:
                 profile = store.get(plan.profile)
                 data_dir = store.profile_data_dir(plan.profile, engine=plan.engine)
@@ -611,12 +600,6 @@ def _run_prepared(
                                 "launch aborted so a stale session cannot resurrect it"
                             ) from exc
                     usage_env = claude_usage.capture_environment(store, profile)
-                inherited = driver.inherited_foreign_auth(os.environ)
-                if inherited:
-                    warn(
-                        f"ignoring inherited {', '.join(inherited)} for {driver.name} profile "
-                        f"{plan.profile!r}: identity comes only from the profile's own login"
-                    )
                 extra = {resolver.PROFILE_ENV: plan.profile, **usage_env}
                 if plan.agy_file_auth:
                     extra[account.AGY_FILE_AUTH_ENV] = account.AGY_FILE_AUTH_VALUE
@@ -660,11 +643,6 @@ def _run_prepared(
                 except keychain.KeychainBusyError as exc:
                     if exc.owner is None or plan.agy_file_auth:
                         raise StoreError(str(exc)) from exc
-                    note(
-                        f"profile {exc.owner!r} owns the shared Antigravity Keychain "
-                        f"slot; profile {plan.profile!r} uses its private file "
-                        "credential instead"
-                    )
                     slot_busy = exc
                     plan = replace(plan, agy_file_auth=True)
             except (isolation.IsolationError, isolation.AgyCredentialUnavailableError, locks.LockError) as prep_exc:

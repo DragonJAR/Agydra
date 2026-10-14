@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import isolation
 import platforms
 import runner
-from conftest import BaseCase
+from conftest import BaseCase, posix_only
 from store import Store
 
 
@@ -42,13 +42,12 @@ class TestCodexIsolation(BaseCase):
         self.assertEqual(env.get("AGYDRA_PROFILE"), "openai-work")
         self.assertIn("AGYDRA_REAL_HOME", env)
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "POSIX-only: hard-codes /host/home and /host/.codex paths that "
+    @posix_only(
+        reason="POSIX-only: hard-codes /host/home and /host/.codex paths that "
         "os.path.abspath on Windows anchors to the drive root "
         "(C:\\\\host\\\\home). The Windows counterpart lives in the "
         "codex_isolation tests under a Windows-only skipIf or a separate "
-        "path-prefixed test.",
+        "path-prefixed test."
     )
     def test_extra_cannot_override_isolation_environment(self):
         self.store.create("openai-work", engine="codex")

@@ -1,7 +1,6 @@
 """Claude live usage source: `claude -p /usage` parsing, execution, cache and fallback."""
 import json
 import os
-import stat
 import sys
 import unittest
 import uuid
@@ -17,7 +16,7 @@ import cli
 import platforms
 import usage
 
-from conftest import BaseCase
+from conftest import BaseCase, posix_only, write_fake_binary
 
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 
@@ -75,10 +74,11 @@ sys.stdout.write(os.environ["FAKE_USAGE_TEXT"])
 
 
 def write_fake_usage_claude(path: Path) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(FAKE_CLAUDE.format(python=sys.executable), encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
-    return path
+    return write_fake_binary(
+        path.parent,
+        path.name,
+        body=FAKE_CLAUDE.format(python=sys.executable),
+    )
 
 
 def statusline_payload(five, seven, session):
@@ -164,7 +164,7 @@ class TestParseUsageText(unittest.TestCase):
         self.assertNotEqual(claude_usage.parse_claude_usage_payload(limits).state, "observed")
 
 
-@unittest.skipIf(sys.platform.startswith("win"), "POSIX fake claude binary")
+@posix_only("POSIX fake claude binary")
 class TestRunLiveUsage(BaseCase):
     def setUp(self):
         super().setUp()

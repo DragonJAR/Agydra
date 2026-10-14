@@ -14,7 +14,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from conftest import _make_jwt, isolated_store_env
+from conftest import _make_jwt, isolated_store_env, posix_only
 
 import keychain
 import models
@@ -231,13 +231,12 @@ class TestKeychainLoginCapture(unittest.TestCase):
             record_email.assert_called_once_with(store, "work")
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    "Windows-keychain semantics differ (no OpenProcess-style launch_guard, "
+@posix_only(
+    reason="Windows-keychain semantics differ (no OpenProcess-style launch_guard, "
     "different signal-handling on the subprocess.Popen side). The test's "
     "POSIX assumptions about SIGINT and the kernel-held lock file do not "
     "translate to the Windows runner's cmd.exe shell; a Windows counterpart "
-    "would need a different runner design.",
+    "would need a different runner design."
 )
 class TestKeychainRunHardening(unittest.TestCase):
     """_run must never hang: stdout/stderr go to temp files (the Security
@@ -419,6 +418,7 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
             self.assertEqual(rc, 0)
             drain.assert_called_once()
 
+    @posix_only(reason="Windows never uses the exec path")
     def test_drain_not_run_when_child_not_waited(self):
         """The exec path (POSIX interactive) cannot drain: ``launch_argv``
         replaces the process. Asserting the non-call keeps the documented
@@ -432,8 +432,6 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
         with isolated_store_env(), mock.patch.dict(
             os.environ, {"AGYDRA_AGY_BIN": sys.executable}
         ):
-            if platforms.is_windows():
-                self.skipTest("Windows never uses the exec path")
             store = Store()
             store.create("work")
             plan = runner.build_plan(store, [], flag_ref="work")
@@ -532,15 +530,13 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
         self.assertEqual(captured["pid_while_held"], os.getpid())
         self.assertIsNone(locks.lock_holder_pid(store, "work"))
 
+    @posix_only("the plain exec path is POSIX-only")
     def test_plain_exec_path_still_records_a_real_pid(self):
         import os
         from unittest import mock
 
         import locks
         import platforms
-
-        if platforms.is_windows():
-            self.skipTest("Windows waits on a child instead of replacing the process")
 
         captured = {}
 
@@ -627,14 +623,12 @@ class TestRunnerReleasesLockOnExecFailure(unittest.TestCase):
     function at all, so releasing unconditionally after ``launch_argv``
     returns is always safe."""
 
+    @posix_only("the plain exec failure path is POSIX-only")
     def test_launch_argv_failure_releases_the_lock(self):
         from unittest import mock
 
         import locks
         import platforms
-
-        if platforms.is_windows():
-            self.skipTest("the plain exec failure path is POSIX-only")
 
         with isolated_store_env(), mock.patch.dict(
             os.environ, {"AGYDRA_AGY_BIN": sys.executable}
@@ -727,9 +721,7 @@ class TestRunnerJoinSemantics(unittest.TestCase):
                     self.assertEqual(rc, 0)
                 finally:
                     locks.release_lease(store, "cx")
-                self.assertTrue(
-                    any("refresh-token rotation" in str(w) for w in warnings)
-                )
+                self.assertEqual(warnings, [])
             finally:
                 os.environ.pop("AGYDRA_AGY_BIN", None)
                 os.environ.pop("AGYDRA_CODEX_BIN", None)

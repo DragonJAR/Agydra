@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import engines
-from conftest import BaseCase
+from conftest import BaseCase, write_fake_binary
 
 
 class TestEngineDriverRegistry(BaseCase):
@@ -66,9 +66,7 @@ class TestEngineDriverRegistry(BaseCase):
 
     def test_resolve_binary_explicit(self):
         driver = engines.get_engine("codex")
-        explicit_bin = self._tmp / "bin" / "custom_codex"
-        explicit_bin.parent.mkdir(parents=True, exist_ok=True)
-        explicit_bin.touch(mode=0o755)
+        explicit_bin = write_fake_binary(self._tmp / "bin", "custom_codex")
         resolved = driver.resolve_binary(str(explicit_bin))
         self.assertEqual(resolved, explicit_bin)
 

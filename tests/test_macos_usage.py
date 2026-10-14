@@ -22,7 +22,7 @@ import platforms
 import runner
 import usage
 import account
-from conftest import BaseCase, _make_jwt
+from conftest import BaseCase, _make_jwt, posix_only
 from store import Store, StoreError
 
 from test_keychain import _FAKE_KEYCHAIN
@@ -124,6 +124,7 @@ REAL_USAGE_JSON = {
 }
 
 
+@posix_only("swap.lock contention requires POSIX fcntl")
 class TestMacosUsageContention(BaseCase):
     def setUp(self):
         super().setUp()
@@ -147,9 +148,6 @@ class TestMacosUsageContention(BaseCase):
         (clidir / "antigravity-oauth-token").write_text(json.dumps(envelope), encoding="utf-8")
 
     def test_usage_works_while_swap_lock_held_by_subprocess(self):
-        if keychain.fcntl is None:
-            self.skipTest("swap.lock contention requires POSIX fcntl")
-
         lock_path = keychain._slots_dir(self.store) / "swap.lock"
         platforms.ensure_dir(lock_path.parent)
 
@@ -197,9 +195,6 @@ class TestMacosUsageContention(BaseCase):
             proc.wait(timeout=5)
 
     def test_runner_fails_cleanly_when_swap_lock_held_by_subprocess(self):
-        if keychain.fcntl is None:
-            self.skipTest("swap.lock contention requires POSIX fcntl")
-
         lock_path = keychain._slots_dir(self.store) / "swap.lock"
         platforms.ensure_dir(lock_path.parent)
 
@@ -242,9 +237,6 @@ class TestMacosUsageContention(BaseCase):
             proc.wait(timeout=5)
 
     def test_usage_does_not_mutate_shared_slot_under_contention(self):
-        if keychain.fcntl is None:
-            self.skipTest("swap.lock contention requires POSIX fcntl")
-
         lock_path = keychain._slots_dir(self.store) / "swap.lock"
         platforms.ensure_dir(lock_path.parent)
 
@@ -293,9 +285,6 @@ class TestMacosUsageContention(BaseCase):
             proc.wait(timeout=5)
 
     def test_serialized_access_nonblocking_fails_cleanly_under_contention(self):
-        if keychain.fcntl is None:
-            self.skipTest("swap.lock contention requires POSIX fcntl")
-
         lock_path = keychain._slots_dir(self.store) / "swap.lock"
         platforms.ensure_dir(lock_path.parent)
 

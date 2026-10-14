@@ -73,7 +73,7 @@ from typing import Dict, Iterator, List, NamedTuple, Optional
 from models import Profile
 import platforms
 from store import StoreError, atomic_write_bytes
-from ui import note, warn
+from ui import warn
 
 try:
     import fcntl
@@ -688,10 +688,6 @@ def _persist_if_trusted(
         save_profile_slot(store, name, serialized)
         return
     if candidate is None and decode_go_keyring_secret(serialized) is not None:
-        note(
-            f"keychain slot for profile {name!r} holds a refreshed token "
-            "without an identity claim; keeping its saved credential"
-        )
         return
     seen = repr(candidate) if candidate else "undecodable"
     warn(

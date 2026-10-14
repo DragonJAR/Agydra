@@ -18,6 +18,7 @@ import isolation
 import platforms
 import store
 import usage
+from tests.conftest import posix_only, write_fake_binary
 
 
 def _make_dummy_jwt(payload: dict) -> str:
@@ -59,8 +60,7 @@ class TestGrokEngine(unittest.TestCase):
 
     def test_binary_resolution(self):
         # 1. Explicit path
-        fake_bin = self._tmp / "fake_grok"
-        fake_bin.touch(mode=0o755)
+        fake_bin = write_fake_binary(self._tmp, "fake_grok")
         self.assertEqual(platforms.resolve_grok_binary(str(fake_bin)), fake_bin)
 
         # 2. Environment variable
@@ -164,9 +164,8 @@ class TestGrokEngine(unittest.TestCase):
             self.assertTrue(sock.startswith(f"/tmp/agydra-{os.getuid()}/"))
             self.assertFalse(sock.startswith(str(self.home)))
 
+    @posix_only(reason="sun_path limit is POSIX-only")
     def test_grok_leader_socket_stays_on_overlay_when_it_fits(self):
-        if platforms.is_windows():
-            self.skipTest("sun_path limit is POSIX-only")
         overlay = Path("/tmp/agy-ov/gk")
         preferred = str(overlay / ".grok" / "leader.sock")
         self.assertLessEqual(len(os.fsencode(preferred)), 103)
@@ -174,9 +173,8 @@ class TestGrokEngine(unittest.TestCase):
         self.assertEqual(env["GROK_HOME"], str(overlay / ".grok"))
         self.assertEqual(env["GROK_LEADER_SOCKET"], preferred)
 
+    @posix_only(reason="sun_path and POSIX permission semantics")
     def test_grok_leader_socket_shortens_when_overlay_path_exceeds_sun_path(self):
-        if platforms.is_windows():
-            self.skipTest("sun_path limit is POSIX-only")
         overlay = Path("/" + ("p" * 90) + "/work")
         other = Path("/" + ("p" * 90) + "/lab")
         preferred = str(overlay / ".grok" / "leader.sock")

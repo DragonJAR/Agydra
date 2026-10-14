@@ -1,13 +1,12 @@
 """A stale configured engine path falls back to PATH on every caller, not only launches."""
 import os
-import stat
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import engines
-from conftest import BaseCase
+from conftest import BaseCase, write_fake_binary
 from store import Store
 
 
@@ -17,12 +16,10 @@ class TestConfiguredBinaryFallback(BaseCase):
         self.store = Store()
         self.bin_dir = self._tmp / "path-bin"
         self.bin_dir.mkdir()
+        self.binaries = {}
         for name in ("agy", "codex", "grok", "claude"):
-            path = self.bin_dir / name
-            path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            path.chmod(path.stat().st_mode | stat.S_IXUSR)
-            if os.name == "nt":
-                (self.bin_dir / f"{name}.cmd").write_text("@exit /b 0\n", encoding="utf-8")
+            path = write_fake_binary(self.bin_dir, name)
+            self.binaries[name] = path
         os.environ["PATH"] = str(self.bin_dir) + os.pathsep + os.environ.get("PATH", "")
         for driver in engines._REGISTRY.values():
             os.environ.pop(driver.env_bin_var, None)
@@ -38,7 +35,7 @@ class TestConfiguredBinaryFallback(BaseCase):
 
     def test_explicit_binary_still_wins_over_config(self):
         driver = engines.get_engine("codex")
-        explicit = self.bin_dir / "codex"
+        explicit = self.binaries["codex"]
         found = driver.resolve_configured_binary(self.store.load_config(), str(explicit))
         self.assertEqual(Path(found).resolve(), explicit.resolve())
 

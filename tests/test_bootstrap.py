@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 import bootstrap
+from tests.conftest import posix_only, write_fake_binary
 
 
 def _make_fake_project(tmp: Path, *, with_console: bool) -> Path:
@@ -35,13 +36,19 @@ def _make_fake_project(tmp: Path, *, with_console: bool) -> Path:
     (proj / "agydra.py").write_text("VERSION = '9.9.9'\n", encoding="utf-8")
     if with_console:
         vpy = bootstrap.venv_python(proj)
-        vpy.parent.mkdir(parents=True, exist_ok=True)
-        vpy.write_text("#!/bin/sh\necho 'agydra 9.9.9'\n", encoding="utf-8")
-        vpy.chmod(0o755)
+        write_fake_binary(
+            vpy.parent,
+            vpy.name,
+            body="#!/bin/sh\necho 'agydra 9.9.9'\n",
+            windows_body="@echo off\r\necho agydra 9.9.9\r\n",
+        )
         console = bootstrap.console_script(proj)
-        console.parent.mkdir(parents=True, exist_ok=True)
-        console.write_text("#!/bin/sh\necho 'agydra 9.9.9'\n", encoding="utf-8")
-        console.chmod(0o755)
+        write_fake_binary(
+            console.parent,
+            console.name,
+            body="#!/bin/sh\necho 'agydra 9.9.9'\n",
+            windows_body="@echo off\r\necho agydra 9.9.9\r\n",
+        )
     return proj
 
 
@@ -226,11 +233,10 @@ class RuntimeModuleDrift(unittest.TestCase):
                 [],
             )
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "POSIX-only: the shim starts with a #!/bin/sh shebang. The "
+    @posix_only(
+        reason="POSIX-only: the shim starts with a #!/bin/sh shebang. The "
         "Windows shim uses a different shebang (cmd.exe /c on the shim "
-        "path) and is tested separately.",
+        "path) and is tested separately."
     )
     def test_shim_content_carries_marker_and_target(self):
         s = bootstrap._shim_content(Path("/abs/path/venv/bin/agydra"))
@@ -238,11 +244,10 @@ class RuntimeModuleDrift(unittest.TestCase):
         self.assertIn("/abs/path/venv/bin/agydra", s)
         self.assertTrue(s.startswith("#!/bin/sh"))
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "POSIX-only: PATH-segment matching uses case-sensitive startswith that "
+    @posix_only(
+        reason="POSIX-only: PATH-segment matching uses case-sensitive startswith that "
         "is the wrong contract on Windows. The Windows counterpart is "
-        "test_dir_on_path_windows_normalization, exercised on Windows hosts.",
+        "test_dir_on_path_windows_normalization, exercised on Windows hosts."
     )
     def test_dir_on_path_posix(self):
         with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/home/user/.local/bin"}):
@@ -283,9 +288,8 @@ class CheckState(unittest.TestCase):
             self.assertTrue(state["venv"])
             self.assertTrue(state["console"])
 
+    @posix_only(reason="POSIX shim semantics")
     def test_check_state_exact_managed_shim_without_execute_permission_is_stale(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX shim semantics")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)):
@@ -302,9 +306,8 @@ class CheckState(unittest.TestCase):
             self.assertEqual(state["shim_state"], "stale")
             self.assertFalse(state["shim_ok"])
 
+    @posix_only(reason="POSIX shim semantics")
     def test_check_state_exact_executable_managed_shim_is_ok(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX shim semantics")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)):
@@ -321,9 +324,8 @@ class CheckState(unittest.TestCase):
             self.assertEqual(state["shim_state"], "ok")
             self.assertTrue(state["shim_ok"])
 
+    @posix_only(reason="POSIX shim semantics")
     def test_check_state_classifies_foreign_shim(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX shim semantics")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)):
@@ -334,9 +336,8 @@ class CheckState(unittest.TestCase):
             self.assertEqual(state["shim_state"], "foreign")
             self.assertFalse(state["shim_ok"])
 
+    @posix_only(reason="POSIX shim semantics")
     def test_check_state_does_not_accept_a_target_path_prefix(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX shim semantics")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)):
@@ -357,12 +358,11 @@ class CheckState(unittest.TestCase):
 class VerifyInstall(unittest.TestCase):
     """verify_install examines real shim/console paths — sandbox HOME first."""
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "POSIX-only: _make_fake_project creates a venv with a #!/bin/sh "
+    @posix_only(
+        reason="POSIX-only: _make_fake_project creates a venv with a #!/bin/sh "
         "shebang which cmd.exe cannot execute. The Windows shim uses a "
         "different shebang (cmd.exe /c on the shim path) and is tested "
-        "in a Windows-specific skipIf elsewhere.",
+        "in a Windows-specific skipIf elsewhere."
     )
     def test_verify_accepts_well_formed_candidate(self):
         with tempfile.TemporaryDirectory() as td:
@@ -397,9 +397,7 @@ class EnsureVenvRecreate(unittest.TestCase):
             def fake_run(argv):
                 calls.append(list(argv))
                 vpy = bootstrap.venv_python(proj)
-                vpy.parent.mkdir(parents=True, exist_ok=True)
-                vpy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-                vpy.chmod(0o755)
+                write_fake_binary(vpy.parent, vpy.name)
                 class _R:
                     returncode = 0
                     stdout = ""
@@ -530,9 +528,8 @@ class InstallEditableFailure(unittest.TestCase):
 class ShimInstall(unittest.TestCase):
     """ensure_path_shim: writes idempotently, refuses foreign files, refreshes stale."""
 
+    @posix_only
     def test_shim_has_executable_mode_before_atomic_replace(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)) as expected:
@@ -552,9 +549,8 @@ class ShimInstall(unittest.TestCase):
                 self.assertEqual(observed_modes, [0o755])
                 self.assertEqual(expected.stat().st_mode & 0o777, 0o755)
 
+    @posix_only
     def test_correct_executable_shim_is_not_replaced(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)) as expected:
@@ -572,9 +568,8 @@ class ShimInstall(unittest.TestCase):
                 self.assertEqual(expected.stat().st_mode & 0o777, 0o750)
                 replace.assert_not_called()
 
+    @posix_only(reason="POSIX shim semantics")
     def test_writes_shim_with_marker(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)) as expected:
@@ -584,9 +579,8 @@ class ShimInstall(unittest.TestCase):
             self.assertIn(bootstrap.SHIM_MARKER, body)
             self.assertIn(str(bootstrap.console_script(proj)), body)
 
+    @posix_only(reason="POSIX shim semantics")
     def test_refuses_foreign_shim(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)):
@@ -596,9 +590,8 @@ class ShimInstall(unittest.TestCase):
                 with self.assertRaises(bootstrap.BootstrapError):
                     bootstrap.ensure_path_shim(proj, lambda _l: None)
 
+    @posix_only(reason="POSIX shim semantics")
     def test_force_overwrites_foreign_shim(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)) as expected:
@@ -611,10 +604,9 @@ class ShimInstall(unittest.TestCase):
                 self.assertIn(bootstrap.SHIM_MARKER, body)
                 self.assertIn(str(bootstrap.console_script(proj)), body)
 
+    @posix_only(reason="POSIX shim semantics")
     def test_refuses_foreign_shim_advises_force(self):
         """Foreign shim rejection error message must advise user about --force."""
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)):
@@ -626,9 +618,8 @@ class ShimInstall(unittest.TestCase):
                 self.assertIn("(or use --force)", str(ctx.exception))
                 self.assertIn("refusing to overwrite foreign file", str(ctx.exception))
 
+    @posix_only(reason="POSIX shim semantics")
     def test_replaces_dangling_symlink_at_shim_path(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX shim semantics")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)) as expected:
@@ -644,17 +635,18 @@ class ShimInstall(unittest.TestCase):
                 self.assertIn(str(bootstrap.console_script(proj)), expected.read_text(encoding="utf-8"))
                 self.assertEqual(bootstrap.check_state(proj)["shim_state"], "ok")
 
+    @posix_only(reason="POSIX shim semantics")
     def test_shim_quotes_shell_metacharacters_in_target_path(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX shim semantics")
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             marker = base / "shell-expanded"
             project = base / f"project\n$(touch {marker})"
             target = project / "venv" / "bin" / "agydra"
-            target.parent.mkdir(parents=True)
-            target.write_text("#!/bin/sh\nprintf 'ready\\n'\n", encoding="utf-8")
-            target.chmod(0o755)
+            target = write_fake_binary(
+                target.parent,
+                target.name,
+                body="#!/bin/sh\nprintf 'ready\\n'\n",
+            )
             shim = base / "shim"
             shim.write_text(bootstrap._shim_content(target), encoding="utf-8")
             shim.chmod(0o755)
@@ -739,10 +731,9 @@ class ShimInstall(unittest.TestCase):
             self.assertIsNone(res_true)
             self.assertTrue(any("Windows: add the venv Scripts dir to PATH" in msg for msg in logs))
 
+    @posix_only(reason="POSIX shim semantics")
     def test_refresh_stale_managed_shim_with_and_without_force(self):
         """A stale managed shim (with SHIM_MARKER) is refreshed both with and without force."""
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)) as expected:
@@ -763,9 +754,8 @@ class ShimInstall(unittest.TestCase):
                 self.assertEqual(res, expected)
                 self.assertIn(str(bootstrap.console_script(proj)), expected.read_text(encoding="utf-8"))
 
+    @posix_only(reason="POSIX shim semantics")
     def test_idempotent_on_existing_managed_shim(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)) as expected:
@@ -773,6 +763,7 @@ class ShimInstall(unittest.TestCase):
                 shim2 = bootstrap.ensure_path_shim(proj, lambda _l: None)
                 self.assertEqual(shim2, expected)
 
+    @posix_only(reason="POSIX shim semantics")
     def test_shim_write_goes_through_temp_file_and_replace(self):
         """Refreshing an existing shim must never touch the live shim path
         directly: a failure during the final rename (disk full, permission
@@ -780,8 +771,6 @@ class ShimInstall(unittest.TestCase):
         instead of a truncated/corrupt file, matching every other durable
         write in the project (store.py's mkstemp + fsync + os.replace
         discipline)."""
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)) as expected:
@@ -796,13 +785,12 @@ class ShimInstall(unittest.TestCase):
                 self.assertEqual(expected.read_text(encoding="utf-8"), original)
                 self.assertEqual(list(expected.parent.glob("agydra.*.tmp")), [])
 
+    @posix_only(reason="POSIX shim semantics")
     def test_oserror_writing_shim_becomes_bootstrap_error(self):
         """A filesystem failure inside ensure_path_shim (e.g. an unwritable
         ~/.local/bin) must surface as a clean BootstrapError, matching every
         other bootstrap step, instead of propagating a raw OSError out of
         run()."""
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)):
@@ -813,9 +801,8 @@ class ShimInstall(unittest.TestCase):
                     with self.assertRaises(bootstrap.BootstrapError):
                         bootstrap.ensure_path_shim(proj, lambda _l: None)
 
+    @posix_only(reason="POSIX shim semantics")
     def test_run_reports_clean_message_when_shim_write_fails(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)):
@@ -858,10 +845,9 @@ class RunDispatch(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertTrue(any("synthetic failure" in line for line in captured))
 
+    @posix_only(reason="POSIX shim semantics")
     def test_run_fails_on_foreign_shim_without_force(self):
         """bootstrap.run(..., force=False) must fail when a foreign shim exists."""
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)):
@@ -884,10 +870,9 @@ class RunDispatch(unittest.TestCase):
                 self.assertTrue(any("refusing to overwrite foreign file" in msg for msg in captured))
                 self.assertTrue(any("(or use --force)" in msg for msg in captured))
 
+    @posix_only(reason="POSIX shim semantics")
     def test_run_succeeds_on_foreign_shim_with_force(self):
         """bootstrap.run(..., force=True) overwrites a foreign shim and completes setup."""
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             with _sandbox_home(Path(td)) as expected:
@@ -1010,9 +995,8 @@ class RootEntryForceContract(unittest.TestCase):
         run.assert_not_called()
         launch.assert_called_once()
 
+    @posix_only(reason="POSIX shim semantics")
     def test_foreign_shim_survives_launcher_force_on_first_run(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         import agydra
 
         with tempfile.TemporaryDirectory() as td:
@@ -1089,9 +1073,8 @@ class PackageInstallationSemantics(unittest.TestCase):
             self.assertEqual(state["shim_state"], "n/a")
             self.assertNotIn("installed", state)
 
+    @posix_only(reason="POSIX shim semantics")
     def test_source_checkout_keeps_venv_and_foreign_shim_guard(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX-only")
         with tempfile.TemporaryDirectory() as td:
             proj = _make_fake_project(Path(td), with_console=True)
             self.assertTrue(bootstrap.is_source_checkout(proj))
@@ -1158,11 +1141,10 @@ class TestBootstrapFixes(unittest.TestCase):
                 with self.assertRaises(bootstrap.BootstrapError):
                     bootstrap.ensure_venv(root, lambda _l: None)
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "POSIX-only: the PATH fixture uses ':' separators and POSIX paths, "
+    @posix_only(
+        reason="POSIX-only: the PATH fixture uses ':' separators and POSIX paths, "
         "which os.pathsep/os.path cannot parse on Windows; the Windows branch "
-        "is covered by test_dir_on_path_windows_normalization.",
+        "is covered by test_dir_on_path_windows_normalization."
     )
     def test_dir_on_path_handles_trailing_slash_and_tilde_on_posix(self):
         with mock.patch.dict(os.environ, {"PATH": "/custom/bin/:~/other/bin"}, clear=True):

@@ -17,9 +17,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 try:
-    from conftest import BaseCase
+    from conftest import BaseCase, make_dir_link, snapshot_tree
 except ImportError:
-    from tests.conftest import BaseCase
+    from tests.conftest import BaseCase, make_dir_link, snapshot_tree
 import account
 import cli
 import locks
@@ -302,8 +302,7 @@ class TestClaudeCli(BaseCase):
         env = dict(os.environ)
         env.update(claude_usage.capture_environment(self.store, profile))
         env["CLAUDE_CONFIG_DIR"] = str(self.store.claude_config_dir_for_seq(profile.seq))
-        before = {str(path.relative_to(self.store.root)): path.read_bytes()
-                  for path in self.store.root.rglob("*") if path.is_file()}
+        before = snapshot_tree(self.store.root, files_only=True)
         with contextlib.redirect_stdout(io.StringIO()) as out:
             cli.cmd_usage(self.store, SimpleNamespace(ref=None, claude_settings="cc"))
         settings = json.loads(out.getvalue())
@@ -322,8 +321,7 @@ class TestClaudeCli(BaseCase):
             self.assertEqual(arguments[0], sys.executable)
             self.assertEqual(arguments[1:3], ["-m", "claude_usage"])
             self.assertEqual(arguments[arguments.index("--store") + 1], str(self.store.root))
-        after = {str(path.relative_to(self.store.root)): path.read_bytes()
-                 for path in self.store.root.rglob("*") if path.is_file()}
+        after = snapshot_tree(self.store.root, files_only=True)
         self.assertEqual(before, after)
         payload = {
             "session_id": str(uuid.uuid4()),
@@ -358,27 +356,17 @@ class TestClaudeCli(BaseCase):
         self.store.create("cc", engine="claude")
         journal = self.store.root / "profile-rename.json"
         journal.write_text(json.dumps({"old": "cc", "new": "renamed", "broken": True}))
-        before = {str(path.relative_to(self.store.root)): path.read_bytes()
-                  for path in self.store.root.rglob("*") if path.is_file()}
+        before = snapshot_tree(self.store.root, files_only=True)
         self._run_cli("usage", "cc")
         self._run_cli("usage")
-        after = {str(path.relative_to(self.store.root)): path.read_bytes()
-                 for path in self.store.root.rglob("*") if path.is_file()}
+        after = snapshot_tree(self.store.root, files_only=True)
         self.assertEqual(before, after)
-
-    def _store_files(self):
-        root = self.store.root
-        return {
-            str(path.relative_to(root)): path.read_bytes()
-            for path in root.rglob("*")
-            if path.is_file()
-        }
 
     def test_usage_command_uses_live_reader_without_auth_probe_or_profile_mutation(self):
         import claude_usage
 
         self.store.create("cc", engine="claude")
-        before = self._store_files()
+        before = snapshot_tree(self.store.root, files_only=True)
         synthetic = usage.UsageResult(
             name="cc", ok=True, engine="claude", source="live", quality="live"
         )
@@ -389,16 +377,14 @@ class TestClaudeCli(BaseCase):
             claude_usage, "query_claude_usage_live", return_value=synthetic
         ) as live:
             cli.cmd_usage(self.store, SimpleNamespace(ref="cc"))
-        after = self._store_files()
+        after = snapshot_tree(self.store.root, files_only=True)
 
         live.assert_called_once()
         self.assertEqual(live.call_args.args[1], "cc")
-        snapshot_lock = str(Path("locks") / f".usage-snapshot{locks.LOCK_SUFFIX}")
         changed = {
             name
             for name in before.keys() | after.keys()
             if before.get(name) != after.get(name)
-            and name != snapshot_lock
         }
         self.assertEqual(changed, {usage_snapshot.SNAPSHOT_FILENAME})
 
@@ -493,7 +479,7 @@ class TestClaudeCaptureEnable(BaseCase):
         outside = self._tmp / "outside-claude-config"
         outside.mkdir()
         config_dir.rmdir()
-        config_dir.symlink_to(outside, target_is_directory=True)
+        make_dir_link(config_dir, outside)
 
         with self.assertRaises(cli.isolation.IsolationError):
             self._run_apply()

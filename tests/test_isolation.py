@@ -1,9 +1,7 @@
 """Overlay construction: idempotent, .gemini -> profile store, generic stays clean."""
-import gc
 import os
 import sys
 import unittest
-import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -14,7 +12,7 @@ import isolation
 import platforms
 from store import Store
 
-from conftest import BaseCase
+from conftest import BaseCase, make_dir_link, posix_only, snapshot_tree
 
 
 class TestIsolation(BaseCase):
@@ -42,7 +40,7 @@ class TestIsolation(BaseCase):
     def test_overlay_mirrors_unrelated_home_entries(self):
         overlay = isolation.build_overlay("alpha", self.data_dir, self.store.root)
         mirrored = overlay / ".gitconfig"
-        if mirrored.exists() or mirrored.is_symlink():
+        if mirrored.exists() or isolation._is_link(mirrored):
             self.assertTrue(isolation._is_link(mirrored))
             self.assertEqual(
                 mirrored.resolve(), (self.fake_home / ".gitconfig").resolve()
@@ -213,7 +211,7 @@ class TestMigrateRealDir(BaseCase):
         outside.mkdir()
         (outside / "secret.txt").write_text("outside data", encoding="utf-8")
         link = real_dir / "escape"
-        link.symlink_to(outside, target_is_directory=True)
+        make_dir_link(link, outside)
 
         with self.assertRaises(isolation.IsolationError):
             isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
@@ -233,12 +231,12 @@ class TestMigrateRealDir(BaseCase):
         outside = self.fake_home / "outside"
         outside.mkdir()
         (outside / "secret.txt").write_text("outside", encoding="utf-8")
-        (nested / "escape").symlink_to(outside, target_is_directory=True)
+        make_dir_link(nested / "escape", outside)
 
         with self.assertRaises(isolation.IsolationError):
             isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
 
-        self.assertTrue((nested / "escape").is_symlink())
+        self.assertTrue(isolation._is_link(nested / "escape"))
         self.assertFalse((self.data_dir / "nested").exists())
 
     def test_migrate_refuses_nested_destination_symlink(self):
@@ -251,14 +249,14 @@ class TestMigrateRealDir(BaseCase):
         outside.mkdir()
         target_dir = self.data_dir / "clash"
         target_dir.mkdir()
-        (target_dir / "escape").symlink_to(outside, target_is_directory=True)
+        make_dir_link(target_dir / "escape", outside)
 
         with self.assertRaises(isolation.IsolationError):
             isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
 
         self.assertFalse((outside / "marker.txt").exists())
         self.assertTrue((real_dir / "clash" / "escape" / "marker.txt").exists())
-        self.assertTrue((target_dir / "escape").is_symlink())
+        self.assertTrue(isolation._is_link(target_dir / "escape"))
 
     def test_migrate_refuses_symlink_as_profile_data_dir(self):
         real_dir = self.fake_home / "real-dir"
@@ -267,7 +265,7 @@ class TestMigrateRealDir(BaseCase):
         outside = self.fake_home / "outside"
         outside.mkdir()
         target = self.fake_home / "profile-data-link"
-        target.symlink_to(outside, target_is_directory=True)
+        make_dir_link(target, outside)
 
         with self.assertRaises(isolation.IsolationError):
             isolation.migrate_real_dir_to_store(real_dir, target)
@@ -441,7 +439,7 @@ class TestMigrateRealDir(BaseCase):
         outside = self.fake_home / "outside-link"
         outside.mkdir()
         link = real_dir / "bad-link"
-        link.symlink_to(outside, target_is_directory=True)
+        make_dir_link(link, outside)
 
         with self.assertRaises(isolation.IsolationError):
             isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
@@ -529,12 +527,10 @@ class TestIsolationAncestorMirroring(BaseCase):
         b = isolation.build_overlay("alpha", data_dir, store_root)
         self.assertEqual(a, b)
 
-        def snapshot(root: Path):
-            return sorted(
-                str(p.relative_to(root)) for p in _walk_no_follow(root)
-            )
-
-        self.assertEqual(snapshot(a), snapshot(b))
+        self.assertEqual(
+            sorted(snapshot_tree(a, contents=False)),
+            sorted(snapshot_tree(b, contents=False)),
+        )
 
     def test_preexisting_real_library_with_agy_content_survives_and_gains_links(self):
         store_root = self.fake_home / "Library" / "Application Support" / "agydra"
@@ -621,10 +617,7 @@ class TestIsolationAncestorMirroring(BaseCase):
         store_root.mkdir(parents=True)
         app_support = self.fake_home / "Library" / "Application Support"
         loop = app_support / "loop"
-        try:
-            loop.symlink_to(app_support, target_is_directory=True)
-        except (OSError, NotImplementedError):
-            self.skipTest("symlinks are not supported on this filesystem")
+        make_dir_link(loop, app_support)
         data_dir = self._make_store("alpha")
 
         overlay = isolation.build_overlay("alpha", data_dir, store_root)
@@ -731,12 +724,11 @@ class TestIsolationAncestorMirroring(BaseCase):
             )
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    "Linux-only: the bwrap CLI and /run/user/<uid> paths do not exist on "
+@posix_only(
+    reason="Linux-only: the bwrap CLI and /run/user/<uid> paths do not exist on "
     "Windows. The class is also skipped on macOS via the existing POSIX "
     "guard; on Windows it pins Linux-only sandbox-wrap behavior that has "
-    "no Windows counterpart.",
+    "no Windows counterpart."
 )
 class TestSandboxWrap(unittest.TestCase):
     def test_sandbox_wrap_creates_directories_before_tmpfs(self):
@@ -781,25 +773,12 @@ class TestSandboxWrap(unittest.TestCase):
         )
 
 
-def _tree_snapshot(root: Path):
-    snapshot = {}
-    for entry in sorted(root.rglob("*")):
-        relative = str(entry.relative_to(root))
-        if entry.is_symlink():
-            snapshot[relative] = ("link", os.readlink(entry))
-        elif entry.is_dir():
-            snapshot[relative] = ("dir", None)
-        else:
-            snapshot[relative] = ("file", entry.read_bytes())
-    return snapshot
-
-
 def _restore_tree_permissions(root: Path) -> None:
     if not root.exists():
         return
     os.chmod(root, 0o700)
     for entry in root.rglob("*"):
-        if not entry.is_symlink():
+        if not isolation._is_link(entry):
             os.chmod(entry, 0o700)
 
 
@@ -827,27 +806,14 @@ class TestMigrateCleanupFailure(BaseCase):
             (self.data_dir / "history.jsonl").read_text(encoding="utf-8"), "line\n"
         )
 
-    def test_unremovable_source_raises_without_relinking(self):
-        if platforms.is_windows() or os.geteuid() == 0:
-            self.skipTest("POSIX permission semantics for a non-root user")
-        os.chmod(self.real_dir / "nested", 0o555)
-        old_hook = getattr(sys, "unraisablehook", None)
-        def _silent_unraisable(unraisable):
-            if issubclass(getattr(unraisable, "exc_type", object), (ResourceWarning, Warning)) or "scandir" in str(getattr(unraisable, "object", "")):
-                return
-            if old_hook is not None:
-                old_hook(unraisable)
-        if old_hook is not None:
-            sys.unraisablehook = _silent_unraisable
-        try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=ResourceWarning)
-                with self.assertRaises(isolation.IsolationError):
-                    isolation.migrate_real_dir_to_store(self.real_dir, self.data_dir)
-                gc.collect()
-        finally:
-            if old_hook is not None:
-                sys.unraisablehook = old_hook
+    def test_cleanup_permission_error_raises_without_relinking(self):
+        with mock.patch.object(
+            isolation.store, "rmtree", side_effect=PermissionError("denied")
+        ) as remove:
+            with self.assertRaises(isolation.IsolationError):
+                isolation.migrate_real_dir_to_store(self.real_dir, self.data_dir)
+
+        remove.assert_called_once_with(self.real_dir)
         self.assertTrue(os.path.lexists(self.real_dir))
         self.assertEqual(
             (self.data_dir / "nested" / "token.json").read_text(encoding="utf-8"), "secret"
@@ -857,11 +823,11 @@ class TestMigrateCleanupFailure(BaseCase):
         outside = self.fake_home / "outside"
         outside.mkdir()
         (outside / "keep.txt").write_bytes(b"external")
-        before = _tree_snapshot(outside)
+        before = snapshot_tree(outside)
         with mock.patch.object(isolation.store, "rmtree"):
             with self.assertRaises(isolation.IsolationError):
                 isolation.migrate_real_dir_to_store(self.real_dir, self.data_dir)
-        self.assertEqual(_tree_snapshot(outside), before)
+        self.assertEqual(snapshot_tree(outside), before)
 
     def test_successful_cleanup_still_returns_none(self):
         self.assertIsNone(isolation.migrate_real_dir_to_store(self.real_dir, self.data_dir))
@@ -877,7 +843,7 @@ class TestOverlayLinkGuards(BaseCase):
         self.outside = self.fake_home / "outside-tree"
         self.outside.mkdir()
         (self.outside / "keep.txt").write_bytes(b"external")
-        self.before = _tree_snapshot(self.outside)
+        self.before = snapshot_tree(self.outside)
 
     def _link_dir(self, link: Path, target: Path) -> None:
         link.parent.mkdir(parents=True, exist_ok=True)
@@ -889,13 +855,13 @@ class TestOverlayLinkGuards(BaseCase):
         with self.assertRaises(isolation.IsolationError) as cm:
             isolation.build_overlay("alpha", self.data_dir, self.store.root)
         self.assertIn("overlay", str(cm.exception))
-        self.assertEqual(_tree_snapshot(self.outside), self.before)
+        self.assertEqual(snapshot_tree(self.outside), self.before)
 
     def test_overlay_directory_link_is_rejected_before_any_write(self):
         self._link_dir(self.store.overlays_dir / "alpha", self.outside)
         with self.assertRaises(isolation.IsolationError):
             isolation.build_overlay("alpha", self.data_dir, self.store.root)
-        self.assertEqual(_tree_snapshot(self.outside), self.before)
+        self.assertEqual(snapshot_tree(self.outside), self.before)
 
     def test_profile_data_dir_link_is_rejected_before_any_write(self):
         import shutil
@@ -904,7 +870,7 @@ class TestOverlayLinkGuards(BaseCase):
         self._link_dir(self.data_dir, self.outside)
         with self.assertRaises(isolation.IsolationError):
             isolation.build_overlay("alpha", self.data_dir, self.store.root)
-        self.assertEqual(_tree_snapshot(self.outside), self.before)
+        self.assertEqual(snapshot_tree(self.outside), self.before)
         self.assertFalse((self.store.overlays_dir / "alpha").exists())
 
     def test_profile_directory_link_is_rejected_before_any_write(self):
@@ -913,11 +879,11 @@ class TestOverlayLinkGuards(BaseCase):
         profile_dir = self.store.profile_dir("alpha")
         shutil.rmtree(profile_dir)
         (self.outside / "data").mkdir()
-        before = _tree_snapshot(self.outside)
+        before = snapshot_tree(self.outside)
         self._link_dir(profile_dir, self.outside)
         with self.assertRaises(isolation.IsolationError):
             isolation.build_overlay("alpha", profile_dir / "data", self.store.root)
-        self.assertEqual(_tree_snapshot(self.outside), before)
+        self.assertEqual(snapshot_tree(self.outside), before)
 
     def test_codex_config_is_not_written_through_a_data_link(self):
         import shutil
@@ -928,7 +894,7 @@ class TestOverlayLinkGuards(BaseCase):
         self._link_dir(data_dir, self.outside)
         with self.assertRaises(isolation.IsolationError):
             isolation.build_overlay("cx", data_dir, self.store.root, engine="codex")
-        self.assertEqual(_tree_snapshot(self.outside), self.before)
+        self.assertEqual(snapshot_tree(self.outside), self.before)
 
     def test_valid_engine_data_link_still_builds(self):
         overlay = isolation.build_overlay("alpha", self.data_dir, self.store.root)
@@ -944,13 +910,12 @@ class TestOverlayLinkGuards(BaseCase):
             isolation.validate_overlay_roots("beta", self.data_dir, self.store.root)
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    "bwrap is Linux-only; the Windows counterpart uses the cmd /c mklink "
+@posix_only(
+    reason="bwrap is Linux-only; the Windows counterpart uses the cmd /c mklink "
     "junction path. The class tests bwrap-specific behavior "
     "(\"/host/.codex\" dir-bind semantics) that does not translate to "
     "the Windows mklink junction path; a Windows counterpart would need a "
-    "different test design.",
+    "different test design."
 )
 class TestSandboxWrapMasking(unittest.TestCase):
     def _wrap(self, runtime_dir: Path):
@@ -1108,11 +1073,11 @@ class TestCentralLinkProbe(BaseCase):
     def test_overlay_guard_rejects_a_junction_like_reparse_point(self):
         overlay = self.store.overlays_dir / "alpha"
         overlay.mkdir(parents=True)
-        outside_before = _tree_snapshot(self.store.overlays_dir)
+        outside_before = snapshot_tree(self.store.overlays_dir)
         with self._junction_like(overlay):
             with self.assertRaises(isolation.IsolationError):
                 isolation.build_overlay("alpha", self.data_dir, self.store.root)
-        self.assertEqual(_tree_snapshot(self.store.overlays_dir), outside_before)
+        self.assertEqual(snapshot_tree(self.store.overlays_dir), outside_before)
 
     def test_overlay_guard_fails_closed_when_inspection_errors(self):
         def probe(path, *, strict=False):
@@ -1186,13 +1151,12 @@ class TestIsolatedEnvFileAuthMarker(BaseCase):
 
 
 class TestOverlayStoreSymlinkIsolation(BaseCase):
+    @posix_only(reason="POSIX symlink test")
     def test_store_addressed_via_symlink_does_not_leak_profiles_through_overlay(self):
         """Case (a): store addressed via symlink (~/agydra -> ~/Dropbox/agydra).
         The overlay must not link the directory containing the real store,
         preventing access to other profiles.
         """
-        if platforms.is_windows():
-            self.skipTest("POSIX symlink test")
         dropbox = self.fake_home / "Dropbox"
         dropbox.mkdir()
         real_store_dir = dropbox / "agydra"
@@ -1203,7 +1167,7 @@ class TestOverlayStoreSymlinkIsolation(BaseCase):
         victim_token.write_text("secret-data", encoding="utf-8")
 
         symlink_store = self.fake_home / "agydra"
-        symlink_store.symlink_to(real_store_dir)
+        make_dir_link(symlink_store, real_store_dir)
 
         work_data = real_store.profile_data_dir("work")
         overlay = isolation.build_overlay("work", work_data, symlink_store, engine="agy")
@@ -1212,12 +1176,11 @@ class TestOverlayStoreSymlinkIsolation(BaseCase):
         self.assertFalse(leaked.exists())
         self.assertFalse((overlay / "agydra").exists())
 
+    @posix_only(reason="POSIX symlink test")
     def test_home_link_to_ancestor_of_external_store_does_not_leak_profiles(self):
         """Case (b): home link to ancestor of external store (~/data -> /external).
         The overlay must not link ~/data into the overlay, protecting external store profiles.
         """
-        if platforms.is_windows():
-            self.skipTest("POSIX symlink test")
         external = self._tmp / "external"
         external.mkdir()
         ext_store_dir = external / "agydra"
@@ -1228,7 +1191,7 @@ class TestOverlayStoreSymlinkIsolation(BaseCase):
         victim_token.write_text("secret-data", encoding="utf-8")
 
         home_link = self.fake_home / "data"
-        home_link.symlink_to(external)
+        make_dir_link(home_link, external)
 
         work_data = ext_store.profile_data_dir("work")
         overlay = isolation.build_overlay("work", work_data, ext_store_dir, engine="agy")

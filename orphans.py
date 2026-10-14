@@ -68,13 +68,21 @@ class OrphanScan:
         """Human-readable lines, one per non-empty category with resource type and path."""
         lines = []
         if self.overlays:
-            paths = ", ".join(f"overlays/{n}" for n in self.overlays)
+            paths = ", ".join(
+                store_mod.store_relative_path("overlays", n) for n in self.overlays
+            )
             lines.append(f"overlay directories: {paths}")
         if self.keychain_secrets:
-            paths = ", ".join(f"keychain/{n}{_SECRET_SUFFIX}" for n in self.keychain_secrets)
+            paths = ", ".join(
+                store_mod.store_relative_path("keychain", f"{n}{_SECRET_SUFFIX}")
+                for n in self.keychain_secrets
+            )
             lines.append(f"keychain secret backups: {paths}")
         if self.keychain_quarantine:
-            paths = ", ".join(f"keychain/{f}" for f in self.keychain_quarantine)
+            paths = ", ".join(
+                store_mod.store_relative_path("keychain", filename)
+                for filename in self.keychain_quarantine
+            )
             lines.append(f"keychain quarantine files: {paths}")
         return lines
 
@@ -82,11 +90,16 @@ class OrphanScan:
         """Human-readable action items (action + type + path) for preview and confirmation."""
         lines = []
         for name in self.overlays:
-            lines.append(f"remove orphan overlay directory overlays/{name}")
+            path = store_mod.store_relative_path("overlays", name)
+            lines.append(f"remove orphan overlay directory {path}")
         for name in self.keychain_secrets:
-            lines.append(f"remove orphan keychain secret backup keychain/{name}{_SECRET_SUFFIX}")
+            path = store_mod.store_relative_path(
+                "keychain", f"{name}{_SECRET_SUFFIX}"
+            )
+            lines.append(f"remove orphan keychain secret backup {path}")
         for filename in self.keychain_quarantine:
-            lines.append(f"remove orphan keychain quarantine file keychain/{filename}")
+            path = store_mod.store_relative_path("keychain", filename)
+            lines.append(f"remove orphan keychain quarantine file {path}")
         return lines
 
 

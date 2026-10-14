@@ -25,7 +25,7 @@ import cli
 import engines
 import locks
 import store as store_module
-from conftest import BaseCase
+from conftest import BaseCase, make_dir_link
 from store import Store, StoreError
 
 
@@ -244,10 +244,7 @@ class TestExportExclusionMatching(BaseCase):
         target.mkdir()
         (root / "data").mkdir(parents=True)
         (root / "data" / "kept.txt").write_text("", encoding="utf-8")
-        try:
-            (root / "data" / "linked").symlink_to(target, target_is_directory=True)
-        except (OSError, NotImplementedError):
-            self.skipTest("symlinks unavailable")
+        make_dir_link(root / "data" / "linked", target)
         out = self._tmp / "tree.zip"
         with zipfile.ZipFile(out, "w") as zf:
             store_module._zip_tree_without_following(

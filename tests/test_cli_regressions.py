@@ -29,7 +29,7 @@ import shutil as shutil_mod
 import ui
 from ui import strip_ansi
 
-from conftest import BaseCase, run_python_child
+from conftest import BaseCase, posix_only, run_python_child, write_fake_binary
 
 
 class TestListColumnsAlignWithColor(BaseCase):
@@ -160,14 +160,12 @@ class TestDeletePurgesUnderProfileLock(BaseCase):
         self.store = Store()
         self.store.create("kc")
 
+    @posix_only("swap.lock requires POSIX flock")
     def test_same_name_cannot_be_recreated_during_keychain_purge(self):
         import cli
         import keychain
         import locks
         from unittest import mock
-
-        if keychain.fcntl is None:
-            self.skipTest("swap.lock requires POSIX flock")
 
         keychain.save_profile_slot(self.store, "kc", b"old-credential")
         original_purge = keychain.purge_profile_slot
@@ -1035,14 +1033,12 @@ class TestRenameKeepsProfileLockedThroughKeychainMigration(BaseCase):
         self.store = Store()
         self.store.create("old")
 
+    @posix_only("swap.lock requires POSIX flock")
     def test_new_profile_lock_blocks_execution_during_slot_migration(self):
         import cli
         import keychain
         import locks
         from unittest import mock
-
-        if keychain.fcntl is None:
-            self.skipTest("swap.lock requires POSIX flock")
 
         old_slot = keychain.slot_backup_path(self.store, "old")
         old_slot.parent.mkdir(parents=True, exist_ok=True)
@@ -1916,14 +1912,15 @@ class TestF3BinaryUnavailableExitCode(BaseCase):
         self.assertEqual(cm.exception.exit_code, 127)
         self.assertIn(missing_bin, str(cm.exception))
 
+    @posix_only("POSIX exec semantics")
     def test_build_plan_raises_binary_unavailable_error_when_not_executable(self):
-        import platforms
-        if platforms.is_windows():
-            self.skipTest("POSIX exec semantics")
         import runner
-        non_exec = self._tmp / "dummy_non_exec"
-        non_exec.write_text("#!/bin/sh\nexit 0\n")
-        non_exec.chmod(0o644)
+        non_exec = write_fake_binary(
+            self._tmp,
+            "dummy_non_exec",
+            body="#!/bin/sh\nexit 0\n",
+            executable=False,
+        )
         with self.assertRaises(runner.BinaryUnavailableError) as cm:
             runner.build_plan(self.store, [], flag_ref="work", binary_override=str(non_exec))
         self.assertEqual(cm.exception.exit_code, 126)

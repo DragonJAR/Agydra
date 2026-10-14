@@ -11,7 +11,7 @@ import resolver
 import runner
 from store import Store, StoreError
 
-from conftest import BaseCase
+from conftest import BaseCase, posix_only, write_fake_binary
 
 
 class TestResolver(BaseCase):
@@ -78,18 +78,14 @@ class TestResolver(BaseCase):
             self._resolve_engine("codex", flag="personal")
         self.assertIn("was requested", str(ctx.exception))
 
-    def test_stale_env_profile_warns_and_continues_cascade(self):
+    def test_stale_env_profile_continues_cascade_silently(self):
         self.store.create("openai", engine="codex")
-        with mock.patch("resolver.warn") as mock_warn:
-            res = self._resolve_engine("codex", env={resolver.PROFILE_ENV: "ghost"})
-            self.assertEqual(res.name, "openai")
-            mock_warn.assert_any_call("ignoring stale AGYDRA_PROFILE=ghost")
+        res = self._resolve_engine("codex", env={resolver.PROFILE_ENV: "ghost"})
+        self.assertEqual(res.name, "openai")
 
-    def test_stale_env_profile_without_engine_warns_and_falls_back_to_default(self):
-        with mock.patch("resolver.warn") as mock_warn:
-            res = self._resolve(env={resolver.PROFILE_ENV: "gone"}, cwd=self.fake_home)
-            self.assertEqual(res.name, "work")
-            mock_warn.assert_any_call("ignoring stale AGYDRA_PROFILE=gone")
+    def test_stale_env_profile_without_engine_falls_back_to_default_silently(self):
+        res = self._resolve(env={resolver.PROFILE_ENV: "gone"}, cwd=self.fake_home)
+        self.assertEqual(res.name, "work")
 
     def test_missing_flag_or_marker_profile_still_raises(self):
         with self.assertRaises(StoreError):
@@ -430,24 +426,24 @@ class TestPickFreeProfileLazyProbing(BaseCase):
                 handle.release()
 
 
-@unittest.skipIf(sys.platform.startswith("win"), "POSIX fake claude executable")
+@posix_only("POSIX fake claude executable")
 class TestPickFreeProfileClaudeProbeCount(BaseCase):
     def setUp(self):
         super().setUp()
         self.store = Store()
         self.log = self._tmp / "claude-probes.log"
-        fake = self._tmp / "bin" / "claude"
-        fake.parent.mkdir(exist_ok=True)
-        fake.write_text(
-            f"#!{sys.executable}\n"
-            "import json, os, sys\n"
-            f"open({str(self.log)!r}, 'a').write(os.environ.get('CLAUDE_CONFIG_DIR', '') + '\\n')\n"
-            "print(json.dumps({'loggedIn': True, 'authMethod': 'claude.ai', "
-            "'apiProvider': 'firstParty', 'email': 'cc@example.test', "
-            "'configDirectory': os.environ.get('CLAUDE_CONFIG_DIR')}))\n",
-            encoding="utf-8",
+        fake = write_fake_binary(
+            self._tmp / "bin",
+            "claude",
+            body=(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                f"open({str(self.log)!r}, 'a').write(os.environ.get('CLAUDE_CONFIG_DIR', '') + '\\n')\n"
+                "print(json.dumps({'loggedIn': True, 'authMethod': 'claude.ai', "
+                "'apiProvider': 'firstParty', 'email': 'cc@example.test', "
+                "'configDirectory': os.environ.get('CLAUDE_CONFIG_DIR')}))\n"
+            ),
         )
-        fake.chmod(0o755)
         os.environ["AGYDRA_CLAUDE_BIN"] = str(fake)
         for name in ("c1", "c2", "c3", "c4"):
             self.store.create(name, engine="claude")

@@ -23,6 +23,7 @@ import runner
 from conftest import (
     BaseCase,
     _make_jwt,
+    macos_only,
     simulated_macos_keychain,
     write_fake_binary,
 )
@@ -167,10 +168,7 @@ class TestA3RestoreHadSharedOnLoginExit(BaseCase):
             self.assertEqual(shared_state.get("gemini"), ambient_had_shared)
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    "macOS-only: Keychain bridge and simulated POSIX session pids",
-)
+@macos_only(reason="Keychain bridge and simulated POSIX session pids")
 class TestF1ConcurrentLoginAdoption(BaseCase):
     def setUp(self):
         super().setUp()

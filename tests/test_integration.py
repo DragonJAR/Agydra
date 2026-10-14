@@ -23,9 +23,12 @@ from conftest import (
     authenticate_agy_profile,
     cli_environment,
     held_cli_session,
+    macos_only,
+    posix_only,
     run_cli,
     spawn_cli,
     write_fake_agy,
+    write_fake_binary,
 )
 
 
@@ -203,12 +206,17 @@ class TestIntegration(BaseCase):
     def test_launch_propagates_child_exit_code(self):
         self.store.create("err")
         if platforms.is_windows():
-            bad = self.bin_dir / "agy-fail.cmd"
-            bad.write_text("@echo off\r\nexit /b 7\r\n", encoding="utf-8")
+            bad = write_fake_binary(
+                self.bin_dir,
+                "agy-fail",
+                windows_body="@echo off\r\nexit /b 7\r\n",
+            )
         else:
-            bad = self.bin_dir / "agy-fail"
-            bad.write_text("#!/usr/bin/env python3\nraise SystemExit(7)\n", encoding="utf-8")
-            bad.chmod(bad.stat().st_mode | 0o111)
+            bad = write_fake_binary(
+                self.bin_dir,
+                "agy-fail",
+                body="#!/usr/bin/env python3\nraise SystemExit(7)\n",
+            )
         result = self._run_cli("-p", "err", "--binary", str(bad))
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertNotIn("Traceback", result.stderr)
@@ -275,6 +283,7 @@ class TestIntegration(BaseCase):
         self.assertEqual(account.sync_profile_email(self.store, "work"), None)
         self.assertEqual(self.store.get("work").email, None)
 
+    @macos_only
     def test_list_shows_email_for_keychain_only_profile(self):
         """A profile created through the macOS keychain bridge (e.g. after
         `agydra login`) can have NO on-disk token file at all -- its email
@@ -285,8 +294,6 @@ class TestIntegration(BaseCase):
         ``security`` shim first on PATH: any shell-out to the real keychain
         tool is recorded and fails the test, so the host keychain is never
         touched. The profile is created before the bridge is enabled."""
-        if not platforms.is_macos():
-            self.skipTest("macOS-only keychain bridge")
         import keychain
 
         self.store.create("kc")
@@ -412,13 +419,12 @@ class TestBusyGuards(BaseCase):
         finally:
             handle.release()
 
+    @posix_only("PID recording is POSIX-only by design")
     def test_delete_refuses_busy_profile_names_holder_pid(self):
         """A legacy raw PID recorded by ``LockHandle.record_holder_pid()``
         is not a verified lease holder: the busy message must say the
         holder state could not be verified and must never suggest
         ``kill`` for it."""
-        if sys.platform.startswith("win"):
-            self.skipTest("PID recording is POSIX-only by design")
         handle = locks.try_lock(self.store, "work")
         handle.record_holder_pid()
         try:

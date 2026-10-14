@@ -12,7 +12,7 @@ import locks
 import platforms
 from store import Store
 
-from conftest import BaseCase
+from conftest import BaseCase, posix_only
 
 
 class TestLocks(BaseCase):
@@ -84,9 +84,8 @@ class TestLocks(BaseCase):
         finally:
             handle.release()
 
+    @posix_only
     def test_try_lock_permission_error_becomes_lock_error(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX permission semantics")
         locks.lock_dir(self.store).mkdir(parents=True, exist_ok=True)
         with mock.patch.object(
             locks.os, "open", side_effect=PermissionError("permission denied")
@@ -141,9 +140,8 @@ class TestLockHolderPid(BaseCase):
         self.store = Store()
         self.store.create("work")
 
+    @posix_only("PID recording is POSIX-only by design")
     def test_holder_pid_matches_current_process(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("PID recording is POSIX-only by design")
         import os
 
         handle = locks.try_lock(self.store, "work")
@@ -156,11 +154,10 @@ class TestLockHolderPid(BaseCase):
     def test_holder_pid_none_when_unlocked(self):
         self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
 
+    @posix_only("PID recording is POSIX-only by design")
     def test_holder_pid_none_when_unlocked_with_stale_pid(self):
         """Even if the lock file retains a PID from a previous plain-exec session,
         lock_holder_pid must return None when the profile is unlocked."""
-        if sys.platform.startswith("win"):
-            self.skipTest("PID recording is POSIX-only by design")
         handle = locks.try_lock(self.store, "work")
         handle.record_holder_pid()
         handle.release()
@@ -170,24 +167,22 @@ class TestLockHolderPid(BaseCase):
     def test_holder_pid_none_on_missing_file(self):
         self.assertIsNone(locks.lock_holder_pid(self.store, "missing"))
 
+    @posix_only("PID recording is POSIX-only by design")
     def test_holder_pid_none_without_recording(self):
         """A plain ``try_lock`` with no explicit ``record_holder_pid()``
         call (any non-exec launch path) leaves the lock file without a
         PID at all."""
-        if sys.platform.startswith("win"):
-            self.skipTest("PID recording is POSIX-only by design")
         handle = locks.try_lock(self.store, "work")
         try:
             self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
         finally:
             handle.release()
 
+    @posix_only("PID recording is POSIX-only by design")
     def test_reacquire_without_recording_clears_stale_pid(self):
         """A plain-exec session leaves its PID on disk. A subsequent session
         that does NOT record a PID (waited-child, sandbox) must not inherit
         that stale PID in lock_holder_pid."""
-        if sys.platform.startswith("win"):
-            self.skipTest("PID recording is POSIX-only by design")
         first = locks.try_lock(self.store, "work")
         first.record_holder_pid()
         first.release()
@@ -199,11 +194,10 @@ class TestLockHolderPid(BaseCase):
         finally:
             second.release()
 
+    @posix_only("PID recording is POSIX-only by design")
     def test_holder_pid_survives_reacquire_with_fresh_pid(self):
         """A stale PID from a previous session must not linger: the second
         acquisition overwrites it with the current process's PID."""
-        if sys.platform.startswith("win"):
-            self.skipTest("PID recording is POSIX-only by design")
         import os
 
         first = locks.try_lock(self.store, "work")
@@ -241,9 +235,8 @@ class TestLockInodeConsistency(BaseCase):
         self.store = Store()
         self.store.create("work")
 
+    @posix_only(reason="Windows refuses unlinking open files")
     def test_same_file_detects_a_replaced_path(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("Windows refuses unlinking open files")
         path = locks.lock_path(self.store, "work")
         locks.lock_dir(self.store).mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"")
@@ -256,9 +249,8 @@ class TestLockInodeConsistency(BaseCase):
         finally:
             os.close(fd)
 
+    @posix_only(reason="Windows refuses unlinking open files")
     def test_same_file_false_when_path_now_missing(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("Windows refuses unlinking open files")
         path = locks.lock_path(self.store, "work")
         locks.lock_dir(self.store).mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"")
@@ -269,12 +261,11 @@ class TestLockInodeConsistency(BaseCase):
         finally:
             os.close(fd)
 
+    @posix_only("POSIX inode semantics")
     def test_try_lock_retries_past_a_transient_replace_race(self):
         """A path replaced JUST after ``os.open()`` (the acquire-time
         TOCTOU window) must not hand out a lock on the stale/foreign inode:
         ``try_lock`` retries and succeeds once the race stops."""
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX inode semantics")
         original = locks._same_file
         calls = {"n": 0}
 
@@ -310,9 +301,8 @@ class TestLockInodeConsistency(BaseCase):
         with mock.patch.object(locks, "_same_file", return_value=False):
             self.assertTrue(locks.is_locked(self.store, "work"))
 
+    @posix_only("POSIX inode semantics")
     def test_is_locked_rechecks_path_after_acquiring_probe_lock(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX inode semantics")
         path = locks.lock_path(self.store, "work")
         real_try_lock_fd = locks._try_lock_fd
 
@@ -335,6 +325,7 @@ class TestLockInodeConsistency(BaseCase):
         with mock.patch.object(locks.os, "fstat", side_effect=OSError("stat failed")):
             self.assertTrue(locks.is_locked(self.store, "work"))
 
+    @posix_only(reason="Windows refuses unlinking open files")
     def test_deleted_and_recreated_lock_file_is_undetectable_by_design(self):
         """Documents the fundamental limit spelled out in locks.py's module
         docstring: if the ORIGINAL holder's lock file is deleted (and a new
@@ -345,8 +336,6 @@ class TestLockInodeConsistency(BaseCase):
         is the reasoned, documented boundary of what path-based probing can
         ever detect. Kept as a regression test so nobody "fixes" this test
         into asserting something the module cannot actually guarantee."""
-        if sys.platform.startswith("win"):
-            self.skipTest("Windows refuses unlinking open files")
         handle = locks.try_lock(self.store, "work")
         path = locks.lock_path(self.store, "work")
         path.unlink()

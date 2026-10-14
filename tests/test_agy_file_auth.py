@@ -21,7 +21,7 @@ import platforms
 import profile_rotation
 import runner
 import usage_agy
-from conftest import BaseCase, _make_jwt, simulated_macos_keychain
+from conftest import BaseCase, _make_jwt, posix_only, simulated_macos_keychain
 from store import Store, StoreError
 
 
@@ -125,9 +125,8 @@ class TestAgyFileCredentials(BaseCase):
         self.assertEqual(self._prepare(), self.token_path)
         self.assertEqual(self.token_path.read_bytes(), raw)
 
+    @posix_only
     def test_idle_token_permissions_are_hardened_without_overwriting_it(self):
-        if platforms.is_windows():
-            self.skipTest("POSIX permission hardening")
         raw = self._write_disk()
         self.token_path.chmod(0o644)
         with mock.patch.object(isolation.store, "atomic_write_bytes") as writer:
@@ -136,9 +135,8 @@ class TestAgyFileCredentials(BaseCase):
         self.assertEqual(self.token_path.read_bytes(), raw)
         self.assertEqual(stat.S_IMODE(self.token_path.stat().st_mode), 0o600)
 
+    @posix_only
     def test_live_token_with_unsafe_permissions_is_refused(self):
-        if platforms.is_windows():
-            self.skipTest("POSIX permission hardening")
         self._write_disk()
         self.token_path.chmod(0o644)
         locks.acquire_lease(self.store, "alpha")

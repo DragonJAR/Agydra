@@ -15,33 +15,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import store as store_mod
 from store import Config, Store, StoreError, backup_owner, read_json_object
 
-from conftest import BaseCase, run_python_child, expected_file_mode
+from conftest import (
+    BaseCase,
+    expected_file_mode,
+    make_dir_link,
+    posix_only,
+    run_python_child,
+    snapshot_tree,
+)
 
 
 class TestStore(BaseCase):
     def _run_child(self, source, *args):
         return run_python_child(source, *args)
-
-    def _tree_snapshot(self, root):
-        return tuple(
-            (
-                str(path.relative_to(root)),
-                path.read_bytes() if path.is_file() else None,
-            )
-            for path in sorted((root, *root.rglob("*")))
-        )
-
-    def _external_snapshot(self, root):
-        return tuple(
-            (
-                str(path.relative_to(root)),
-                path.lstat().st_dev,
-                path.lstat().st_ino,
-                stat.S_IMODE(path.lstat().st_mode),
-                path.read_bytes() if stat.S_ISREG(path.lstat().st_mode) else None,
-            )
-            for path in sorted((root, *root.rglob("*")))
-        )
 
     def test_relative_store_root_is_anchored_at_construction(self):
         previous_directory = Path.cwd()
@@ -59,10 +45,7 @@ class TestStore(BaseCase):
         physical_root = self._tmp / "physical-store"
         alias_root = self._tmp / "store-alias"
         physical_root.mkdir()
-        try:
-            alias_root.symlink_to(physical_root, target_is_directory=True)
-        except (OSError, NotImplementedError) as exc:
-            self.skipTest(f"directory symlink is unavailable: {exc}")
+        make_dir_link(alias_root, physical_root)
 
         store = Store(root=alias_root)
         profile = store.create("alpha")
@@ -86,18 +69,15 @@ class TestStore(BaseCase):
         (external / "data" / "sentinel").write_bytes(b"outside-data")
         store.profiles_dir.mkdir(parents=True, exist_ok=True)
         profile_link = store.profile_dir("alpha")
-        try:
-            profile_link.symlink_to(external, target_is_directory=True)
-        except (OSError, NotImplementedError) as exc:
-            self.skipTest(f"directory symlink is unavailable: {exc}")
-        before = self._tree_snapshot(external)
-        root_before = self._tree_snapshot(store.root)
+        make_dir_link(profile_link, external)
+        before = snapshot_tree(external)
+        root_before = snapshot_tree(store.root)
 
         self.assertEqual(store.scan_readonly(), ([], ["alpha"]))
         with self.assertRaisesRegex(StoreError, "symlink or junction"):
             store.get_readonly("alpha")
-        self.assertEqual(self._tree_snapshot(external), before)
-        self.assertEqual(self._tree_snapshot(store.root), root_before)
+        self.assertEqual(snapshot_tree(external), before)
+        self.assertEqual(snapshot_tree(store.root), root_before)
 
         operations = (
             lambda: store.get("alpha"),
@@ -113,7 +93,7 @@ class TestStore(BaseCase):
             ):
                 operation()
 
-        self.assertEqual(self._tree_snapshot(external), before)
+        self.assertEqual(snapshot_tree(external), before)
         self.assertFalse(store.sequence_state_path.exists())
         self.assertFalse(store.profile_dir("renamed").exists())
 
@@ -131,11 +111,8 @@ class TestStore(BaseCase):
         sentinel.write_bytes(b"external profile")
         os.chmod(sentinel, 0o640)
         root.mkdir(parents=True)
-        try:
-            store.profiles_dir.symlink_to(external, target_is_directory=True)
-        except (OSError, NotImplementedError) as exc:
-            self.skipTest(f"directory symlink is unavailable: {exc}")
-        before = self._external_snapshot(external)
+        make_dir_link(store.profiles_dir, external)
+        before = snapshot_tree(external, metadata=True)
 
         operations = (
             store.scan_readonly,
@@ -153,7 +130,7 @@ class TestStore(BaseCase):
 
         self.assertEqual(len(failures), len(operations))
         self.assertTrue(all("profiles" in message for message in failures))
-        self.assertEqual(self._external_snapshot(external), before)
+        self.assertEqual(snapshot_tree(external, metadata=True), before)
 
     def test_profiles_root_symlink_blocks_crud_and_preserves_external_tree(self):
         root = self._tmp / "profiles-root-mutation-store"
@@ -169,11 +146,8 @@ class TestStore(BaseCase):
         sentinel.write_bytes(b"outside-profile")
         os.chmod(sentinel, 0o604)
         root.mkdir(parents=True)
-        try:
-            store.profiles_dir.symlink_to(external, target_is_directory=True)
-        except (OSError, NotImplementedError) as exc:
-            self.skipTest(f"directory symlink is unavailable: {exc}")
-        before = self._external_snapshot(external)
+        make_dir_link(store.profiles_dir, external)
+        before = snapshot_tree(external, metadata=True)
 
         operations = (
             lambda: store.create("new"),
@@ -187,8 +161,8 @@ class TestStore(BaseCase):
             ):
                 operation()
 
-        self.assertEqual(self._external_snapshot(external), before)
-        self.assertTrue(store.profiles_dir.is_symlink())
+        self.assertEqual(snapshot_tree(external, metadata=True), before)
+        self.assertTrue(store_mod.platforms.is_link(store.profiles_dir))
 
     def test_profile_data_symlink_blocks_resolution_and_reads(self):
         store = Store()
@@ -200,11 +174,8 @@ class TestStore(BaseCase):
         sentinel = external / "sentinel"
         sentinel.write_bytes(b"external data")
         os.chmod(sentinel, 0o644)
-        try:
-            data_dir.symlink_to(external, target_is_directory=True)
-        except (OSError, NotImplementedError) as exc:
-            self.skipTest(f"directory symlink is unavailable: {exc}")
-        before = self._external_snapshot(external)
+        make_dir_link(data_dir, external)
+        before = snapshot_tree(external, metadata=True)
 
         self.assertEqual(store.scan_readonly(), ([], ["alpha"]))
         operations = (
@@ -219,7 +190,7 @@ class TestStore(BaseCase):
             ):
                 operation()
 
-        self.assertEqual(self._external_snapshot(external), before)
+        self.assertEqual(snapshot_tree(external, metadata=True), before)
 
     def test_profile_data_symlink_blocks_mutations_without_touching_target(self):
         store = Store()
@@ -232,11 +203,8 @@ class TestStore(BaseCase):
         sentinel = external / "sentinel"
         sentinel.write_bytes(b"must stay")
         os.chmod(sentinel, 0o604)
-        try:
-            data_dir.symlink_to(external, target_is_directory=True)
-        except (OSError, NotImplementedError) as exc:
-            self.skipTest(f"directory symlink is unavailable: {exc}")
-        before = self._external_snapshot(external)
+        make_dir_link(data_dir, external)
+        before = snapshot_tree(external, metadata=True)
 
         operations = (
             lambda: store.save(profile),
@@ -250,8 +218,8 @@ class TestStore(BaseCase):
             ):
                 operation()
 
-        self.assertEqual(self._external_snapshot(external), before)
-        self.assertTrue(data_dir.is_symlink())
+        self.assertEqual(snapshot_tree(external, metadata=True), before)
+        self.assertTrue(store_mod.platforms.is_link(data_dir))
 
     def test_profile_metadata_symlink_is_unreadable_and_never_touched(self):
         store = Store()
@@ -268,13 +236,13 @@ class TestStore(BaseCase):
         except (OSError, NotImplementedError) as exc:
             self.skipTest(f"file symlink is unavailable: {exc}")
         before = external_metadata.read_bytes()
-        root_before = self._tree_snapshot(store.root)
+        root_before = snapshot_tree(store.root)
 
         self.assertEqual(store.scan_readonly(), ([], ["alpha"]))
         with self.assertRaisesRegex(StoreError, "metadata .* symlink or junction"):
             store.get_readonly("alpha")
         self.assertEqual(external_metadata.read_bytes(), before)
-        self.assertEqual(self._tree_snapshot(store.root), root_before)
+        self.assertEqual(snapshot_tree(store.root), root_before)
         with self.assertRaisesRegex(StoreError, "metadata .* symlink or junction"):
             store.delete("alpha", backup=False)
         self.assertEqual(external_metadata.read_bytes(), before)
@@ -957,9 +925,8 @@ class TestStore(BaseCase):
         with zipfile.ZipFile(backup) as zf:
             self.assertNotIn("_keychain/nokc.secret", zf.namelist())
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        r"Windows-specific path-format mismatch: \`os.readlink\` on Windows "
+    @posix_only(
+        reason=r"Windows-specific path-format mismatch: \`os.readlink\` on Windows "
         r"returns the symlink target as the canonical Windows path "
         r"(potentially with a \`\\\\?\` UNC prefix), but the test compares "
         r"the raw bytes against \`str(outside)\` which is the POSIX-style "
@@ -968,7 +935,7 @@ class TestStore(BaseCase):
         r"every platform; only the byte-level comparison is platform-specific. "
         r"On a Windows host where the runner is in the same working directory "
         r"as the profile, the comparison would also pass — the runner's deep "
-        r"checkout path is what makes the bytes diverge.",
+        r"checkout path is what makes the bytes diverge."
     )
     def test_backup_zip_stores_file_symlinks_without_dereferencing(self):
         """A file symlink inside a profile's ``data/`` must reach the
@@ -1168,9 +1135,10 @@ class TestStore(BaseCase):
         self.assertIn("chmod denied", message)
         self.assertIn("could not restore original permissions", message)
 
+    @posix_only
     def test_rmtree_restores_mode_of_surviving_readonly_directory(self):
-        if os.name != "posix" or (hasattr(os, "geteuid") and os.geteuid() == 0):
-            self.skipTest("requires non-root POSIX directory permission semantics")
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("requires a non-root user")
         import shutil
 
         root = self._tmp / "readonly-tree"
@@ -1788,7 +1756,7 @@ store.rename("old", "new")
 
         profile_names = ("new", "peer")
         profiles_before = {
-            name: self._tree_snapshot(store.profile_dir(name)) for name in profile_names
+            name: snapshot_tree(store.profile_dir(name)) for name in profile_names
         }
         journal_before = store.rename_journal_path.read_bytes()
 
@@ -1801,7 +1769,7 @@ store.rename("old", "new")
         self.assertTrue(store.rename_journal_path.is_file())
         self.assertEqual(store.rename_journal_path.read_bytes(), journal_before)
         for name, snapshot in profiles_before.items():
-            self.assertEqual(self._tree_snapshot(store.profile_dir(name)), snapshot)
+            self.assertEqual(snapshot_tree(store.profile_dir(name)), snapshot)
 
     def test_rename_overlay_cleanup_failure_keeps_journal_for_recovery(self):
         store = Store()
@@ -1904,9 +1872,7 @@ Store(root=root).rename("old", "new")
         store.create("old")
         self.assertFalse(store.has_pending_rename())
         store.rename_journal_path.write_text("{pending", encoding="utf-8")
-        before = sorted(
-            (str(p), p.read_bytes() if p.is_file() else b"") for p in store.root.rglob("*")
-        )
+        before = snapshot_tree(store.root)
         with mock.patch("locks.try_lock") as lock, mock.patch("locks.try_mutation_lock") as mutation_lock, mock.patch("locks.try_sequence_lock") as seq_lock:
             self.assertTrue(store.has_pending_rename())
             for read in (
@@ -1919,9 +1885,7 @@ Store(root=root).rename("old", "new")
         lock.assert_not_called()
         mutation_lock.assert_not_called()
         seq_lock.assert_not_called()
-        after = sorted(
-            (str(p), p.read_bytes() if p.is_file() else b"") for p in store.root.rglob("*")
-        )
+        after = snapshot_tree(store.root)
         self.assertEqual(before, after)
 
     def test_has_pending_rename_fails_closed_when_journal_is_uninspectable(self):
@@ -2219,12 +2183,9 @@ class TestLeasedSessionBlocksMutations(BaseCase):
         self.registry = self.locks.lock_path(self.store, "work").read_bytes()
 
     def _tree(self):
-        return sorted(
-            (str(p), p.read_bytes() if p.is_file() else b"")
-            for p in self.store.root.rglob("*")
-            if p.parent != self.store.backups_dir
-            and self.locks.lock_dir(self.store) not in p.parents
-            and p != self.locks.lock_dir(self.store)
+        return snapshot_tree(
+            self.store.root,
+            exclude=(self.store.backups_dir, self.locks.lock_dir(self.store)),
         )
 
     def test_flock_is_free_but_delete_is_refused_with_data_untouched(self):
@@ -2368,7 +2329,7 @@ class TestRoutineSaveSkipsTheWholeStoreScan(BaseCase):
         (outside / "profile.json").write_text("{}", encoding="utf-8")
         before = (outside / "profile.json").read_bytes()
         shutil.rmtree(self.store.profile_dir("alpha"))
-        self.store.profile_dir("alpha").symlink_to(outside, target_is_directory=True)
+        make_dir_link(self.store.profile_dir("alpha"), outside)
         with self.assertRaisesRegex(StoreError, "symlink|junction|real"):
             self.store.save(profile)
         self.assertEqual((outside / "profile.json").read_bytes(), before)
@@ -2437,7 +2398,7 @@ class TestStoreRmtreeAndScan(BaseCase):
         target.mkdir()
         (target / "data.txt").write_bytes(b"payload")
         link = self._tmp / "link"
-        link.symlink_to(target, target_is_directory=True)
+        make_dir_link(link, target)
         store_mod.rmtree(link)
         self.assertFalse(link.exists() or link.is_symlink())
         self.assertTrue(target.exists())
@@ -2462,7 +2423,7 @@ class TestStoreRmtreeAndScan(BaseCase):
         self.store.overlays_dir.mkdir(parents=True, exist_ok=True)
         target = self._tmp / "outside-overlay"
         target.mkdir()
-        overlay.symlink_to(target, target_is_directory=True)
+        make_dir_link(overlay, target)
         self.store.delete("symprof")
         self.assertFalse(overlay.exists() or overlay.is_symlink())
         self.assertTrue(target.exists())

@@ -13,19 +13,14 @@ from unittest import mock
 from pathlib import Path
 
 import platforms
+from tests.conftest import macos_only, make_dir_link, posix_only, write_fake_binary
 
 
 class TestBaseDir(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("AGYDRA_HOME", None)
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "POSIX-only: \"/tmp/custom-root\" is interpreted as "
-        "\"C:\\\\tmp\\\\custom-root\" on Windows because os.path.abspath "
-        "anchors absolute paths to the drive root. Use a Windows-style "
-        "absolute path or tempfile.mkdtemp on a Windows host.",
-    )
+    @posix_only("POSIX root path format")
     def test_env_override_wins(self):
         os.environ["AGYDRA_HOME"] = str(Path("/tmp/custom-root"))
         self.assertEqual(platforms.base_dir(), Path("/tmp/custom-root"))
@@ -159,13 +154,12 @@ class TestHomeRedirectVar(unittest.TestCase):
         )
 
 
+@posix_only(
+    reason="POSIX-only: tests create scripts with a #!/bin/sh shebang; cmd.exe "
+    "cannot execute them in the GitHub Actions Windows-2022 runner. "
+    "Set AGYDRA_RUN_WIN32_RESOLVE=1 on a real Windows host to enable."
+)
 class TestResolveAgyBinary(unittest.TestCase):
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "POSIX-only: tests create scripts with a #!/bin/sh shebang; cmd.exe "
-        "cannot execute them in the GitHub Actions Windows-2022 runner. "
-        "Set AGYDRA_RUN_WIN32_RESOLVE=1 on a real Windows host to enable.",
-    )
     def setUp(self):
         self._tmp = Path(tempfile.mkdtemp(prefix="agydra-platforms-"))
         self._old = {
@@ -183,11 +177,7 @@ class TestResolveAgyBinary(unittest.TestCase):
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _touch(self, name):
-        p = self._tmp / name
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        return p
+        return write_fake_binary(self._tmp, name)
 
     def test_explicit_flag_wins_over_env_and_path(self):
         flag = self._touch("flag-agy")
@@ -202,7 +192,6 @@ class TestResolveAgyBinary(unittest.TestCase):
 
     def test_path_lookup_fallback(self):
         found = self._touch("agy")
-        found.chmod(found.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         os.environ["PATH"] = str(found.parent)
         self.assertEqual(platforms.resolve_agy_binary(), found)
 
@@ -224,13 +213,11 @@ class TestResolveAgyBinary(unittest.TestCase):
             platforms.resolve_agy_binary(str(self._tmp / "missing-agy"))
         )
 
+    @posix_only("POSIX exec semantics")
     def test_nonexecutable_explicit_returns_none(self):
         """Bug guard: a binary without exec permission must not be returned
         on POSIX (would fail launch with exit 126 while doctor says ok)."""
-        if platforms.is_windows():
-            self.skipTest("POSIX exec semantics")
-        p = self._tmp / "noexec-agy"
-        p.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        p = write_fake_binary(self._tmp, "noexec-agy", executable=False)
         os.environ[platforms.AGY_BIN_ENV] = str(p)
         self.assertIsNone(platforms.resolve_agy_binary())
 
@@ -314,10 +301,9 @@ class TestLaunch(unittest.TestCase):
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _script(self, name, body):
-        p = self._tmp / name
-        p.write_text(body, encoding="utf-8")
-        p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        return p
+        return write_fake_binary(
+            self._tmp, name, body=body, windows_body=body
+        )
 
     def test_propagates_child_exit_code(self):
         if not platforms.is_windows():
@@ -332,11 +318,9 @@ class TestLaunch(unittest.TestCase):
         )
         self.assertEqual(code, 127)
 
+    @posix_only("POSIX exec semantics")
     def test_not_executable_returns_126(self):
-        script = self._tmp / "noexec"
-        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        if platforms.is_windows():
-            self.skipTest("POSIX exec semantics")
+        script = write_fake_binary(self._tmp, "noexec", executable=False)
         code = platforms.launch_argv([str(script)], dict(os.environ))
         self.assertEqual(code, 126)
 
@@ -410,11 +394,11 @@ class TestWaitedInterrupt(unittest.TestCase):
                     pass
                 proc.communicate(timeout=5)
 
-    @unittest.skipIf(platforms.is_windows(), "real POSIX process-group SIGINT")
+    @posix_only("real POSIX process-group SIGINT")
     def test_interrupt_allows_child_cleanup_longer_than_subprocess_grace(self):
         self._assert_child_cleanup_survives(group_interrupt=True)
 
-    @unittest.skipIf(platforms.is_windows(), "real POSIX parent-only SIGINT")
+    @posix_only("real POSIX parent-only SIGINT")
     def test_parent_only_interrupt_waits_until_child_cleanup_finishes(self):
         self._assert_child_cleanup_survives(group_interrupt=False)
 
@@ -457,11 +441,10 @@ class TestLinkDetection(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 platforms.is_link(Path("entry"), strict=True)
 
-    @unittest.skipIf(platforms.is_windows(), "symlink permissions vary on Windows")
-    def test_real_dangling_symlink_is_detected_without_following(self):
+    def test_real_dangling_directory_link_is_detected_without_following(self):
         with tempfile.TemporaryDirectory(prefix="agydra-link-") as directory:
             path = Path(directory) / "dangling"
-            path.symlink_to(Path(directory) / "missing", target_is_directory=True)
+            make_dir_link(path, Path(directory) / "missing")
             self.assertTrue(platforms.is_link(path, strict=True))
 
 
@@ -472,36 +455,24 @@ class TestDrainTtyInput(unittest.TestCase):
     (``^[[?1;2c``) after agydra's output. It must be a safe no-op everywhere
     the precondition does not hold: never raises, never touches non-TTYs."""
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "POSIX-only: imports termios, which is not available on Windows. "
-        "The Windows counterpart is TestLinkDetection.test_posix_flushes_input_queue "
-        "is already excluded on Windows; this class's tests need either a real "
-        "Windows host with termios available (POSIX layer) or a complete rewrite.",
-    )
     def _fake_stdin(self, isatty: bool, fileno=0):
         import types
 
         return types.SimpleNamespace(isatty=lambda: isatty, fileno=lambda: fileno)
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "POSIX-only: imports termios, which is not available on Windows.",
-    )
+    @posix_only(reason="termios is unavailable on Windows")
     def test_noop_when_stdin_is_not_a_tty(self):
         import sys as _sys
         from unittest import mock
 
-        with mock.patch.object(_sys, "stdin", self._fake_stdin(False)), \
+        with mock.patch.dict(sys.modules, {"termios": mock.MagicMock()}), \
+                mock.patch.object(_sys, "stdin", self._fake_stdin(False)), \
                 mock.patch.object(platforms, "is_windows", return_value=False), \
                 mock.patch("termios.tcflush") as flush:
             platforms.drain_tty_input()
         flush.assert_not_called()
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "POSIX-only: imports termios, which is not available on Windows.",
-    )
+    @posix_only(reason="termios is unavailable on Windows")
     def test_posix_flushes_input_queue(self):
         import sys as _sys
         import termios
@@ -514,10 +485,6 @@ class TestDrainTtyInput(unittest.TestCase):
         # TCIFLUSH = input queue ONLY (never TCOFLUSH: output must survive).
         flush.assert_called_once_with(7, termios.TCIFLUSH)
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "POSIX-only: imports termios, which is not available on Windows.",
-    )
     def test_windows_flushes_console_input_buffer(self):
         import ctypes
         import sys as _sys
@@ -534,10 +501,7 @@ class TestDrainTtyInput(unittest.TestCase):
         kernel32.GetStdHandle.assert_called_once_with(-10)
         kernel32.FlushConsoleInputBuffer.assert_called_once_with(1234)
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        "POSIX-only: imports termios, which is not available on Windows.",
-    )
+    @posix_only(reason="termios is unavailable on Windows")
     def test_never_raises_on_tty_errors(self):
         import sys as _sys
         from unittest import mock
@@ -559,7 +523,8 @@ class TestDrainTtyInput(unittest.TestCase):
 
         stdin = self._fake_stdin(True)
         stdin.fileno = bad_fileno
-        with mock.patch.object(_sys, "stdin", stdin), \
+        with mock.patch.dict(sys.modules, {"termios": mock.MagicMock()}), \
+                mock.patch.object(_sys, "stdin", stdin), \
                 mock.patch.object(platforms, "is_windows", return_value=False), \
                 mock.patch("termios.tcflush") as flush:
             platforms.drain_tty_input()
@@ -681,12 +646,11 @@ class TestRealHome(unittest.TestCase):
             self.assertEqual(platforms.real_home(), Path.home())
 
 
-@unittest.skipIf(
-    sys.platform == "win32",
-    "macOS-only: the test pins the macOS fcntl.fcntl F_GETPATH fallback "
+@posix_only(
+    reason="macOS-only: the test pins the macOS fcntl.fcntl F_GETPATH fallback "
     "to scandir. Windows has its own canonicalization path (GetFinalPathNameByHandle) "
     "and no equivalent of fcntl.fcntl, so the assertion targets behavior "
-    "the Windows runner cannot exercise.",
+    "the Windows runner cannot exercise."
 )
 class TestCanonicalPath(unittest.TestCase):
     def test_canonical_path_existing_directory(self):
@@ -800,10 +764,9 @@ class TestCanonicalPath(unittest.TestCase):
                     self.assertEqual(platforms.canonical_path(lower_path), cased_file)
                     self.assertEqual(platforms.canonical_path(upper_path), cased_file)
 
+    @posix_only(reason="POSIX symlink test")
     def test_canonical_path_symlink_resolution(self):
         """canonical_path resolves symlinks and canonicalizes the target casing."""
-        if platforms.is_windows():
-            self.skipTest("POSIX symlink test")
         with tempfile.TemporaryDirectory() as td:
             base = Path(td).resolve()
             target_dir = base / "TargetDir"
@@ -816,10 +779,11 @@ class TestCanonicalPath(unittest.TestCase):
 
             self.assertEqual(platforms.canonical_path(link), target_file)
 
+    @macos_only("macOS mkfifo test")
     def test_canonical_path_fifo_does_not_hang(self):
         """canonical_path must not block indefinitely on a named pipe (FIFO)."""
-        if not platforms.is_macos() or not hasattr(os, "mkfifo"):
-            self.skipTest("macOS mkfifo test")
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("mkfifo unavailable")
         with tempfile.TemporaryDirectory() as td:
             fifo = Path(td) / "test_pipe"
             os.mkfifo(fifo)

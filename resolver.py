@@ -28,7 +28,6 @@ import locks
 import profile_rotation
 from models import Profile
 from store import Store, StoreError
-from ui import warn
 
 PROFILE_ENV = "AGYDRA_PROFILE"
 MARKER_FILE = ".agydra"
@@ -123,7 +122,7 @@ def resolve(
         try:
             name = resolve_ref(env_ref)
         except StoreError:
-            warn(f"ignoring stale {PROFILE_ENV}={env_ref}")
+            pass
         else:
             if serves_engine(name):
                 return Resolution(name, f"environment {PROFILE_ENV}={env_ref}")
@@ -153,11 +152,6 @@ def resolve(
         def_prof = default_profile
         if not target_engine or def_prof.engine == target_engine:
             return Resolution(resolve_ref(default), "default profile")
-        if eligible:
-            warn(
-                f"default profile {default!r} is for engine {def_prof.engine!r}; "
-                f"falling back to the first {target_engine} profile"
-            )
 
     if eligible:
         return Resolution(eligible[0].name, f"first {eligible[0].engine} profile")

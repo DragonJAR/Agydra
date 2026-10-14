@@ -17,6 +17,7 @@ import platforms
 import engines
 import i18n
 from store import Store, StoreError
+import store as store_mod
 from ui import console_print, paint, warn
 
 OK = "ok"
@@ -307,7 +308,10 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
     if claude_orphans:
         return WARN, i18n.t(
             "doctor.isolation.claude_orphans",
-            entries=", ".join(f"claude-config/{n}" for n in claude_orphans),
+            entries=", ".join(
+                store_mod.store_relative_path("claude-config", n)
+                for n in claude_orphans
+            ),
         )
     if recoverable:
         return WARN, i18n.t(

@@ -16,7 +16,7 @@ import engines
 import platforms
 import runner
 from store import Store
-from tests.conftest import BaseCase
+from tests.conftest import BaseCase, posix_only, write_fake_binary
 
 
 def _make_fake_project(tmp: Path, name: str = "proj", *, with_console: bool = True) -> Path:
@@ -26,13 +26,9 @@ def _make_fake_project(tmp: Path, name: str = "proj", *, with_console: bool = Tr
     (proj / "agydra.py").write_text("VERSION = '1.0.0'\n", encoding="utf-8")
     if with_console:
         vpy = bootstrap.venv_python(proj)
-        vpy.parent.mkdir(parents=True, exist_ok=True)
-        vpy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        vpy.chmod(0o755)
+        write_fake_binary(vpy.parent, vpy.name)
         console = bootstrap.console_script(proj)
-        console.parent.mkdir(parents=True, exist_ok=True)
-        console.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        console.chmod(0o755)
+        write_fake_binary(console.parent, console.name)
     return proj
 
 
@@ -80,9 +76,8 @@ class TestD1ShimRepointingAndRepair(unittest.TestCase):
                 shim.write_text(bootstrap._shim_content(target), encoding="utf-8")
                 self.assertEqual(bootstrap.shim_target(shim), target)
 
+    @posix_only(reason="POSIX shim semantics")
     def test_implicit_run_does_not_repoint_shim_to_second_checkout(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX shim semantics")
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             proj1 = _make_fake_project(base, "proj1", with_console=True)
@@ -98,9 +93,8 @@ class TestD1ShimRepointingAndRepair(unittest.TestCase):
                 bootstrap.ensure_path_shim(proj2, lambda l: None, explicit=True)
                 self.assertEqual(bootstrap.shim_target(), bootstrap.console_script(proj2))
 
+    @posix_only(reason="POSIX shim semantics")
     def test_dead_shim_repaired_on_implicit_run(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX shim semantics")
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
             proj = _make_fake_project(base, "proj", with_console=True)
@@ -127,7 +121,7 @@ class TestD2BrokenVenvAutoRepair(unittest.TestCase):
             vpy.unlink()
 
             def fake_perform(out=None, root=None, force=False, explicit=False, **_kw):
-                vpy.touch(mode=0o755)
+                write_fake_binary(vpy.parent, vpy.name)
                 return bootstrap.InstallResult(code=0, essential_ok=True, console=None)
 
             with mock.patch("agydra.__file__", str(proj / "agydra.py")), \
@@ -179,10 +173,8 @@ class TestD3BinaryResolutionOrder(BaseCase):
     def test_env_var_overrides_config(self):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td)
-            env_bin = bin_dir / "env_agy"
-            env_bin.touch(mode=0o755)
-            cfg_bin = bin_dir / "cfg_agy"
-            cfg_bin.touch(mode=0o755)
+            env_bin = write_fake_binary(bin_dir, "env_agy")
+            cfg_bin = write_fake_binary(bin_dir, "cfg_agy")
 
             with mock.patch.dict(os.environ, {"AGYDRA_AGY_BIN": str(env_bin)}):
                 driver = engines.get_engine("agy")
@@ -192,8 +184,9 @@ class TestD3BinaryResolutionOrder(BaseCase):
     def test_invalid_config_warns_and_falls_through_to_path(self):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td)
-            path_bin = bin_dir / ("agy.exe" if platforms.is_windows() else "agy")
-            path_bin.touch(mode=0o755)
+            path_bin = write_fake_binary(
+                bin_dir, "agy.exe" if platforms.is_windows() else "agy"
+            )
 
             with mock.patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=False):
                 os.environ.pop("AGYDRA_AGY_BIN", None)
@@ -208,8 +201,9 @@ class TestD3BinaryResolutionOrder(BaseCase):
     def test_explicit_invalid_stays_error_and_does_not_fall_through(self):
         with tempfile.TemporaryDirectory() as td:
             bin_dir = Path(td)
-            path_bin = bin_dir / ("agy.exe" if platforms.is_windows() else "agy")
-            path_bin.touch(mode=0o755)
+            path_bin = write_fake_binary(
+                bin_dir, "agy.exe" if platforms.is_windows() else "agy"
+            )
 
             with mock.patch.dict(os.environ, {"PATH": str(bin_dir)}):
                 driver = engines.get_engine("agy")
@@ -295,9 +289,8 @@ class TestD8ExitCodesForInvalidBinary(BaseCase):
         self.assertEqual(ctx.exception.exit_code, 127)
         self.assertIn("/nonexistent/agy/path", str(ctx.exception))
 
+    @posix_only(reason="POSIX executable permission semantics")
     def test_build_plan_not_executable_binary_exits_126(self):
-        if platforms.is_windows():
-            self.skipTest("POSIX exec semantics")
         self.store.create("work")
         with tempfile.NamedTemporaryFile() as tf:
             os.chmod(tf.name, 0o644)

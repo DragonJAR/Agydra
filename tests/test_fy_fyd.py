@@ -31,7 +31,7 @@ from unittest import mock
 import agydra
 import bootstrap
 import platforms
-from conftest import BaseCase
+from conftest import BaseCase, posix_only, write_fake_binary
 
 FAKE_CONSOLE_BODY = (
     "#!/bin/sh\n"
@@ -43,10 +43,7 @@ FAKE_IDLE_PYTHON = "#!/bin/sh\nexit 0\n"
 
 
 def _write_executable(path: Path, body: str) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
-    path.chmod(0o755)
-    return path
+    return write_fake_binary(path.parent, path.name, body=body)
 
 
 class BaseCaseWithCheckout(BaseCase):
@@ -62,7 +59,7 @@ class BaseCaseWithCheckout(BaseCase):
 
 
 class TestLauncherSurvivesOptionalShimFailure(BaseCaseWithCheckout):
-    @unittest.skipIf(platforms.is_windows(), "shim is POSIX-only")
+    @posix_only("shim is POSIX-only")
     def test_first_run_launches_when_only_the_shim_step_fails(self) -> None:
         """FYH6-1: a foreign shim no longer turns the first run into a failure.
 
@@ -215,7 +212,7 @@ class TestPiplessVenvRefused(BaseCaseWithCheckout):
 
 
 class TestDanglingShimIsRepairedByLauncher(BaseCaseWithCheckout):
-    @unittest.skipIf(platforms.is_windows(), "symlink is POSIX-only")
+    @posix_only("symlink is POSIX-only")
     def test_launcher_repairs_a_dangling_shim_on_the_next_run(self) -> None:
         """FYH6-4: a dangling shim link is dead state, repaired without force.
 
@@ -247,7 +244,7 @@ class TestDanglingShimIsRepairedByLauncher(BaseCaseWithCheckout):
 
 
 class TestVerifyCountsOnlyTheOwnShim(BaseCaseWithCheckout):
-    @unittest.skipIf(platforms.is_windows(), "shim is POSIX-only")
+    @posix_only("shim is POSIX-only")
     def test_own_delegating_shim_stays_the_first_candidate(self) -> None:
         """FYH6-5 positive side: a shim delegating to THIS root is tried
         first; the bare console script only runs when the shim fails to
@@ -279,7 +276,7 @@ class TestVerifyCountsOnlyTheOwnShim(BaseCaseWithCheckout):
 
 
 class TestDriftProbeChecksImportLocation(BaseCaseWithCheckout):
-    @unittest.skipIf(platforms.is_windows(), "shebang exec is POSIX-only")
+    @posix_only("shebang exec is POSIX-only")
     def test_modules_resolving_outside_the_root_are_flagged(self) -> None:
         """FYH6-6: a venv serving another checkout's files is not healthy."""
         foreign = self._tmp / "other-checkout"
@@ -299,7 +296,7 @@ class TestDriftProbeChecksImportLocation(BaseCaseWithCheckout):
             bootstrap.unimportable_modules(root, vpy), ["account", "agydra"]
         )
 
-    @unittest.skipIf(platforms.is_windows(), "shebang exec is POSIX-only")
+    @posix_only("shebang exec is POSIX-only")
     def test_modules_resolving_inside_the_root_pass(self) -> None:
         """FYH6-6: a healthy editable install resolves every module locally."""
         root = self._make_checkout("checkout", with_console=True)
@@ -328,7 +325,7 @@ class TestPerformInstallEssentialOptionalSplit(BaseCaseWithCheckout):
         self.assertEqual(result.code, 1)
         self.assertIsNone(result.console)
 
-    @unittest.skipIf(platforms.is_windows(), "shim is POSIX-only")
+    @posix_only("shim is POSIX-only")
     def test_optional_shim_failure_keeps_the_launch_essential(self) -> None:
         root = self._make_checkout("checkout", with_console=True)
         with mock.patch.object(

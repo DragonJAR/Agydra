@@ -88,6 +88,10 @@ _LEGACY_RENAME_JOURNAL_VERSION = 1
 _RENAME_ACTION_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}\Z")
 
 
+def store_relative_path(*parts: str) -> str:
+    return str(Path(*parts))
+
+
 class StoreError(Exception):
     pass
 

@@ -368,19 +368,15 @@ class TestFYCBugFixes(BaseCase):
         source_dir.mkdir()
         unreadable_file = source_dir / "unreadable.txt"
         unreadable_file.write_text("secret", encoding="utf-8")
-        unreadable_file.chmod(0o000)
 
         class Args:
             ref = "work"
             source = str(source_dir)
 
-        if platforms.is_windows():
-            copy_patch = mock.patch(
-                "shutil.copytree",
-                side_effect=shutil.Error([(str(unreadable_file), "dst", "Permission denied")]),
-            )
-        else:
-            copy_patch = contextlib.nullcontext()
+        copy_patch = mock.patch(
+            "shutil.copytree",
+            side_effect=shutil.Error([(str(unreadable_file), "dst", "Permission denied")]),
+        )
         try:
             with copy_patch, self.assertRaises(StoreError):
                 cli.cmd_import(self.store, Args)
@@ -388,11 +384,7 @@ class TestFYCBugFixes(BaseCase):
             self.assertTrue(settings_file.exists())
             self.assertEqual(settings_file.read_text(encoding="utf-8"), '{"preserved": true}')
         finally:
-            try:
-                unreadable_file.chmod(0o600)
-                shutil.rmtree(source_dir.parent, ignore_errors=True)
-            except OSError:
-                pass
+            shutil.rmtree(source_dir.parent, ignore_errors=True)
 
     def test_b8_cli_uses_cannot_safely_proceed_message_on_lock_error(self):
         with mock.patch("locks.try_mutation_lock", side_effect=locks.LockError("busy fd")):

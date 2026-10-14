@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import keychain
 import platforms
 import usage
-from conftest import BaseCase, _make_jwt
+from conftest import BaseCase, _make_jwt, posix_only
 from store import Store
 
 _FAKE_KEYCHAIN = Path("/fake/login.keychain-db")
@@ -327,10 +327,8 @@ class TestQueryProfileUsageTimeoutKillsProcessGroup(_UsageBase):
     running and orphaned.
     """
 
+    @posix_only(reason="process-group kill semantics differ on Windows")
     def test_hung_fake_agys_grandchild_is_fully_terminated(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("process-group kill semantics differ on Windows")
-
         heartbeat_log = self._tmp / "heartbeat.log"
         os.environ["FAKE_AGY_USAGE_SPAWN_CHILD_LOG"] = str(heartbeat_log)
         os.environ["FAKE_AGY_USAGE_SLEEP"] = "5"

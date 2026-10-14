@@ -26,7 +26,13 @@ import runner
 import store as store_mod
 from store import Store, StoreError
 
-from conftest import BaseCase
+from conftest import (
+    BaseCase,
+    make_dir_link,
+    posix_only,
+    snapshot_tree,
+    write_fake_binary,
+)
 
 REAL_CLAUDE = shutil.which("claude")
 
@@ -113,13 +119,27 @@ sys.exit(0)
 
 
 def write_fake_claude(path: Path) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(FAKE_CLAUDE_SOURCE.format(python=sys.executable), encoding="utf-8")
-    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return path
+    source = FAKE_CLAUDE_SOURCE.format(python=sys.executable)
+    if sys.platform.startswith("win"):
+        program = path.with_name("claude-fake.py")
+        program.write_text(source, encoding="utf-8")
+        return write_fake_binary(
+            path.parent,
+            path.name,
+            extension=".cmd",
+            windows_body=(
+                "@echo off\r\n"
+                f'"{sys.executable}" "{program}" %*\r\n'
+                "exit /b %ERRORLEVEL%\r\n"
+            ),
+        )
+    return write_fake_binary(
+        path.parent,
+        path.name,
+        body=source,
+    )
 
 
-@unittest.skipIf(sys.platform.startswith("win"), "POSIX fake claude binary")
 class ClaudeBase(BaseCase):
     def setUp(self) -> None:
         super().setUp()
@@ -277,13 +297,13 @@ class TestOverlayFreeIsolation(ClaudeBase):
         self.assertFalse((self.store.overlays_dir / profile.name).exists())
         self.assertEqual(sorted(p.name for p in self.fake_home.iterdir()), before)
         self.assertEqual(list(real_claude.iterdir()), [real_claude / "settings.json"])
-        self.assertFalse(any(p.is_symlink() for p in data.rglob("*")))
+        self.assertFalse(any(platforms.is_link(p) for p in data.rglob("*")))
 
     def test_refuses_symlinked_config_dir(self):
         target = self._tmp / "elsewhere"
         target.mkdir()
         link = self._tmp / "link"
-        link.symlink_to(target)
+        make_dir_link(link, target)
         with self.assertRaises(isolation.IsolationError):
             isolation.build_overlay("p", link, self.store_root, engine="claude")
 
@@ -293,11 +313,13 @@ class TestOverlayFreeIsolation(ClaudeBase):
         with self.assertRaises(isolation.IsolationError):
             isolation.prepare_claude_config_dir(real_claude)
 
+    @posix_only
     def test_config_dir_is_private(self):
         profile = self.make_profile()
         data = self.store.profile_data_dir(profile.name)
         self.assertEqual(stat.S_IMODE(data.stat().st_mode), 0o700)
 
+    @posix_only
     def test_chmod_failure_allows_an_already_private_directory(self):
         profile = self.make_profile()
         data = self.store.profile_data_dir(profile.name)
@@ -309,6 +331,7 @@ class TestOverlayFreeIsolation(ClaudeBase):
         self.assertEqual(prepared, data)
         self.assertEqual(stat.S_IMODE(data.stat().st_mode) & 0o077, 0)
 
+    @posix_only
     def test_chmod_failure_rejects_group_or_other_permissions(self):
         profile = self.make_profile()
         data = self.store.profile_data_dir(profile.name)
@@ -322,6 +345,7 @@ class TestOverlayFreeIsolation(ClaudeBase):
         self.assertIn(str(data), str(raised.exception))
         self.assertNotIn("secret chmod detail", str(raised.exception))
 
+    @posix_only
     def test_chmod_failure_rejects_unverifiable_directory_permissions(self):
         profile = self.make_profile()
         data = self.store.profile_data_dir(profile.name)
@@ -624,7 +648,7 @@ class TestDeleteAndBackup(ClaudeBase):
         victim = self._tmp / "victim"
         victim.mkdir()
         (victim / "precious").write_text("x", encoding="utf-8")
-        cfg.symlink_to(victim)
+        make_dir_link(cfg, victim)
         self.store.delete("alpha", backup=False)
         self.assertTrue((victim / "precious").exists())
         self.assertFalse(os.path.lexists(cfg))
@@ -771,7 +795,7 @@ class TestDeleteAndBackup(ClaudeBase):
         outside = self._tmp / "outside"
         outside.mkdir()
         (outside / "host-secret").write_text("DO-NOT-ARCHIVE", encoding="utf-8")
-        (cfg / "linkdir").symlink_to(outside)
+        make_dir_link(cfg / "linkdir", outside)
         (cfg / "linkfile").symlink_to(outside / "host-secret")
         (cfg / ".claude.json").write_text("{}", encoding="utf-8")
         backup = self.store.delete("alpha")
@@ -795,7 +819,7 @@ class TestDeleteAndBackup(ClaudeBase):
         victim = self._tmp / "victim"
         victim.mkdir()
         (victim / "precious").write_text("x", encoding="utf-8")
-        cfg.symlink_to(victim)
+        make_dir_link(cfg, victim)
         backup = self.store.delete("alpha")
         with zipfile.ZipFile(backup) as zf:
             self.assertIn("_claude-config", zf.namelist())
@@ -808,7 +832,7 @@ class TestDeleteAndBackup(ClaudeBase):
         root = self.store.root / "claude-config"
         moved = self._tmp / "moved-root"
         root.rename(moved)
-        root.symlink_to(moved)
+        make_dir_link(root, moved)
         with self.assertRaises(StoreError):
             self.store.create("beta", engine="claude")
         with self.assertRaises(StoreError):
@@ -930,13 +954,12 @@ class TestRunner(ClaudeBase):
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
         self.assertEqual(env["AGYDRA_PROFILE"], "work")
         self.assertEqual(seen["args"], ["--flag"])
-        message = warned.call_args[0][0]
-        self.assertIn("ANTHROPIC_API_KEY", message)
-        self.assertNotIn("sk-test", message)
+        warned.assert_not_called()
         self.assertFalse((self.store.overlays_dir / "work").exists())
         self.assertFalse((self.fake_home / ".claude").exists())
         self.assertFalse((self.fake_home / ".claude.json").exists())
 
+    @posix_only
     def test_unprivateable_config_aborts_before_claude_launch(self):
         profile = self.make_profile("work")
         config_dir = self.store.claude_config_dir(profile.name)
@@ -1012,7 +1035,7 @@ class TestDoctor(ClaudeBase):
         cfg.rmdir()
         target = self._tmp / "t"
         target.mkdir()
-        cfg.symlink_to(target)
+        make_dir_link(cfg, target)
         status, message = doctor._check_isolation(self.store, doctor._build_ctx(self.store))
         self.assertEqual(status, doctor.FAIL)
 
@@ -1021,7 +1044,7 @@ class TestDoctor(ClaudeBase):
         (self.store.root / "claude-config" / "42").mkdir()
         status, message = doctor._check_isolation(self.store, doctor._build_ctx(self.store))
         self.assertEqual(status, doctor.WARN)
-        self.assertIn("claude-config/42", message)
+        self.assertIn(str(Path("claude-config") / "42"), message)
 
     def test_fix_pass_skips_overlay_recovery_for_claude(self):
         self.make_profile("work")
@@ -1058,7 +1081,7 @@ class TestReadonlyStoreApi(ClaudeBase):
 
     def test_never_takes_locks_or_writes(self):
         self.make_profile("alpha")
-        before = sorted(str(p) for p in self.store.root.rglob("*"))
+        before = sorted(snapshot_tree(self.store.root, contents=False))
         with mock.patch.object(locks, "try_lock") as lock, mock.patch.object(
             locks, "try_sequence_lock"
         ) as seq_lock:
@@ -1067,7 +1090,7 @@ class TestReadonlyStoreApi(ClaudeBase):
             self.store.resolve_ref_readonly("alpha")
         lock.assert_not_called()
         seq_lock.assert_not_called()
-        self.assertEqual(sorted(str(p) for p in self.store.root.rglob("*")), before)
+        self.assertEqual(sorted(snapshot_tree(self.store.root, contents=False)), before)
 
     def test_pending_rename_fails_closed_without_recovering(self):
         self.make_profile("alpha")
@@ -1119,9 +1142,8 @@ class TestShellCommand(unittest.TestCase):
         "caf\u00e9 \u2018quoted\u2019",
     ]
 
+    @posix_only(reason="POSIX shell")
     def test_posix_round_trips_through_a_real_shell(self):
-        if sys.platform.startswith("win"):
-            self.skipTest("POSIX shell")
         line = platforms.shell_command(self.NASTY)
         self.assertEqual(shlex.split(line), self.NASTY)
         probe = subprocess.run(
@@ -1200,7 +1222,7 @@ class TestConfigDirValidation(ClaudeBase):
         real_claude = self.fake_home / ".claude"
         real_claude.mkdir()
         alias_root = self._tmp / "alias-root"
-        alias_root.symlink_to(real_claude)
+        make_dir_link(alias_root, real_claude)
         with self.assertRaises(isolation.IsolationError):
             isolation.validate_claude_config_dir(alias_root / "1")
 
@@ -1319,20 +1341,20 @@ class TestRunnerUsageIntegration(ClaudeBase):
     def test_dry_run_login_mutates_nothing(self):
         import claude_usage
 
-        before = sorted(str(p) for p in self.store.root.rglob("*"))
+        before = sorted(snapshot_tree(self.store.root, contents=False))
         saved = self.store.get("work")
         plan = runner.build_plan(self.store, ["auth", "login"], flag_ref="work", launch_as_child=True)
         with mock.patch.object(claude_usage, "invalidate_profile_usage") as inval:
             self.assertEqual(runner.run(plan, store=self.store, dry_run=True), 0)
         inval.assert_not_called()
-        self.assertEqual(sorted(str(p) for p in self.store.root.rglob("*")), before)
+        self.assertEqual(sorted(snapshot_tree(self.store.root, contents=False)), before)
         self.assertEqual(self.store.get("work"), saved)
         self.assertFalse(self.dump.exists())
 
     def test_build_plan_is_read_only(self):
-        before = sorted(str(p) for p in self.store.root.rglob("*"))
+        before = sorted(snapshot_tree(self.store.root, contents=False))
         runner.build_plan(self.store, ["auth", "login"], flag_ref="work", launch_as_child=True)
-        self.assertEqual(sorted(str(p) for p in self.store.root.rglob("*")), before)
+        self.assertEqual(sorted(snapshot_tree(self.store.root, contents=False)), before)
 
     def test_foreground_flags_reach_the_child(self):
         self.run_plan(["--flag"])

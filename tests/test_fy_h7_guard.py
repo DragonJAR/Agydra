@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import os
-import stat
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from conftest import BaseCase
+from conftest import BaseCase, write_fake_binary
 import cli
 import engines
 import isolation
@@ -80,9 +79,12 @@ class TestFYH7RegressionGuards(BaseCase):
         self.assertEqual(rc_missing, 127)
 
         if not platforms.is_windows():
-            non_exec = self.store_root / "non_executable_file"
-            non_exec.write_text("dummy", encoding="utf-8")
-            non_exec.chmod(0o644)
+            non_exec = write_fake_binary(
+                self.store_root,
+                "non_executable_file",
+                body="dummy",
+                executable=False,
+            )
             rc_non_exec = platforms.run_wait([str(non_exec)], {})
             self.assertEqual(rc_non_exec, 126)
 

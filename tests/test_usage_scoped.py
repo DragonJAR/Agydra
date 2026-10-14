@@ -28,7 +28,7 @@ import keychain
 import platforms
 import usage
 import usage_agy
-from conftest import BaseCase, _make_jwt
+from conftest import BaseCase, _make_jwt, posix_only
 from store import Store, StoreError
 
 
@@ -289,9 +289,8 @@ class TestQueryProfileUsageScoped(_ScopedBase):
         self.assertIn("credential not found", result.error)
         mock_run.assert_not_called()
 
+    @posix_only("swap.lock contention requires POSIX fcntl")
     def test_does_not_acquire_swap_lock(self):
-        if keychain.fcntl is None:
-            self.skipTest("swap.lock contention requires POSIX fcntl")
         lock_path = keychain._slots_dir(self.store) / "swap.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with mock.patch.object(platforms, "run_with_group_kill", return_value=self._success_proc()), \
@@ -300,9 +299,8 @@ class TestQueryProfileUsageScoped(_ScopedBase):
         self.assertTrue(result.ok, result.error)
         mock_guard.assert_not_called()
 
+    @posix_only("swap.lock contention requires POSIX fcntl")
     def test_query_works_while_swap_lock_held_by_other_process(self):
-        if keychain.fcntl is None:
-            self.skipTest("swap.lock contention requires POSIX fcntl")
         lock_path = keychain._slots_dir(self.store) / "swap.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         sub_code = (

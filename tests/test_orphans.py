@@ -14,7 +14,7 @@ import locks
 import orphans
 from store import Store, _backup_stamp
 
-from conftest import BaseCase
+from conftest import BaseCase, make_dir_link, snapshot_tree
 
 
 class TestFindOrphans(BaseCase):
@@ -57,15 +57,30 @@ class TestFindOrphans(BaseCase):
         self.assertFalse(scan.is_empty())
 
         desc = scan.describe()
-        self.assertIn("overlay directories: overlays/ghost", desc)
-        self.assertIn("keychain secret backups: keychain/ghost.secret", desc)
-        self.assertIn(f"keychain quarantine files: keychain/{self.ghost_quarantine.name}", desc)
+        self.assertIn(
+            f"overlay directories: {Path('overlays') / 'ghost'}", desc
+        )
+        self.assertIn(
+            f"keychain secret backups: {Path('keychain') / 'ghost.secret'}", desc
+        )
+        self.assertIn(
+            f"keychain quarantine files: {Path('keychain') / self.ghost_quarantine.name}",
+            desc,
+        )
         self.assertFalse(any("backup archives" in line for line in desc))
 
         actions = scan.describe_actions()
-        self.assertIn("remove orphan overlay directory overlays/ghost", actions)
-        self.assertIn("remove orphan keychain secret backup keychain/ghost.secret", actions)
-        self.assertIn(f"remove orphan keychain quarantine file keychain/{self.ghost_quarantine.name}", actions)
+        self.assertIn(
+            f"remove orphan overlay directory {Path('overlays') / 'ghost'}", actions
+        )
+        self.assertIn(
+            f"remove orphan keychain secret backup {Path('keychain') / 'ghost.secret'}",
+            actions,
+        )
+        self.assertIn(
+            f"remove orphan keychain quarantine file {Path('keychain') / self.ghost_quarantine.name}",
+            actions,
+        )
         self.assertFalse(any("backups/" in line for line in actions))
 
     def test_clean_store_reports_empty(self):
@@ -295,15 +310,12 @@ class TestRemoveOrphans(BaseCase):
         marker.write_text("keep", encoding="utf-8")
         link = self.store.overlays_dir / "ghost"
         link.rmdir()
-        try:
-            link.symlink_to(outside, target_is_directory=True)
-        except (OSError, NotImplementedError) as exc:
-            self.skipTest(str(exc))
+        make_dir_link(link, outside)
 
         scan = orphans.find_orphans(self.store, self.store.names())
         removed = orphans.remove_orphans(self.store, scan)
 
-        self.assertFalse(link.is_symlink())
+        self.assertFalse(orphans.platforms.is_link(link))
         self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
         self.assertIn("overlay: ghost", removed)
 
@@ -436,18 +448,12 @@ class TestOrphanLinkSafety(BaseCase):
         (self.outside / "ghost").mkdir(parents=True)
         (self.outside / "ghost" / "keep.txt").write_bytes(b"external")
 
-    def _snapshot(self):
-        return sorted(
-            (str(p.relative_to(self.outside)), p.read_bytes() if p.is_file() else b"")
-            for p in self.outside.rglob("*")
-        )
-
     def test_overlays_root_link_is_never_scanned_or_written_through(self):
         import shutil
 
         shutil.rmtree(self.store.overlays_dir)
-        self.store.overlays_dir.symlink_to(self.outside, target_is_directory=True)
-        before = self._snapshot()
+        make_dir_link(self.store.overlays_dir, self.outside)
+        before = snapshot_tree(self.outside)
 
         scan = orphans.find_orphans(self.store, self.store.names())
         removed = orphans.remove_orphans(
@@ -456,11 +462,11 @@ class TestOrphanLinkSafety(BaseCase):
 
         self.assertEqual(scan.overlays, [])
         self.assertEqual(removed, [])
-        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(snapshot_tree(self.outside), before)
 
     def test_dangling_overlay_link_is_reported_and_removed_without_following_it(self):
         link = self.store.overlays_dir / "ghost"
-        link.symlink_to(self._tmp / "missing-target", target_is_directory=True)
+        make_dir_link(link, self._tmp / "missing-target")
         scan = orphans.find_orphans(self.store, self.store.names())
         self.assertEqual(scan.overlays, ["ghost"])
         removed = orphans.remove_orphans(self.store, scan)
@@ -488,15 +494,15 @@ class TestOrphanLinkSafety(BaseCase):
         stamp = _backup_stamp()
         (self.outside / f"ghost-{stamp}.zip").write_bytes(b"zip")
         (self.outside / "ghost.secret").write_bytes(b"secret")
-        self.store.backups_dir.symlink_to(self.outside, target_is_directory=True)
-        keychain._slots_dir(self.store).symlink_to(self.outside, target_is_directory=True)
-        before = self._snapshot()
+        make_dir_link(self.store.backups_dir, self.outside)
+        make_dir_link(keychain._slots_dir(self.store), self.outside)
+        before = snapshot_tree(self.outside)
         scan = orphans.find_orphans(self.store, self.store.names())
         orphans.remove_orphans(self.store, orphans.OrphanScan(
             keychain_secrets=["ghost"]
         ))
         self.assertTrue(scan.is_empty())
-        self.assertEqual(self._snapshot(), before)
+        self.assertEqual(snapshot_tree(self.outside), before)
 
 
 class TestOrphanKeychainBusy(BaseCase):

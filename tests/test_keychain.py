@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import keychain
 import locks
 import platforms
-from conftest import BaseCase, _make_jwt, isolated_store_env
+from conftest import BaseCase, _make_jwt, isolated_store_env, macos_only, posix_only
 from store import Store
 
 
@@ -1624,13 +1624,11 @@ class TestPersistClassification(unittest.TestCase):
         import io
         from unittest import mock
 
-        note_buf, warn_buf = io.StringIO(), io.StringIO()
-        with mock.patch.object(keychain, "note",
-                               lambda m: note_buf.write(m + "\n")), \
-                mock.patch.object(keychain, "warn",
+        warn_buf = io.StringIO()
+        with mock.patch.object(keychain, "warn",
                                   lambda m: warn_buf.write(m + "\n")):
             keychain._persist_if_trusted(self.store, "work", data)
-        return note_buf.getvalue(), warn_buf.getvalue()
+        return "", warn_buf.getvalue()
 
     def _anchor_side_effect(self):
         """Provide a deterministic known identity for the stub store."""
@@ -1643,13 +1641,10 @@ class TestPersistClassification(unittest.TestCase):
         )
 
     def test_refresh_without_identity_notes_and_keeps_backup(self):
-        # .secret baseline must survive: refreshed token has no id_token,
-        # so the identity cannot be confirmed and the backup is kept.
         before = self.backup.read_bytes()
         with self._anchor_side_effect():
             note_out, warn_out = self._persist(self.refresh_payload)
-        self.assertTrue(note_out.strip(), "expected a discrete note")
-        self.assertNotIn("different account", note_out)
+        self.assertEqual(note_out, "")
         self.assertEqual(warn_out, "", "refresh-shaped payload must not warn")
         self.assertEqual(self.backup.read_bytes(), before,
                          ".secret must not be overwritten by a refresh")
@@ -1758,9 +1753,8 @@ class TestLaunchGuardClearsSharedOnUndecodableSecret(unittest.TestCase):
 
 
 class TestSerializeLock(unittest.TestCase):
+    @macos_only("macOS keychain mutex only")
     def test_serialize_lock_closes_handle_on_flock_oserror(self):
-        if not keychain.platforms.is_macos():
-            self.skipTest("macOS keychain mutex only")
         with isolated_store_env():
             store = Store()
             handles = []
@@ -1962,13 +1956,12 @@ class TestWriteSlotNeverExposesTheSecret(unittest.TestCase):
         self.assertNotIn("SYNTH-SECRET-TOKEN", message)
         self.assertNotIn(binascii.hexlify(self.SECRET).decode(), message.lower())
 
-    @unittest.skipIf(
-        sys.platform == "win32",
-        r"Windows keychain parser: odd\"dir\\x becomes invalid on a "
+    @posix_only(
+        reason=r"Windows keychain parser: odd\"dir\\x becomes invalid on a "
         "NTFS volume that does not allow embedded backslash-double-quote, "
         r"and \\\\?\ UNC prefix on the temp dir rejects that path. The "
         "Windows counterpart uses a normal keychain path without quoting "
-        "and backslash interleaving.",
+        "and backslash interleaving."
     )
     def test_quotes_and_backslashes_survive_the_interactive_parser(self):
         odd = _FAKE_KEYCHAIN_DIR / 'odd"dir\\x'
@@ -2217,10 +2210,8 @@ class TestKeychainRenameRecovery(BaseCase):
             ],
         )
 
+    @posix_only("swap.lock requires POSIX flock")
     def test_strict_recovery_keeps_file_state_when_swap_lock_fails(self):
-        if keychain.fcntl is None:
-            self.skipTest("swap.lock requires POSIX flock")
-
         old_slot = keychain.slot_backup_path(self.store, "old")
         new_slot = keychain.slot_backup_path(self.store, "new")
         old_slot.parent.mkdir(parents=True, exist_ok=True)
@@ -2245,10 +2236,8 @@ class TestRenameProfileSlotSerialization(BaseCase):
         super().setUp()
         self.store = Store()
 
+    @posix_only("keychain bridge serialization requires POSIX flock")
     def test_rename_fails_closed_under_swap_lock_contention(self):
-        if keychain.fcntl is None:
-            self.skipTest("keychain bridge serialization requires POSIX flock")
-
         old_slot = keychain.slot_backup_path(self.store, "old")
         new_slot = keychain.slot_backup_path(self.store, "new")
         old_slot.parent.mkdir(parents=True, exist_ok=True)

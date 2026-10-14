@@ -21,7 +21,7 @@ import resolver
 import runner
 from store import Store, StoreError
 
-from conftest import BaseCase, authenticate_agy_profile as _authenticate, held_cli_session
+from conftest import BaseCase, authenticate_agy_profile as _authenticate, held_cli_session, macos_only
 
 
 def _install_foreign_holder(store, name: str, pid: int = 424242) -> None:
@@ -277,9 +277,8 @@ class TestRunnerForce(BaseCase):
         self.assertEqual([item["held_during_spawn"] for item in observed], [True])
         self.assertFalse(locks.is_locked(self.store, "work"))
 
+    @macos_only("the Antigravity Keychain bridge is macOS-only")
     def test_agy_keychain_launch_waits_for_guard_restoration(self):
-        if not platforms.is_macos():
-            self.skipTest("the Antigravity Keychain bridge is macOS-only")
         plan = runner.build_plan(self.store, ["chat"], flag_ref="work")
 
         with mock.patch("keychain.supported", return_value=True), \

@@ -24,7 +24,7 @@ import locks
 import platforms
 import store as store_module
 import usage
-from conftest import BaseCase
+from conftest import BaseCase, make_dir_link, snapshot_tree
 from store import Store
 
 NOW = datetime(2026, 10, 1, 15, 0, tzinfo=timezone.utc)
@@ -56,35 +56,6 @@ def _payload(session=SESSION_ONE, five=20, seven=35, *, five_reset=None, seven_r
             ),
         },
     }
-
-
-def _tree_state(root: Path, exclude=()):
-    result = {}
-    if not root.exists():
-        return result
-    excluded = {Path(p).resolve() for p in exclude}
-    for path in sorted(root.rglob("*")):
-        try:
-            if path.resolve() in excluded:
-                continue
-        except OSError:
-            pass
-        relative = path.relative_to(root).as_posix()
-        metadata = path.lstat()
-        if stat.S_ISDIR(metadata.st_mode):
-            result[relative] = ("directory", metadata.st_mtime_ns)
-        elif stat.S_ISREG(metadata.st_mode):
-            try:
-                content = path.read_bytes()
-            except PermissionError:
-                if platforms.is_windows() and path.parent.name == "locks":
-                    content = b""
-                else:
-                    raise
-            result[relative] = ("file", content, metadata.st_mtime_ns)
-        elif stat.S_ISLNK(metadata.st_mode):
-            result[relative] = ("symlink", os.readlink(path), metadata.st_mtime_ns)
-    return result
 
 
 class _BinaryStdin:
@@ -379,12 +350,12 @@ class TestClaudeUsage(BaseCase):
     def test_pending_rename_returns_unknown_without_recovering_or_writing(self):
         journal = self.store.rename_journal_path
         journal.write_text("{pending", encoding="utf-8")
-        before = _tree_state(self.store.root)
+        before = snapshot_tree(self.store.root, metadata=True)
         with mock.patch.object(self.store, "get", side_effect=AssertionError("recovery lookup")):
             result = usage.query_profile_usage(self.store, self.profile.name)
         self.assertEqual(result.quality, "unknown")
         self.assertEqual(result.error, "profile rename recovery pending")
-        self.assertEqual(_tree_state(self.store.root), before)
+        self.assertEqual(snapshot_tree(self.store.root, metadata=True), before)
 
     def test_unknown_engine_returns_explicit_error_without_agy_auth_probe(self):
         self.store.create("mystery")
@@ -414,16 +385,20 @@ class TestClaudeUsage(BaseCase):
             profile_lock = locks.try_lock(self.store, self.profile.name)
             self.assertIsNotNone(profile_lock)
             lock_path = locks.lock_path(self.store, self.profile.name)
-            before = _tree_state(self.store.root, exclude=[lock_path])
+            before = snapshot_tree(
+                self.store.root, exclude=[lock_path], metadata=True
+            )
             try:
                 result = usage.query_profile_usage(self.store, self.profile.name)
             finally:
                 profile_lock.release()
         self.assertEqual(result.quality, "observed")
-        self.assertEqual(_tree_state(self.store.root, exclude=[lock_path]), before)
+        self.assertEqual(
+            snapshot_tree(self.store.root, exclude=[lock_path], metadata=True), before
+        )
 
     def test_query_without_snapshot_is_unknown_without_store_mutations(self):
-        before = _tree_state(self.store.root)
+        before = snapshot_tree(self.store.root, metadata=True)
         with mock.patch.object(
             claude_usage, "run_live_usage", return_value=(None, "live_binary_missing")
         ):
@@ -431,7 +406,7 @@ class TestClaudeUsage(BaseCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.quality, "unknown")
         self.assertEqual(result.groups, [])
-        self.assertEqual(_tree_state(self.store.root), before)
+        self.assertEqual(snapshot_tree(self.store.root, metadata=True), before)
 
     def test_capture_rejects_invalid_session_ids_and_busy_profile_cache_lock(self):
         self.assertFalse(self._capture(_payload(session="../not-a-uuid")))
@@ -781,7 +756,7 @@ class TestUsageCacheDirectoryProbe(BaseCase):
             with self.assertRaises(claude_usage.UsageCacheError):
                 claude_usage._safe_existing_directory(directory)
         dangling = self._tmp / "dangling"
-        dangling.symlink_to(self._tmp / "nowhere", target_is_directory=True)
+        make_dir_link(dangling, self._tmp / "nowhere")
         with self.assertRaises(claude_usage.UsageCacheError):
             claude_usage._safe_existing_directory(dangling)
         self.assertTrue(claude_usage._safe_existing_directory(self._tmp / "absent"))
