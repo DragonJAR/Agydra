@@ -16,7 +16,7 @@ import cli
 import runner
 import usage
 from unittest import mock
-from conftest import BaseCase, _make_jwt
+from conftest import BaseCase, _make_jwt, write_fake_binary
 from store import Store
 
 
@@ -27,9 +27,7 @@ class TestCodexParity(BaseCase):
         # Create a fake codex binary
         bin_dir = self._tmp / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
-        self.fake_codex = bin_dir / "codex"
-        self.fake_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        self.fake_codex.chmod(0o755)
+        self.fake_codex = write_fake_binary(bin_dir, "codex")
 
     def test_flag_forwarding_preserves_arbitrary_codex_flags(self):
         self.store.create("cx", engine="codex")

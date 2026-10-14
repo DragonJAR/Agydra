@@ -20,7 +20,12 @@ import locks
 import platforms
 import profile_rotation
 import runner
-from conftest import BaseCase, _make_jwt, simulated_macos_keychain
+from conftest import (
+    BaseCase,
+    _make_jwt,
+    simulated_macos_keychain,
+    write_fake_binary,
+)
 from store import Store, StoreError
 
 
@@ -353,13 +358,14 @@ class TestA4RandomCandidateErrorHandling(BaseCase):
         # When alpha is picked, if its binary is missing, -r must replan to beta
         with mock.patch.object(alpha_driver, "resolve_binary", side_effect=lambda *a, **kw: None if (a and a[0] == "missing") or kw.get("explicit") == "missing" else original_resolve(*a, **kw)):
             called_alpha = False
+            fallback_binary = write_fake_binary(self.bin_dir, "agy-fallback")
 
             def mock_resolve_binary(*_a, **_kw):
                 nonlocal called_alpha
                 if not called_alpha:
                     called_alpha = True
                     return None
-                return Path("/bin/echo")
+                return fallback_binary
 
             with mock.patch.object(alpha_driver, "resolve_binary", side_effect=mock_resolve_binary):
                 plan = runner.build_plan(self.store, [], random_pick=True, engine="agy")

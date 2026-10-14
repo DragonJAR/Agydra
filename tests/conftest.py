@@ -345,6 +345,40 @@ def write_fake_agy(path: Path) -> Path:
     return path
 
 
+def write_fake_binary(directory: Path, name: str) -> Path:
+    """Create a trivial executable using the active platform's executable rules."""
+    import platforms
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    if not sys.platform.startswith("win"):
+        path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if platforms.is_executable_file(path):
+        return path
+    path.unlink()
+
+    pathext = os.environ.get("PATHEXT") or platforms._DEFAULT_PATHEXT
+    batch_extension = next(
+        (
+            extension.lower()
+            for extension in pathext.split(";")
+            if extension.lower() in (".cmd", ".bat")
+        ),
+        None,
+    )
+    if batch_extension is None:
+        raise AssertionError("PATHEXT has no batch extension for a fake executable")
+    path = directory / f"{name}{batch_extension}"
+    path.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
+    if not sys.platform.startswith("win"):
+        path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if not platforms.is_executable_file(path):
+        raise AssertionError(f"fake executable {path} is not executable on this platform")
+    return path
+
+
 class BaseCase(unittest.TestCase):
     """Isolated environment: fake home + agydra store + fake agy binary.
 

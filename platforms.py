@@ -185,16 +185,15 @@ def _validate_binary_candidate(candidate: str) -> Optional[Path]:
     if not candidate_clean:
         return None
     p = Path(candidate_clean).expanduser()
-    if _is_executable_file(p):
+    if is_executable_file(p):
         return p
+    if is_windows() and os.path.dirname(str(p)):
+        if not p.suffix:
+            return _probe_pathext(p)
+        return None
     which_p = shutil.which(str(p), path=_sanitized_path_env())
     if which_p:
         return Path(which_p)
-    if is_windows():
-        if os.path.dirname(str(p)) and not p.suffix:
-            probed = _probe_pathext(p)
-            if probed:
-                return probed
     return None
 
 

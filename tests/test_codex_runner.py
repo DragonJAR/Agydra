@@ -15,7 +15,7 @@ import cli
 import platforms
 import resolver
 import runner
-from conftest import BaseCase, _make_jwt
+from conftest import BaseCase, _make_jwt, write_fake_binary
 from store import Store, StoreError
 
 
@@ -24,10 +24,7 @@ class TestCodexRunner(BaseCase):
         super().setUp()
         self.store = Store()
         # Set up fake codex binary
-        self.codex_bin = self.bin_dir / ("codex.cmd" if sys.platform.startswith("win") else "codex")
-        self.codex_bin.parent.mkdir(parents=True, exist_ok=True)
-        self.codex_bin.write_text("#!/bin/sh\necho codex\n", encoding="utf-8")
-        self.codex_bin.chmod(0o755)
+        self.codex_bin = write_fake_binary(self.bin_dir, "codex")
         os.environ["AGYDRA_CODEX_BIN"] = str(self.codex_bin)
 
     def test_build_plan_for_codex_profile(self):
@@ -61,9 +58,7 @@ class TestCodexRunner(BaseCase):
     def test_describe_shows_grok_destinations_without_creating_socket_paths(self):
         import hashlib
 
-        grok_bin = self.bin_dir / "grok"
-        grok_bin.write_text("synthetic grok binary", encoding="utf-8")
-        grok_bin.chmod(0o755)
+        grok_bin = write_fake_binary(self.bin_dir, "grok")
         self.store.create("grok-home", engine="grok")
         preferred = self.store.overlays_dir / "grok-home" / ".grok" / "leader.sock"
         if platforms.is_windows() or len(os.fsencode(str(preferred))) <= 103:

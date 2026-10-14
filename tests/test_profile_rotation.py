@@ -19,7 +19,7 @@ import profile_rotation
 import resolver
 import runner
 import usage_snapshot
-from conftest import BaseCase, authenticate_agy_profile
+from conftest import BaseCase, authenticate_agy_profile, write_fake_binary
 from store import Store, StoreError
 
 
@@ -31,9 +31,7 @@ class TestProfileRotation(BaseCase):
         self.project.mkdir()
         self.executables = {}
         for engine in ("codex", "grok", "claude"):
-            executable = self.bin_dir / engine
-            executable.write_text("synthetic executable", encoding="utf-8")
-            executable.chmod(0o755)
+            executable = write_fake_binary(self.bin_dir, engine)
             self.executables[engine] = executable
             os.environ[f"AGYDRA_{engine.upper()}_BIN"] = str(executable)
         self.launched = []

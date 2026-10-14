@@ -400,16 +400,28 @@ class TestFybBinaryUnavailableExitCodes(BaseCase):
         with mock.patch.dict(os.environ, {"PATH": str(self._tmp), "AGYDRA_AGY_BIN": ""}):
             self._assert_exit_code(126)
 
-    def test_resolved_path_is_checked_with_platform_executable_rules(self):
-        import engines
+    def test_windows_extensionless_explicit_binary_uses_pathext(self):
+        candidate = self._tmp / "codex"
+        candidate.write_text("not a Windows executable", encoding="utf-8")
+        candidate.chmod(0o755)
+        expected = self._tmp / "codex.CMD"
+        expected.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
 
-        binary = self._write_non_executable(self._tmp / "resolved-non-executable.txt")
-        driver = engines.get_engine("agy")
-        with mock.patch.object(
-            driver, "resolve_configured_binary", return_value=binary
-        ), mock.patch("engines.get_engine", return_value=driver), mock.patch.object(
-            platforms, "is_executable_file", return_value=False
-        ), mock.patch.dict(
-            os.environ, {"AGYDRA_AGY_BIN": str(binary)}
+        with mock.patch.object(platforms, "is_windows", return_value=True), mock.patch.dict(
+            os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}
         ):
-            self._assert_exit_code(126)
+            resolved = platforms.resolve_binary("codex", explicit=str(candidate))
+
+        self.assertEqual(resolved, expected)
+
+    def test_windows_explicit_path_rejects_suffix_outside_pathext(self):
+        candidate = self._tmp / "codex.txt"
+        candidate.write_text("not a Windows executable", encoding="utf-8")
+        candidate.chmod(0o755)
+
+        with mock.patch.object(platforms, "is_windows", return_value=True), mock.patch.dict(
+            os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}
+        ):
+            resolved = platforms.resolve_binary("codex", explicit=str(candidate))
+
+        self.assertIsNone(resolved)
