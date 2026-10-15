@@ -398,13 +398,66 @@ def _read_all(fd: int) -> bytes:
         ))
 
 
-def _open_registry_path(path: Path, *, writable: bool = False, create: bool = False) -> int:
-    """Own a regular, no-follow descriptor on the verified registry inode.
+def _open_windows_registry_path(path: Path, *, writable: bool, create: bool) -> int:
+    """Use one binary CRT open, with explicit pre/post path validation.
 
-    The shared opener validates existing entries. Writable flock operations
-    reopen nonblocking and verify the same inode before any read or write.
-    Creation is exclusive, so a planted FIFO or link is never opened as new.
+    Windows retains the pre-B3 nonexclusive creation contract: no read-only
+    WinDLL handle followed by a second writable open. Unlike POSIX this is
+    not a kernel no-follow open; reject reparse points, nonregular entries
+    and replaced inodes before reading, writing or taking a byte-range lock.
     """
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        if not create:
+            raise
+        before = None
+    if platforms.is_link(path, strict=True):
+        raise platforms.FileLinkError(errno.ELOOP, module_text(
+            "locks.changed_during_validation", "{path} changed during validation", path=path
+        ), str(path))
+    if before is not None and not stat.S_ISREG(before.st_mode):
+        raise platforms.NonRegularFileError(errno.EINVAL, module_text(
+            "locks.is_not_a_regular_file", "{path} is not a regular file", path=path
+        ), str(path))
+    flags = (os.O_RDWR if writable else os.O_RDONLY) | getattr(os, "O_BINARY", 0)
+    if create:
+        flags |= os.O_CREAT
+    fd = os.open(path, flags, 0o600)
+    transferred = False
+    try:
+        opened = os.fstat(fd)
+        current = path.lstat()
+        if platforms.is_link(path, strict=True):
+            raise platforms.FileLinkError(errno.ELOOP, module_text(
+                "locks.changed_during_validation", "{path} changed during validation", path=path
+            ), str(path))
+        if not stat.S_ISREG(opened.st_mode):
+            raise platforms.NonRegularFileError(errno.EINVAL, module_text(
+                "locks.is_not_a_regular_file", "{path} is not a regular file", path=path
+            ), str(path))
+        inspected = (current,) if before is None else (before, current)
+        if any((entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino) for entry in inspected):
+            raise platforms.FileLinkError(errno.ELOOP, module_text(
+                "locks.changed_during_validation", "{path} changed during validation", path=path
+            ), str(path))
+        transferred = True
+        return fd
+    finally:
+        if not transferred:
+            os.close(fd)
+
+
+def _open_registry_path(path: Path, *, writable: bool = False, create: bool = False) -> int:
+    """Own a verified registry descriptor using the explicit platform contract.
+
+    Windows uses one CRT open with pre/post checks, not kernel no-follow.
+    On POSIX the shared no-follow opener validates existing entries. Writable
+    flock operations reopen nonblocking and verify the same inode before use.
+    POSIX creation is exclusive, so planted special entries are not opened as new.
+    """
+    if platforms.is_windows():
+        return _open_windows_registry_path(path, writable=writable, create=create)
     if create:
         try:
             return os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1165,7 +1218,11 @@ def lock_holder_pid(store, name: str) -> Optional[int]:
         return holders[0].pid
     path = lock_path(store, name)
     try:
-        raw = platforms.read_regular_file_no_follow(path)
+        fd = _open_registry_path(path)
+        try:
+            raw = _read_all(fd)
+        finally:
+            os.close(fd)
     except OSError:
         return None
     parsed = _parse_holders(raw)

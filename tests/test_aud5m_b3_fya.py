@@ -1,4 +1,5 @@
 """Regression contracts for AUD5M Batch 3 FYA, using stdlib unittest."""
+import contextlib
 import json
 import os
 import subprocess
@@ -45,6 +46,101 @@ class TestBatch3Contracts(BaseCase):
         for raw in (b"0", b"9999999999"):
             with self.subTest(legacy=raw):
                 self.assertIsNone(locks._parse_holders(raw))
+
+    def test_windows_registry_uses_single_binary_crt_open_without_exclusive_creation(self):
+        path = locks.lock_path(self.s, "windows")
+        path.parent.mkdir(exist_ok=True)
+        original = os.open
+        calls = []
+        def tracked(target, flags, *args, **kwargs):
+            self.assertFalse(flags & os.O_EXCL, "Windows must not probe creation with O_EXCL")
+            calls.append(flags)
+            return original(target, flags, *args, **kwargs)
+        with mock.patch.object(platforms, "is_windows", return_value=True), \
+                mock.patch.object(platforms, "open_regular_file_no_follow", side_effect=AssertionError("Windows registry must not reopen through the read-only WinDLL helper")), \
+                mock.patch.object(locks.os, "open", side_effect=tracked):
+            for creating in (True, False):
+                fd = locks._open_registry_path(path, writable=True, create=creating)
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    os.write(fd, b"{}\r\n")
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    self.assertEqual(os.read(fd, 4), b"{}\r\n")
+                    self.assertFalse(os.get_inheritable(fd))
+                finally:
+                    os.close(fd)
+            rotation_path = path.with_name(".profile-rotation-any.lock")
+            for attempt in range(4):
+                handle = locks.try_lock_path(rotation_path)
+                self.assertIsNotNone(handle)
+                handle.release()
+            with mock.patch.object(locks, "_same_file", return_value=False):
+                self.assertIsNone(locks.try_lock_path(rotation_path))
+        self.assertEqual(len(calls), 6 + locks._MAX_LOCK_ATTEMPTS)
+        for flags in calls:
+            self.assertEqual(flags & getattr(os, "O_BINARY", 0), getattr(os, "O_BINARY", 0))
+        self.assertEqual(path.read_bytes(), b"{}\r\n")
+
+    def test_windows_process_mocks_do_not_control_registry_file_opening(self):
+        import ctypes
+        path = locks.lock_path(self.s, "windows")
+        path.parent.mkdir(exist_ok=True)
+        raw = b'{"holders":[{"pid":4321,"start":"133"}]}'
+        windows_os = SimpleNamespace(**dict(vars(os), name="nt", O_BINARY=getattr(os, "O_BINARY", 0)))
+        kernel = mock.Mock()
+        kernel.OpenProcess.return_value = None
+        file_api = contextlib.nullcontext if os.name == "nt" else lambda: mock.patch.dict(
+            sys.modules, {"msvcrt": SimpleNamespace(open_osfhandle=lambda handle, flags: os.dup(handle))}
+        )
+        for error in (5, 1450, 87):
+            with self.subTest(error=error):
+                path.write_bytes(raw)
+                with mock.patch.object(platforms, "is_windows", return_value=True), \
+                        mock.patch.object(platforms, "os", windows_os), \
+                        mock.patch.object(ctypes, "WinDLL", return_value=kernel, create=True), \
+                        mock.patch.object(ctypes, "get_last_error", return_value=error, create=True), \
+                        file_api():
+                    expected = [] if error == 87 else [locks.Holder(4321, "133")]
+                    self.assertEqual(locks.lease_holders(self.s, "windows"), expected)
+                    self.assertEqual(locks.is_locked(self.s, "windows"), error != 87)
+                    handle = locks.try_mutation_lock(self.s, "windows", patience_s=0)
+                    if error == 87:
+                        self.assertIsNotNone(handle)
+                        handle.release()
+                    else:
+                        self.assertIsNone(handle)
+                    with mock.patch.object(locks, "lease_holders", return_value=None), \
+                            mock.patch.object(locks, "is_locked", return_value=True):
+                        self.assertEqual(locks.lock_holder_pid(self.s, "windows"), 4321)
+                self.assertEqual(path.read_bytes(), raw)
+
+    def test_windows_registry_replacement_is_refused_and_descriptor_closed(self):
+        path = locks.lock_path(self.s, "windows")
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(b"original")
+        replacement = path.with_name("replacement")
+        replacement.write_bytes(b"replacement")
+        original = os.open
+        opened = []
+        def swapped(target, flags, *args, **kwargs):
+            os.replace(replacement, path)
+            fd = original(target, flags, *args, **kwargs)
+            opened.append(fd)
+            return fd
+        with mock.patch.object(platforms, "is_windows", return_value=True), \
+                mock.patch.object(locks.os, "open", side_effect=swapped):
+            with self.assertRaises(platforms.FileLinkError):
+                locks._open_registry_path(path, writable=True)
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])
+        self.assertEqual(path.read_bytes(), b"replacement")
+        with mock.patch.object(platforms, "is_windows", return_value=True), \
+                mock.patch.object(platforms, "is_link", return_value=True), \
+                mock.patch.object(locks.os, "open") as opening:
+            with self.assertRaises(platforms.FileLinkError):
+                locks._open_registry_path(path, writable=True)
+            opening.assert_not_called()
 
     def test_mutation_interrupt_releases_handle(self):
         handles = []
