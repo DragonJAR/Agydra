@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import math
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import os
@@ -1132,9 +1131,7 @@ def parse_finite_number(
             type=type(value).__name__,
         )
     try:
-        parsed = float(value)
-        if not math.isfinite(parsed):
-            raise ValueError("non-finite number")
+        parsed = usage.parse_finite_number(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise argparse.ArgumentTypeError(i18n.t(
             "cli.invalid_finite_number", name=name, value=shown,
@@ -1166,8 +1163,10 @@ def _restore_cached_groups(cached_groups: Any) -> List[usage.UsageGroup]:
     restored: List[usage.UsageGroup] = []
     if not isinstance(cached_groups, list):
         return restored
+    invalid_groups = 0
     for g in cached_groups:
-        if not isinstance(g, dict):
+        if not isinstance(g, dict) or not isinstance(g.get("buckets", []), list):
+            invalid_groups += 1
             continue
         buckets: List[usage.UsageBucket] = []
         for b in g.get("buckets", []):
@@ -1191,6 +1190,12 @@ def _restore_cached_groups(cached_groups: Any) -> List[usage.UsageGroup]:
                 )
             )
         restored.append(usage.UsageGroup(name=str(g.get("name") or ""), buckets=buckets))
+    if invalid_groups:
+        _warn(module_text(
+            "cli.cached_groups_skipped",
+            "ignored {count} malformed cached quota groups (invalid_cached_groups)",
+            count=invalid_groups,
+        ))
     return restored
 
 
@@ -1990,35 +1995,31 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
         source_payloads: Dict[str, bytes] = {}
         for name in SHARED_CONFIG_FILES:
             file = src_dir / name
-            if file.is_file():
+            try:
+                raw = platforms.read_regular_file_no_follow(file)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise StoreError(module_text(
+                    "cli.share_source_unsafe",
+                    "cannot safely read shared configuration {path} ({error}); no configuration copied",
+                    path=file, error=type(exc).__name__,
+                )) from exc
+            if name.endswith(".json"):
                 try:
-                    raw = file.read_bytes()
-                except OSError as exc:
+                    locks.json_loads_utf8(raw)
+                except (ValueError, UnicodeDecodeError) as exc:
                     _note(
                         i18n.t(
-                            "cmd.share_config.skip_unreadable",
+                            "cmd.share_config.skip_invalid_json",
                             name=name,
                             src=src,
                             exc=exc,
-                            default=f"skipping unreadable {name} in {src}: {exc}",
+                            default=f"skipping invalid JSON {name} in {src}: {exc}",
                         )
                     )
                     continue
-                if name.endswith(".json"):
-                    try:
-                        locks.json_loads_utf8(raw)
-                    except (ValueError, UnicodeDecodeError) as exc:
-                        _note(
-                            i18n.t(
-                                "cmd.share_config.skip_invalid_json",
-                                name=name,
-                                src=src,
-                                exc=exc,
-                                default=f"skipping invalid JSON {name} in {src}: {exc}",
-                            )
-                        )
-                        continue
-                source_payloads[name] = raw
+            source_payloads[name] = raw
         copied: List[str] = []
         for target_name in resolved:
             target_profile = target_profiles[target_name]
@@ -2363,9 +2364,10 @@ def cmd_import(store: Store, args) -> int:
                 try:
                     store_rmtree(tmp)
                 except OSError as exc:
-                    _warn(i18n.t(
-                        "cmd.import.cleanup_failed", path=tmp, error=str(exc),
-                        default="import staging directory {path} needs manual cleanup: {error}",
+                    _warn(module_text(
+                        "cmd.import.cleanup_failed",
+                        "import staging directory {path} needs manual cleanup: {error}",
+                        path=tmp, error=str(exc),
                     ))
             raise
         if driver.needs_keychain:

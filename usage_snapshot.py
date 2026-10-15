@@ -78,10 +78,10 @@ def _finite_or_none(value: Any) -> Optional[float]:
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
-    if number != number or number in (float("inf"), float("-inf")):
+    try:
+        return usage.parse_finite_number(value)
+    except (TypeError, ValueError, OverflowError):
         return None
-    return number
 
 
 def _profile_entry(profile: Any) -> Dict[str, Any]:

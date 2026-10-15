@@ -157,17 +157,30 @@ def _is_ineligible_message(text: object) -> bool:
             or lowered == module_text("usage.eligibility_rejected", "not eligible").lower())
 
 
+def parse_finite_number(value: object) -> float:
+    """Coerce a finite float; callers own schema checks and error presentation.
+
+    Shared conversion boundary extracted from the CLI parser, so domain
+    consumers neither import argparse/UI code nor duplicate overflow handling.
+    """
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite number")
+    return parsed
+
+
 def _is_finite_number(value: object) -> bool:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return False
     try:
-        return math.isfinite(value)
-    except OverflowError:
+        parse_finite_number(value)
+        return True
+    except (TypeError, ValueError, OverflowError):
         return False
 
 
 def parse_iso_utc(raw: object, *, require_utc: bool = False) -> Optional[datetime]:
-    """Decode an ISO-8601 UTC timestamp or unix epoch into a ``datetime``.
+    """Normalize a datetime, ISO-8601 timestamp or unix epoch to UTC.
 
     Single source of truth for every timestamp Agydra reads: quota reset
     times, snapshot ``observed_at`` stamps and Claude usage windows all
@@ -183,20 +196,21 @@ def parse_iso_utc(raw: object, *, require_utc: bool = False) -> Optional[datetim
     """
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
         try:
-            ts = float(raw)
-            if not math.isfinite(ts):
-                return None
+            ts = parse_finite_number(raw)
             if ts > 1e11:
                 ts /= 1000.0
             return datetime.fromtimestamp(ts, tz=timezone.utc)
         except (ValueError, OSError, OverflowError):
             return None
-    if not isinstance(raw, str) or not raw:
-        return None
-    text = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
+    if isinstance(raw, datetime):
+        parsed = raw
+    elif isinstance(raw, str) and raw:
+        text = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
         return None
     if parsed.tzinfo is None:
         if require_utc:
@@ -208,7 +222,10 @@ def parse_iso_utc(raw: object, *, require_utc: bool = False) -> Optional[datetim
                 return None
         except (OverflowError, ValueError):
             return None
-    return parsed
+    try:
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return None
 
 
 def _parse_bucket(raw: object) -> Optional[UsageBucket]:
@@ -421,10 +438,9 @@ def parse_codex_usage_payload(
             detected_plan = f"{detected_plan} (${float(balance):.2f})"
         elif isinstance(balance, str) and balance.strip():
             try:
-                bal_f = float(balance.strip())
-                if math.isfinite(bal_f):
-                    detected_plan = f"{detected_plan} (${bal_f:.2f})"
-            except ValueError:
+                bal_f = parse_finite_number(balance.strip())
+                detected_plan = f"{detected_plan} (${bal_f:.2f})"
+            except (ValueError, OverflowError):
                 pass
 
     buckets: List[UsageBucket] = []
@@ -1264,6 +1280,12 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
         proc = usage_agy.run_scoped_usage_query(
             store, name, binary, token_bytes,
             timeout=timeout, config=config,
+        )
+    except usage_agy.StagedCredentialError as exc:
+        return UsageResult(
+            name=name, ok=False, engine=engine, email=profile.email,
+            error=str(exc), error_code="staged_credential_unsafe",
+            authentication_state="authenticated",
         )
     except subprocess.TimeoutExpired:
         return UsageResult(

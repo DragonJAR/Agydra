@@ -53,10 +53,15 @@ import resolver
 import store as store_module
 from store import StoreError as StoreException
 from ui import warn
+from text import module_text
 
 SCOPED_STORAGE_FLAG = account.AGY_FILE_AUTH_ENV
 SCOPED_STORAGE_VALUE = account.AGY_FILE_AUTH_VALUE
 USAGE_ARGV = ("--print", "/usage", "--output-format", "json")
+
+
+class StagedCredentialError(StoreException):
+    """Required privacy hardening failed before the quota child could start."""
 
 
 def scoped_token_bytes(store, name: str, profile, data_dir: Path) -> Optional[bytes]:
@@ -97,8 +102,12 @@ def run_scoped_usage_query(
         token_path.write_bytes(token_bytes)
         try:
             token_path.chmod(0o600)
-        except OSError:
-            pass
+        except OSError as exc:
+            raise StagedCredentialError(module_text(
+                "usage.staged_token_unsafe",
+                "cannot secure staged credential {path} ({error}); quota query refused",
+                path=token_path, error=type(exc).__name__,
+            )) from exc
         env = isolation.isolated_env(
             staging_root,
             extra={resolver.PROFILE_ENV: name, SCOPED_STORAGE_FLAG: SCOPED_STORAGE_VALUE},
