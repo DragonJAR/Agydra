@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -26,6 +27,7 @@ import locks
 import platforms
 import resolver
 import runner
+import store as store_module
 import ui
 import usage
 import usage_snapshot
@@ -489,6 +491,7 @@ def _assert_free(store: Store, name: str, action: str = "modifying the profile")
     result: a PID is named (with a ``kill`` hint) only for a holder whose
     process start token was recorded. A busy lock without a registered
     lease, or with an unreadable registry, is reported as unverified."""
+    _require_no_pending_import(store, name)
     if locks.is_locked(store, name):
         holders = locks.lease_holders(store, name) or []
         verified = [holder for holder in holders if holder.start]
@@ -625,6 +628,7 @@ def _resolve_profile_auth_and_email(
     sync_email: bool = True,
     data_dir: Optional[Path] = None,
 ) -> Tuple[str, Optional[str], Any]:
+    _require_no_pending_import(store, profile.name)
     engine = profile.engine
     name = profile.name
     if data_dir is None:
@@ -738,6 +742,7 @@ def _cmd_login_in_recovery_scope(store: Store, args) -> int:
         resolve_ref = store.resolve_ref_readonly if dry_run else store.resolve_ref
         name = resolve_ref(args.ref)
     profile = store.get_readonly(name) if dry_run else store.get(name)
+    _require_no_pending_import(store, name)
     engine = profile.engine
     data_dir = store.profile_data_dir(name, engine=engine, profile=profile)
     state = None
@@ -791,6 +796,7 @@ def _resolve_profile_target_readonly(
         else store.get_readonly(resolution.name)
     )
     resolution.profile = profile
+    _require_no_pending_import(store, profile.name)
     return resolution, profile
 
 
@@ -1308,6 +1314,8 @@ def _claude_state_label(result: "usage.UsageResult") -> str:
 
 def _cmd_usage_compact(store: Store, _args) -> int:
     profiles, _unreadable = store.scan()
+    for profile in profiles:
+        _require_no_pending_import(store, profile.name)
     if not profiles:
         print(i18n.t("cmd.list.no_profiles", default="no profiles; create one with: agydra create <name>"))
         return 0
@@ -1848,6 +1856,7 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
         for reference, expected_name in references:
             _ensure_ref_unchanged(store, reference, expected_name, "sharing config")
         src_profile = store.get(src)
+        _require_no_pending_import(store, src)
         if src_profile.name != src:
             raise StoreError(
                 f"cannot safely share config from {src!r}: profile metadata "
@@ -1855,6 +1864,8 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
             )
         src_dir = store.profile_data_dir(src, engine=src_profile.engine, profile=src_profile)
         target_profiles = {name: store.get(name) for name in resolved}
+        for name in target_profiles:
+            _require_no_pending_import(store, name)
         if any(profile.name != name for name, profile in target_profiles.items()):
             raise StoreError("cannot safely share config: target profile owner changed")
         if src_profile.engine == "claude" or any(
@@ -1935,6 +1946,197 @@ def _summarize_import_failure(exc: "shutil.Error", source: Path) -> str:
     return f"import failed: {count} {unit} could not be copied from {source}{detail}"
 
 
+_IMPORT_JOURNAL = ".import-state.json"
+
+
+def _import_journal_path(store: Store, name: str) -> Path:
+    return store._require_profile_paths_are_real(name) / _IMPORT_JOURNAL
+
+
+def _require_no_pending_import(store: Store, name: str) -> None:
+    path = _import_journal_path(store, name)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise StoreError(i18n.t(
+        "cmd.import.recovery_pending", name=name, path=path,
+        default="profile {name!r} has pending import recovery at {path}; retry import before using it",
+    ))
+
+
+def _require_plan_no_pending_import(store: Store, plan: Any) -> None:
+    """Guard a resolved profile; the runner owns validation of opaque plans."""
+    name = getattr(plan, "profile", None)
+    if isinstance(name, str):
+        _require_no_pending_import(store, name)
+
+
+def _require_profile_identity(profile: Any, expected: Any, action: str) -> None:
+    if (profile.name, profile.seq, profile.engine) != (expected.name, expected.seq, expected.engine):
+        raise StoreError(i18n.t(
+            "cli.profile_identity_changed", name=expected.name, action=action,
+            engine=profile.engine, seq=profile.seq,
+            default="profile {name!r} changed before {action}; current engine {engine}, seq {seq}; retry",
+        ))
+
+
+def _import_directory_identity(path: Path) -> Optional[List[int]]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    if platforms.is_link(path, strict=True) or not stat.S_ISDIR(metadata.st_mode):
+        raise StoreError(i18n.t(
+            "cmd.import.unsafe_directory", path=path,
+            default="import directory must be real and not a link: {path}",
+        ))
+    return [metadata.st_dev, metadata.st_ino]
+
+
+def _sync_import_directory(path: Path) -> None:
+    """Make journal and directory moves durable on POSIX; Windows closes each move."""
+    if platforms.is_windows():
+        return
+    descriptor = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        os.fsync(descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _write_import_journal(path: Path, state: dict) -> None:
+    atomic_write_bytes(path, (json.dumps(state, sort_keys=True) + "\n").encode("utf-8"))
+    _sync_import_directory(path.parent)
+
+
+def _sync_import_tree(path: Path) -> None:
+    if platforms.is_windows():
+        return
+
+    def fail(error: OSError) -> None:
+        raise error
+
+    for directory, _dirs, _files in os.walk(path, topdown=False, followlinks=False, onerror=fail):
+        _sync_import_directory(Path(directory))
+
+
+def _recover_import_transaction(store: Store, profile: Any) -> bool:
+    """Recover one bounded import intent while its profile mutation lock is held.
+
+    An uncommitted publication rolls back; a committed publication only
+    finishes cleanup. Identity/path ambiguity leaves every artifact in place.
+    """
+    journal = _import_journal_path(store, profile.name)
+    try:
+        state = read_json_object(journal, max_bytes=4096)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as exc:
+        raise StoreError(i18n.t(
+            "cmd.import.invalid_journal", path=journal, error=type(exc).__name__,
+            default="cannot recover import journal {path} ({error}); state retained",
+        )) from exc
+    current = store._require_profile_snapshot(profile.name, profile)
+
+    def valid_identity(value: Any) -> bool:
+        return (isinstance(value, list) and len(value) == 2
+                and all(type(number) is int and number >= 0 for number in value))
+
+    valid = (
+        type(state.get("version")) is int and state["version"] == 1
+        and state.get("name") == current.name
+        and type(state.get("seq")) is int and state["seq"] == current.seq
+        and state.get("engine") == current.engine
+        and state.get("state") in ("prepared", "committed")
+        and isinstance(state.get("stage"), str)
+        and re.fullmatch(re.escape(f".import-{current.name}.") + r"[A-Za-z0-9_-]+", state["stage"]) is not None
+        and valid_identity(state.get("staged"))
+        and (state.get("original") is None or valid_identity(state["original"]))
+        and "original" in state
+    )
+    if not valid:
+        raise StoreError(i18n.t(
+            "cmd.import.invalid_journal", path=journal, error="invalid identity or state",
+            default="cannot recover import journal {path} ({error}); state retained",
+        ))
+    data = journal.parent / "data"
+    stage = journal.parent / state["stage"]
+    rollback = stage.with_name(stage.name + ".rollback")
+    data_id = _import_directory_identity(data)
+    stage_id = _import_directory_identity(stage)
+    rollback_id = _import_directory_identity(rollback)
+    original = state["original"]
+    staged = state["staged"]
+    coherent = (stage_id is None or stage_id == staged) and (
+        rollback_id is None or (original is not None and rollback_id == original)
+    )
+    if state["state"] == "committed":
+        coherent = coherent and data_id == staged
+    elif rollback_id is not None:
+        coherent = coherent and data_id in (None, staged)
+    else:
+        coherent = coherent and (data_id == original if original is not None else data_id in (None, staged))
+    if not coherent:
+        raise StoreError(i18n.t(
+            "cmd.import.ambiguous_recovery", path=journal,
+            default="import recovery paths changed or are ambiguous at {path}; state retained",
+        ))
+    if state["state"] == "prepared":
+        if rollback_id is not None:
+            if data_id is not None:
+                store_rmtree(data)
+            store_module.rename_dir_with_retry(rollback, data)
+        elif original is None and data_id is not None:
+            store_rmtree(data)
+        _sync_import_directory(journal.parent)
+    store_rmtree(stage)
+    store_rmtree(rollback)
+    _sync_import_directory(journal.parent)
+    journal.unlink()
+    _sync_import_directory(journal.parent)
+    return True
+
+
+def _publish_import_tree(store: Store, profile: Any, stage: Path, data: Path) -> None:
+    """Publish a complete stage without deleting the only complete old tree."""
+    store._require_profile_snapshot(profile.name, profile)
+    journal = _import_journal_path(store, profile.name)
+    rollback = stage.with_name(stage.name + ".rollback")
+    state = {
+        "version": 1, "name": profile.name, "seq": profile.seq, "engine": profile.engine,
+        "stage": stage.name, "original": _import_directory_identity(data),
+        "staged": _import_directory_identity(stage), "state": "prepared",
+    }
+    if _import_directory_identity(rollback) is not None:
+        raise StoreError(i18n.t(
+            "cmd.import.rollback_exists", path=rollback,
+            default="import rollback path already exists: {path}",
+        ))
+    try:
+        _write_import_journal(journal, state)
+        if state["original"] is not None:
+            store_module.rename_dir_with_retry(data, rollback)
+            _sync_import_directory(journal.parent)
+        rename_dir_with_retry(stage, data)
+        _sync_import_directory(journal.parent)
+        state["state"] = "committed"
+        _write_import_journal(journal, state)
+    except BaseException as exc:
+        try:
+            _recover_import_transaction(store, profile)
+        except Exception as recovery_error:
+            raise StoreError(i18n.t(
+                "cmd.import.rollback_failed", path=journal,
+                error=str(exc), recovery_error=str(recovery_error),
+                default="import failed ({error}); recovery failed ({recovery_error}); retained {path} for retry",
+            )) from exc
+        raise
+    _recover_import_transaction(store, profile)
+
+
 def cmd_import(store: Store, args) -> int:
     ref = args.ref
     looks_like_path = (
@@ -1959,6 +2161,7 @@ def cmd_import(store: Store, args) -> int:
     with _acquire_profile_lock(store, name, "importing into it"), ExitStack() as guards:
         _ensure_ref_unchanged(store, ref, name, "import")
         profile = store.get(name)
+        _recover_import_transaction(store, profile)
         if profile.name != name:
             raise StoreError(
                 f"cannot safely import into {name!r}: profile metadata names "
@@ -1998,14 +2201,21 @@ def cmd_import(store: Store, args) -> int:
                 shutil.copytree(
                     real, tmp, dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns(*driver.import_ignore),
+                    copy_function=atomic_copy,
                 )
             except shutil.Error as exc:
                 raise StoreError(_summarize_import_failure(exc, real)) from exc
-            if data_dir.exists():
-                store_rmtree(data_dir)
-            rename_dir_with_retry(tmp, data_dir)
+            _sync_import_tree(tmp)
+            _publish_import_tree(store, profile, tmp, data_dir)
         except BaseException:
-            shutil.rmtree(tmp, ignore_errors=True)
+            if not os.path.lexists(_import_journal_path(store, name)):
+                try:
+                    store_rmtree(tmp)
+                except OSError as exc:
+                    _warn(i18n.t(
+                        "cmd.import.cleanup_failed", path=tmp, error=str(exc),
+                        default="import staging directory {path} needs manual cleanup: {error}",
+                    ))
             raise
         if driver.needs_keychain:
             try:
@@ -2054,17 +2264,21 @@ def cmd_export(store: Store, args) -> int:
     contract exists.
     """
     name = store.resolve_ref(args.ref)
-    profile = store.get(name)
-    if profile.name != name:
+    expected = store.get(name)
+    if expected.name != name:
         raise StoreError(
             f"cannot safely export {name!r}: profile metadata names a "
-            f"different owner ({profile.name!r})"
+            f"different owner ({expected.name!r})"
         )
-    driver = engines.get_engine(profile.engine)
-    engine_excluded = list(driver.export_credential_ignore())
-    excluded_relpaths: List[str] = [f"data/{p}" for p in engine_excluded]
-    excluded_relpaths.append("_keychain/")
     with _acquire_profile_read_lock(store, name, "exporting it"):
+        _ensure_ref_unchanged(store, args.ref, name, "export")
+        profile = store.get(name)
+        _require_profile_identity(profile, expected, "export")
+        _require_no_pending_import(store, name)
+        driver = engines.get_engine(profile.engine)
+        engine_excluded = list(driver.export_credential_ignore())
+        excluded_relpaths: List[str] = [f"data/{p}" for p in engine_excluded]
+        excluded_relpaths.append("_keychain/")
         if locks.lease_holders(store, name):
             _note(
                 i18n.t(
@@ -2073,7 +2287,6 @@ def cmd_export(store: Store, args) -> int:
                     default=f"exporting live profile {name!r}; the archive is a best-effort snapshot",
                 )
             )
-        _ensure_ref_unchanged(store, args.ref, name, "export")
         dest = Path(args.output) if args.output is not None else _default_export_path(name)
         manifest = {
             "format_version": 1,
@@ -2702,9 +2915,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if values["dry-run"]:
             plan_kwargs["read_only"] = True
             plan = runner.build_plan(store, agy_args, **plan_kwargs)
+            _require_plan_no_pending_import(store, plan)
             return runner.run(plan, store=store, dry_run=True)
         with store.launch_recovery_scope(target_name=values["profile"]):
             plan = runner.build_plan(store, agy_args, **plan_kwargs)
+            _require_plan_no_pending_import(store, plan)
             return runner.run(plan, store=store, dry_run=False)
     except _CLI_REPORTABLE_ERRORS as exc:
         return _report_error(exc)
