@@ -876,21 +876,18 @@ def _try_lock_path(
 ) -> Optional[LockHandle]:
     """Try to take one non-blocking kernel-held advisory lock."""
     for _attempt in range(_MAX_LOCK_ATTEMPTS):
+        fd = None
+        transferred = False
         try:
             platforms.ensure_dir(path.parent)
             fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-        except OSError as exc:
-            raise LockError(f"cannot create {description} {path} ({exc})") from exc
-        try:
             if platforms.is_windows():
                 if os.fstat(fd).st_size == 0:
                     os.write(fd, b"\0")
             if not _try_lock_fd(fd):
-                os.close(fd)
                 return None
             if not _same_file(fd, path):
                 _unlock_fd(fd)
-                os.close(fd)
                 continue
             if not platforms.is_windows():
                 os.set_inheritable(fd, inherit_on_exec)
@@ -899,13 +896,15 @@ def _try_lock_path(
                         os.ftruncate(fd, 0)
                     except OSError:
                         pass
+            handle = LockHandle(fd)
+            transferred = True
+            return handle
         except OSError as exc:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
             raise LockError(f"cannot acquire {description} {path} ({exc})") from exc
-        return LockHandle(fd)
+        finally:
+            if fd is not None and not transferred:
+                os.close(fd)
+
     return None
 
 

@@ -40,7 +40,6 @@ same contract the Codex and Grok paths in ``usage.py`` already enforce.
 """
 from __future__ import annotations
 
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -48,9 +47,12 @@ from typing import Optional
 
 import account
 import isolation
+import i18n
 import platforms
 import resolver
+import store as store_module
 from store import StoreError as StoreException
+from ui import warn
 
 SCOPED_STORAGE_FLAG = account.AGY_FILE_AUTH_ENV
 SCOPED_STORAGE_VALUE = account.AGY_FILE_AUTH_VALUE
@@ -83,12 +85,13 @@ def run_scoped_usage_query(
     """Run ``agy --print /usage`` in a throwaway HOME holding the token.
 
     Propagates whatever ``platforms.run_with_group_kill`` raises (timeout,
-    launch failure); removal of the staging directory is guaranteed on
-    every exit path, and the ``config`` argument carries the same
+    launch failure); removal is attempted on every exit path, with any
+    cleanup failure reported, and the ``config`` argument carries the same
     ``windows_redirect_home`` setting the launch path honors.
     """
     staging_root = Path(tempfile.mkdtemp(prefix="agydra-usage-"))
     try:
+        staging_root = staging_root.parent.resolve() / staging_root.name
         token_path = staging_root / ".gemini" / account.AGY_CLI_DIR / account.TOKEN_FILE
         token_path.parent.mkdir(parents=True)
         token_path.write_bytes(token_bytes)
@@ -112,4 +115,12 @@ def run_scoped_usage_query(
             errors="replace",
         )
     finally:
-        shutil.rmtree(staging_root, ignore_errors=True)
+        try:
+            store_module.rmtree(staging_root)
+        except OSError as exc:
+            warn(i18n.t(
+                "usage.staging_cleanup_failed",
+                path=str(staging_root),
+                error=str(exc),
+                default="staging directory {path} needs manual cleanup: {error}",
+            ))

@@ -7,6 +7,7 @@ package is platform-agnostic.
 from __future__ import annotations
 
 import base64
+import errno
 import os
 import shlex
 import shutil
@@ -14,8 +15,9 @@ import signal
 import stat
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence, Union
+from typing import Any, BinaryIO, Callable, Iterator, Mapping, Optional, Sequence, Union
 
 APP_NAME = "agydra"
 
@@ -71,6 +73,115 @@ def is_link(path: Union[Path, str], *, strict: bool = False) -> bool:
     return stat.S_ISLNK(metadata.st_mode) or bool(
         getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
     )
+
+
+class FileLinkError(OSError):
+    """A no-follow read encountered a link or reparse point."""
+
+
+class NonRegularFileError(OSError):
+    """A no-follow read encountered a non-regular entry."""
+
+
+class FileTooLargeError(OSError):
+    """A bounded read exceeded its byte budget."""
+
+
+MAX_REGULAR_FILE_BYTES = 64 * 1024 * 1024
+
+
+def _open_windows_no_follow(path: Path) -> int:
+    """Open the reparse point itself, never its target, using Win32."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                       wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create.restype = wintypes.HANDLE
+    close = kernel.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+    handle = create(str(absolute_path(path)), 0x80000000, 7, None, 3, 0x02200000, None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    transferred = False
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        transferred = True
+        return fd
+    finally:
+        if not transferred:
+            close(handle)
+
+
+@contextmanager
+def open_regular_file_no_follow(path: Union[Path, str]) -> Iterator[BinaryIO]:
+    """Own a verified regular-file descriptor, including during interruption.
+
+    POSIX O_NOFOLLOW and Windows OPEN_REPARSE_POINT prevent dereferencing
+    the leaf. Identity checks reject replacement between inspection and open.
+    Parent directories remain the caller's domain-specific responsibility.
+    Streaming consumers share this opener without buffering whole archives.
+    """
+    path = Path(path)
+    if is_link(path, strict=True):
+        raise FileLinkError(errno.ELOOP, "file must not be a link", str(path))
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise NonRegularFileError(errno.EINVAL, "file must be regular", str(path))
+    fd = None
+    source = None
+    try:
+        if os.name == "nt":
+            fd = _open_windows_no_follow(path)
+        else:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise FileLinkError(errno.ELOOP, "file became a link", str(path)) from exc
+                raise
+        opened = os.fstat(fd)
+        if is_link(path, strict=True):
+            raise FileLinkError(errno.ELOOP, "file became a link", str(path))
+        current = path.lstat()
+        if not stat.S_ISREG(opened.st_mode):
+            raise NonRegularFileError(errno.EINVAL, "file must be regular", str(path))
+        if any((entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino)
+               for entry in (before, current)):
+            raise FileLinkError(errno.ELOOP, "file identity changed", str(path))
+        source = os.fdopen(fd, "rb")
+        fd = None
+        yield source
+    finally:
+        if source is not None:
+            source.close()
+        elif fd is not None:
+            os.close(fd)
+
+
+def read_regular_file_no_follow(
+    path: Union[Path, str], *, max_bytes: Optional[int] = None
+) -> bytes:
+    """Read within the requested budget and a hard 64 MiB memory ceiling.
+
+    Missing paths raise FileNotFoundError; special entries and oversized
+    contents raise the dedicated OSError subclasses above.
+    """
+    limit = MAX_REGULAR_FILE_BYTES if max_bytes is None else max_bytes
+    if type(limit) is not int or limit < 0:
+        raise ValueError("max_bytes must be a nonnegative integer")
+    limit = min(limit, MAX_REGULAR_FILE_BYTES)
+    with open_regular_file_no_follow(path) as source:
+        if os.fstat(source.fileno()).st_size > limit:
+            raise FileTooLargeError(errno.EFBIG, "file exceeds size limit", str(path))
+        raw = source.read(limit + 1)
+        if len(raw) > limit:
+            raise FileTooLargeError(errno.EFBIG, "file exceeds size limit", str(path))
+        return raw
 
 
 def read_link_target(path: Union[Path, str]) -> str:

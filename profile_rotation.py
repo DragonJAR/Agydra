@@ -100,7 +100,7 @@ def _read_used(
 
 
 def state_file_issue(store: Store, path: Path) -> Optional[str]:
-    """Validate one rotation state file without changing persistent state."""
+    """Validate rotation state through the shared bounded no-follow JSON reader."""
     path = Path(path)
     try:
         info = path.lstat()

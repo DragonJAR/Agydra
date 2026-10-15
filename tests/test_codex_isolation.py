@@ -245,7 +245,8 @@ class TestCodexDaemonConfigEditing(BaseCase):
     def test_read_failure_is_reported_without_sensitive_os_error_text(self):
         self.config.write_text("[features]\ndaemon_auto_start = true\n", encoding="utf-8")
         with mock.patch.object(
-            Path, "read_bytes", side_effect=PermissionError("secret config detail")
+            platforms, "read_regular_file_no_follow",
+            side_effect=PermissionError("secret config detail")
         ):
             with self.assertRaises(isolation.IsolationError) as raised:
                 isolation._disable_codex_daemon_auto_start(self.data_dir)
@@ -340,12 +341,10 @@ class TestCodexDaemonConfigEditing(BaseCase):
         external = self.fake_home / "external.toml"
         external.write_bytes(b'features = { a = 1 }\n')
         self.config.symlink_to(external)
-        isolation._disable_codex_daemon_auto_start(self.data_dir)
+        with self.assertRaises(isolation.IsolationError):
+            isolation._disable_codex_daemon_auto_start(self.data_dir)
         self.assertEqual(external.read_bytes(), b'features = { a = 1 }\n')
-        self.assertFalse(self.config.is_symlink())
-        self._assert_daemon_disabled(
-            b'features = { a = 1 }\n', self.config.read_bytes()
-        )
+        self.assertTrue(self.config.is_symlink())
 
     def test_build_overlay_surfaces_config_errors(self):
         store = Store()

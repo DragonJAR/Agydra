@@ -302,7 +302,7 @@ def usable_agy_credential(
     """
     path = agy_token_path(data_dir)
     try:
-        raw = path.read_bytes()
+        raw = platforms.read_regular_file_no_follow(path)
     except FileNotFoundError:
         raw = None
     except OSError:

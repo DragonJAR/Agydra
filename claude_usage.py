@@ -136,15 +136,11 @@ def _read_json_object(path: Path, limit: int) -> dict:
     import store as store_module
 
     try:
-        metadata = path.lstat()
-        linked = platforms.is_link(path, strict=True)
-        if not stat.S_ISREG(metadata.st_mode) or linked:
-            raise UsageCacheError("usage cache entry is not a regular file")
-        if metadata.st_size > limit:
-            raise UsageCacheError("usage cache entry exceeds its size limit")
-        return store_module.read_json_object(path)
-    except UsageCacheError:
-        raise
+        return store_module.read_json_object(path, max_bytes=limit)
+    except (platforms.FileLinkError, platforms.NonRegularFileError) as exc:
+        raise UsageCacheError("usage cache entry is not a regular file") from exc
+    except platforms.FileTooLargeError as exc:
+        raise UsageCacheError("usage cache entry exceeds its size limit") from exc
     except OSError as exc:
         raise UsageCacheError(f"cannot read usage cache entry ({exc})") from exc
     except (ValueError, RecursionError) as exc:

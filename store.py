@@ -208,7 +208,7 @@ def _retry_backoff(attempts: int, op, delay: float = 0.05) -> None:
             time.sleep(delay * (attempt + 1))
 
 
-def read_json_object(path: Path, *, tolerant: bool = False):
+def read_json_object(path: Path, *, tolerant: bool = False, max_bytes: Optional[int] = None):
     """Read a JSON file as a dict — the shared reader across modules.
 
     Default contract (``tolerant=False``) is strict: non-dict content or any
@@ -221,7 +221,7 @@ def read_json_object(path: Path, *, tolerant: bool = False):
     try:
         import locks
 
-        data = locks.json_loads_utf8(path.read_bytes())
+        data = locks.json_loads_utf8(platforms.read_regular_file_no_follow(path, max_bytes=max_bytes))
     except (OSError, ValueError):
         if tolerant:
             return None
@@ -498,7 +498,7 @@ def _zip_add_file(zf: "zipfile.ZipFile", path: Path, arcname: str) -> None:
         info.external_attr = (stat.S_IMODE(path.stat().st_mode) & 0xFFFF) << 16
     except OSError:
         info.external_attr = 0
-    with path.open("rb") as source, zf.open(info, "w") as target:
+    with platforms.open_regular_file_no_follow(path) as source, zf.open(info, "w") as target:
         shutil.copyfileobj(source, target)
 
 
@@ -2900,18 +2900,26 @@ class Store:
                         json.dumps(manifest, indent=2).encode("utf-8") + b"\n",
                     )
 
-        def verify(tmp: Path) -> None:
-            with zipfile.ZipFile(tmp) as zf:
-                bad = zf.testzip()
-                if bad is not None:
-                    raise StoreError(_store_text(
-                        "store.profile.backup_verification_failed", name=bad
-                    ))
-
-        _atomic_replace(backup_path, payload, verify)
+        _atomic_replace(backup_path, payload, self._verify_backup)
         if prune and dest is None:
             self._prune_backups(name, keep=self.BACKUP_RETENTION)
         return backup_path
+
+    def _verify_backup(self, path: Path) -> None:
+        """Reject unreadable or truncated archives before publication or deletion."""
+        try:
+            with platforms.open_regular_file_no_follow(path) as source:
+                with zipfile.ZipFile(source) as archive:
+                    bad = archive.testzip()
+                    if bad is not None:
+                        raise StoreError(_store_text(
+                            "store.profile.backup_verification_failed", name=bad
+                        ))
+        except (OSError, zipfile.BadZipFile, EOFError, shutil.ReadError) as exc:
+            cause = f"{path} ({type(exc).__name__})"
+            raise StoreError(_store_text(
+                "store.profile.backup_verification_failed", name=cause
+            )) from exc
 
     def _prune_backups(self, name: str, keep: int) -> None:
         """Keep only the newest ``keep`` zips for a profile.
