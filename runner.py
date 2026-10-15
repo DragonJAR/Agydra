@@ -39,6 +39,23 @@ class BinaryUnavailableError(StoreError):
         self.exit_code = exit_code
 
 
+class LaunchIdentityChangedError(StoreError):
+    """A prepared launch no longer names the profile identity it resolved."""
+
+    def __init__(self, plan: LaunchPlan, current: Profile) -> None:
+        from i18n import t
+
+        super().__init__(t(
+            "runner.identity.changed",
+            default="profile {name!r} changed after planning ({old_engine}/{old_seq} -> {engine}/{seq}); launch aborted",
+            name=plan.profile,
+            old_engine=plan.engine,
+            old_seq=plan.profile_seq,
+            engine=current.engine,
+            seq=current.seq,
+        ))
+
+
 def _existing_binary_candidate(value: str) -> Optional[Path]:
     cleaned = platforms.clean_path_value(value)
     if not cleaned:
@@ -155,6 +172,7 @@ class LaunchPlan:
     ignored_env: List[str] = field(default_factory=list)
     redirections: Dict[str, str] = field(default_factory=dict, repr=False)
     agy_file_auth: bool = False
+    profile_seq: Optional[int] = None
 
     def describe(self) -> str:
         if self.engine == "claude":
@@ -383,6 +401,7 @@ def build_plan(
         env_home_value=overlay,
         use_sandbox=use_sandbox,
         engine=driver.name,
+        profile_seq=profile.seq,
         engine_filter=engine.strip().lower() if engine else None,
         launch_as_child=launch_as_child,
         random_pick=random_pick,
@@ -496,9 +515,22 @@ def run(plan: LaunchPlan, store: Optional[Store] = None, dry_run: bool = False) 
         return _run_prepared(selected, store, rotation)
 
 
+def _validated_plan_profile(store: Store, plan: LaunchPlan) -> Profile:
+    """Revalidate through Store; bind sequence on first use of legacy manual plans."""
+    profile = store.get(plan.profile)
+    if profile.engine != plan.engine or (
+        plan.profile_seq is not None and profile.seq != plan.profile_seq
+    ):
+        raise LaunchIdentityChangedError(plan, profile)
+    if plan.profile_seq is None:
+        plan.profile_seq = profile.seq
+    return profile
+
+
 def _prepare_file_auth(
     store: Store, plan: LaunchPlan,
     slot_busy: Optional[keychain.KeychainBusyError] = None,
+    profile: Optional[Profile] = None,
 ) -> None:
     """Validate the private agy credential a file-auth launch will use.
 
@@ -508,8 +540,9 @@ def _prepare_file_auth(
     """
     if not plan.agy_file_auth or plan.launch_as_child:
         return
-    profile = store.get(plan.profile)
-    data_dir = store.profile_data_dir(plan.profile, engine=plan.engine)
+    if profile is None:
+        profile = _validated_plan_profile(store, plan)
+    data_dir = store.profile_data_dir(plan.profile, engine=plan.engine, profile=profile)
     try:
         isolation.prepare_agy_file_auth(store, profile, data_dir)
     except isolation.AgyCredentialUnavailableError as exc:
@@ -575,13 +608,14 @@ def _run_prepared(
         started = False
         try:
             try:
-                _prepare_file_auth(store, plan, slot_busy)
+                profile = _validated_plan_profile(store, plan)
+                _prepare_file_auth(store, plan, slot_busy, profile=profile)
                 membership = {"keychain": False} if plan.agy_file_auth else {}
                 joined = locks.acquire_lease(
                     store, plan.profile, patience_s=locks.LEASE_PATIENCE_S, max_holders=limit,
                     **membership,
                 )
-            except (locks.LockError, isolation.AgyCredentialUnavailableError) as exc:
+            except (locks.LockError, isolation.AgyCredentialUnavailableError, LaunchIdentityChangedError) as exc:
                 if plan.random_pick:
                     plan = _next_random_plan(store, plan, excluded, exc, rotation, causes)
                     continue
@@ -597,9 +631,9 @@ def _run_prepared(
                 raise
             leased = plan.profile
             try:
-                profile = store.get(plan.profile)
-                data_dir = store.profile_data_dir(plan.profile, engine=plan.engine)
-                _prepare_file_auth(store, plan, slot_busy)
+                profile = _validated_plan_profile(store, plan)
+                data_dir = store.profile_data_dir(plan.profile, engine=plan.engine, profile=profile)
+                _prepare_file_auth(store, plan, slot_busy, profile=profile)
                 profile.touch()
                 store.save(profile)
 
@@ -664,7 +698,7 @@ def _run_prepared(
                         raise StoreError(str(exc)) from exc
                     slot_busy = exc
                     plan = replace(plan, agy_file_auth=True)
-            except (isolation.IsolationError, isolation.AgyCredentialUnavailableError, locks.LockError) as prep_exc:
+            except (isolation.IsolationError, isolation.AgyCredentialUnavailableError, locks.LockError, LaunchIdentityChangedError) as prep_exc:
                 if plan.random_pick and not started:
                     plan = _next_random_plan(store, plan, excluded, prep_exc, rotation, causes)
                     continue

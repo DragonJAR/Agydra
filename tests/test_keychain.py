@@ -266,7 +266,7 @@ class TestFileAuthenticationSlotMembership(BaseCase):
             self.assertIsNone(keychain._load_slot_lease(self.store).owner)
 
 
-class TestLaunchGuardRestore(unittest.TestCase):
+class TestLaunchGuardRestore(BaseCase):
     """Regression: a launch exit must not discard a mid-session token refresh.
 
     Scenario: profile slot exists -> guard swaps it into the shared slot ->
@@ -278,9 +278,8 @@ class TestLaunchGuardRestore(unittest.TestCase):
 
     def _cycle(self, initial_shared: bytes | None):
         """Run one enter/(agy refresh)/exit cycle; return (store, keychain)."""
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        store = _StoreStub(Path(tmp.name))
+        store = Store(root=self.store_root)
+        store.create("alpha")
         kc = _MemoryKeychain(initial_shared)
         with mock.patch.object(keychain, "_run", kc.run), \
                 mock.patch.object(keychain, "supported", return_value=True), \
@@ -380,9 +379,8 @@ class TestLaunchGuardRestore(unittest.TestCase):
 
     def test_failure_to_swap_never_persists_foreign_token(self):
         """Fail-open swap: exit must not save the untouched shared token."""
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        store = _StoreStub(Path(tmp.name))
+        store = Store(root=self.store_root)
+        store.create("alpha")
         kc = _MemoryKeychain(b"someone-elsses-token")
 
         def exploding_run(args, input_bytes=None):
@@ -411,7 +409,7 @@ class TestLaunchGuardRestore(unittest.TestCase):
         self.assertEqual(keychain.load_profile_slot(store, "alpha"), pre_existing_envelope)
 
 
-class TestLaunchGuardExitReadSlotDedup(unittest.TestCase):
+class TestLaunchGuardExitReadSlotDedup(BaseCase):
     """``__exit__``'s restore branch must not read the shared slot twice for
     the exact same value: the ``_persist_if_trusted`` read (``current``) and
     the ``elif``'s own ``read_slot`` call cover the identical condition
@@ -419,9 +417,8 @@ class TestLaunchGuardExitReadSlotDedup(unittest.TestCase):
     the first read and restore -- a second read would be a pure repeat."""
 
     def test_exit_reads_shared_slot_at_most_once(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        store = _StoreStub(Path(tmp.name))
+        store = Store(root=self.store_root)
+        store.create("alpha")
         kc = _MemoryKeychain(None)
         keychain.save_profile_slot(
             store, "alpha",
@@ -1248,7 +1245,8 @@ class TestKeychainSlotFormat(BaseCase):
 
     def setUp(self):
         super().setUp()
-        self.store = _StoreStub(Path(self._tmp) / "store")
+        self.store = Store(root=self.store_root)
+        self.store.create("work")
         # Realistic shape: a captured login produces this exact envelope.
         payload = {
             "token": {

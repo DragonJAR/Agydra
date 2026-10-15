@@ -18,7 +18,7 @@ import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Mapping, Optional, Tuple, Union
+from typing import Iterator, Literal, Mapping, Optional, Tuple, Union
 
 import platforms
 import store
@@ -59,6 +59,30 @@ def same_email(first: object, second: object) -> bool:
     return left is not None and right is not None and left.casefold() == right.casefold()
 
 
+@dataclass(frozen=True)
+class IdentityAnchor:
+    """Identity evidence that distinguishes absence from failed verification."""
+
+    anchor: Optional[str]
+    status: Literal["present", "missing", "unverifiable"]
+    path: Optional[Path] = None
+    cause: Optional[str] = None
+
+
+class UnverifiableAnchorError(store.StoreError):
+    """An identity anchor could not be established without weakening trust."""
+
+    def __init__(self, result: IdentityAnchor) -> None:
+        from i18n import t
+
+        super().__init__(t(
+            "account.anchor.unverifiable",
+            default="cannot verify identity anchor at {path} ({cause}); refusing credential adoption",
+            path=result.path,
+            cause=result.cause or "unverifiable",
+        ))
+
+
 def trusted_identity(anchor: object, identity: object) -> bool:
     """Whether a detected credential identity may act for a profile.
 
@@ -66,8 +90,15 @@ def trusted_identity(anchor: object, identity: object) -> bool:
     a profile with a recorded email (``anchor``) only trusts a credential
     naming that same account, while a profile with no recorded email yet
     trusts the first identity detected for it (the bootstrap case of a
-    freshly logged-in profile). A blank identity is never trusted.
+    freshly logged-in profile). A blank identity or unverifiable typed
+    anchor is never trusted.
     """
+    if isinstance(anchor, IdentityAnchor):
+        if anchor.status not in ("present", "missing"):
+            return False
+        if anchor.status == "present" and normalize_email(anchor.anchor) is None:
+            return False
+        anchor = anchor.anchor
     if normalize_email(identity) is None:
         return False
     return normalize_email(anchor) is None or same_email(anchor, identity)
@@ -220,6 +251,65 @@ def agy_token_path(data_dir: Path, *, create_parent: bool = False) -> Path:
     return path
 
 
+def identity_anchor_for(
+    profile_store: store.Store,
+    name: Union[str, Profile],
+    data_dir: Optional[Path] = None,
+    *,
+    include_secret: bool = True,
+) -> IdentityAnchor:
+    """Read metadata, disk and backup evidence without treating failures as absence."""
+    scanned_profile = name if isinstance(name, Profile) else None
+    profile_name = scanned_profile.name if scanned_profile is not None else name
+    metadata_path = profile_store.root / "profiles" / profile_name / "profile.json"
+    try:
+        profile = (
+            profile_store.get(profile_name, profile=scanned_profile)
+            if scanned_profile is not None
+            else profile_store.get(profile_name)
+        )
+    except (store.StoreError, OSError, AttributeError) as exc:
+        return IdentityAnchor(None, "unverifiable", metadata_path, type(exc).__name__)
+    cached = normalize_email(getattr(profile, "email", None))
+    if cached is not None:
+        return IdentityAnchor(cached, "present")
+    if data_dir is None:
+        try:
+            data_dir = profile_store.profile_data_dir(profile_name, engine="agy")
+        except (store.StoreError, OSError, AttributeError) as exc:
+            return IdentityAnchor(None, "unverifiable", metadata_path, type(exc).__name__)
+    path = Path(data_dir) / AGY_CLI_DIR / TOKEN_FILE
+    try:
+        path = agy_token_path(data_dir)
+        raw = store.read_json_object(path)
+    except FileNotFoundError:
+        raw = None
+    except (OSError, RecursionError, ValueError, store.StoreError) as exc:
+        return IdentityAnchor(None, "unverifiable", path, type(exc).__name__)
+    if isinstance(raw, dict):
+        identity = email_from_raw(raw)
+        if identity is not None:
+            return IdentityAnchor(identity, "present")
+    if not include_secret:
+        return IdentityAnchor(None, "missing")
+    import keychain
+
+    path = keychain.slot_backup_path(profile_store, profile_name)
+    try:
+        _require_private_credential_path(path.parent, directory=True)
+        _require_private_credential_path(path)
+        secret = platforms.read_regular_file_no_follow(path)
+        decoded = keychain.decode_go_keyring_secret(secret)
+    except FileNotFoundError:
+        return IdentityAnchor(None, "missing")
+    except (store.StoreError, OSError, AttributeError, ValueError, RecursionError) as exc:
+        return IdentityAnchor(None, "unverifiable", path, type(exc).__name__)
+    if decoded is None:
+        return IdentityAnchor(None, "unverifiable", path, "InvalidCredential")
+    identity = email_from_raw(decoded)
+    return IdentityAnchor(identity, "present" if identity is not None else "missing")
+
+
 def anchor_for(
     profile_store: store.Store,
     name: Union[str, Profile],
@@ -227,45 +317,13 @@ def anchor_for(
     *,
     include_secret: bool = True,
 ) -> Optional[str]:
-    """Return identity evidence in metadata, disk credentials, then backup."""
-    scanned_profile = name if isinstance(name, Profile) else None
-    profile_name = scanned_profile.name if scanned_profile is not None else name
-    try:
-        profile = (
-            profile_store.get(profile_name, profile=scanned_profile)
-            if scanned_profile is not None
-            else profile_store.get(profile_name)
-        )
-    except (store.StoreError, OSError, AttributeError):
-        return None
-    cached = normalize_email(getattr(profile, "email", None))
-    if cached is not None:
-        return cached
-    if data_dir is None:
-        try:
-            data_dir = profile_store.profile_data_dir(profile_name, engine="agy")
-        except (store.StoreError, OSError, AttributeError):
-            data_dir = None
-    if data_dir is not None:
-        try:
-            path = agy_token_path(data_dir)
-            raw = store.read_json_object(path, tolerant=True)
-        except (OSError, RecursionError, ValueError, store.StoreError):
-            raw = None
-        if isinstance(raw, dict):
-            identity = email_from_raw(raw)
-            if identity is not None:
-                return identity
-    if not include_secret:
-        return None
-    try:
-        import keychain
-
-        secret = keychain.load_profile_slot(profile_store, profile_name)
-        decoded = keychain.decode_go_keyring_secret(secret)
-    except (store.StoreError, OSError, AttributeError, ValueError):
-        return None
-    return email_from_raw(decoded) if isinstance(decoded, dict) else None
+    """Compatibility reader: return verified evidence or raise a typed refusal."""
+    result = identity_anchor_for(
+        profile_store, name, data_dir, include_secret=include_secret
+    )
+    if result.status == "unverifiable":
+        raise UnverifiableAnchorError(result)
+    return result.anchor
 
 
 def write_agy_token(data_dir: Path, raw: bytes) -> Path:
@@ -320,7 +378,7 @@ def usable_agy_credential(
             return None
         identity = email_from_raw(decoded)
         if identity is not None and not trusted_identity(
-            anchor_for(profile_store, profile, data_dir), identity
+            identity_anchor_for(profile_store, profile, data_dir), identity
         ):
             return None
         return raw
@@ -335,7 +393,7 @@ def usable_agy_credential(
     except RecursionError:
         return None
     if not _usable_agy_token(decoded) or not trusted_identity(
-        anchor_for(profile_store, profile, data_dir), email_from_raw(decoded)
+        identity_anchor_for(profile_store, profile, data_dir), email_from_raw(decoded)
     ):
         return None
     return json.dumps(decoded, separators=(",", ":")).encode("utf-8")

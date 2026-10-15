@@ -1348,7 +1348,7 @@ def launch_guard(
                             others = [h for h in holders if h.pid != os.getpid()]
                             if not others:
                                 self._finalize_ownership(state)
-            except (KeychainError, OSError) as exc:
+            except (KeychainError, OSError, StoreError) as exc:
                 warn(f"keychain restore failed ({exc}); shared slot left as-is")
             finally:
                 self._abandon_membership()
@@ -1369,10 +1369,7 @@ def launch_guard(
             else:
                 has_content = True if capture else current
                 if has_content is not None:
-                    try:
-                        delete_slot(shared_slot(), self._keychain_path)
-                    except KeychainError:
-                        pass
+                    delete_slot(shared_slot(), self._keychain_path)
             _save_slot_lease(store, None, None)
 
         def _capture_and_keep(self):
