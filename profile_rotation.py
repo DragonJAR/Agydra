@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import math
-import stat
 import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import engines
 import locks
+from text import module_text
 import platforms
 import usage_snapshot
 from models import Profile, profile_identity
@@ -38,7 +38,11 @@ def lock_path(store: Store, engine: Optional[str]) -> Path:
 
 def _require_real_path(path: Path) -> None:
     if platforms.is_link(path, strict=True):
-        raise StoreError(f"rotation path must not be a link: {path}")
+        raise StoreError(module_text(
+            'profile_rotation.rotation_path_must_not_be_a_link',
+            'rotation path must not be a link: {path}',
+            path=path,
+        ))
 
 
 def _identity(profile: Profile) -> ProfileIdentity:
@@ -49,7 +53,7 @@ def _identity_key(profile: Profile) -> IdentityKey:
     return profile.engine, profile.seq, profile.name
 
 
-def _valid_identity(store: Store, scope: str, value: object) -> bool:
+def _valid_identity(scope: str, value: object) -> bool:
     if type(value) is int:
         return value > 0
     if not isinstance(value, str) or not value.startswith("legacy:"):
@@ -63,73 +67,72 @@ def _valid_identity(store: Store, scope: str, value: object) -> bool:
     if scope != ALL_SCOPE and engine != scope:
         return False
     try:
-        store.validate_name(name)
+        Store.validate_name(name)
     except StoreError:
         return False
     return name == name.lower()
+
+
+class RotationStateError(StoreError):
+    """A rotation document or its scope cannot be trusted."""
+
+
+def _validate_rotation_doc(raw: object, path: Path) -> Set[ProfileIdentity]:
+    """Validate one document without I/O, retaining positive and legacy identities."""
+    name = path.name
+    if not name.startswith("profile-rotation-") or not name.endswith(".json"):
+        raise RotationStateError(module_text('profile_rotation.unexpected_rotation_state_filename', 'unexpected rotation state filename'))
+    scope = name[len("profile-rotation-"):-5]
+    if scope != ALL_SCOPE and scope not in engines.SUPPORTED_ENGINES:
+        raise RotationStateError(module_text(
+            'profile_rotation.unsupported_rotation_scope',
+            'unsupported rotation scope {scope!r}',
+            scope=scope,
+        ))
+    if not isinstance(raw, dict):
+        raise RotationStateError(module_text('profile_rotation.invalid_schema_or_profile_identity', 'invalid schema or profile identity'))
+    used = raw.get("used")
+    if (
+        type(raw.get("version")) is not int
+        or raw.get("version") != 1
+        or raw.get("engine") != scope
+        or not isinstance(used, list)
+        or any(not _valid_identity(scope, value) for value in used)
+        or len(used) != len(set(used))
+    ):
+        raise RotationStateError(module_text('profile_rotation.invalid_schema_or_profile_identity', 'invalid schema or profile identity'))
+    return set(used)
 
 
 def _read_used(
     store: Store, scope: str, *, repair: bool = False
 ) -> Set[ProfileIdentity]:
     path = state_path(store, scope)
-    issue = state_file_issue(store, path)
-    if issue is not None:
+    try:
+        return _validate_rotation_doc(read_json_object(path), path)
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError, RotationStateError) as exc:
         if repair and store.repair_persistent_state(path, lock_held=True):
             return set()
         raise StoreError(
-            f"invalid rotation state {path} ({issue}); run `agydra doctor --fix`"
-        )
-    try:
-        document = read_json_object(path)
-    except FileNotFoundError:
-        return set()
-    except (OSError, ValueError) as exc:
-        raise StoreError(f"cannot read rotation state {path} ({exc})") from exc
-    used = document.get("used")
-    if (
-        type(document.get("version")) is not int
-        or document.get("version") != 1
-        or document.get("engine") != scope
-        or not isinstance(used, list)
-        or any(not _valid_identity(store, scope, value) for value in used)
-        or len(used) != len(set(used))
-    ):
-        raise StoreError(f"invalid rotation state: {path}")
-    return set(used)
+            module_text(
+                'profile_rotation.invalid_rotation_state_run_agydra_doctor_fix',
+                'invalid rotation state {path} ({exc}); run `agydra doctor --fix`',
+                path=path,
+                exc=exc,
+            )
+        ) from exc
 
 
 def state_file_issue(store: Store, path: Path) -> Optional[str]:
-    """Validate rotation state through the shared bounded no-follow JSON reader."""
-    path = Path(path)
+    """Adapt the shared reader and pure validator for persistent-state diagnosis."""
     try:
-        info = path.lstat()
+        _validate_rotation_doc(read_json_object(Path(path)), Path(path))
     except FileNotFoundError:
         return None
-    except OSError as exc:
-        return f"cannot inspect file ({exc})"
-    if not stat.S_ISREG(info.st_mode) or platforms.is_link(path, strict=True):
-        return "path is not a regular file"
-    name = path.name
-    if not name.startswith("profile-rotation-") or not name.endswith(".json"):
-        return "unexpected rotation state filename"
-    scope = name[len("profile-rotation-"):-5]
-    if scope != ALL_SCOPE and scope not in engines.SUPPORTED_ENGINES:
-        return f"unsupported rotation scope {scope!r}"
-    try:
-        document = read_json_object(path)
-    except (OSError, RecursionError, ValueError) as exc:
-        return f"unreadable or corrupt JSON ({exc})"
-    used = document.get("used")
-    if (
-        type(document.get("version")) is not int
-        or document.get("version") != 1
-        or document.get("engine") != scope
-        or not isinstance(used, list)
-        or any(not _valid_identity(store, scope, value) for value in used)
-        or len(used) != len(set(used))
-    ):
-        return "invalid schema or profile identity"
+    except (OSError, ValueError, RotationStateError) as exc:
+        return str(exc)
     return None
 
 
@@ -178,7 +181,7 @@ class Rotation:
                     _require_real_path(path.parent)
                     _require_real_path(path)
                     return locks.try_lock_path(
-                        path, f"{scope} profile rotation lock"
+                        path, module_text('profile_rotation.lock_description', '{scope} profile rotation lock', scope=scope)
                     )
 
                 handle = locks.wait_for(
@@ -186,13 +189,22 @@ class Rotation:
                 )
                 if handle is None:
                     raise StoreError(
-                        f"{scope} profile rotation is busy; retry in a moment"
+                        module_text(
+                            'profile_rotation.profile_rotation_is_busy_retry_in_a_moment',
+                            '{scope} profile rotation is busy; retry in a moment',
+                            scope=scope,
+                        )
                     )
                 self.handles.append(handle)
         except OSError as exc:
             self.release()
             raise StoreError(
-                f"cannot lock {self.scope} profile rotation ({exc})"
+                module_text(
+                    'profile_rotation.cannot_lock_profile_rotation',
+                    'cannot lock {scope} profile rotation ({exc})',
+                    scope=self.scope,
+                    exc=exc,
+                )
             ) from exc
         except BaseException:
             self.release()
@@ -237,16 +249,29 @@ class Rotation:
             if self.scope == ALL_SCOPE or profile.engine == self.scope
         ]
         if not candidates:
-            raise StoreError(f"no eligible {self.scope} profile for rotation")
+            raise StoreError(module_text(
+                'profile_rotation.no_eligible_profile_for_rotation',
+                'no eligible {scope} profile for rotation',
+                scope=self.scope,
+            ))
         return _choose(self.store, candidates, self, exclude, eligible, priority)
 
     def commit(self, profile: Profile) -> None:
         if self.handles == [] or self.selected is None:
-            raise StoreError("profile rotation has no locked selection")
+            raise StoreError(module_text(
+                'profile_rotation.profile_rotation_has_no_locked_selection',
+                'profile rotation has no locked selection',
+            ))
         if _identity_key(profile) != _identity_key(self.selected):
-            raise StoreError("profile identity changed during rotation preparation")
+            raise StoreError(module_text(
+                'profile_rotation.profile_identity_changed_during_rotation_preparation',
+                'profile identity changed during rotation preparation',
+            ))
         if self.scope != ALL_SCOPE and profile.engine != self.scope:
-            raise StoreError("profile engine changed during rotation preparation")
+            raise StoreError(module_text(
+                'profile_rotation.profile_engine_changed_during_rotation_preparation',
+                'profile engine changed during rotation preparation',
+            ))
         path = state_path(self.store, self.scope)
         _require_real_path(path)
         try:
@@ -257,7 +282,12 @@ class Rotation:
             })
         except OSError as exc:
             raise StoreError(
-                f"cannot save {self.scope} profile rotation ({exc})"
+                module_text(
+                    'profile_rotation.cannot_save_profile_rotation',
+                    'cannot save {scope} profile rotation ({exc})',
+                    scope=self.scope,
+                    exc=exc,
+                )
             ) from exc
         self.release()
 
@@ -272,7 +302,10 @@ def _choose(
 ) -> Profile:
     candidates = profiles
     if not candidates:
-        raise NoEligibleProfileError("no profile remains in the rotation scope")
+        raise NoEligibleProfileError(module_text(
+            'profile_rotation.no_profile_remains_in_the_rotation_scope',
+            'no profile remains in the rotation scope',
+        ))
     used = _read_used(store, rotation.scope, repair=bool(rotation.handles))
     quotas = rotation.quota_for(candidates)
     order = {}
@@ -319,9 +352,15 @@ def _choose(
             return selected(profile, reset=not blocked)
     if blocked:
         raise RotationCycleExhaustedError(
-            "no untried unused profile remains in the rotation scope"
+            module_text(
+                'profile_rotation.no_untried_unused_profile_remains_in_the_rotation_scope',
+                'no untried unused profile remains in the rotation scope',
+            )
         )
-    raise NoEligibleProfileError("no eligible profile remains in the rotation scope")
+    raise NoEligibleProfileError(module_text(
+        'profile_rotation.no_eligible_profile_remains_in_the_rotation_scope',
+        'no eligible profile remains in the rotation scope',
+    ))
 
 
 def preview(

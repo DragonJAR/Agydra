@@ -28,6 +28,7 @@ import tempfile
 from pathlib import Path
 from typing import List, NamedTuple, Optional, Tuple
 
+from text import module_text
 import platforms
 import store
 from models import Profile
@@ -74,7 +75,12 @@ def _reject_link(path: Path, message: str) -> None:
     try:
         linked = platforms.is_link(path, strict=True)
     except OSError as exc:
-        raise IsolationError(f"cannot inspect {path} ({exc}); refusing to continue") from exc
+        raise IsolationError(module_text(
+            'isolation.cannot_inspect_refusing_to_continue',
+            'cannot inspect {path} ({exc}); refusing to continue',
+            path=path,
+            exc=exc,
+        )) from exc
     if linked:
         raise IsolationError(message)
 
@@ -250,14 +256,21 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
                     store.rmtree(link)
                 except OSError as exc:
                     raise IsolationError(
-                        f"could not remove stale overlay link {link} to "
-                        f"mirror the real ancestor directory {entry}: {exc}"
+                        module_text(
+                            'isolation.could_not_remove_stale_overlay_link_to_mirror_the',
+                            'could not remove stale overlay link {link} to mirror the real ancestor directory {entry}: {exc}',
+                            link=link,
+                            entry=entry,
+                            exc=exc,
+                        )
                     ) from exc
             if link.exists() and not link.is_dir():
                 raise IsolationError(
-                    f"overlay entry {link} is a real file, not the "
-                    "expected mirrored directory; refusing to break "
-                    "isolation — remove it manually or recreate the profile"
+                    module_text(
+                        'isolation.overlay_entry_is_a_real_file_not_the_expected',
+                        'overlay entry {link} is a real file, not the expected mirrored directory; refusing to break isolation — remove it manually or recreate the profile',
+                        link=link,
+                    )
                 )
             platforms.ensure_dir(link)
             _mirror_dir(entry, link, level + 1, ctx)
@@ -310,25 +323,41 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
     data_dir = Path(data_dir)
     if _is_link(real_dir) or not real_dir.is_dir():
         raise IsolationError(
-            f"cannot migrate {real_dir}: expected a real directory "
-            "(a link there means nothing needs recovering)"
+            module_text(
+                'isolation.cannot_migrate_expected_a_real_directory_a_link_there',
+                'cannot migrate {real_dir}: expected a real directory (a link there means nothing needs recovering)',
+                real_dir=real_dir,
+            )
         )
     if not data_dir.is_dir():
         raise IsolationError(
-            f"cannot migrate {real_dir}: profile data dir {data_dir} does "
-            "not exist yet (create the profile first)"
+            module_text(
+                'isolation.cannot_migrate_profile_data_dir_does_not_exist_yet',
+                'cannot migrate {real_dir}: profile data dir {data_dir} does not exist yet (create the profile first)',
+                real_dir=real_dir,
+                data_dir=data_dir,
+            )
         )
     if _is_link(data_dir):
         raise IsolationError(
-            f"cannot migrate {real_dir}: profile data dir {data_dir} "
-            "must not be a symlink or junction"
+            module_text(
+                'isolation.cannot_migrate_profile_data_dir_must_not_be_a',
+                'cannot migrate {real_dir}: profile data dir {data_dir} must not be a symlink or junction',
+                real_dir=real_dir,
+                data_dir=data_dir,
+            )
         )
 
     try:
         entries = list(real_dir.iterdir())
     except OSError as exc:
         raise IsolationError(
-            f"could not list entries in {real_dir}: {exc}"
+            module_text(
+                'isolation.could_not_list_entries_in',
+                'could not list entries in {real_dir}: {exc}',
+                real_dir=real_dir,
+                exc=exc,
+            )
         ) from exc
 
     def files_are_identical(source: Path, target: Path) -> bool:
@@ -345,25 +374,36 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
         for entry in real_dir.rglob("*"):
             if _is_link(entry):
                 raise IsolationError(
-                    f"cannot migrate {entry}: real_dir must not contain "
-                    "symlinks or junctions (isolation invariant); remove it "
-                    "manually and re-run `agydra doctor --fix`"
+                    module_text(
+                        'isolation.cannot_migrate_real_dir_must_not_contain_symlinks_or',
+                        'cannot migrate {entry}: real_dir must not contain symlinks or junctions (isolation invariant); remove it manually and re-run `agydra doctor --fix`',
+                        entry=entry,
+                    )
                 )
             target = data_dir / entry.relative_to(real_dir)
             if _is_link(target):
                 raise IsolationError(
-                    f"cannot migrate {entry}: profile data target {target} is "
-                    "a symlink or junction (isolation invariant)"
+                    module_text(
+                        'isolation.cannot_migrate_profile_data_target_is_a_symlink_or',
+                        'cannot migrate {entry}: profile data target {target} is a symlink or junction (isolation invariant)',
+                        entry=entry,
+                        target=target,
+                    )
                 )
             if not target.exists():
                 continue
             if entry.is_dir() != target.is_dir():
-                target_type = "directory" if target.is_dir() else "file"
-                source_type = "directory" if entry.is_dir() else "file"
+                target_type = module_text('isolation.entry_type.directory', 'directory') if target.is_dir() else module_text('isolation.entry_type.file', 'file')
+                source_type = module_text('isolation.entry_type.directory', 'directory') if entry.is_dir() else module_text('isolation.entry_type.file', 'file')
                 raise IsolationError(
-                    f"cannot migrate {entry}: a {target_type} already exists "
-                    f"at {target} (type mismatch with source {source_type}); "
-                    "resolve manually and re-run `agydra doctor --fix`"
+                    module_text(
+                        'isolation.cannot_migrate_a_already_exists_at_type_mismatch_with',
+                        'cannot migrate {entry}: a {target_type} already exists at {target} (type mismatch with source {source_type}); resolve manually and re-run `agydra doctor --fix`',
+                        entry=entry,
+                        target_type=target_type,
+                        target=target,
+                        source_type=source_type,
+                    )
                 )
             if (
                 entry.is_file()
@@ -371,9 +411,12 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
                 and not files_are_identical(entry, target)
             ):
                 raise IsolationError(
-                    f"cannot migrate {entry}: a file with different contents "
-                    f"already exists at {target} (file-to-file collision); "
-                    "resolve manually and re-run `agydra doctor --fix`"
+                    module_text(
+                        'isolation.cannot_migrate_a_file_with_different_contents_already_exists',
+                        'cannot migrate {entry}: a file with different contents already exists at {target} (file-to-file collision); resolve manually and re-run `agydra doctor --fix`',
+                        entry=entry,
+                        target=target,
+                    )
                 )
 
         for entry in entries:
@@ -382,13 +425,21 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
                 for descendant in target.rglob("*"):
                     if _is_link(descendant):
                         raise IsolationError(
-                            f"cannot migrate {entry}: profile data target "
-                            f"contains symlink or junction {descendant}"
+                            module_text(
+                                'isolation.cannot_migrate_profile_data_target_contains_symlink_or_junction',
+                                'cannot migrate {entry}: profile data target contains symlink or junction {descendant}',
+                                entry=entry,
+                                descendant=descendant,
+                            )
                         )
     except OSError as exc:
         raise IsolationError(
-            f"could not validate overlay data in {real_dir} ({exc}); "
-            "no migration data was changed"
+            module_text(
+                'isolation.could_not_validate_overlay_data_in_no_migration_data',
+                'could not validate overlay data in {real_dir} ({exc}); no migration data was changed',
+                real_dir=real_dir,
+                exc=exc,
+            )
         ) from exc
 
     def copy_file(source: str, destination: str) -> str:
@@ -402,9 +453,12 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
             ):
                 return str(destination_path)
             raise IsolationError(
-                f"cannot migrate {source_path}: conflicting data exists at "
-                f"{destination_path}; resolve manually and re-run "
-                "`agydra doctor --fix`"
+                module_text(
+                    'isolation.cannot_migrate_conflicting_data_exists_at_resolve_manually_and',
+                    'cannot migrate {source_path}: conflicting data exists at {destination_path}; resolve manually and re-run `agydra doctor --fix`',
+                    source_path=source_path,
+                    destination_path=destination_path,
+                )
             )
 
         descriptor, temporary_name = tempfile.mkstemp(
@@ -443,9 +497,12 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
                 copy_file(str(entry), str(target))
     except OSError as exc:
         raise IsolationError(
-            f"could not copy overlay data from {real_dir} into the profile "
-            f"store ({exc}); the source remains intact — fix the cause and "
-            "re-run `agydra doctor --fix`"
+            module_text(
+                'isolation.could_not_copy_overlay_data_from_into_the_profile',
+                'could not copy overlay data from {real_dir} into the profile store ({exc}); the source remains intact — fix the cause and re-run `agydra doctor --fix`',
+                real_dir=real_dir,
+                exc=exc,
+            )
         ) from exc
 
     removal_error = ""
@@ -455,9 +512,13 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
         removal_error = f" ({exc})"
     if os.path.lexists(real_dir):
         raise IsolationError(
-            f"all overlay data was copied into {data_dir}, but source cleanup "
-            f"failed for {real_dir}{removal_error}; fix the cause and re-run "
-            "`agydra doctor --fix`"
+            module_text(
+                'isolation.all_overlay_data_was_copied_into_but_source_cleanup',
+                'all overlay data was copied into {data_dir}, but source cleanup failed for {real_dir}{removal_error}; fix the cause and re-run `agydra doctor --fix`',
+                data_dir=data_dir,
+                real_dir=real_dir,
+                removal_error=removal_error,
+            )
         )
 
 
@@ -476,31 +537,50 @@ def validate_claude_config_dir(config_dir: Path) -> Path:
     for candidate in (config_dir, config_dir.parent):
         _reject_link(
             candidate,
-            f"claude config path {candidate} must not be a symlink or junction; "
-            "refusing to risk aliasing the real ~/.claude",
+            module_text(
+                'isolation.claude_config_path_must_not_be_a_symlink_or',
+                'claude config path {candidate} must not be a symlink or junction; refusing to risk aliasing the real ~/.claude',
+                candidate=candidate,
+            ),
         )
     real_claude = platforms.claude_data_dir()
     if os.path.lexists(real_claude) and os.path.lexists(config_dir):
         real_identity = _identity(real_claude)
         if real_identity is not None and _identity(config_dir) == real_identity:
             raise IsolationError(
-                f"claude config directory {config_dir} is the real {real_claude}; "
-                "refusing to break isolation"
+                module_text(
+                    'isolation.claude_config_directory_is_the_real_refusing_to_break',
+                    'claude config directory {config_dir} is the real {real_claude}; refusing to break isolation',
+                    config_dir=config_dir,
+                    real_claude=real_claude,
+                )
             )
         resolved = platforms.canonical_path(config_dir)
         real_resolved = platforms.canonical_path(real_claude)
         if resolved.is_relative_to(real_resolved) or real_resolved.is_relative_to(resolved):
             raise IsolationError(
-                f"claude config directory {config_dir} overlaps the real {real_claude}"
+                module_text(
+                    'isolation.claude_config_directory_overlaps_the_real',
+                    'claude config directory {config_dir} overlaps the real {real_claude}',
+                    config_dir=config_dir,
+                    real_claude=real_claude,
+                )
             )
     if os.path.lexists(config_dir) and not config_dir.is_dir():
-        raise IsolationError(f"claude config path {config_dir} is not a directory")
+        raise IsolationError(module_text(
+            'isolation.claude_config_path_is_not_a_directory',
+            'claude config path {config_dir} is not a directory',
+            config_dir=config_dir,
+        ))
     for filename in CLAUDE_OWNED_STATE_FILES:
         entry = config_dir / filename
         _reject_link(
             entry,
-            f"claude state file {entry} must be a regular file owned by the "
-            "profile, not a symlink or junction",
+            module_text(
+                'isolation.claude_state_file_must_be_a_regular_file_owned',
+                'claude state file {entry} must be a regular file owned by the profile, not a symlink or junction',
+                entry=entry,
+            ),
         )
     return config_dir
 
@@ -527,18 +607,31 @@ def prepare_claude_config_dir(data_dir: Path) -> Path:
                 chmod_reason = _safe_os_error_reason(exc)
                 verify_reason = _safe_os_error_reason(verify_exc)
                 raise IsolationError(
-                    f"cannot verify private permissions for Claude config directory "
-                    f"{data_dir} after chmod failed ({chmod_reason}; {verify_reason})"
+                    module_text(
+                        'isolation.cannot_verify_private_permissions_for_claude_config_directory_after_reason_verify_reason',
+                        'cannot verify private permissions for Claude config directory {data_dir} after chmod failed ({chmod_reason}; {verify_reason})',
+                        data_dir=data_dir,
+                        chmod_reason=chmod_reason,
+                        verify_reason=verify_reason,
+                    )
                 ) from None
             if linked or not stat.S_ISDIR(metadata.st_mode):
                 raise IsolationError(
-                    f"cannot verify private permissions for Claude config directory "
-                    f"{data_dir} after chmod failed ({_safe_os_error_reason(exc)})"
+                    module_text(
+                        'isolation.cannot_verify_private_permissions_for_claude_config_directory_after',
+                        'cannot verify private permissions for Claude config directory {data_dir} after chmod failed ({error_reason})',
+                        data_dir=data_dir,
+                        error_reason=_safe_os_error_reason(exc),
+                    )
                 ) from None
             if stat.S_IMODE(metadata.st_mode) & 0o077:
                 raise IsolationError(
-                    f"Claude config directory {data_dir} still grants group or other "
-                    f"permissions after chmod failed ({_safe_os_error_reason(exc)})"
+                    module_text(
+                        'isolation.claude_config_directory_still_grants_group_or_other_permissions',
+                        'Claude config directory {data_dir} still grants group or other permissions after chmod failed ({error_reason})',
+                        data_dir=data_dir,
+                        error_reason=_safe_os_error_reason(exc),
+                    )
                 ) from None
     return validate_claude_config_dir(data_dir)
 
@@ -559,8 +652,11 @@ def validate_overlay_roots(name: str, data_dir: Path, store_root: Path) -> Path:
     for candidate in (overlays_root, overlay):
         _reject_link(
             candidate,
-            f"overlay path {candidate} must not be a symlink or junction; "
-            "refusing to write outside the profile store",
+            module_text(
+                'isolation.overlay_path_must_not_be_a_symlink_or_junction',
+                'overlay path {candidate} must not be a symlink or junction; refusing to write outside the profile store',
+                candidate=candidate,
+            ),
         )
     chain = [data_dir, data_dir.parent]
     if store_root in data_dir.parents:
@@ -568,8 +664,11 @@ def validate_overlay_roots(name: str, data_dir: Path, store_root: Path) -> Path:
     for candidate in chain:
         _reject_link(
             candidate,
-            f"profile data path {candidate} must not be a symlink or junction; "
-            "refusing to write outside the profile store",
+            module_text(
+                'isolation.profile_data_path_must_not_be_a_symlink_or',
+                'profile data path {candidate} must not be a symlink or junction; refusing to write outside the profile store',
+                candidate=candidate,
+            ),
         )
     return overlay
 
@@ -613,12 +712,11 @@ def build_overlay(name: str, data_dir: Path, store_root: Path, engine: str = "ag
         store.rmtree(data_link)
     if data_link.exists() and not _is_link(data_link):
         raise IsolationError(
-            f"overlay entry {data_link} is a real directory/file, not the "
-            "expected link to the profile store; refusing to break "
-            "isolation — run `agydra doctor --fix` to migrate its contents "
-            "into the profile store and relink automatically (preserves data), "
-            "or remove it manually / recreate the profile "
-            "(destructive: discards whatever the overlay directory contains)"
+            module_text(
+                'isolation.overlay_entry_is_a_real_directory_file_not_the',
+                'overlay entry {data_link} is a real directory/file, not the expected link to the profile store; refusing to break isolation — run `agydra doctor --fix` to migrate its contents into the profile store and relink automatically (preserves data), or remove it manually / recreate the profile (destructive: discards whatever the overlay directory contains)',
+                data_link=data_link,
+            )
         )
     if not _is_link(data_link):
         try:
@@ -665,12 +763,21 @@ def _prepare_agy_file_auth(
             raw = account.usable_agy_credential(profile_store, current, data_dir)
         except store.StoreError:
             raise AgyCredentialUntrustedError(
-                f"unsafe private Antigravity credential path for profile {current.name!r} at {data_dir}"
+                module_text(
+                    'isolation.unsafe_private_antigravity_credential_path_for_profile_at',
+                    'unsafe private Antigravity credential path for profile {name!r} at {data_dir}',
+                    name=current.name,
+                    data_dir=data_dir,
+                )
             ) from None
         if raw is None:
             raise AgyCredentialUntrustedError(
-                f"no trusted Antigravity credential for profile {current.name!r} "
-                f"at {path}; authenticate that profile with agydra login"
+                module_text(
+                    'isolation.no_trusted_antigravity_credential_for_profile_at_authenticate_that',
+                    'no trusted Antigravity credential for profile {name!r} at {path}; authenticate that profile with agydra login',
+                    name=current.name,
+                    path=path,
+                )
             )
         if path.exists():
             metadata = path.lstat()
@@ -685,17 +792,28 @@ def _prepare_agy_file_auth(
         handle = locks.try_mutation_lock(profile_store, profile.name)
         if handle is None:
             raise AgyCredentialBusyError(
-                f"cannot prepare private Antigravity credentials for live profile "
-                f"{profile.name!r}; finish its sessions before retrying"
+                module_text(
+                    'isolation.cannot_prepare_private_antigravity_credentials_for_live_profile_finish',
+                    'cannot prepare private Antigravity credentials for live profile {name!r}; finish its sessions before retrying',
+                    name=profile.name,
+                )
             )
         try:
             current = profile_store.get(profile.name)
             if (current.seq, current.engine, current.created) != (
                 profile.seq, profile.engine, profile.created
             ):
-                raise IsolationError(f"profile {profile.name!r} changed during authentication preparation")
+                raise IsolationError(module_text(
+                    'isolation.profile_changed_during_authentication_preparation',
+                    'profile {name!r} changed during authentication preparation',
+                    name=profile.name,
+                ))
             if profile_store.profile_data_dir(current.name, engine="agy") != Path(data_dir):
-                raise IsolationError(f"profile {profile.name!r} authentication path changed")
+                raise IsolationError(module_text(
+                    'isolation.profile_authentication_path_changed',
+                    'profile {name!r} authentication path changed',
+                    name=profile.name,
+                ))
             path, raw = ready(current)
             if path is not None:
                 return path
@@ -710,19 +828,36 @@ def _prepare_agy_file_auth(
             checked, _raw = ready(current)
             if checked is None:
                 raise AgyCredentialUntrustedError(
-                    f"cannot verify private Antigravity credential permissions: {path}"
+                    module_text(
+                        'isolation.cannot_verify_private_antigravity_credential_permissions',
+                        'cannot verify private Antigravity credential permissions: {path}',
+                        path=path,
+                    )
                 )
             return checked
         finally:
             handle.release()
     except OSError as exc:
         raise IsolationError(
-            f"cannot prepare private Antigravity credentials at {data_dir} "
-            f"({_safe_os_error_reason(exc)})"
+            module_text(
+                'isolation.cannot_prepare_private_antigravity_credentials_at',
+                'cannot prepare private Antigravity credentials at {data_dir} ({error_reason})',
+                data_dir=data_dir,
+                error_reason=_safe_os_error_reason(exc),
+            )
         ) from None
 
 
 _AF_UNIX_PATH_MAX = 103
+
+
+def grok_leader_socket_target(overlay_path: Path, data_dir_name: str = ".grok") -> Path:
+    """Choose the socket destination without inspecting or changing the filesystem."""
+    preferred = Path(overlay_path) / data_dir_name / "leader.sock"
+    if platforms.is_windows() or len(os.fsencode(preferred)) <= _AF_UNIX_PATH_MAX:
+        return preferred
+    digest = hashlib.sha256(os.fsencode(preferred)).hexdigest()[:16]
+    return Path(f"/tmp/agydra-{os.getuid()}") / f"{digest}.sock"
 
 
 def grok_leader_socket(overlay: Path, data_dir_name: str = ".grok") -> str:
@@ -735,13 +870,10 @@ def grok_leader_socket(overlay: Path, data_dir_name: str = ".grok") -> str:
     the socket never lands in the host ``~/.grok``.
     """
     preferred = overlay / data_dir_name / "leader.sock"
-    preferred_s = str(preferred)
-    if platforms.is_windows() or len(os.fsencode(preferred_s)) <= _AF_UNIX_PATH_MAX:
-        return preferred_s
-    uid = os.getuid()
-    digest = hashlib.sha256(os.fsencode(preferred_s)).hexdigest()[:16]
-    sock_dir = _private_unix_socket_dir(uid)
-    sock = sock_dir / f"{digest}.sock"
+    sock = grok_leader_socket_target(overlay, data_dir_name)
+    if sock == preferred:
+        return str(sock)
+    _private_unix_socket_dir(os.getuid())
     _reclaim_owned_socket(sock)
     return str(sock)
 
@@ -758,7 +890,11 @@ def _private_unix_socket_dir(uid: int) -> Path:
         os.chmod(path, 0o700)
         _require_private_dir(path, uid)
         if stat.S_IMODE(path.lstat().st_mode) != 0o700:
-            raise IsolationError(f"refusing grok leader socket dir {path}: mode is not 0700")
+            raise IsolationError(module_text(
+                'isolation.refusing_grok_leader_socket_dir_mode_is_not',
+                'refusing grok leader socket dir {path}: mode is not 0700',
+                path=path,
+            ))
     return path
 
 
@@ -767,10 +903,20 @@ def _require_private_dir(path: Path, uid: int) -> None:
         st = path.lstat()
         linked = platforms.is_link(path, strict=True)
     except OSError as exc:
-        raise IsolationError(f"refusing grok leader socket dir {path}: {exc}") from exc
+        raise IsolationError(module_text(
+            'isolation.refusing_grok_leader_socket_dir',
+            'refusing grok leader socket dir {path}: {exc}',
+            path=path,
+            exc=exc,
+        )) from exc
     if linked or not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
         raise IsolationError(
-            f"refusing grok leader socket dir {path}: not a private directory owned by uid {uid}"
+            module_text(
+                'isolation.refusing_grok_leader_socket_dir_not_a_private_directory',
+                'refusing grok leader socket dir {path}: not a private directory owned by uid {uid}',
+                path=path,
+                uid=uid,
+            )
         )
 
 
@@ -864,7 +1010,7 @@ def _scan_toml_quoted(text: str, index: int) -> int:
                 _decode_toml_basic_string(text[index + 1 : cursor])
             return cursor + 1
         cursor += 1
-    raise ValueError("unterminated string")
+    raise ValueError(module_text('isolation.unterminated_string', 'unterminated string'))
 
 
 def _scan_toml_multiline(text: str, index: int) -> int:
@@ -873,7 +1019,7 @@ def _scan_toml_multiline(text: str, index: int) -> int:
     while True:
         found = text.find(delimiter, cursor)
         if found < 0:
-            raise ValueError("unterminated multi-line string")
+            raise ValueError(module_text('isolation.unterminated_multi_line_string', 'unterminated multi-line string'))
         if delimiter == '"""':
             backslashes = 0
             while found - 1 - backslashes >= index + 3 and text[found - 1 - backslashes] == "\\":
@@ -913,14 +1059,14 @@ def _decode_toml_basic_string(raw: str, multiline: bool = False) -> str:
             continue
         cursor += 1
         if cursor >= len(raw):
-            raise ValueError("invalid escape in quoted key")
+            raise ValueError(module_text('isolation.invalid_escape_in_quoted_key', 'invalid escape in quoted key'))
         marker = raw[cursor]
         if multiline and marker in " \t\r\n":
             start = cursor
             while cursor < len(raw) and raw[cursor] in " \t\r\n":
                 cursor += 1
             if "\n" not in raw[start:cursor]:
-                raise ValueError("invalid multiline continuation")
+                raise ValueError(module_text('isolation.invalid_multiline_continuation', 'invalid multiline continuation'))
             continue
         if marker in _TOML_SIMPLE_ESCAPES:
             decoded.append(_TOML_SIMPLE_ESCAPES[marker])
@@ -929,10 +1075,17 @@ def _decode_toml_basic_string(raw: str, multiline: bool = False) -> str:
         width = {"u": 4, "U": 8}.get(marker)
         digits = raw[cursor + 1 : cursor + 1 + (width or 0)]
         if width is None or len(digits) != width or any(c not in string.hexdigits for c in digits):
-            raise ValueError(f"invalid escape \\{marker} in quoted key")
+            raise ValueError(module_text(
+                'isolation.invalid_escape_in_quoted_key_in_quoted_key',
+                'invalid escape \\{marker} in quoted key',
+                marker=marker,
+            ))
         code_point = int(digits, 16)
         if 0xD800 <= code_point <= 0xDFFF or code_point > 0x10FFFF:
-            raise ValueError("invalid unicode scalar value in basic string")
+            raise ValueError(module_text(
+                'isolation.invalid_unicode_scalar_value_in_basic_string',
+                'invalid unicode scalar value in basic string',
+            ))
         decoded.append(chr(code_point))
         cursor += 1 + width
     return "".join(decoded)
@@ -943,7 +1096,7 @@ def _parse_toml_key(text: str, index: int) -> Tuple[Tuple[str, ...], int]:
     while True:
         index = _skip_toml_blanks(text, index)
         if index >= len(text):
-            raise ValueError("unexpected end of key")
+            raise ValueError(module_text('isolation.unexpected_end_of_key', 'unexpected end of key'))
         character = text[index]
         if character in "\"'":
             end = _scan_toml_quoted(text, index)
@@ -955,7 +1108,7 @@ def _parse_toml_key(text: str, index: int) -> Tuple[Tuple[str, ...], int]:
             while end < len(text) and text[end] in _BARE_KEY_CHARS:
                 end += 1
             if end == index:
-                raise ValueError("invalid key")
+                raise ValueError(module_text('isolation.invalid_key', 'invalid key'))
             parts.append(text[index:end])
             index = end
         index = _skip_toml_blanks(text, index)
@@ -988,7 +1141,7 @@ def _scan_toml_value(text: str, index: int, inline: bool = False) -> Tuple[int, 
                 break
             depth -= 1
             if depth < 0:
-                raise ValueError("unbalanced brackets")
+                raise ValueError(module_text('isolation.unbalanced_brackets', 'unbalanced brackets'))
         elif character == "\n" and depth == 0 and not inline:
             break
         elif character == "," and depth == 0 and inline:
@@ -997,7 +1150,7 @@ def _scan_toml_value(text: str, index: int, inline: bool = False) -> Tuple[int, 
             last = cursor + 1
         cursor += 1
     if depth != 0:
-        raise ValueError("unterminated array or inline table")
+        raise ValueError(module_text('isolation.unterminated_array_or_inline_table', 'unterminated array or inline table'))
     return last, cursor
 
 
@@ -1023,10 +1176,10 @@ def _toml_statements(text: str) -> List[_TomlStatement]:
             closing = "]]" if array else "]"
             path, cursor = _parse_toml_key(text, cursor + len(closing))
             if not text.startswith(closing, cursor):
-                raise ValueError("unterminated table header")
+                raise ValueError(module_text('isolation.unterminated_table_header', 'unterminated table header'))
             cursor = _skip_toml_blanks(text, cursor + len(closing))
             if cursor < len(text) and text[cursor] not in "#\r\n":
-                raise ValueError("unexpected text after table header")
+                raise ValueError(module_text('isolation.unexpected_text_after_table_header', 'unexpected text after table header'))
             end = _end_of_toml_line(text, cursor)
             statements.append(
                 _TomlStatement("array-header" if array else "header", start, end, path, cursor, cursor)
@@ -1036,11 +1189,11 @@ def _toml_statements(text: str) -> List[_TomlStatement]:
         path, cursor = _parse_toml_key(text, cursor)
         cursor = _skip_toml_blanks(text, cursor)
         if cursor >= len(text) or text[cursor] != "=":
-            raise ValueError("expected '=' after key")
+            raise ValueError(module_text('isolation.expected_after_key', "expected '=' after key"))
         value_start = _skip_toml_blanks(text, cursor + 1)
         value_end, cursor = _scan_toml_value(text, value_start)
         if value_end == value_start:
-            raise ValueError("missing value")
+            raise ValueError(module_text('isolation.missing_value', 'missing value'))
         end = _end_of_toml_line(text, cursor)
         statements.append(_TomlStatement("key", start, end, path, value_start, value_end))
         cursor = end
@@ -1050,7 +1203,7 @@ def _toml_statements(text: str) -> List[_TomlStatement]:
 def _inline_table_with_daemon_disabled(text: str, statement: _TomlStatement) -> str:
     start, end = statement.value_start, statement.value_end
     if text[start] != "{" or text[end - 1] != "}":
-        raise ValueError(f"{_FEATURES_TABLE} must be a table")
+        raise ValueError(module_text('isolation.must_be_a_table', '{table} must be a table', table=_FEATURES_TABLE))
     limit = end - 1
     cursor = start + 1
     entries: List[Tuple[Tuple[str, ...], int, int]] = []
@@ -1063,7 +1216,7 @@ def _inline_table_with_daemon_disabled(text: str, statement: _TomlStatement) -> 
         path, cursor = _parse_toml_key(text, cursor)
         cursor = _skip_toml_blanks(text, cursor)
         if cursor >= limit or text[cursor] != "=":
-            raise ValueError("expected '=' in inline table")
+            raise ValueError(module_text('isolation.expected_in_inline_table', "expected '=' in inline table"))
         value_start = _skip_toml_blanks(text, cursor + 1)
         value_end, cursor = _scan_toml_value(text, value_start, inline=True)
         entries.append((path, value_start, value_end))
@@ -1091,7 +1244,7 @@ def _with_daemon_auto_start_disabled(content: str) -> str:
     for statement in _toml_statements(text):
         if statement.kind == "array-header":
             if statement.path == (_FEATURES_TABLE,):
-                raise ValueError(f"{_FEATURES_TABLE} must be a table")
+                raise ValueError(module_text('isolation.must_be_a_table', '{table} must be a table', table=_FEATURES_TABLE))
             table = statement.path + ("[]",)
             continue
         if statement.kind == "header":
@@ -1104,7 +1257,7 @@ def _with_daemon_auto_start_disabled(content: str) -> str:
             setting = setting or statement
         elif full == (_FEATURES_TABLE,):
             if text[statement.value_start] != "{":
-                raise ValueError(f"{_FEATURES_TABLE} must be a table")
+                raise ValueError(module_text('isolation.must_be_a_table', '{table} must be a table', table=_FEATURES_TABLE))
             inline = inline or statement
         elif not table and statement.path[0] == _FEATURES_TABLE:
             dotted = True
@@ -1147,33 +1300,57 @@ def _disable_codex_daemon_auto_start(data_dir: Path) -> None:
             store.atomic_write_text(cfg, "[features]\ndaemon_auto_start = false\n")
         except (OSError, ValueError) as exc:
             raise IsolationError(
-                f"cannot create Codex config {cfg} ({_safe_os_error_reason(exc)})"
+                module_text(
+                    'isolation.cannot_create_codex_config',
+                    'cannot create Codex config {cfg} ({error_reason})',
+                    cfg=cfg,
+                    error_reason=_safe_os_error_reason(exc),
+                )
             ) from None
         return
     except OSError as exc:
         raise IsolationError(
-            f"cannot inspect Codex config {cfg} ({_safe_os_error_reason(exc)})"
+            module_text(
+                'isolation.cannot_inspect_codex_config',
+                'cannot inspect Codex config {cfg} ({error_reason})',
+                cfg=cfg,
+                error_reason=_safe_os_error_reason(exc),
+            )
         ) from None
     try:
         raw = platforms.read_regular_file_no_follow(cfg)
     except OSError as exc:
         raise IsolationError(
-            f"cannot read Codex config {cfg} ({_safe_os_error_reason(exc)})"
+            module_text(
+                'isolation.cannot_read_codex_config',
+                'cannot read Codex config {cfg} ({error_reason})',
+                cfg=cfg,
+                error_reason=_safe_os_error_reason(exc),
+            )
         ) from None
     try:
         content = raw.decode("utf-8")
         updated = _with_daemon_auto_start_disabled(content)
     except ValueError as exc:
         raise IsolationError(
-            f"cannot disable the Codex daemon: {cfg} is not a usable TOML file "
-            f"({exc}); fix or remove it"
+            module_text(
+                'isolation.cannot_disable_the_codex_daemon_is_not_a_usable',
+                'cannot disable the Codex daemon: {cfg} is not a usable TOML file ({exc}); fix or remove it',
+                cfg=cfg,
+                exc=exc,
+            )
         ) from exc
     if updated != content:
         try:
             store.atomic_write_text(cfg, updated)
         except (OSError, ValueError) as exc:
             raise IsolationError(
-                f"cannot write Codex config {cfg} ({_safe_os_error_reason(exc)})"
+                module_text(
+                    'isolation.cannot_write_codex_config',
+                    'cannot write Codex config {cfg} ({error_reason})',
+                    cfg=cfg,
+                    error_reason=_safe_os_error_reason(exc),
+                )
             ) from None
 
 

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import AbstractSet, Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, TypeVar, Union
 
+from text import module_text
 import platforms
 import vocab
 from models import Config, Profile, _utcnow_iso, normalize_engine
@@ -229,11 +230,20 @@ def read_json_object(path: Path, *, tolerant: bool = False, max_bytes: Optional[
     except RecursionError as exc:
         if tolerant:
             return None
-        raise ValueError(f"{path.name}: JSON nesting exceeds the supported depth") from exc
+        raise ValueError(module_text(
+            'store.json_nesting_exceeds_the_supported_depth',
+            '{name}: JSON nesting exceeds the supported depth',
+            name=path.name,
+        )) from exc
     if not isinstance(data, dict):
         if tolerant:
             return None
-        raise ValueError(f"{path.name}: expected a JSON object, got {type(data).__name__}")
+        raise ValueError(module_text(
+            'store.expected_a_json_object_got',
+            '{name}: expected a JSON object, got {type_name}',
+            name=path.name,
+            type_name=type(data).__name__,
+        ))
     return data
 
 
@@ -267,7 +277,7 @@ def _chmod_path_without_following(
         or current.st_ino != inode
         or platforms.is_link(path, strict=True)
     ):
-        raise OSError(errno.EBUSY, "path identity changed during cleanup", str(path))
+        raise OSError(errno.EBUSY, module_text('store.path_identity_changed_during_cleanup', 'path identity changed during cleanup'), str(path))
     if os.chmod in os.supports_follow_symlinks:
         os.chmod(path, mode, follow_symlinks=False)
     else:
@@ -278,7 +288,7 @@ def _chmod_path_without_following(
         or updated.st_ino != inode
         or platforms.is_link(path, strict=True)
     ):
-        raise OSError(errno.EBUSY, "path identity changed during cleanup", str(path))
+        raise OSError(errno.EBUSY, module_text('store.path_identity_changed_during_cleanup', 'path identity changed during cleanup'), str(path))
 
 
 def _restore_rmtree_modes(
@@ -304,7 +314,7 @@ def _restore_rmtree_modes(
             failures.append(
                 (
                     path,
-                    OSError(errno.EBUSY, "path identity changed during cleanup", str(path)),
+                    OSError(errno.EBUSY, module_text('store.path_identity_changed_during_cleanup', 'path identity changed during cleanup'), str(path)),
                 )
             )
             continue
@@ -325,15 +335,25 @@ def _raise_rmtree_failure(
     if cleanup_error is not None and restore_errors:
         details = "; ".join(f"{target}: {error}" for target, error in restore_errors)
         raise OSError(
-            f"could not remove {path} ({cleanup_error}); could not restore "
-            f"original permissions ({details})"
+            module_text(
+                'store.could_not_remove_could_not_restore_original_permissions',
+                'could not remove {path} ({cleanup_error}); could not restore original permissions ({details})',
+                path=path,
+                cleanup_error=cleanup_error,
+                details=details,
+            )
         ) from cleanup_error
     if cleanup_error is not None:
         raise cleanup_error
     if restore_errors:
         details = "; ".join(f"{target}: {error}" for target, error in restore_errors)
         raise OSError(
-            f"could not restore original permissions after removing {path} ({details})"
+            module_text(
+                'store.could_not_restore_original_permissions_after_removing',
+                'could not restore original permissions after removing {path} ({details})',
+                path=path,
+                details=details,
+            )
         ) from restore_errors[0][1]
 
 
@@ -343,7 +363,11 @@ def _verify_rmtree_directory(path: Path, original, current) -> None:
         or not os.path.samestat(original, current)
         or platforms.is_link(path, strict=True)
     ):
-        raise OSError(f"{path} changed while retrying recursive removal")
+        raise OSError(module_text(
+            'store.changed_while_retrying_recursive_removal',
+            '{path} changed while retrying recursive removal',
+            path=path,
+        ))
 
 
 def _verify_rmtree_directory_identity(path: Path, original) -> None:
@@ -366,7 +390,10 @@ def _raise_rmtree_callback_error(excinfo) -> None:
         if isinstance(error, BaseException):
             traceback = excinfo[2] if len(excinfo) > 2 else None
             raise error.with_traceback(traceback)
-    raise OSError("recursive removal callback omitted its original error")
+    raise OSError(module_text(
+        'store.recursive_removal_callback_omitted_its_original_error',
+        'recursive removal callback omitted its original error',
+    ))
 
 
 def _retry_rmtree_callback(
@@ -446,7 +473,7 @@ def _require_rmtree_removed(path: Path) -> None:
         path.lstat()
     except FileNotFoundError:
         return
-    raise OSError(f"could not fully remove {path}")
+    raise OSError(module_text('store.could_not_fully_remove', 'could not fully remove {path}', path=path))
 
 
 def _tree_has_entries(root: Path) -> bool:
@@ -610,9 +637,45 @@ def _profile_missing_message(name: str) -> str:
     return _store_text("store.profile.missing", name=name)
 
 
+_STORE_ACTION_KEYS = {'creating': 'store.action.creating',
+ 'renaming': 'store.action.renaming',
+ 'deleting': 'store.action.deleting',
+ 'recovering': 'store.action.recovering',
+ 'recovering rename': 'store.action.recovering_rename',
+ 'updating configuration': 'store.action.updating_configuration',
+ 'checking a profile': 'store.action.checking_a_profile',
+ 'reading a profile': 'store.action.reading_a_profile',
+ 'reading profiles': 'store.action.reading_profiles',
+ 'reading the default profile': 'store.action.reading_the_default_profile',
+ 'setting the default profile': 'store.action.setting_the_default_profile',
+ 'repairing configuration': 'store.action.repairing_configuration',
+ 'repairing profile sequence': 'store.action.repairing_profile_sequence'}
+
+
+_STORE_LABEL_KEYS = {'profiles root': 'store.label.profiles_root',
+ 'directory': 'store.label.directory',
+ 'metadata': 'store.label.metadata',
+ 'data': 'store.label.data',
+ 'profile sequence': 'store.label.profile_sequence'}
+
+
+def _store_action_text(action: str) -> str:
+    key = _STORE_ACTION_KEYS.get(action)
+    return action if key is None else module_text(key, action)
+
+
+def _store_label_text(label: str) -> str:
+    key = _STORE_LABEL_KEYS.get(label)
+    return label if key is None else module_text(key, label)
+
+
 def _store_text(key: str, **values: object) -> str:
     import i18n
 
+    if "action" in values:
+        values["action"] = _store_action_text(str(values["action"]))
+    if isinstance(values.get("subject"), str) and values["subject"] in _STORE_LABEL_KEYS:
+        values["subject"] = _store_label_text(str(values["subject"]))
     return i18n.t(key, **values)
 
 
@@ -691,7 +754,11 @@ def remove_link(path: Path) -> None:
     except FileNotFoundError:
         return
     if not platforms.is_link(path, strict=True):
-        raise OSError(f"refusing to remove non-link as a link: {path}")
+        raise OSError(module_text(
+            'store.refusing_to_remove_non_link_as_a_link',
+            'refusing to remove non-link as a link: {path}',
+            path=path,
+        ))
     directory_attribute = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
     attributes = getattr(metadata, "st_file_attributes", 0)
     is_directory_link = bool(attributes & directory_attribute) or stat.S_ISDIR(
@@ -725,9 +792,17 @@ class Store:
         cls, action: str, handler: Callable[["Store", str, str, dict], None]
     ) -> None:
         if not isinstance(action, str) or not _RENAME_ACTION_RE.fullmatch(action):
-            raise StoreError(f"invalid rename recovery action {action!r}")
+            raise StoreError(module_text(
+                'store.invalid_rename_recovery_action',
+                'invalid rename recovery action {action!r}',
+                action=action,
+            ))
         if not callable(handler):
-            raise StoreError(f"rename recovery handler for {action!r} is not callable")
+            raise StoreError(module_text(
+                'store.rename_recovery_handler_for_is_not_callable',
+                'rename recovery handler for {action!r} is not callable',
+                action=action,
+            ))
         cls._rename_recovery_handlers[action] = handler
 
     @property
@@ -841,7 +916,7 @@ class Store:
             scope = Path(path).name[len("profile-rotation-"):-5]
             handle = locks.try_lock_path(
                 profile_rotation.lock_path(self, scope),
-                f"{scope} profile rotation repair lock",
+                module_text('store.rotation.repair_lock', '{scope} profile rotation repair lock', scope=scope),
             )
             if handle is None:
                 raise StoreError(_store_text("store.rotation.busy", scope=scope))
@@ -902,21 +977,25 @@ class Store:
             )) from exc
         return self.quarantine_state_bytes(path, raw)
 
-    def _configuration_state_issue(self) -> Optional[str]:
+    def _read_validated_config(self) -> Tuple[Config, Optional[str]]:
+        """Return one validated snapshot and its diagnostic without rereading JSON."""
         path = self.config_path
         try:
             info = path.lstat()
         except FileNotFoundError:
-            return None
+            return Config(), None
         except OSError as exc:
-            return _store_text("store.config.issue_inspect", path=path, error=exc)
+            return Config(), _store_text("store.config.issue_inspect", path=path, error=exc)
         if not stat.S_ISREG(info.st_mode) or platforms.is_link(path, strict=True):
-            return _store_text("store.config.issue_not_regular", path=path)
+            return Config(), _store_text("store.config.issue_not_regular", path=path)
         try:
-            Config.from_dict(read_json_object(path))
+            config = Config.from_dict(read_json_object(path))
         except (OSError, ValueError, TypeError, AttributeError) as exc:
-            return _store_text("store.config.issue_corrupt", path=path, error=exc)
-        return None
+            return Config(), _store_text("store.config.issue_corrupt", path=path, error=exc)
+        return config, None
+
+    def _configuration_state_issue(self) -> Optional[str]:
+        return self._read_validated_config()[1]
 
     def _repair_configuration_state(self, replacement: Optional[Any] = None) -> bool:
         issue = self._configuration_state_issue()
@@ -946,12 +1025,12 @@ class Store:
         try:
             profiles, unreadable = self._scan(tolerant=True)
         except (StoreError, OSError) as exc:
-            diagnostic = f"surviving max seq=unknown ({type(exc).__name__})"
+            diagnostic = module_text('store.sequence.maximum_unknown', 'surviving max seq=unknown ({error_type})', error_type=type(exc).__name__)
         else:
             maximum = max((profile.seq for profile in profiles), default=0)
-            diagnostic = f"surviving max seq={maximum}"
+            diagnostic = module_text('store.sequence.maximum', 'surviving max seq={maximum}', maximum=maximum)
             if unreadable:
-                diagnostic += f"; unreadable profiles={', '.join(unreadable)}"
+                diagnostic += module_text('store.sequence.unreadable_profiles', '; unreadable profiles={names}', names=', '.join(unreadable))
         return StoreError(_store_text(
             "store.sequence.unreadable",
             path=self.sequence_state_path,
@@ -1069,7 +1148,7 @@ class Store:
         return locks.reset_unreadable_registry(self, name)
 
     def load_config(self) -> Config:
-        issue = self._configuration_state_issue()
+        config, issue = self._read_validated_config()
         if issue is not None:
             if not getattr(self, "_config_warned", False):
                 warn(_store_text(
@@ -1078,20 +1157,7 @@ class Store:
                     error=issue,
                 ))
                 self._config_warned = True
-            return Config()
-        if self.config_path.exists():
-            try:
-                return Config.from_dict(read_json_object(self.config_path))
-            except (OSError, ValueError, TypeError, AttributeError) as exc:
-                if not getattr(self, "_config_warned", False):
-                    warn(_store_text(
-                        "store.config.corrupt_warning",
-                        path=self.config_path,
-                        error=exc,
-                    ))
-                    self._config_warned = True
-                return Config()
-        return Config()
+        return config
 
     def save_config(self, config: Config) -> None:
         if not self._config_writable():
@@ -1115,26 +1181,16 @@ class Store:
         releases the lock; a busy lock fails with ``StoreError`` once the
         shared read patience (:data:`READ_LOCK_PATIENCE_S`) expires."""
         if not callable(mutator):
-            raise StoreError("configuration mutator must be callable")
+            raise StoreError(module_text('store.configuration_mutator_must_be_callable', 'configuration mutator must be callable'))
 
         def operation() -> Config:
-            issue = self._configuration_state_issue()
-            if issue is None:
-                try:
-                    config = Config.from_dict(read_json_object(self.config_path))
-                except FileNotFoundError:
-                    config = Config()
-                except (OSError, ValueError, TypeError, AttributeError) as exc:
-                    raise StoreError(_store_text(
-                        "store.config.read_failed",
-                        path=self.config_path,
-                        error=exc,
-                    )) from exc
-            else:
-                config = Config()
+            config, issue = self._read_validated_config()
             mutator(config)
             if not isinstance(config, Config):
-                raise StoreError("configuration mutator must leave a Config instance")
+                raise StoreError(module_text(
+                    'store.configuration_mutator_must_leave_a_config_instance',
+                    'configuration mutator must leave a Config instance',
+                ))
             if issue is None:
                 self._write_config(config)
             else:
@@ -1172,10 +1228,11 @@ class Store:
     def _require_real_filesystem_path(
         self, path: Path, label: str, profile_name: Optional[str] = None
     ) -> None:
+        label = _store_label_text(label)
         try:
             linked = platforms.is_link(path, strict=True)
         except OSError as exc:
-            subject = f"profile {profile_name!r} {label}" if profile_name else label
+            subject = module_text('store.path.profile_subject', 'profile {name!r} {label}', name=profile_name, label=label) if profile_name else label
             raise StoreError(_store_text(
                 "store.path.inspect_failed",
                 subject=subject,
@@ -1183,7 +1240,7 @@ class Store:
                 error=exc,
             )) from exc
         if linked:
-            subject = f"profile {profile_name!r} {label}" if profile_name else label
+            subject = module_text('store.path.profile_subject', 'profile {name!r} {label}', name=profile_name, label=label) if profile_name else label
             raise StoreError(_store_text(
                 "store.path.symlink_refused", subject=subject, path=path
             ))
@@ -1217,13 +1274,17 @@ class Store:
     ) -> str:
         name = raw.get("name")
         if not isinstance(name, str):
-            raise ValueError("metadata profile name must be a string")
+            raise ValueError(module_text('store.metadata_profile_name_must_be_a_string', 'metadata profile name must be a string'))
         try:
             self.validate_name(name)
         except StoreError as exc:
-            raise ValueError(f"metadata contains an invalid profile name {name!r}") from exc
+            raise ValueError(module_text(
+                'store.metadata_contains_an_invalid_profile_name',
+                'metadata contains an invalid profile name {name!r}',
+                name=name,
+            )) from exc
         if expected_name is not None and name != expected_name:
-            raise ValueError("metadata name does not match its directory")
+            raise ValueError(module_text('store.metadata_name_does_not_match_its_directory', 'metadata name does not match its directory'))
         return name
 
     def profile_data_dir(
@@ -1527,9 +1588,9 @@ class Store:
             ) from exc
         if handle is None:
             if action == "creating":
-                message = "profile sequence allocation is busy; sequence lock is busy"
+                message = module_text('store.sequence.allocation_busy', 'profile sequence allocation is busy; sequence lock is busy')
             else:
-                message = "profile sequence lock is busy"
+                message = module_text('store.sequence.busy_detail', 'profile sequence lock is busy')
             raise StoreError(_store_text(
                 "store.sequence.lock_busy", message=message, action=action
             ))
@@ -2394,12 +2455,17 @@ class Store:
                     except locks.LockError as exc:
                         raise StoreError(
                             cannot_safely_proceed_message(
-                                action, f"profile {name!r}", exc
+                                action, module_text('store.profile.subject', 'profile {name!r}', name=name), exc
                             )
                         ) from exc
                     if handle is None:
                         raise ProfileBusyError(
-                            f"profile {name!r} has a live session; end it before {action}"
+                            module_text(
+                                'store.profile_has_a_live_session_end_it_before',
+                                'profile {name!r} has a live session; end it before {action}',
+                                name=name,
+                                action=_store_action_text(action),
+                            )
                         )
                     handles.append(handle)
                 try:
@@ -3012,10 +3078,10 @@ class Store:
             and ref not in _WINDOWS_RESERVED_NAMES
             and ref not in vocab.RESERVED_NAMES
         )
-        hint = f" — create it with: agydra create {ref}" if can_create else ""
+        hint = module_text('store.profile.create_hint', ' — create it with: agydra create {ref}', ref=ref) if can_create else ""
         raise StoreError(_store_text(
             "store.profile.unknown_ref",
             ref=ref,
-            names=", ".join(names) or "(none)",
+            names=", ".join(names) or module_text('store.profile.none', '(none)'),
             hint=hint,
         ))

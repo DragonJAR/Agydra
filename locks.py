@@ -102,6 +102,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, TypeVar
 
+from text import module_text
 import platforms
 
 def json_loads_utf8(raw: bytes) -> object:
@@ -405,11 +406,11 @@ def _write_in_place(fd: int, payload: bytes) -> None:
         while view:
             written = os.write(fd, view)
             if written <= 0:
-                raise LockError("short write on lock descriptor")
+                raise LockError(module_text('locks.short_write_on_lock_descriptor', 'short write on lock descriptor'))
             view = view[written:]
         os.ftruncate(fd, len(payload))
     except OSError as exc:
-        raise LockError(f"cannot update lock descriptor ({exc})") from exc
+        raise LockError(module_text('locks.cannot_update_lock_descriptor', 'cannot update lock descriptor ({exc})', exc=exc)) from exc
 
 
 def _write_holders(fd: int, holders: List[Holder]) -> None:
@@ -449,9 +450,13 @@ def _lock_read_brief(fd: int) -> bool:
 REGISTRY_ISSUE_BUSY = "is busy during validation"
 
 
+class RegistryBusyIssue(str):
+    """Localized busy diagnostics retain a locale-independent classification."""
+
+
 def registry_issue_is_busy(issue: Optional[str]) -> bool:
     """True iff the persistent issue indicates lock contention rather than corruption."""
-    return bool(issue and REGISTRY_ISSUE_BUSY in issue)
+    return isinstance(issue, RegistryBusyIssue) or bool(issue and REGISTRY_ISSUE_BUSY in issue)
 
 
 def lease_registry_state_issue(store, name: str) -> Optional[str]:
@@ -462,27 +467,27 @@ def lease_registry_state_issue(store, name: str) -> Optional[str]:
     except FileNotFoundError:
         return None
     except OSError as exc:
-        return f"cannot inspect {path} ({exc})"
+        return module_text('locks.cannot_inspect', 'cannot inspect {path} ({exc})', path=path, exc=exc)
     if not stat.S_ISREG(info.st_mode) or platforms.is_link(path, strict=True):
-        return f"{path} is not a regular file"
+        return module_text('locks.is_not_a_regular_file', '{path} is not a regular file', path=path)
     flags = os.O_RDWR if platforms.is_windows() else os.O_RDONLY
     try:
         fd = os.open(path, flags)
     except OSError as exc:
-        return f"cannot open {path} ({exc})"
+        return module_text('locks.cannot_open', 'cannot open {path} ({exc})', path=path, exc=exc)
     locked = False
     try:
         locked = _lock_read_brief(fd)
         if not locked:
-            return f"{path} {REGISTRY_ISSUE_BUSY}"
+            return RegistryBusyIssue(module_text('locks.registry_busy', '{path} is busy during validation', path=path))
         if not _same_file(fd, path):
-            return f"{path} changed during validation"
+            return module_text('locks.changed_during_validation', '{path} changed during validation', path=path)
         try:
             parsed = _parse_holders(_read_all(fd))
         except OSError as exc:
-            return f"cannot read {path} ({exc})"
+            return module_text('locks.cannot_read', 'cannot read {path} ({exc})', path=path, exc=exc)
         if parsed is None:
-            return f"{path} has an unreadable registry"
+            return module_text('locks.has_an_unreadable_registry', '{path} has an unreadable registry', path=path)
         return None
     finally:
         if locked:
@@ -501,13 +506,23 @@ def repair_unreadable_registry(store, name: str, path: Path, fd: int) -> bool:
             return False
         raw = _read_all(fd)
     except OSError as exc:
-        raise LockError(f"cannot inspect lease registry {path} ({exc})") from exc
+        raise LockError(module_text(
+            'locks.cannot_inspect_lease_registry',
+            'cannot inspect lease registry {path} ({exc})',
+            path=path,
+            exc=exc,
+        )) from exc
     if _parse_holders(raw) is not None:
         return False
     try:
         store.quarantine_state_bytes(path, raw)
     except Exception as exc:
-        raise LockError(f"cannot preserve unreadable lease registry {path} ({exc})") from exc
+        raise LockError(module_text(
+            'locks.cannot_preserve_unreadable_lease_registry',
+            'cannot preserve unreadable lease registry {path} ({exc})',
+            path=path,
+            exc=exc,
+        )) from exc
     _write_holders(fd, [])
     return True
 
@@ -617,7 +632,7 @@ def acquire_lease(
     the conservative legacy default for a new holder.
     """
     if keychain is not None and not isinstance(keychain, bool):
-        raise LockError("invalid lease authentication membership")
+        raise LockError(module_text('locks.invalid_lease_authentication_membership', 'invalid lease authentication membership'))
     path = lock_path(store, name)
 
     def join() -> Optional[int]:
@@ -632,7 +647,7 @@ def acquire_lease(
                     return None
                 parsed = _parse_holders(_read_all(fd))
                 if parsed is None:
-                    raise LockError(f"cannot decode live lease registry {path}")
+                    raise LockError(module_text('locks.cannot_decode_live_lease_registry', 'cannot decode live lease registry {path}', path=path))
                 holders = _prune_holders(parsed)
                 sessions = [holder for holder in holders if not holder.is_reader]
                 previous = next(
@@ -666,8 +681,13 @@ def acquire_lease(
                 session_count = sum(not holder.is_reader for holder in merged)
                 if max_holders is not None and session_count >= max_holders:
                     raise LeaseLimitError(
-                        f"profile {name!r} already has {session_count} live "
-                        f"session(s) (limit of {max_holders})"
+                        module_text(
+                            'locks.profile_already_has_live_session_s_limit_of',
+                            'profile {name!r} already has {count} live session(s) (limit of {limit})',
+                            name=name,
+                            count=session_count,
+                            limit=max_holders,
+                        )
                     )
                 merged.append(entry)
                 _write_holders(fd, merged)
@@ -679,7 +699,7 @@ def acquire_lease(
 
     joined = wait_for(join, patience_s)
     if joined is None:
-        raise LockError(f"cannot acquire lease lock {path}")
+        raise LockError(module_text('locks.cannot_acquire_lease_lock', 'cannot acquire lease lock {path}', path=path))
     return joined
 
 
@@ -702,7 +722,7 @@ def release_lease(store, name: str, patience_s: float = 0.0) -> None:
         except FileNotFoundError:
             return True
         except OSError as exc:
-            raise LockError(f"cannot open lease {path} ({exc})") from exc
+            raise LockError(module_text('locks.cannot_open_lease', 'cannot open lease {path} ({exc})', path=path, exc=exc)) from exc
         try:
             if not _try_lock_fd(fd):
                 return None
@@ -711,7 +731,7 @@ def release_lease(store, name: str, patience_s: float = 0.0) -> None:
                     return None
                 parsed = _parse_holders(_read_all(fd))
                 if parsed is None:
-                    raise LockError(f"cannot decode live lease registry {path}")
+                    raise LockError(module_text('locks.cannot_decode_live_lease_registry', 'cannot decode live lease registry {path}', path=path))
                 holders = _prune_holders(parsed)
                 remaining = [
                     holder for holder in holders
@@ -725,7 +745,7 @@ def release_lease(store, name: str, patience_s: float = 0.0) -> None:
             os.close(fd)
 
     if wait_for(leave, patience_s) is None:
-        raise LockError(f"cannot acquire lease lock {path}")
+        raise LockError(module_text('locks.cannot_acquire_lease_lock', 'cannot acquire lease lock {path}', path=path))
 
 
 def acquire_read_lease(
@@ -745,7 +765,7 @@ def acquire_read_lease(
                     return None
                 parsed = _parse_holders(_read_all(fd))
                 if parsed is None:
-                    raise LockError(f"cannot decode live lease registry {path}")
+                    raise LockError(module_text('locks.cannot_decode_live_lease_registry', 'cannot decode live lease registry {path}', path=path))
                 holders = _prune_holders(parsed)
                 reader_id = str(uuid.uuid4())
                 holders.append(
@@ -781,7 +801,7 @@ def release_read_lease(
         except FileNotFoundError:
             return True
         except OSError as exc:
-            raise LockError(f"cannot open lease {path} ({exc})") from exc
+            raise LockError(module_text('locks.cannot_open_lease', 'cannot open lease {path} ({exc})', path=path, exc=exc)) from exc
         try:
             if not _try_lock_fd(fd):
                 return None
@@ -790,7 +810,7 @@ def release_read_lease(
                     return None
                 parsed = _parse_holders(_read_all(fd))
                 if parsed is None:
-                    raise LockError(f"cannot decode live lease registry {path}")
+                    raise LockError(module_text('locks.cannot_decode_live_lease_registry', 'cannot decode live lease registry {path}', path=path))
                 holders = _prune_holders(parsed)
                 remaining = [
                     holder
@@ -809,18 +829,18 @@ def release_read_lease(
             os.close(fd)
 
     if wait_for(leave_reader, patience_s) is None:
-        raise LockError(f"cannot release profile read lease {path}")
+        raise LockError(module_text('locks.cannot_release_profile_read_lease', 'cannot release profile read lease {path}', path=path))
 
 
 def normalize_usage_session_id(session_id: object) -> str:
     if not isinstance(session_id, str):
-        raise ValueError("usage session id must be a UUID string")
+        raise ValueError(module_text('locks.usage_session_id_must_be_a_uuid_string', 'usage session id must be a UUID string'))
     try:
         canonical = str(uuid.UUID(session_id))
     except (ValueError, AttributeError, TypeError) as exc:
-        raise ValueError("usage session id must be a canonical UUID") from exc
+        raise ValueError(module_text('locks.usage_session_id_must_be_a_canonical_uuid', 'usage session id must be a canonical UUID')) from exc
     if session_id.lower() != canonical:
-        raise ValueError("usage session id must be a canonical UUID")
+        raise ValueError(module_text('locks.usage_session_id_must_be_a_canonical_uuid', 'usage session id must be a canonical UUID'))
     return canonical
 
 
@@ -828,7 +848,7 @@ def usage_cache_lock_path(
     store: object, seq: int, session_id: Optional[str] = None
 ) -> Path:
     if type(seq) is not int or seq < 1:
-        raise ValueError(f"invalid usage cache sequence {seq!r}")
+        raise ValueError(module_text('locks.invalid_usage_cache_sequence', 'invalid usage cache sequence {seq!r}', seq=seq))
     scope = "generation" if session_id is None else normalize_usage_session_id(session_id)
     return lock_dir(store) / f".usage-cache-{seq}-{scope}{LOCK_SUFFIX}"
 
@@ -838,7 +858,7 @@ def try_usage_cache_lock(
 ) -> Optional[LockHandle]:
     """Acquire the profile-generation or one profile-session cache lock."""
     path = usage_cache_lock_path(store, seq, session_id)
-    description = "usage-cache generation lock" if session_id is None else "usage-cache session lock"
+    description = module_text('locks.description.usage_cache_generation_lock', 'usage-cache generation lock') if session_id is None else module_text('locks.description.usage_cache_session_lock', 'usage-cache session lock')
     return _try_lock_path(path, description, False)
 
 
@@ -900,7 +920,13 @@ def _try_lock_path(
             transferred = True
             return handle
         except OSError as exc:
-            raise LockError(f"cannot acquire {description} {path} ({exc})") from exc
+            raise LockError(module_text(
+                'locks.cannot_acquire',
+                'cannot acquire {description} {path} ({exc})',
+                description=description,
+                path=path,
+                exc=exc,
+            )) from exc
         finally:
             if fd is not None and not transferred:
                 os.close(fd)
@@ -909,13 +935,15 @@ def _try_lock_path(
 
 
 def try_lock_path(
-    path: Path, description: str = "lock", inherit_on_exec: bool = False
+    path: Path, description: Optional[str] = None, inherit_on_exec: bool = False
 ) -> Optional[LockHandle]:
     """Try to take one non-blocking kernel-held advisory lock on a given path.
 
     Returns a LockHandle if acquired, or None if the lock is held by another
     process or if the path could not be verified against TOCTOU races.
     """
+    if description is None:
+        description = module_text('locks.description.lock', 'lock')
     return _try_lock_path(path, description, inherit_on_exec)
 
 
@@ -930,7 +958,7 @@ def try_lock(store, name: str) -> Optional[LockHandle]:
     this module (fail-closed). Raises LockError only when the lock cannot
     be managed at all.
     """
-    return _try_lock_path(lock_path(store, name), "session lock", True)
+    return _try_lock_path(lock_path(store, name), module_text('locks.description.session_lock', 'session lock'), True)
 
 
 def try_read_lock(
@@ -947,7 +975,7 @@ def try_read_lock(
     except LockError:
         return wait_for(
             lambda: _try_lock_path(
-                lock_path(store, name), "profile read lock", False
+                lock_path(store, name), module_text('locks.description.profile_read_lock', 'profile read lock'), False
             ),
             patience_s,
         )
@@ -977,7 +1005,7 @@ def try_mutation_lock(
     """
     def inspect() -> Optional[object]:
         path = lock_path(store, name)
-        handle = _try_lock_path(path, "session lock", False)
+        handle = _try_lock_path(path, module_text('locks.description.session_lock', 'session lock'), False)
         if handle is None:
             return None
         try:
@@ -1004,8 +1032,13 @@ def reset_unreadable_registry(
     except FileNotFoundError:
         return False
     except OSError as exc:
-        raise LockError(f"cannot inspect lease registry {path} ({exc})") from exc
-    handle = _try_lock_path(path, "lease registry repair lock", False)
+        raise LockError(module_text(
+            'locks.cannot_inspect_lease_registry',
+            'cannot inspect lease registry {path} ({exc})',
+            path=path,
+            exc=exc,
+        )) from exc
+    handle = _try_lock_path(path, module_text('locks.description.lease_registry_repair_lock', 'lease registry repair lock'), False)
     if handle is None:
         return False
     try:
@@ -1014,7 +1047,12 @@ def reset_unreadable_registry(
         try:
             parsed = _parse_holders(_read_all(handle._fd))
         except OSError as exc:
-            raise LockError(f"cannot read lease registry {path} ({exc})") from exc
+            raise LockError(module_text(
+                'locks.cannot_read_lease_registry',
+                'cannot read lease registry {path} ({exc})',
+                path=path,
+                exc=exc,
+            )) from exc
         if parsed is not None:
             return False
         if not dry_run:
@@ -1032,7 +1070,7 @@ def try_sequence_lock(store) -> Optional[LockHandle]:
     never carries a session PID.
     """
     return _try_lock_path(
-        sequence_lock_path(store), "profile sequence lock", False
+        sequence_lock_path(store), module_text('locks.description.profile_sequence_lock', 'profile sequence lock'), False
     )
 
 

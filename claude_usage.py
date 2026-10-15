@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 
 import locks
+from text import module_text
 import platforms
 
 if TYPE_CHECKING:
@@ -81,9 +82,12 @@ def _usage_module() -> Any:
 def _utc_datetime(value: Optional[datetime]) -> datetime:
     result = value or datetime.now(timezone.utc)
     if not isinstance(result, datetime) or result.tzinfo is None:
-        raise ValueError("observation time must be timezone-aware UTC")
+        raise ValueError(module_text(
+            'claude_usage.observation_time_must_be_timezone_aware_utc',
+            'observation time must be timezone-aware UTC',
+        ))
     if result.utcoffset() != timezone.utc.utcoffset(result):
-        raise ValueError("observation time must be UTC")
+        raise ValueError(module_text('claude_usage.observation_time_must_be_utc', 'observation time must be UTC'))
     return result.astimezone(timezone.utc)
 
 
@@ -98,7 +102,7 @@ def _cache_root(store: Any) -> Path:
 
 def _cache_dir(store: Any, seq: int) -> Path:
     if not _valid_sequence(seq):
-        raise ValueError(f"invalid profile sequence {seq!r}")
+        raise ValueError(module_text('claude_usage.invalid_profile_sequence', 'invalid profile sequence {seq!r}', seq=seq))
     return Path(store.usage_cache_dir(seq))
 
 
@@ -113,9 +117,16 @@ def _safe_existing_directory(path: Path) -> bool:
     except FileNotFoundError:
         return True
     except OSError as exc:
-        raise UsageCacheError(f"cannot inspect usage cache directory ({exc})") from exc
+        raise UsageCacheError(module_text(
+            'claude_usage.cannot_inspect_usage_cache_directory',
+            'cannot inspect usage cache directory ({exc})',
+            exc=exc,
+        )) from exc
     if linked or not stat.S_ISDIR(mode):
-        raise UsageCacheError("usage cache directory is not a regular directory")
+        raise UsageCacheError(module_text(
+            'claude_usage.usage_cache_directory_is_not_a_regular_directory',
+            'usage cache directory is not a regular directory',
+        ))
     return True
 
 
@@ -124,7 +135,10 @@ def _safe_directory_chain(store: Any, directory: Path) -> None:
     try:
         relative = directory.relative_to(root)
     except ValueError as exc:
-        raise UsageCacheError("usage cache path escapes the profile store") from exc
+        raise UsageCacheError(module_text(
+            'claude_usage.usage_cache_path_escapes_the_profile_store',
+            'usage cache path escapes the profile store',
+        )) from exc
     current = root
     _safe_existing_directory(current)
     for part in relative.parts:
@@ -138,13 +152,16 @@ def _read_json_object(path: Path, limit: int) -> dict:
     try:
         return store_module.read_json_object(path, max_bytes=limit)
     except (platforms.FileLinkError, platforms.NonRegularFileError) as exc:
-        raise UsageCacheError("usage cache entry is not a regular file") from exc
+        raise UsageCacheError(module_text('claude_usage.usage_cache_entry_is_not_a_regular_file', 'usage cache entry is not a regular file')) from exc
     except platforms.FileTooLargeError as exc:
-        raise UsageCacheError("usage cache entry exceeds its size limit") from exc
+        raise UsageCacheError(module_text(
+            'claude_usage.usage_cache_entry_exceeds_its_size_limit',
+            'usage cache entry exceeds its size limit',
+        )) from exc
     except OSError as exc:
-        raise UsageCacheError(f"cannot read usage cache entry ({exc})") from exc
+        raise UsageCacheError(module_text('claude_usage.cannot_read_usage_cache_entry', 'cannot read usage cache entry ({exc})', exc=exc)) from exc
     except (ValueError, RecursionError) as exc:
-        raise UsageCacheError("usage cache entry is invalid JSON") from exc
+        raise UsageCacheError(module_text('claude_usage.usage_cache_entry_is_invalid_json', 'usage cache entry is invalid JSON')) from exc
 
 
 def _parse_utc_time(raw: object) -> Optional[datetime]:
@@ -204,20 +221,38 @@ def _read_generation(store: Any, seq: int) -> Tuple[int, bool]:
     except FileNotFoundError:
         return 0, False
     except OSError as exc:
-        raise UsageCacheError("usage cache generation could not be inspected") from exc
+        raise UsageCacheError(module_text(
+            'claude_usage.usage_cache_generation_could_not_be_inspected',
+            'usage cache generation could not be inspected',
+        )) from exc
     if not stat.S_ISREG(metadata.st_mode) or linked:
-        raise UsageCacheError("usage cache generation is not a regular file")
+        raise UsageCacheError(module_text(
+            'claude_usage.usage_cache_generation_is_not_a_regular_file',
+            'usage cache generation is not a regular file',
+        ))
     raw = _read_json_object(path, MAX_CACHE_BYTES)
     if set(raw) != {"version", "seq", "generation", "deleted"}:
-        raise UsageCacheError("usage cache generation has an unsupported schema")
+        raise UsageCacheError(module_text(
+            'claude_usage.usage_cache_generation_has_an_unsupported_schema',
+            'usage cache generation has an unsupported schema',
+        ))
     if type(raw.get("version")) is not int or raw["version"] != SCHEMA_VERSION:
-        raise UsageCacheError("usage cache generation has an unsupported version")
+        raise UsageCacheError(module_text(
+            'claude_usage.usage_cache_generation_has_an_unsupported_version',
+            'usage cache generation has an unsupported version',
+        ))
     if type(raw.get("seq")) is not int or raw["seq"] != seq:
-        raise UsageCacheError("usage cache generation sequence is invalid")
+        raise UsageCacheError(module_text(
+            'claude_usage.usage_cache_generation_sequence_is_invalid',
+            'usage cache generation sequence is invalid',
+        ))
     if not _valid_generation(raw.get("generation")):
-        raise UsageCacheError("usage cache generation value is invalid")
+        raise UsageCacheError(module_text('claude_usage.usage_cache_generation_value_is_invalid', 'usage cache generation value is invalid'))
     if type(raw.get("deleted")) is not bool:
-        raise UsageCacheError("usage cache generation deleted flag is invalid")
+        raise UsageCacheError(module_text(
+            'claude_usage.usage_cache_generation_deleted_flag_is_invalid',
+            'usage cache generation deleted flag is invalid',
+        ))
     return raw["generation"], raw["deleted"]
 
 
@@ -298,34 +333,58 @@ def _read_cache_record(path: Path, seq: int, session_id: str) -> dict:
         "windows",
     }
     if set(raw) != expected_keys:
-        raise UsageCacheError("Claude usage snapshot has an unsupported schema")
+        raise UsageCacheError(module_text(
+            'claude_usage.claude_usage_snapshot_has_an_unsupported_schema',
+            'Claude usage snapshot has an unsupported schema',
+        ))
     if type(raw.get("version")) is not int or raw["version"] != SCHEMA_VERSION:
-        raise UsageCacheError("Claude usage snapshot has an unsupported version")
+        raise UsageCacheError(module_text(
+            'claude_usage.claude_usage_snapshot_has_an_unsupported_version',
+            'Claude usage snapshot has an unsupported version',
+        ))
     if type(raw.get("seq")) is not int or raw["seq"] != seq:
-        raise UsageCacheError("Claude usage snapshot sequence is invalid")
+        raise UsageCacheError(module_text(
+            'claude_usage.claude_usage_snapshot_sequence_is_invalid',
+            'Claude usage snapshot sequence is invalid',
+        ))
     if not _valid_generation(raw.get("generation")):
-        raise UsageCacheError("Claude usage snapshot generation is invalid")
+        raise UsageCacheError(module_text(
+            'claude_usage.claude_usage_snapshot_generation_is_invalid',
+            'Claude usage snapshot generation is invalid',
+        ))
     try:
         saved_session = locks.normalize_usage_session_id(raw.get("session_id"))
     except ValueError as exc:
-        raise UsageCacheError("Claude usage snapshot session id is invalid") from exc
+        raise UsageCacheError(module_text(
+            'claude_usage.claude_usage_snapshot_session_id_is_invalid',
+            'Claude usage snapshot session id is invalid',
+        )) from exc
     if saved_session != session_id:
-        raise UsageCacheError("Claude usage snapshot session id does not match its path")
+        raise UsageCacheError(module_text(
+            'claude_usage.claude_usage_snapshot_session_id_does_not_match_its',
+            'Claude usage snapshot session id does not match its path',
+        ))
     observed_at = _parse_utc_time(raw.get("observed_at"))
     if observed_at is None:
-        raise UsageCacheError("Claude usage snapshot observation time is invalid")
+        raise UsageCacheError(module_text(
+            'claude_usage.claude_usage_snapshot_observation_time_is_invalid',
+            'Claude usage snapshot observation time is invalid',
+        ))
     state = raw.get("state")
     reason = raw.get("reason")
     windows = raw.get("windows")
     if state not in ("observed", "unknown") or not isinstance(windows, dict):
-        raise UsageCacheError("Claude usage snapshot state is invalid")
+        raise UsageCacheError(module_text('claude_usage.claude_usage_snapshot_state_is_invalid', 'Claude usage snapshot state is invalid'))
     if state == "unknown":
         if windows or reason not in UNKNOWN_REASONS:
-            raise UsageCacheError("Claude usage unknown state is invalid")
+            raise UsageCacheError(module_text('claude_usage.claude_usage_unknown_state_is_invalid', 'Claude usage unknown state is invalid'))
     elif windows == {} or reason is not None:
-        raise UsageCacheError("Claude usage observed state is invalid")
+        raise UsageCacheError(module_text('claude_usage.claude_usage_observed_state_is_invalid', 'Claude usage observed state is invalid'))
     if not set(windows).issubset(REQUIRED_WINDOWS):
-        raise UsageCacheError("Claude usage snapshot contains an unsupported window")
+        raise UsageCacheError(module_text(
+            'claude_usage.claude_usage_snapshot_contains_an_unsupported_window',
+            'Claude usage snapshot contains an unsupported window',
+        ))
     normalized_windows = {}
     usage = _usage_module()
     for key, value in windows.items():
@@ -334,7 +393,7 @@ def _read_cache_record(path: Path, seq: int, session_id: str) -> dict:
             "resets_at",
             "observed_at",
         }:
-            raise UsageCacheError("Claude usage window schema is invalid")
+            raise UsageCacheError(module_text('claude_usage.claude_usage_window_schema_is_invalid', 'Claude usage window schema is invalid'))
         bucket_id, name, window = WINDOW_SPECS[key]
         bucket = usage._parse_window_bucket(
             value,
@@ -347,10 +406,13 @@ def _read_cache_record(path: Path, seq: int, session_id: str) -> dict:
             strict_reset_utc=True,
         )
         if bucket is None:
-            raise UsageCacheError("Claude usage percentage is invalid")
+            raise UsageCacheError(module_text('claude_usage.claude_usage_percentage_is_invalid', 'Claude usage percentage is invalid'))
         window_observed_at = _parse_utc_time(value.get("observed_at"))
         if window_observed_at is None:
-            raise UsageCacheError("Claude usage window observation time is invalid")
+            raise UsageCacheError(module_text(
+                'claude_usage.claude_usage_window_observation_time_is_invalid',
+                'Claude usage window observation time is invalid',
+            ))
         normalized_windows[key] = {
             "used_percentage": float(value["used_percentage"]),
             "resets_at": bucket.reset_time.isoformat() if bucket.reset_time is not None else None,
@@ -362,7 +424,10 @@ def _read_cache_record(path: Path, seq: int, session_id: str) -> dict:
             for value in normalized_windows.values()
         )
         if first_window_observation != observed_at:
-            raise UsageCacheError("Claude usage snapshot observation time does not match its windows")
+            raise UsageCacheError(module_text(
+                'claude_usage.claude_usage_snapshot_observation_time_does_not_match_its',
+                'Claude usage snapshot observation time does not match its windows',
+            ))
     return {
         "version": SCHEMA_VERSION,
         "seq": seq,
@@ -549,14 +614,20 @@ def invalidate_claude_usage_cache(
     store: Any, seq: int, *, deleted: bool = False
 ) -> int:
     if not _valid_sequence(seq) or type(deleted) is not bool:
-        raise UsageCacheError("invalid Claude usage cache invalidation arguments")
+        raise UsageCacheError(module_text(
+            'claude_usage.invalid_claude_usage_cache_invalidation_arguments',
+            'invalid Claude usage cache invalidation arguments',
+        ))
     scope_lock = locks.try_usage_cache_lock(store, seq)
     if scope_lock is None:
-        raise UsageCacheError("Claude usage cache is busy")
+        raise UsageCacheError(module_text('claude_usage.claude_usage_cache_is_busy', 'Claude usage cache is busy'))
     with scope_lock:
         current_generation, current_deleted = _read_generation(store, seq)
         if current_deleted and not deleted:
-            raise UsageCacheError("Claude profile usage cache was already deleted")
+            raise UsageCacheError(module_text(
+                'claude_usage.claude_profile_usage_cache_was_already_deleted',
+                'Claude profile usage cache was already deleted',
+            ))
         next_generation = current_generation if current_deleted and deleted else current_generation + 1
         next_deleted = current_deleted or deleted
         generation_path = _generation_path(store, seq)
@@ -571,7 +642,10 @@ def invalidate_claude_usage_cache(
             failures = []
             entries = _list_session_paths(cache_dir)
             if entries is None:
-                raise UsageCacheError("too many Claude usage snapshots to invalidate")
+                raise UsageCacheError(module_text(
+                    'claude_usage.too_many_claude_usage_snapshots_to_invalidate',
+                    'too many Claude usage snapshots to invalidate',
+                ))
             for entry in entries:
                 try:
                     metadata = entry.lstat()
@@ -585,7 +659,10 @@ def invalidate_claude_usage_cache(
                 except OSError as exc:
                     failures.append(exc)
             if failures:
-                raise UsageCacheError("some Claude usage snapshots could not be cleared") from failures[0]
+                raise UsageCacheError(module_text(
+                    'claude_usage.some_claude_usage_snapshots_could_not_be_cleared',
+                    'some Claude usage snapshots could not be cleared',
+                )) from failures[0]
         return next_generation
 
 
@@ -599,9 +676,16 @@ def invalidate_profile_usage(
     try:
         profile = _read_profile_without_recovery(store, name)
     except Exception as exc:
-        raise UsageCacheError("Claude profile metadata could not be read safely") from exc
+        raise UsageCacheError(module_text(
+            'claude_usage.claude_profile_metadata_could_not_be_read_safely',
+            'Claude profile metadata could not be read safely',
+        )) from exc
     if profile.engine != "claude":
-        raise UsageCacheError(f"profile {name!r} is not a Claude profile")
+        raise UsageCacheError(module_text(
+            'claude_usage.profile_is_not_a_claude_profile',
+            'profile {name!r} is not a Claude profile',
+            name=name,
+        ))
     return invalidate_claude_usage_cache(store, profile.seq, deleted=deleted)
 
 
@@ -676,6 +760,14 @@ def _window_signature(windows: dict) -> tuple:
     )
 
 
+def _window_name(key: str, default: str) -> str:
+    if key == "five_hour":
+        return module_text("claude_usage.window.five_hour", "5 Hours")
+    if key == "seven_day":
+        return module_text("claude_usage.window.seven_day", "7 Days")
+    return default
+
+
 def _build_groups(windows: dict) -> List["UsageGroup"]:
     usage = _usage_module()
     buckets = []
@@ -688,7 +780,7 @@ def _build_groups(windows: dict) -> List["UsageGroup"]:
         bucket = usage._parse_window_bucket(
             raw_window,
             bucket_id=bucket_id,
-            name=name,
+            name=_window_name(key, name),
             window=window,
             used_key="used_percentage",
             reset_key="resets_at",
@@ -713,25 +805,29 @@ def query_claude_usage(
         if profile is None:
             profile = _read_profile_without_recovery(store, name)
         if profile.engine != "claude":
-            return _result(name, ok=False, error=f"unsupported usage engine: {profile.engine}")
+            return _result(name, ok=False, error=module_text(
+                'claude_usage.unsupported_usage_engine',
+                'unsupported usage engine: {engine}',
+                engine=profile.engine,
+            ))
         if usage._has_pending_profile_rename(store, name):
-            return _result(name, error="profile rename recovery pending")
+            return _result(name, error=module_text('claude_usage.profile_rename_recovery_pending', 'profile rename recovery pending'))
         if type(ttl_seconds) is not int or ttl_seconds <= 0:
-            return _result(name, ok=False, error="invalid local usage cache TTL", quality="corrupt")
+            return _result(name, ok=False, error=module_text('claude_usage.invalid_local_usage_cache_ttl', 'invalid local usage cache TTL'), quality="corrupt")
         current = _utc_datetime(now)
         seq = profile.seq
         if not _valid_sequence(seq):
-            return _result(name, ok=False, error="invalid profile sequence", quality="corrupt")
+            return _result(name, ok=False, error=module_text('claude_usage.invalid_profile_sequence_invalid_profile_sequence', 'invalid profile sequence'), quality="corrupt")
         generation, deleted = _read_generation(store, seq)
         if deleted:
-            return _result(name, error="profile usage cache was invalidated")
+            return _result(name, error=module_text('claude_usage.profile_usage_cache_was_invalidated', 'profile usage cache was invalidated'))
         cache_dir = _cache_dir(store, seq)
         _safe_directory_chain(store, cache_dir)
         paths = _list_session_paths(cache_dir) if cache_dir.is_dir() else []
         if paths is None:
-            return _result(name, ok=False, error="too many Claude usage sessions", quality="unknown")
+            return _result(name, ok=False, error=module_text('claude_usage.too_many_claude_usage_sessions', 'too many Claude usage sessions'), quality="unknown")
         if len(paths) > MAX_SESSION_RECORDS:
-            return _result(name, ok=False, error="too many Claude usage sessions", quality="unknown")
+            return _result(name, ok=False, error=module_text('claude_usage.too_many_claude_usage_sessions', 'too many Claude usage sessions'), quality="unknown")
         records = []
         corrupt = False
         for path in paths:
@@ -748,11 +844,11 @@ def query_claude_usage(
         try:
             final_generation, final_deleted = _read_generation(store, seq)
         except UsageCacheError:
-            return _result(name, ok=False, error="invalid Claude usage generation", quality="corrupt")
+            return _result(name, ok=False, error=module_text('claude_usage.invalid_claude_usage_generation', 'invalid Claude usage generation'), quality="corrupt")
         if final_deleted or final_generation != generation:
-            return _result(name, error="profile usage cache changed during read")
+            return _result(name, error=module_text('claude_usage.profile_usage_cache_changed_during_read', 'profile usage cache changed during read'))
         if corrupt:
-            return _result(name, ok=False, error="invalid Claude usage cache entry", quality="corrupt")
+            return _result(name, ok=False, error=module_text('claude_usage.invalid_claude_usage_cache_entry', 'invalid Claude usage cache entry'), quality="corrupt")
         if not records:
             return _result(name)
 
@@ -765,7 +861,7 @@ def query_claude_usage(
                     for window in record["windows"].values()
                 ]
             if any(value is not None and value > current for value in future_times):
-                return _result(name, quality="unknown", error="local clock moved backward")
+                return _result(name, quality="unknown", error=module_text('claude_usage.local_clock_moved_backward', 'local clock moved backward'))
 
         live_records = [
             record
@@ -799,12 +895,18 @@ def query_claude_usage(
                     continue
 
         if fresh_unknown_records and active_records:
-            return _result(name, quality="ambiguous", error="Claude sessions have incomplete quota snapshots")
+            return _result(name, quality="ambiguous", error=module_text(
+                'claude_usage.claude_sessions_have_incomplete_quota_snapshots',
+                'Claude sessions have incomplete quota snapshots',
+            ))
         if fresh_unknown_records:
             reasons = {record["reason"] for record in fresh_unknown_records}
             if len(reasons) > 1:
-                return _result(name, quality="ambiguous", error="Claude sessions have discordant status")
-            return _result(name, error="Claude statusLine did not provide rate_limits")
+                return _result(name, quality="ambiguous", error=module_text('claude_usage.claude_sessions_have_discordant_status', 'Claude sessions have discordant status'))
+            return _result(name, error=module_text(
+                'claude_usage.claude_statusline_did_not_provide_rate_limits',
+                'Claude statusLine did not provide rate_limits',
+            ))
 
         if not active_records:
             if stale_observations:
@@ -813,7 +915,10 @@ def query_claude_usage(
 
         signatures = {_window_signature(windows) for windows in active_records}
         if len(signatures) != 1:
-            return _result(name, quality="ambiguous", error="Claude sessions have discordant quota snapshots")
+            return _result(name, quality="ambiguous", error=module_text(
+                'claude_usage.claude_sessions_have_discordant_quota_snapshots',
+                'Claude sessions have discordant quota snapshots',
+            ))
         windows = {}
         for key, value in active_records[0].items():
             first_observed = min(record[key]["observed_at"] for record in active_records)
@@ -836,7 +941,7 @@ def query_claude_usage(
             live=live,
         )
     except Exception:
-        return _result(name, ok=False, error="Claude usage could not be read", quality="corrupt")
+        return _result(name, ok=False, error=module_text('claude_usage.claude_usage_could_not_be_read', 'Claude usage could not be read'), quality="corrupt")
 
 
 _USAGE_LINE_RE = re.compile(
@@ -1057,7 +1162,7 @@ def _config_directory_matches(store: Any, seq: int) -> bool:
 
 def _display_line(snapshot: ClaudeUsageSnapshot, now: datetime) -> str:
     if snapshot.state != "observed" or not snapshot.windows:
-        return "Claude Code quota unknown"
+        return module_text('claude_usage.claude_code_quota_unknown', 'Claude Code quota unknown')
     usage = _usage_module()
     parts = []
     for key, (bucket_id, name, window) in WINDOW_SPECS.items():
@@ -1077,11 +1182,12 @@ def _display_line(snapshot: ClaudeUsageSnapshot, now: datetime) -> str:
         if bucket is None or (bucket.reset_time is not None and bucket.reset_time <= now):
             continue
         remaining = f"{bucket.remaining_fraction * 100:.1f}".rstrip("0").rstrip(".")
-        reset = f"; reset {bucket.reset_time.isoformat()}" if bucket.reset_time else ""
-        parts.append(f"{window} {remaining}% remaining{reset}")
+        reset = module_text('claude_usage.display.reset', '; reset {time}', time=bucket.reset_time.isoformat()) if bucket.reset_time else ""
+        label = module_text('claude_usage.display.weekly', 'weekly') if window == "weekly" else window
+        parts.append(module_text('claude_usage.display.window', '{window} {remaining}% remaining{reset}', window=label, remaining=remaining, reset=reset))
     if not parts:
-        return "Claude Code quota unknown"
-    return "Claude Code quota: " + " | ".join(parts)
+        return module_text('claude_usage.claude_code_quota_unknown', 'Claude Code quota unknown')
+    return module_text('claude_usage.display.quota', 'Claude Code quota: {windows}', windows=" | ".join(parts))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
