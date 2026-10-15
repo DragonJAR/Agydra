@@ -103,10 +103,7 @@ def _check_store(store: Store, _ctx: "_DoctorContext"):
             pass
         finally:
             os.close(fd)
-            try:
-                Path(probe_name).unlink()
-            except OSError:
-                pass
+            Path(probe_name).unlink()
     except OSError as exc:
         return FAIL, i18n.t("doctor.store.fail", path=store.root, error=exc)
     return OK, i18n.t("doctor.store.ok", path=store.root)

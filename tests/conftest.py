@@ -16,9 +16,43 @@ from pathlib import Path
 
 os.environ["AGYDRA_NO_KEYCHAIN"] = "1"
 
-_HANG_DUMP_SECONDS = os.environ.get("AGYDRA_TEST_HANG_DUMP_SECONDS", "")
-if _HANG_DUMP_SECONDS.isdigit() and int(_HANG_DUMP_SECONDS) > 0:
-    faulthandler.dump_traceback_later(int(_HANG_DUMP_SECONDS), exit=True)
+MAX_HANG_DUMP_SECONDS = 86400
+
+
+def parse_hang_dump_seconds(
+    raw: str | None,
+    max_seconds: int = MAX_HANG_DUMP_SECONDS,
+    warn=None,
+) -> int | None:
+    """Parse AGYDRA_TEST_HANG_DUMP_SECONDS with whitespace trimming, strict ASCII digits,
+    capping to max_seconds, and a one-line warning on non-empty invalid values."""
+    if raw is None:
+        return None
+    val = raw.strip()
+    if not val:
+        return None
+    if not (val.isascii() and val.isdigit()):
+        msg = f"warning: AGYDRA_TEST_HANG_DUMP_SECONDS must be ASCII digits, got {val!r}\n"
+        if callable(warn):
+            warn(msg.rstrip("\n"))
+        elif warn is not None and hasattr(warn, "write"):
+            warn.write(msg)
+        else:
+            sys.stderr.write(msg)
+        return None
+    seconds = int(val)
+    if seconds <= 0:
+        return None
+    return min(seconds, max_seconds)
+
+
+_parse_hang_dump_seconds = parse_hang_dump_seconds
+
+_HANG_DUMP_SECONDS = parse_hang_dump_seconds(
+    os.environ.get("AGYDRA_TEST_HANG_DUMP_SECONDS", "")
+)
+if _HANG_DUMP_SECONDS is not None:
+    faulthandler.dump_traceback_later(_HANG_DUMP_SECONDS, exit=True)
 
 os.environ["LC_ALL"] = "C.UTF-8"
 os.environ.pop("LC_MESSAGES", None)

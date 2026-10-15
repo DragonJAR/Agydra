@@ -22,6 +22,7 @@ import platforms
 import ui
 from store import Store
 
+import conftest
 from conftest import BaseCase, _make_jwt, make_dir_link, posix_only
 
 
@@ -82,6 +83,21 @@ class TestDoctor(BaseCase):
         self.assertIn("no live sessions", msg)
         status, msg = doctor._check_schema_canary(self.store, ctx)
         self.assertEqual(status, doctor.OK)
+
+    def test_check_store_fails_when_probe_unlink_raises(self):
+        ctx = self._ctx()
+        with mock.patch.object(Path, "unlink", side_effect=PermissionError("simulated unlink failure")):
+            status, msg = doctor._check_store(self.store, ctx)
+        self.assertEqual(status, doctor.FAIL)
+        self.assertIn("simulated unlink failure", msg)
+        self.assertNotIn("store writable", msg)
+
+    def test_check_store_fails_when_store_root_not_creatable(self):
+        ctx = self._ctx()
+        with mock.patch("tempfile.mkstemp", side_effect=PermissionError("simulated mkstemp failure")):
+            status, msg = doctor._check_store(self.store, ctx)
+        self.assertEqual(status, doctor.FAIL)
+        self.assertIn("simulated mkstemp failure", msg)
 
     def test_report_messages_use_the_active_catalog_language(self):
         import i18n
@@ -1154,6 +1170,60 @@ class TestDoctorLockRegistryCorrupt(BaseCase):
         finally:
             handle.release()
         self.assertEqual(lock_file.read_text(encoding="utf-8"), "{corrupt registry json")
+
+
+class TestHangDumpSeconds(unittest.TestCase):
+    def test_empty_stays_noop(self):
+        self.assertIsNone(conftest.parse_hang_dump_seconds(""))
+        self.assertIsNone(conftest.parse_hang_dump_seconds("   "))
+        self.assertIsNone(conftest.parse_hang_dump_seconds(None))
+
+    def test_whitespace_tolerated(self):
+        self.assertEqual(conftest.parse_hang_dump_seconds("  42  "), 42)
+        self.assertEqual(conftest.parse_hang_dump_seconds("\t100\n"), 100)
+
+    def test_zero_is_noop(self):
+        self.assertIsNone(conftest.parse_hang_dump_seconds("0"))
+        self.assertIsNone(conftest.parse_hang_dump_seconds(" 0 "))
+
+    def test_oversize_capped(self):
+        self.assertEqual(
+            conftest.parse_hang_dump_seconds("1000000"),
+            conftest.MAX_HANG_DUMP_SECONDS,
+        )
+        self.assertEqual(
+            conftest.parse_hang_dump_seconds("86400"),
+            86400,
+        )
+        self.assertEqual(
+            conftest.parse_hang_dump_seconds("86401"),
+            conftest.MAX_HANG_DUMP_SECONDS,
+        )
+
+    def test_non_ascii_rejected_with_warning(self):
+        buf = io.StringIO()
+        res = conftest.parse_hang_dump_seconds("\u0661\u0662", warn=buf)
+        self.assertIsNone(res)
+        self.assertIn("warning: AGYDRA_TEST_HANG_DUMP_SECONDS must be ASCII digits", buf.getvalue())
+        self.assertIn("\u0661\u0662", buf.getvalue())
+
+    def test_garbage_rejected_with_warning(self):
+        buf = io.StringIO()
+        res = conftest.parse_hang_dump_seconds("abc", warn=buf)
+        self.assertIsNone(res)
+        self.assertIn("warning: AGYDRA_TEST_HANG_DUMP_SECONDS must be ASCII digits", buf.getvalue())
+
+    def test_negative_rejected_with_warning(self):
+        buf = io.StringIO()
+        res = conftest.parse_hang_dump_seconds("-10", warn=buf)
+        self.assertIsNone(res)
+        self.assertIn("warning: AGYDRA_TEST_HANG_DUMP_SECONDS must be ASCII digits", buf.getvalue())
+
+    def test_warning_defaults_to_stderr(self):
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            res = conftest.parse_hang_dump_seconds("not-a-number")
+        self.assertIsNone(res)
+        self.assertIn("warning: AGYDRA_TEST_HANG_DUMP_SECONDS must be ASCII digits", stderr.getvalue())
 
 
 if __name__ == "__main__":
