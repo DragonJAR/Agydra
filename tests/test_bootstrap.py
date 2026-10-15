@@ -154,11 +154,11 @@ class Helpers(unittest.TestCase):
 
 
 class RuntimeModuleDrift(unittest.TestCase):
-    """The editable install resolves top-level modules through a generated
-    finder, not a copy. Adding a module to the repo therefore leaves that
-    finder stale: `agydra` works from the repo (cwd shadows the finder) and
-    dies with ModuleNotFoundError everywhere else. These tests pin the
-    detection of that state, which no other check can see.
+    """Venvs installed before ``package-dir`` was declared resolve top-level
+    modules through a generated finder that froze the module list, so a
+    module added to the repo makes `agydra` die with ModuleNotFoundError; a
+    copied checkout's venv imports the original directory's files. These
+    tests pin the detection of those states, which no other check can see.
     """
 
     def test_runtime_modules_is_derived_from_disk_and_ignores_non_sources(self):

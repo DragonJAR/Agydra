@@ -237,11 +237,10 @@ def runtime_modules(root: Path) -> List[str]:
     """Top-level runtime module names shipped by this checkout.
 
     The repo is a flat layout, so the authoritative list is the ``*.py`` at
-    the project root. ``pyproject.toml``'s ``py-modules`` is a hand-maintained
-    mirror of that set, and PEP 660 editable installs bake a SECOND copy of it
-    into a ``__editable__*.py`` finder in site-packages. Both mirrors go stale
-    when a module is added, which is why every consumer here derives the list
-    from disk instead of trusting either copy.
+    the project root. ``pyproject.toml``'s ``py-modules`` mirrors that set for
+    wheels (``tests/test_packaging.py`` pins the two equal); editable installs
+    add the root itself to ``sys.path`` through a ``.pth`` entry, so they track
+    the disk directly. Consumers here derive the list from disk too.
     """
     if not is_source_checkout(root):
         return []
@@ -251,13 +250,13 @@ def runtime_modules(root: Path) -> List[str]:
 def unimportable_modules(root: Path, vpy: Path) -> List[str]:
     """Runtime modules the venv's active install cannot use from THIS root.
 
-    An editable install resolves top-level modules through a generated finder
-    rather than copying the files, so adding a module to the repo leaves the
-    finder pointing at a map that lacks it. The console script then dies with
-    a bare ``ModuleNotFoundError`` the moment it is run from OUTSIDE the repo,
-    while the same command works inside it (cwd shadows the finder). That
-    asymmetry is the whole failure mode, and it is invisible to every check
-    that imports in-process.
+    The editable install adds the project root to ``sys.path`` via a ``.pth``
+    entry, so modules added later import without a reinstall. A venv
+    installed before ``pyproject.toml`` declared ``package-dir`` still holds
+    a generated finder that froze the module list at install time: there the
+    console script dies with a bare ``ModuleNotFoundError`` for any module
+    added since, from any cwd (a console script's ``sys.path[0]`` is its bin
+    directory, never the cwd). Checks that import in-process cannot see it.
 
     A copied or moved checkout has the inverse failure: its venv's finder
     still maps module names to the ORIGINAL directory, so every import

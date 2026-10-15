@@ -239,5 +239,78 @@ class TestWorkflowInstallsBuildTools(unittest.TestCase):
         self.assertEqual(text.count("os: "), 3)
 
 
+EDITABLE_SNIPPET = (
+    "from setuptools import build_meta as b; print(b.build_editable('dist'))"
+)
+
+
+class TestEditableInstall(unittest.TestCase):
+    """The editable install must track the checkout, not a frozen module map.
+
+    For a flat layout setuptools defaults to a generated finder that maps
+    each ``py-modules`` entry at install time; a module added afterwards is
+    unknown to it and ``agydra`` dies with ``ModuleNotFoundError`` until the
+    venv is reinstalled. Declaring the project root as the package dir makes
+    setuptools emit a plain ``.pth`` path instead, so the venv imports
+    whatever modules the checkout holds now.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        reason = _build_tools_problem()
+        if reason:
+            if os.environ.get("CI"):
+                raise AssertionError(f"{reason}; the CI job must install it")
+            raise unittest.SkipTest(reason)
+        cls._tmp = tempfile.TemporaryDirectory(prefix="agydra-editable-")
+        base = Path(cls._tmp.name)
+        cls.base = base
+        cls.project = base / "project"
+        shutil.copytree(ROOT, cls.project, ignore=IGNORED)
+        done = subprocess.run(
+            [sys.executable, "-c", EDITABLE_SNIPPET], cwd=cls.project,
+            capture_output=True, text=True, timeout=300,
+            env=_clean_env(base / "home"),
+        )
+        if done.returncode != 0:
+            if "No module named 'wheel'" in done.stderr:
+                raise unittest.SkipTest("wheel support is not available")
+            raise AssertionError(f"editable build failed:\n{done.stdout}\n{done.stderr}")
+        cls.site = base / "site-packages"
+        wheel = next((cls.project / "dist").glob("*.whl"))
+        with zipfile.ZipFile(wheel) as archive:
+            cls.wheel_names = archive.namelist()
+            archive.extractall(cls.site)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_editable_wheel_is_a_path_entry_without_a_module_finder(self):
+        top_level = [name for name in self.wheel_names if "/" not in name]
+        self.assertEqual([n for n in top_level if n.endswith(".py")], [])
+        pth = [n for n in top_level if n.endswith(".pth")]
+        self.assertEqual(len(pth), 1)
+        entry = (self.site / pth[0]).read_text(encoding="utf-8").strip()
+        self.assertEqual(Path(entry).resolve(), self.project.resolve())
+
+    def test_module_added_after_install_imports_from_outside_the_checkout(self):
+        (self.project / "added_after_install.py").write_text(
+            "VALUE = 'fresh'\n", encoding="utf-8"
+        )
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        done = subprocess.run(
+            [sys.executable, "-S", "-c",
+             "import site, sys; site.addsitedir(sys.argv[1]); "
+             "import added_after_install as m; print(m.VALUE)",
+             str(self.site)],
+            cwd=elsewhere, capture_output=True, text=True, timeout=60,
+            env=_clean_env(self.base / "home"),
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.strip(), "fresh")
+
+
 if __name__ == "__main__":
     unittest.main()

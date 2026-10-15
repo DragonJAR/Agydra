@@ -54,7 +54,11 @@ agydra = "cli:main"
 
 # Flat layout: every module lives at the repo root next to pyproject.toml.
 # py-modules (not packages.find) is what setuptools uses for this shape.
+# package-dir maps the root explicitly so editable installs get a plain .pth
+# path entry instead of a finder that freezes this list at install time: a
+# module added later is importable without re-running `pip install -e .`.
 [tool.setuptools]
+package-dir = { "" = "." }
 py-modules = [
     "account",
     "agydra",

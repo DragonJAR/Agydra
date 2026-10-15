@@ -571,13 +571,12 @@ def _check_bootstrap(_store: Store, _ctx: "_DoctorContext"):
 def _editable_install_drift(root: Path, vpy: Path) -> List[str]:
     """Runtime modules this checkout added that the venv install cannot import.
 
-    An editable install maps top-level modules through a generated finder
-    instead of copying them, so a module added to the repo since the last
-    ``pip install -e .`` is missing from that map: ``agydra`` then dies with a
-    bare ``ModuleNotFoundError``, but ONLY outside the repo -- inside it the
-    cwd shadows the finder and hides the drift. This is the only check that
-    interrogates the install the way the shim does, so it is also the only one
-    that can see the failure before it happens.
+    Current editable installs are a ``.pth`` path entry and cannot drift; a
+    venv installed with the older generated finder froze the module list, so
+    a module added since makes ``agydra`` die with ``ModuleNotFoundError``. A
+    copied checkout whose venv still points at the original directory drifts
+    too. This is the only check that interrogates the install the way the
+    shim does, so it is also the only one that can see either failure.
     """
     import bootstrap
 
