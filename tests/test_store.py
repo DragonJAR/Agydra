@@ -979,24 +979,26 @@ class TestStore(BaseCase):
         self.assertIsNotNone(reacquired)
         reacquired.release()
 
-    def test_corrupt_sequence_state_is_quarantined_before_mutations(self):
+    def test_corrupt_sequence_state_blocks_mutations_and_preserves_bytes(self):
         store = Store()
         store.create("first")
         store.create("second")
         store.sequence_state_path.write_text("{invalid", encoding="utf-8")
 
-        created = store.create("new")
-        store.rename("first", "renamed")
-        store.delete("second", backup=False)
+        with self.assertRaises(StoreError):
+            store.create("new")
+        with self.assertRaises(StoreError):
+            store.rename("first", "renamed")
+        with self.assertRaises(StoreError):
+            store.delete("second", backup=False)
 
-        self.assertEqual(created.seq, 3)
-        self.assertFalse(store.profile_dir("first").exists())
-        self.assertFalse(store.profile_dir("second").exists())
-        self.assertTrue(store.profile_dir("new").is_dir())
-        self.assertTrue(store.profile_dir("renamed").is_dir())
+        self.assertTrue(store.profile_dir("first").is_dir())
+        self.assertTrue(store.profile_dir("second").is_dir())
+        self.assertEqual(
+            store.sequence_state_path.read_text(encoding="utf-8"), "{invalid"
+        )
         quarantined = list(store.root.glob("profile-sequence.json.corrupt-*"))
-        self.assertEqual(len(quarantined), 1)
-        self.assertEqual(quarantined[0].read_text(encoding="utf-8"), "{invalid")
+        self.assertEqual(len(quarantined), 0)
 
     def test_sequence_state_write_failure_prevents_partial_mutations(self):
         store = Store()

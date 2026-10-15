@@ -135,7 +135,7 @@ class TestFxLifecycle(BaseCase):
         handle = locks.try_mutation_lock(self.store, "busy-prof", patience_s=1.0)
         self.assertIsNone(handle)
 
-    def test_c4_create_purges_keychain_outside_sequence_lock(self):
+    def test_c4_create_purges_keychain_inside_sequence_lock(self):
         calls = []
         import engines
         driver = engines.get_engine("agy")
@@ -151,7 +151,7 @@ class TestFxLifecycle(BaseCase):
             self.store.create("test-purge-seq", engine="agy")
         self.assertTrue(len(calls) > 0)
         purge_call, seq_held = calls[0]
-        self.assertFalse(seq_held)
+        self.assertTrue(seq_held)
 
     def test_c5_pending_rename_recovery_action_failure_allows_unrelated_reads(self):
         self.store.create("unrelated")

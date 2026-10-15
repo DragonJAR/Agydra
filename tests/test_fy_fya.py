@@ -384,16 +384,19 @@ class TestFyaRoundTwoDefects(BaseCase):
         self.assertEqual(len(quarantined), 1)
         self.assertEqual(quarantined[0].read_bytes(), b"{broken-config")
 
-    def test_runtime_sequence_recovery_quarantines_and_rebuilds_from_profiles(self):
+    def test_runtime_sequence_recovery_preserves_corrupt_counter(self):
         first = self.store.create("first")
         self.store.sequence_state_path.write_bytes(b"{broken-sequence")
 
-        next_profile = self.store.create("next")
+        with self.assertRaises(StoreError):
+            self.store.create("next")
 
-        self.assertEqual(next_profile.seq, first.seq + 1)
+        self.assertEqual(
+            self.store.sequence_state_path.read_bytes(), b"{broken-sequence"
+        )
         quarantined = list(self.store.root.glob("profile-sequence.json.corrupt-*"))
-        self.assertEqual(len(quarantined), 1)
-        self.assertEqual(quarantined[0].read_bytes(), b"{broken-sequence")
+        self.assertEqual(len(quarantined), 0)
+        del first
 
     def test_rotation_runtime_repair_uses_its_cycle_lock_and_quarantines(self):
         profile = self.store.create("work")
@@ -423,7 +426,7 @@ class TestFyaRoundTwoDefects(BaseCase):
         self.assertIn(str(self.store.sequence_state_path), message)
         self.assertEqual(self.store.sequence_state_path.read_bytes(), original)
 
-    def test_doctor_fix_repairs_config_and_sequence_through_shared_policies(self):
+    def test_doctor_fix_preserves_corrupt_sequence_counter(self):
         self.store.create("work")
         self.store.config_path.write_bytes(b"{broken-config")
         self.store.sequence_state_path.write_bytes(b"{broken-sequence")
@@ -435,12 +438,14 @@ class TestFyaRoundTwoDefects(BaseCase):
             doctor._apply_fixes(self.store, context)
 
         self.assertIsNotNone(self.store.config_path.stat())
-        self.assertEqual(self.store._read_sequence_state(), 1)
+        self.assertEqual(
+            self.store.sequence_state_path.read_bytes(), b"{broken-sequence"
+        )
         self.assertEqual(
             len(list(self.store.root.glob("agydra.json.corrupt-*"))), 1
         )
         self.assertEqual(
-            len(list(self.store.root.glob("profile-sequence.json.corrupt-*"))), 1
+            len(list(self.store.root.glob("profile-sequence.json.corrupt-*"))), 0
         )
 
     def test_delete_tolerates_duplicate_sequences_for_non_claude_profiles(self):

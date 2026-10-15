@@ -764,7 +764,7 @@ class Store:
             PersistentStateDeclaration(
                 "profile sequence",
                 self.sequence_state_path,
-                "quarantine the old file and rebuild from profile metadata",
+                "preserve the counter until its high-water mark can be trusted",
                 self._sequence_state_issue,
                 lambda _fd=None, _replacement=None: self._repair_sequence_state(),
             ),
@@ -935,16 +935,28 @@ class Store:
         return None
 
     def _repair_sequence_state(self) -> bool:
-        issue = self._sequence_state_issue()
-        if issue is None:
-            return False
-        profiles, unreadable = self._scan(tolerant=True)
-        if unreadable:
-            return False
-        self._quarantine_state_file(self.sequence_state_path)
-        maximum = max((profile.seq for profile in profiles), default=0)
-        self._persist_sequence_state(maximum)
-        return True
+        """Never reconstruct a corrupt high-water mark from surviving identities."""
+        try:
+            self._read_sequence_state()
+        except StoreError as exc:
+            raise self._unrecoverable_sequence_state_error(exc) from exc
+        return False
+
+    def _unrecoverable_sequence_state_error(self, cause: StoreError) -> StoreError:
+        try:
+            profiles, unreadable = self._scan(tolerant=True)
+        except (StoreError, OSError) as exc:
+            diagnostic = f"surviving max seq=unknown ({type(exc).__name__})"
+        else:
+            maximum = max((profile.seq for profile in profiles), default=0)
+            diagnostic = f"surviving max seq={maximum}"
+            if unreadable:
+                diagnostic += f"; unreadable profiles={', '.join(unreadable)}"
+        return StoreError(_store_text(
+            "store.sequence.unreadable",
+            path=self.sequence_state_path,
+            error=f"{cause}; {diagnostic}",
+        ))
 
     def _rename_state_issue(self) -> Optional[str]:
         try:
@@ -1350,10 +1362,6 @@ class Store:
             )) from exc
 
         def _create_under_locks() -> Profile:
-            if driver.needs_keychain:
-                import keychain
-
-                keychain.purge_profile_slot(self, name)
             return self._with_sequence_lock(
                 "creating",
                 lambda: self._create_locked(name, description, driver),
@@ -1365,10 +1373,14 @@ class Store:
         profile_dir = self._require_profile_paths_are_real(name)
         config = self.load_config()
         config_writable = self._config_writable()
-        self._cleanup_create_stages(name)
         if profile_dir.exists():
             raise StoreError(_store_text("store.profile.already_exists", name=name))
         seq = self._reserve_next_sequence()
+        self._cleanup_create_stages(name)
+        if driver.needs_keychain:
+            import keychain
+
+            keychain.purge_profile_slot(self, name)
         stage_dir: Optional[Path] = None
         config_dir: Optional[Path] = None
         try:
@@ -1980,11 +1992,8 @@ class Store:
     ) -> int:
         try:
             last_seq = self._read_sequence_state()
-        except StoreError:
-            self.repair_persistent_state(
-                self.sequence_state_path, sequence_locked=True
-            )
-            last_seq = self._read_sequence_state()
+        except StoreError as exc:
+            raise self._unrecoverable_sequence_state_error(exc) from exc
         profiles, unreadable = (
             self._scan(tolerant=True) if deleting_name is not None else self._scan()
         )
