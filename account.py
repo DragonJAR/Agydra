@@ -448,8 +448,36 @@ GROK_AUTH_FILE = "auth.json"
 GROK_CONFIG_FILE = "config.toml"
 
 
+def _grok_config_value(raw: str) -> Optional[str]:
+    """Read a single-line key value without consuming its trailing comment."""
+    raw = raw.strip()
+    if raw.startswith('"'):
+        try:
+            value, end = json.JSONDecoder().raw_decode(raw)
+        except ValueError:
+            return None
+        suffix = raw[end:].lstrip()
+        if suffix and not suffix.startswith("#"):
+            return None
+    elif raw.startswith("'"):
+        end = raw.find("'", 1)
+        if end < 0:
+            return None
+        value = raw[1:end]
+        suffix = raw[end + 1:].lstrip()
+        if suffix and not suffix.startswith("#"):
+            return None
+    else:
+        value = raw.split("#", 1)[0].strip()
+    try:
+        value.encode("utf-8")
+    except ValueError:
+        return None
+    return value if _has_credential(value) else None
+
+
 def grok_config_api_key(data_dir: Path) -> Optional[str]:
-    """First credential-bearing ``api_key`` value in Grok's config.toml."""
+    """Last exact ``api_key`` assignment across Grok's config.toml wins."""
     cfg_path = Path(data_dir) / GROK_CONFIG_FILE
     if not cfg_path.is_file():
         return None
@@ -457,13 +485,12 @@ def grok_config_api_key(data_dir: Path) -> Optional[str]:
         content = cfg_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
+    result = None
     for line in content.splitlines():
-        line = line.strip()
-        if line.startswith("api_key") and "=" in line:
-            val = line.split("=", 1)[1].strip().strip('"\'').strip()
-            if _has_credential(val):
-                return val
-    return None
+        raw_key, separator, raw_value = line.partition("=")
+        if separator and raw_key.strip() in ("api_key", '"api_key"', "'api_key'"):
+            result = _grok_config_value(raw_value)
+    return result
 
 
 def update_grok_tokens(
@@ -852,8 +879,22 @@ def display_email(store: Optional[store.Store], profile: Profile) -> Optional[st
     if store is None:
         return None
     engine = getattr(profile, "engine", "agy") or "agy"
-    data_dir = store.profile_data_dir(profile.name, engine=engine)
-    return detect_email(data_dir, store, profile.name, engine=engine)
+    from store import StoreError
+
+    try:
+        data_dir = store.profile_data_dir(profile.name, engine=engine)
+        return detect_email(data_dir, store, profile.name, engine=engine)
+    except (StoreError, OSError) as exc:
+        from i18n import t
+        from ui import warn
+
+        warn(t(
+            "account.display_email.failed",
+            default="cannot read stored email for profile {name!r} ({cause})",
+            name=profile.name,
+            cause=type(exc).__name__,
+        ))
+        return None
 
 
 def row_email(

@@ -860,6 +860,8 @@ def _scan_toml_quoted(text: str, index: int) -> int:
             cursor += 2
             continue
         if character == quote:
+            if quote == '"':
+                _decode_toml_basic_string(text[index + 1 : cursor])
             return cursor + 1
         cursor += 1
     raise ValueError("unterminated string")
@@ -884,6 +886,8 @@ def _scan_toml_multiline(text: str, index: int) -> int:
         while end < len(text) and text[end] == delimiter[0] and extra < 2:
             end += 1
             extra += 1
+        if delimiter == '"""':
+            _decode_toml_basic_string(text[index + 3 : end - 3], multiline=True)
         return end
 
 
@@ -898,7 +902,7 @@ _TOML_SIMPLE_ESCAPES = {
 }
 
 
-def _decode_toml_basic_string(raw: str) -> str:
+def _decode_toml_basic_string(raw: str, multiline: bool = False) -> str:
     decoded: List[str] = []
     cursor = 0
     while cursor < len(raw):
@@ -911,6 +915,13 @@ def _decode_toml_basic_string(raw: str) -> str:
         if cursor >= len(raw):
             raise ValueError("invalid escape in quoted key")
         marker = raw[cursor]
+        if multiline and marker in " \t\r\n":
+            start = cursor
+            while cursor < len(raw) and raw[cursor] in " \t\r\n":
+                cursor += 1
+            if "\n" not in raw[start:cursor]:
+                raise ValueError("invalid multiline continuation")
+            continue
         if marker in _TOML_SIMPLE_ESCAPES:
             decoded.append(_TOML_SIMPLE_ESCAPES[marker])
             cursor += 1
@@ -919,10 +930,10 @@ def _decode_toml_basic_string(raw: str) -> str:
         digits = raw[cursor + 1 : cursor + 1 + (width or 0)]
         if width is None or len(digits) != width or any(c not in string.hexdigits for c in digits):
             raise ValueError(f"invalid escape \\{marker} in quoted key")
-        try:
-            decoded.append(chr(int(digits, 16)))
-        except (ValueError, OverflowError) as exc:
-            raise ValueError("invalid unicode escape in quoted key") from exc
+        code_point = int(digits, 16)
+        if 0xD800 <= code_point <= 0xDFFF or code_point > 0x10FFFF:
+            raise ValueError("invalid unicode scalar value in basic string")
+        decoded.append(chr(code_point))
         cursor += 1 + width
     return "".join(decoded)
 
@@ -1134,7 +1145,7 @@ def _disable_codex_daemon_auto_start(data_dir: Path) -> None:
     except FileNotFoundError:
         try:
             store.atomic_write_text(cfg, "[features]\ndaemon_auto_start = false\n")
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise IsolationError(
                 f"cannot create Codex config {cfg} ({_safe_os_error_reason(exc)})"
             ) from None
@@ -1160,7 +1171,7 @@ def _disable_codex_daemon_auto_start(data_dir: Path) -> None:
     if updated != content:
         try:
             store.atomic_write_text(cfg, updated)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise IsolationError(
                 f"cannot write Codex config {cfg} ({_safe_os_error_reason(exc)})"
             ) from None
