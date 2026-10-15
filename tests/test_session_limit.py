@@ -17,7 +17,12 @@ import models
 import platforms
 import resolver
 import runner
-from conftest import BaseCase, LiveHolders as _LiveHolders, authenticate_agy_profile as _authenticate
+from conftest import (
+    BaseCase,
+    LiveHolders as _LiveHolders,
+    authenticate_agy_profile as _authenticate,
+    child_launch_double,
+)
 from store import Store, StoreError
 
 
@@ -117,7 +122,9 @@ class TestRunnerLimit(BaseCase):
         return 0
 
     def _run(self, plan):
-        with mock.patch.object(platforms, "launch_argv", side_effect=self._launch):
+        with mock.patch.object(
+            platforms, "launch_argv", side_effect=child_launch_double(self._launch)
+        ):
             return runner.run(plan, store=self.store)
 
     def test_explicit_profile_at_the_limit_is_refused_without_spawning(self):
@@ -238,7 +245,8 @@ class TestDefaultIsUnlimited(BaseCase):
             for kwargs in ({"random_pick": True}, {"flag_ref": "alpha"}):
                 plan = runner.build_plan(self.store, ["chat"], **kwargs)
                 with mock.patch.object(
-                    platforms, "launch_argv", side_effect=lambda a, e: spawned.append(a) or 0
+                    platforms, "launch_argv",
+                    side_effect=child_launch_double(lambda a, e: spawned.append(a) or 0),
                 ):
                     self.assertEqual(runner.run(plan, store=self.store), 0)
         self.assertEqual(len(spawned), 2)

@@ -22,7 +22,7 @@ import platforms
 import runner
 import usage
 import account
-from conftest import BaseCase, _make_jwt, posix_only
+from conftest import BaseCase, _make_jwt, child_launch_double, posix_only
 from store import Store, StoreError
 
 from test_keychain import _FAKE_KEYCHAIN
@@ -455,7 +455,9 @@ class TestStoreRootAdoption(BaseCase):
         plan = runner.build_plan(self.store, ["chat"], flag_ref="alpha")
         with mock.patch.object(
             isolation, "isolated_env", return_value=dict(os.environ)
-        ) as isolated_env, mock.patch.object(platforms, "launch_argv", return_value=0):
+        ) as isolated_env, mock.patch.object(
+            platforms, "launch_argv", side_effect=child_launch_double()
+        ):
             self.assertEqual(runner.run(plan, store=self.store), 0)
         self.assertEqual(isolated_env.call_args.kwargs["store_root"], self.store.root)
 

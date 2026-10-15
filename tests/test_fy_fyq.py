@@ -17,7 +17,7 @@ import keychain
 import locks
 import resolver
 import runner
-from conftest import BaseCase, _make_jwt, write_fake_binary
+from conftest import BaseCase, _make_jwt, child_launch_double, write_fake_binary
 from store import Store
 
 
@@ -57,7 +57,9 @@ class TestKeychainSlotNoticeSilenced(BaseCase):
         stderr = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             with mock.patch.object(keychain, "launch_guard", busy_guard):
-                with mock.patch.object(runner.platforms, "launch_argv", return_value=0):
+                with mock.patch.object(
+                    runner.platforms, "launch_argv", side_effect=child_launch_double()
+                ):
                     rc = runner._run_prepared(plan, self.store)
 
         self.assertEqual(rc, 0)
@@ -74,7 +76,9 @@ class TestKeychainSlotNoticeSilenced(BaseCase):
             stdout = io.StringIO()
             stderr = io.StringIO()
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                with mock.patch.object(runner.platforms, "launch_argv", return_value=0):
+                with mock.patch.object(
+                    runner.platforms, "launch_argv", side_effect=child_launch_double()
+                ):
                     rc = runner._run_prepared(plan, self.store)
             self.assertEqual(rc, 0)
             self.assertEqual(stdout.getvalue(), "")
@@ -91,7 +95,9 @@ class TestKeychainSlotNoticeSilenced(BaseCase):
             stdout = io.StringIO()
             stderr = io.StringIO()
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                with mock.patch.object(runner.platforms, "run_wait", return_value=0):
+                with mock.patch.object(
+                    runner.platforms, "run_wait", side_effect=child_launch_double()
+                ):
                     rc = runner._run_prepared(plan, self.store)
             self.assertEqual(rc, 0)
             self.assertEqual(stdout.getvalue(), "")
@@ -107,7 +113,9 @@ class TestKeychainSlotNoticeSilenced(BaseCase):
         stderr = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "secret-key"}):
-                with mock.patch.object(runner.platforms, "launch_argv", return_value=0):
+                with mock.patch.object(
+                    runner.platforms, "launch_argv", side_effect=child_launch_double()
+                ):
                     rc = runner._run_prepared(plan, self.store)
         self.assertEqual(rc, 0)
         self.assertEqual(stdout.getvalue(), "")

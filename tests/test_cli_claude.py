@@ -17,9 +17,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 try:
-    from conftest import BaseCase, make_dir_link, snapshot_tree
+    from conftest import BaseCase, child_launch_double, make_dir_link, snapshot_tree
 except ImportError:
-    from tests.conftest import BaseCase, make_dir_link, snapshot_tree
+    from tests.conftest import BaseCase, child_launch_double, make_dir_link, snapshot_tree
 import account
 import cli
 import locks
@@ -91,15 +91,14 @@ class TestClaudeCli(BaseCase):
             events.append("invalidate")
             return invalidate(store, name)
 
-        def native_login(argv, env, *, on_started):
-            on_started()
+        def native_login(argv, env):
             events.append("native login")
             self.assertEqual(argv[-2:], ["auth", "login"])
             self.assertEqual(env[claude_usage.GENERATION_ENV], "1")
             self.assertTrue(cli.locks.is_locked(self.store, "cc"))
             return 0
 
-        with patch.object(account, "claude_auth_status", return_value=account.ClaudeAuthStatus("unauthenticated")), patch.object(claude_usage, "invalidate_profile_usage", side_effect=locked_invalidate), patch.object(cli.runner.platforms, "run_wait", side_effect=native_login), patch.object(cli.runner.platforms, "launch_argv", side_effect=native_login), patch.object(cli.runner.platforms, "drain_tty_input"), contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(account, "claude_auth_status", return_value=account.ClaudeAuthStatus("unauthenticated")), patch.object(claude_usage, "invalidate_profile_usage", side_effect=locked_invalidate), patch.object(cli.runner.platforms, "run_wait", side_effect=child_launch_double(native_login)), patch.object(cli.runner.platforms, "launch_argv", side_effect=child_launch_double(native_login)), patch.object(cli.runner.platforms, "drain_tty_input"), contextlib.redirect_stdout(io.StringIO()):
             code = cli.cmd_login(self.store, SimpleNamespace(ref="cc", dry_run=False, force=True))
         self.assertEqual(code, 0)
         self.assertEqual(events, ["invalidate", "native login"])

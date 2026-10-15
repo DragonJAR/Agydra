@@ -15,7 +15,7 @@ import cli
 import platforms
 import resolver
 import runner
-from conftest import BaseCase, _make_jwt, write_fake_binary
+from conftest import BaseCase, _make_jwt, child_launch_double, write_fake_binary
 from store import Store, StoreError
 
 
@@ -88,7 +88,7 @@ class TestCodexRunner(BaseCase):
         plan = runner.build_plan(self.store, ["--version"], flag_ref="cx-work")
 
         with mock.patch("keychain.launch_guard") as mock_guard, \
-             mock.patch("platforms.launch_argv", return_value=0):
+             mock.patch("platforms.launch_argv", side_effect=child_launch_double()):
             rc = runner.run(plan, store=self.store, dry_run=False)
             self.assertEqual(rc, 0)
             mock_guard.assert_not_called()

@@ -16,7 +16,7 @@ import engines
 import platforms
 import runner
 from store import Store
-from tests.conftest import BaseCase, posix_only, write_fake_binary
+from tests.conftest import BaseCase, child_launch_double, posix_only, write_fake_binary
 
 
 def _make_fake_project(tmp: Path, name: str = "proj", *, with_console: bool = True) -> Path:
@@ -127,7 +127,7 @@ class TestD2BrokenVenvAutoRepair(unittest.TestCase):
             with mock.patch("agydra.__file__", str(proj / "agydra.py")), \
                  mock.patch("sys.argv", ["agydra.py", "--version"]), \
                  mock.patch("bootstrap.perform_install", side_effect=fake_perform) as mock_boot_run, \
-                 mock.patch("platforms.launch_argv", return_value=0):
+                 mock.patch("platforms.launch_argv", side_effect=child_launch_double()):
                 res = agydra.main()
                 self.assertEqual(res, 0)
                 mock_boot_run.assert_called_once()
@@ -144,7 +144,7 @@ class TestD2BrokenVenvAutoRepair(unittest.TestCase):
                      "bootstrap.perform_install",
                      return_value=bootstrap.InstallResult(code=0, essential_ok=True, console=None),
                  ) as mock_boot_run, \
-                 mock.patch("platforms.launch_argv", return_value=0):
+                 mock.patch("platforms.launch_argv", side_effect=child_launch_double()):
                 res = agydra.main()
                 self.assertEqual(res, 0)
                 mock_boot_run.assert_called_once()
@@ -161,7 +161,7 @@ class TestD2BrokenVenvAutoRepair(unittest.TestCase):
                      "bootstrap.perform_install",
                      return_value=bootstrap.InstallResult(code=1, essential_ok=False, console=None),
                  ) as mock_boot_run, \
-                 mock.patch("platforms.launch_argv", return_value=0) as mock_launch:
+                 mock.patch("platforms.launch_argv", side_effect=child_launch_double()) as mock_launch:
                 mock_vpy.return_value.exists.return_value = False
                 res = agydra.main()
                 self.assertEqual(res, 1)

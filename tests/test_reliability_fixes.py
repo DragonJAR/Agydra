@@ -14,7 +14,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from conftest import _make_jwt, isolated_store_env, posix_only
+from conftest import child_launch_double, _make_jwt, isolated_store_env, posix_only
 
 import keychain
 import models
@@ -385,7 +385,7 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
                 store, [], flag_ref="work", launch_as_child=True
             )
             with mock.patch.object(
-                platforms, "run_wait", return_value=0
+                platforms, "run_wait", side_effect=child_launch_double()
             ) as run_wait:
                 rc = runner.run(plan, store=store)
             self.assertEqual(rc, 0)
@@ -412,7 +412,7 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
                 store, [], flag_ref="work", launch_as_child=True
             )
             with mock.patch.object(
-                platforms, "run_wait", return_value=0
+                platforms, "run_wait", side_effect=child_launch_double()
             ), mock.patch.object(platforms, "drain_tty_input") as drain:
                 rc = runner.run(plan, store=store)
             self.assertEqual(rc, 0)
@@ -436,7 +436,7 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
             store.create("work")
             plan = runner.build_plan(store, [], flag_ref="work")
             with mock.patch.object(
-                platforms, "launch_argv", return_value=0
+                platforms, "launch_argv", side_effect=child_launch_double()
             ), mock.patch.object(platforms, "drain_tty_input") as drain:
                 runner.run(plan, store=store)
             drain.assert_not_called()
@@ -478,7 +478,7 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
                     store, [], flag_ref="work", launch_as_child=True
                 )
                 with mock.patch.object(
-                    platforms, "run_wait", return_value=0
+                    platforms, "run_wait", side_effect=child_launch_double()
                 ), mock.patch.object(
                     keychain, "launch_guard", return_value=_RecordingGuard()
                 ), mock.patch.object(
@@ -509,9 +509,8 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
 
         captured = {}
 
-        def fake_run_wait(argv, env, *, on_started):
+        def fake_run_wait(argv, env):
             captured["pid_while_held"] = locks.lock_holder_pid(store, "work")
-            on_started()
             return 0
 
         with isolated_store_env(), mock.patch.dict(
@@ -523,7 +522,7 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
                 store, [], flag_ref="work", launch_as_child=True
             )
             with mock.patch.object(
-                platforms, "run_wait", side_effect=fake_run_wait
+                platforms, "run_wait", side_effect=child_launch_double(fake_run_wait)
             ):
                 rc = runner.run(plan, store=store)
             self.assertEqual(rc, 0)
@@ -541,7 +540,7 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
 
         captured = {}
 
-        def fake_launch_argv(*args, **kwargs):
+        def fake_launch_argv(*args):
             captured["pid_while_held"] = locks.lock_holder_pid(store, "work")
             return 0
 
@@ -552,7 +551,7 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
             store.create("work")
             plan = runner.build_plan(store, [], flag_ref="work")
             with mock.patch.object(
-                platforms, "launch_argv", side_effect=fake_launch_argv
+                platforms, "launch_argv", side_effect=child_launch_double(fake_launch_argv)
             ) as launch_argv:
                 rc = runner.run(plan, store=store)
             self.assertEqual(rc, 0)
@@ -642,7 +641,8 @@ class TestRunnerReleasesLockOnExecFailure(unittest.TestCase):
                 "process_alive",
                 side_effect=lambda pid: pid == os.getpid(),
             ), mock.patch.object(
-                platforms, "launch_argv", return_value=126
+                platforms, "launch_argv",
+                side_effect=child_launch_double(return_value=126, started=False),
             ) as launch_argv:
                 rc = runner.run(plan, store=store)
             self.assertEqual(rc, 126)
@@ -674,7 +674,9 @@ class TestRunnerJoinSemantics(unittest.TestCase):
 
         with isolated_store_env(), mock.patch.dict(
             self if False else {}, {}
-        ), mock.patch.object(platforms, "run_wait", return_value=0) as waits:
+        ), mock.patch.object(
+            platforms, "run_wait", side_effect=child_launch_double()
+        ) as waits:
             import os
             import sys
 
@@ -714,7 +716,7 @@ class TestRunnerJoinSemantics(unittest.TestCase):
                 locks.acquire_lease(store, "cx")
                 try:
                     with mock.patch.object(
-                        platforms, "run_wait", return_value=0
+                        platforms, "run_wait", side_effect=child_launch_double()
                     ), mock.patch.object(
                         runner, "warn", side_effect=warnings.append
                     ):
@@ -790,7 +792,9 @@ class TestRunnerPickRetryPreservesCwd(unittest.TestCase):
             try:
                 with mock.patch.object(runner, "build_plan", side_effect=tracked_build_plan), \
                         mock.patch.object(keychain, "launch_guard", side_effect=lambda *a, **k: _BusyThenOkGuard()), \
-                        mock.patch.object(runner.platforms, "launch_argv", return_value=0):
+                        mock.patch.object(
+                            runner.platforms, "launch_argv", side_effect=child_launch_double()
+                        ):
                     rc = runner.run(plan, store=store)
                 self.assertEqual(rc, 0)
                 self.assertIn(custom_cwd, build_plan_cwds)

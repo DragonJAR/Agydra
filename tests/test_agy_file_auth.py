@@ -21,7 +21,13 @@ import platforms
 import profile_rotation
 import runner
 import usage_agy
-from conftest import BaseCase, _make_jwt, posix_only, simulated_macos_keychain
+from conftest import (
+    BaseCase,
+    _make_jwt,
+    child_launch_double,
+    posix_only,
+    simulated_macos_keychain,
+)
 from store import Store, StoreError
 
 
@@ -356,8 +362,13 @@ class TestRandomAgyFileLaunch(BaseCase):
                 mock.patch.object(
                     keychain, "launch_guard",
                     side_effect=guard or AssertionError("random file auth must bypass Keychain"),
-                ), mock.patch.object(platforms, "launch_argv", side_effect=launch or self._capture), \
-                mock.patch.object(platforms, "run_wait", side_effect=launch or self._capture):
+                ), mock.patch.object(
+                    platforms, "launch_argv",
+                    side_effect=child_launch_double(launch or self._capture),
+                ), mock.patch.object(
+                    platforms, "run_wait",
+                    side_effect=child_launch_double(launch or self._capture),
+                ):
             return runner.run(plan, store=self.store)
 
     def test_live_keychain_owner_never_substitutes_the_selected_profile(self):
@@ -528,7 +539,9 @@ class TestRandomAgyFileLaunch(BaseCase):
                         mock.patch.object(
                             keychain, "launch_guard", return_value=contextlib.nullcontext()
                         ) as guard, mock.patch.object(isolation, "prepare_agy_file_auth") as prepare, \
-                        mock.patch.object(platforms, "run_wait", return_value=0):
+                        mock.patch.object(
+                            platforms, "run_wait", side_effect=child_launch_double()
+                        ):
                     self.assertEqual(runner.run(plan, store=self.store), 0)
                 guard.assert_called_once_with(self.store, "alpha", capture=login)
                 prepare.assert_not_called()
@@ -560,8 +573,7 @@ class TestRandomAgyFileLaunch(BaseCase):
             "id_token": _make_jwt({"email": "gamma@example.com"}),
         }).encode("utf-8")
 
-        def native_login(_argv, env, *, on_started):
-            on_started()
+        def native_login(_argv, env):
             self.assertEqual(env["AGYDRA_PROFILE"], "gamma")
             self.assertEqual(env[account.AGY_FILE_AUTH_ENV], account.AGY_FILE_AUTH_VALUE)
             self.assertFalse(locks.lease_holders(self.store, "gamma")[0].keychain)

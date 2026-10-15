@@ -26,7 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 import bootstrap
-from tests.conftest import posix_only, write_fake_binary
+from tests.conftest import child_launch_double, posix_only, write_fake_binary
 
 
 def _make_fake_project(tmp: Path, *, with_console: bool) -> Path:
@@ -939,7 +939,7 @@ class RootEntryForceContract(unittest.TestCase):
                     mock.patch.object(agydra.os.path, "isfile", side_effect=_isfile_hiding_console_script(installed)), \
                     mock.patch.object(bootstrap, "run", side_effect=fake_run), \
                     mock.patch.object(bootstrap, "perform_install", side_effect=fake_perform), \
-                    mock.patch("platforms.launch_argv", return_value=0):
+                    mock.patch("platforms.launch_argv", side_effect=child_launch_double()):
                 self.assertEqual(agydra.main(), 0)
         return forced
 
@@ -975,7 +975,7 @@ class RootEntryForceContract(unittest.TestCase):
                     mock.patch.object(sys, "argv", ["agydra.py", "setup"]), \
                     mock.patch.object(agydra.os.path, "isfile", side_effect=_isfile_hiding_console_script([True])), \
                     mock.patch.object(bootstrap, "run", side_effect=fake_run), \
-                    mock.patch("platforms.launch_argv", return_value=0) as launch:
+                    mock.patch("platforms.launch_argv", side_effect=child_launch_double()) as launch:
                 self.assertEqual(agydra.main(), 0)
         launch.assert_not_called()
         self.assertEqual(forced, [False])
@@ -990,7 +990,7 @@ class RootEntryForceContract(unittest.TestCase):
                     mock.patch.object(sys, "argv", ["agydra.py", "setup", "-n"]), \
                     mock.patch.object(agydra.os.path, "isfile", side_effect=_isfile_hiding_console_script([True])), \
                     mock.patch.object(bootstrap, "run") as run, \
-                    mock.patch("platforms.launch_argv", return_value=0) as launch:
+                    mock.patch("platforms.launch_argv", side_effect=child_launch_double()) as launch:
                 self.assertEqual(agydra.main(), 0)
         run.assert_not_called()
         launch.assert_called_once()

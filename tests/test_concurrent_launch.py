@@ -24,6 +24,7 @@ from conftest import (
     BaseCase,
     LiveHolders,
     authenticate_agy_profile as _authenticate,
+    child_launch_double,
     held_cli_session,
     simulated_macos_keychain,
 )
@@ -281,8 +282,12 @@ class TestRandomPickExhaustion(BaseCase):
         try:
             with simulated_macos_keychain(), \
                     mock.patch.object(keychain, "launch_guard") as guard, \
-                    mock.patch.object(platforms, "run_wait", side_effect=launch), \
-                    mock.patch.object(platforms, "launch_argv", side_effect=launch):
+                    mock.patch.object(
+                        platforms, "run_wait", side_effect=child_launch_double(launch)
+                    ), \
+                    mock.patch.object(
+                        platforms, "launch_argv", side_effect=child_launch_double(launch)
+                    ):
                 for _ in range(3):
                     self.assertEqual(runner.run(plan, store=self.store), 0)
                 guard.assert_not_called()
@@ -315,8 +320,12 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
         try:
             with simulated_macos_keychain(), \
                     mock.patch.object(keychain, "launch_guard") as guard, \
-                    mock.patch.object(platforms, "run_wait", side_effect=launch), \
-                    mock.patch.object(platforms, "launch_argv", side_effect=launch):
+                    mock.patch.object(
+                        platforms, "run_wait", side_effect=child_launch_double(launch)
+                    ), \
+                    mock.patch.object(
+                        platforms, "launch_argv", side_effect=child_launch_double(launch)
+                    ):
                 self.assertEqual(runner.run(plan, store=self.store), 0)
             guard.assert_not_called()
             self.assertEqual(keychain._load_slot_lease(self.store).owner, "gamma")
@@ -370,8 +379,12 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
                 stderr = io.StringIO()
                 with simulated_macos_keychain(), \
                         mock.patch.object(keychain, "launch_guard") as guard, \
-                        mock.patch.object(platforms, "run_wait", side_effect=launch), \
-                        mock.patch.object(platforms, "launch_argv", side_effect=launch), \
+                        mock.patch.object(
+                            platforms, "run_wait", side_effect=child_launch_double(launch)
+                        ), \
+                        mock.patch.object(
+                            platforms, "launch_argv", side_effect=child_launch_double(launch)
+                        ), \
                         contextlib.redirect_stderr(stderr):
                     self.assertEqual(runner.run(plan, store=self.store), 0)
                 self.assertEqual(stderr.getvalue(), "")
@@ -388,8 +401,12 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
             first = plan.profile
             with simulated_macos_keychain(), \
                     mock.patch.object(keychain, "launch_guard") as guard, \
-                    mock.patch.object(platforms, "run_wait", return_value=0), \
-                    mock.patch.object(platforms, "launch_argv", return_value=0):
+                    mock.patch.object(
+                        platforms, "run_wait", side_effect=child_launch_double()
+                    ), \
+                    mock.patch.object(
+                        platforms, "launch_argv", side_effect=child_launch_double()
+                    ):
                 self.assertEqual(runner.run(plan, store=self.store), 0)
             guard.assert_not_called()
             self.assertNotEqual(first, "gamma")
@@ -401,8 +418,12 @@ class TestRandomPickPreservesRotationUnderKeychainOwnership(BaseCase):
         keychain._slot_lease_path(self.store).write_bytes(b"not-json")
         with simulated_macos_keychain(), \
                 mock.patch.object(keychain, "launch_guard") as guard, \
-                mock.patch.object(platforms, "run_wait", return_value=0), \
-                mock.patch.object(platforms, "launch_argv", return_value=0):
+                    mock.patch.object(
+                        platforms, "run_wait", side_effect=child_launch_double()
+                    ), \
+                    mock.patch.object(
+                        platforms, "launch_argv", side_effect=child_launch_double()
+                    ):
             self.assertEqual(runner.run(plan, store=self.store), 0)
         guard.assert_not_called()
         self.assertEqual(keychain._slot_lease_path(self.store).read_bytes(), b"not-json")
@@ -471,13 +492,16 @@ class TestSessionEndRecordsEmail(BaseCase):
         self.assertIsNone(self.store.get("andrea").email)
 
         plan = runner.build_plan(self.store, ["chat"], flag_ref="andrea", launch_as_child=True)
-        def started_child(_argv, _env, *, on_started):
-            on_started()
+        def started_child(_argv, _env):
             return 0
 
         with simulated_macos_keychain(), \
-                mock.patch.object(platforms, "run_wait", side_effect=started_child), \
-                mock.patch.object(platforms, "launch_argv", return_value=0):
+                mock.patch.object(
+                    platforms, "run_wait", side_effect=child_launch_double(started_child)
+                ), \
+                mock.patch.object(
+                    platforms, "launch_argv", side_effect=child_launch_double(started_child)
+                ):
             rc = runner.run(plan, store=self.store)
         self.assertEqual(rc, 0)
         self.assertEqual(self.store.get("andrea").email, "andrea@example.com")
@@ -502,8 +526,12 @@ class TestSessionEndRecordsEmail(BaseCase):
 
         plan = runner.build_plan(self.store, ["chat"], flag_ref="andrea", launch_as_child=True)
         with simulated_macos_keychain(), \
-                mock.patch.object(platforms, "run_wait", return_value=0), \
-                mock.patch.object(platforms, "launch_argv", return_value=0), \
+                mock.patch.object(
+                    platforms, "run_wait", side_effect=child_launch_double()
+                ), \
+                mock.patch.object(
+                    platforms, "launch_argv", side_effect=child_launch_double()
+                ), \
                 mock.patch.object(locks, "try_mutation_lock", return_value=None):
             rc = runner.run(plan, store=self.store)
         self.assertEqual(rc, 0)

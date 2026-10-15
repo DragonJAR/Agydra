@@ -31,7 +31,7 @@ from unittest import mock
 import agydra
 import bootstrap
 import platforms
-from conftest import BaseCase, posix_only, write_fake_binary
+from conftest import BaseCase, child_launch_double, posix_only, write_fake_binary
 
 FAKE_CONSOLE_BODY = (
     "#!/bin/sh\n"
@@ -83,7 +83,7 @@ class TestLauncherSurvivesOptionalShimFailure(BaseCaseWithCheckout):
                     return_value=bootstrap.venv_python(root),
                 ), \
                 mock.patch.object(bootstrap, "install_editable", side_effect=fake_install), \
-                mock.patch("platforms.launch_argv", return_value=0) as launch:
+                mock.patch("platforms.launch_argv", side_effect=child_launch_double()) as launch:
             code = agydra.main()
         self.assertEqual(code, 0)
         self.assertEqual(
@@ -227,7 +227,7 @@ class TestDanglingShimIsRepairedByLauncher(BaseCaseWithCheckout):
 
         with mock.patch.object(agydra, "__file__", str(root / "agydra.py")), \
                 mock.patch.object(sys, "argv", ["agydra.py", "--version"]), \
-                mock.patch("platforms.launch_argv", return_value=0) as launch:
+                mock.patch("platforms.launch_argv", side_effect=child_launch_double()) as launch:
             code = agydra.main()
         self.assertEqual(code, 0)
         self.assertFalse(shim.is_symlink())
@@ -428,7 +428,7 @@ class TestLauncherFlushesBeforeExec(BaseCaseWithCheckout):
         with mock.patch.object(sys, "stdout", recorder), \
                 mock.patch.object(agydra, "__file__", str(root / "agydra.py")), \
                 mock.patch.object(sys, "argv", ["agydra.py", "--version"]), \
-                mock.patch("platforms.launch_argv", return_value=0):
+                mock.patch("platforms.launch_argv", side_effect=child_launch_double()):
             code = agydra.main()
         self.assertEqual(code, 0)
         self.assertTrue(recorder.flushed)
@@ -447,7 +447,7 @@ class TestLauncherFlushesBeforeExec(BaseCaseWithCheckout):
         with mock.patch.object(sys, "stdout", recorder), \
                 mock.patch.object(agydra, "__file__", str(root / "agydra.py")), \
                 mock.patch.object(sys, "argv", ["agydra.py", "setup", "-n"]), \
-                mock.patch("platforms.launch_argv", return_value=0):
+                mock.patch("platforms.launch_argv", side_effect=child_launch_double()):
             code = agydra.main()
         self.assertEqual(code, 0)
         self.assertTrue(recorder.flushed)
@@ -500,7 +500,8 @@ class TestDanglingJunctionSelfHeal(BaseCaseWithCheckout):
         def _record(path):
             removed.append(path)
 
-        with mock.patch.object(bootstrap, "_is_dangling_link", return_value=True), \
+        with mock.patch.object(bootstrap.platforms, "is_windows", return_value=False), \
+                mock.patch.object(bootstrap, "_is_dangling_link", return_value=True), \
                 mock.patch.object(bootstrap, "_remove_shim_link_entry", side_effect=_record):
             result = bootstrap.ensure_path_shim(root, lambda line: None)
         self.assertEqual(result, shim)
@@ -532,7 +533,8 @@ class TestDanglingJunctionSelfHeal(BaseCaseWithCheckout):
         shim = self.fake_home / ".local" / "bin" / "agydra"
         shim.parent.mkdir(parents=True, exist_ok=True)
         shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        with mock.patch.object(bootstrap, "_remove_shim_link_entry") as remove:
+        with mock.patch.object(bootstrap.platforms, "is_windows", return_value=False), \
+                mock.patch.object(bootstrap, "_remove_shim_link_entry") as remove:
             with self.assertRaises(bootstrap.BootstrapError):
                 bootstrap.ensure_path_shim(root, lambda line: None)
         remove.assert_not_called()

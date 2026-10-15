@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import account
 import platforms
 import runner
-from conftest import BaseCase, _make_jwt
+from conftest import BaseCase, _make_jwt, child_launch_double
 from store import Store
 
 
@@ -54,14 +54,17 @@ class TestRunnerStartState(BaseCase):
         self.assertEqual(self.store.get(self.profile.name).email, "alice@example.com")
 
     def test_exec_failure_status_does_not_reanchor_profile_email(self):
-        with mock.patch.object(platforms, "launch_argv", return_value=127):
+        with mock.patch.object(
+            platforms, "launch_argv",
+            side_effect=child_launch_double(return_value=127, started=False),
+        ):
             self.assertEqual(runner._run_prepared(self.plan, self.store), 127)
 
         self.assertEqual(self.store.get(self.profile.name).email, "alice@example.com")
 
     def test_started_waited_child_reanchors_profile_email_on_exit(self):
         self.plan.launch_as_child = True
-        def start_and_exit(_argv, _env, *, on_started):
+        def start_and_exit(_argv, _env, *, on_started=None):
             on_started()
             return 0
 
@@ -74,7 +77,7 @@ class TestRunnerStartState(BaseCase):
     def test_started_waited_child_exit_127_reanchors_profile_email(self):
         self.plan.launch_as_child = True
 
-        def start_and_exit(_argv, _env, *, on_started):
+        def start_and_exit(_argv, _env, *, on_started=None):
             on_started()
             return 127
 
@@ -86,7 +89,10 @@ class TestRunnerStartState(BaseCase):
 
     def test_waited_spawn_failure_exit_127_does_not_reanchor_profile_email(self):
         self.plan.launch_as_child = True
-        with mock.patch.object(platforms, "run_wait", return_value=127):
+        with mock.patch.object(
+            platforms, "run_wait",
+            side_effect=child_launch_double(return_value=127, started=False),
+        ):
             with mock.patch.object(platforms, "drain_tty_input"):
                 self.assertEqual(runner._run_prepared(self.plan, self.store), 127)
 

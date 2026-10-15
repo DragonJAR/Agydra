@@ -19,7 +19,7 @@ import profile_rotation
 import resolver
 import runner
 import usage_snapshot
-from conftest import BaseCase, authenticate_agy_profile, write_fake_binary
+from conftest import BaseCase, authenticate_agy_profile, child_launch_double, write_fake_binary
 from store import Store, StoreError
 
 
@@ -124,7 +124,7 @@ class TestProfileRotation(BaseCase):
         with mock.patch.object(
             account, "auth_state", side_effect=self._auth_state(_auth_states)
         ), mock.patch.object(
-            platforms, "launch_argv", side_effect=self._record_launch
+            platforms, "launch_argv", side_effect=child_launch_double(self._record_launch)
         ):
             self.assertEqual(runner.run(plan, store=self.store), 0)
         return self.launched[-1]
@@ -281,7 +281,7 @@ class TestProfileRotation(BaseCase):
         ), mock.patch.object(
             locks, "acquire_lease", side_effect=acquire
         ), mock.patch.object(
-            platforms, "launch_argv", side_effect=launch
+            platforms, "launch_argv", side_effect=child_launch_double(launch)
         ):
             self.assertEqual(runner.run(plan, store=self.store), 0)
 
@@ -319,7 +319,7 @@ class TestProfileRotation(BaseCase):
         ) as quota_read, mock.patch.object(
             locks, "acquire_lease", side_effect=acquire
         ), mock.patch.object(
-            platforms, "launch_argv", side_effect=self._record_launch
+            platforms, "launch_argv", side_effect=child_launch_double(self._record_launch)
         ):
             self.assertEqual(runner.run(plan, store=self.store), 0)
 
@@ -360,7 +360,7 @@ class TestProfileRotation(BaseCase):
         ), mock.patch.object(
             keychain, "launch_guard"
         ) as guard, mock.patch.object(
-            platforms, "launch_argv", side_effect=launch
+            platforms, "launch_argv", side_effect=child_launch_double(launch)
         ):
             self.assertEqual(runner.run(plan, store=self.store), 0)
 
@@ -384,9 +384,9 @@ class TestProfileRotation(BaseCase):
         ), mock.patch.object(
             keychain, "launch_guard"
         ) as guard, mock.patch.object(
-            platforms, "launch_argv", side_effect=self._record_launch
+            platforms, "launch_argv", side_effect=child_launch_double(self._record_launch)
         ), mock.patch.object(
-            platforms, "run_wait", side_effect=self._record_launch
+            platforms, "run_wait", side_effect=child_launch_double(self._record_launch)
         ):
             rc = runner.run(plan, store=self.store)
 
@@ -540,7 +540,9 @@ class TestProfileRotation(BaseCase):
                 mock.patch.object(locks, "is_locked", side_effect=lambda _store, name: name in busy_names), \
                 mock.patch.object(locks, "acquire_lease", side_effect=acquire), \
                 mock.patch.object(locks, "release_lease"), \
-                mock.patch.object(platforms, "launch_argv", side_effect=self._record_launch):
+                mock.patch.object(
+                    platforms, "launch_argv", side_effect=child_launch_double(self._record_launch)
+                ):
             self.assertEqual(runner.run(forced_plan, store=self.store), 0)
 
         self.assertEqual(acquire_calls, [None])
@@ -632,7 +634,9 @@ class TestProfileRotation(BaseCase):
 
         reopened = Store(self.store_root)
         with mock.patch.object(account, "auth_state", side_effect=self._auth_state()), \
-                mock.patch.object(platforms, "launch_argv", side_effect=self._record_launch):
+                mock.patch.object(
+                    platforms, "launch_argv", side_effect=child_launch_double(self._record_launch)
+                ):
             next_plan = runner.build_plan(
                 reopened,
                 ["chat"],

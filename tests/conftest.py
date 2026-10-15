@@ -84,6 +84,21 @@ def cli_environment(extra: dict = None) -> dict:
 CLI_ENTRY = "import sys; from cli import main; sys.exit(main())"
 
 
+def simulate_child_started(on_started):
+    if on_started is not None:
+        on_started()
+
+
+def child_launch_double(delegate=None, *, return_value=0, started=True):
+    def launch(*args, on_started=None, **kwargs):
+        result = delegate(*args, **kwargs) if delegate is not None else return_value
+        if started:
+            simulate_child_started(on_started)
+        return result
+
+    return launch
+
+
 def cli_command(*args) -> list:
     """Argv running the CLI exactly like the installed console script.
 

@@ -21,7 +21,13 @@ import resolver
 import runner
 from store import Store, StoreError
 
-from conftest import BaseCase, authenticate_agy_profile as _authenticate, held_cli_session, macos_only
+from conftest import (
+    BaseCase,
+    authenticate_agy_profile as _authenticate,
+    child_launch_double,
+    held_cli_session,
+    macos_only,
+)
 
 
 def _install_foreign_holder(store, name: str, pid: int = 424242) -> None:
@@ -192,7 +198,7 @@ class TestRunnerForce(BaseCase):
             )
             return 0
 
-        return fake_launch
+        return child_launch_double(fake_launch)
 
     def test_forced_run_spawns_without_taking_or_stealing_the_held_lock(self):
         _install_foreign_holder(self.store, "work")
@@ -243,7 +249,8 @@ class TestRunnerForce(BaseCase):
             ), mock.patch.object(
                 platforms, "process_alive", return_value=True
             ), mock.patch.object(
-                platforms, "run_wait", side_effect=lambda argv, env, **kwargs: (kwargs.get("on_started") and kwargs["on_started"]()) or spawned.append(argv) or 0
+                platforms, "run_wait",
+                side_effect=child_launch_double(lambda argv, env: spawned.append(argv) or 0),
             ):
                 rc = runner.run(plan, store=self.store)
             self.assertEqual((rc, len(spawned)), (0, 1))
@@ -295,8 +302,12 @@ class TestRunnerForce(BaseCase):
 
         with mock.patch("keychain.supported", return_value=True), \
                 mock.patch("keychain.launch_guard") as guard_factory, \
-                mock.patch("platforms.run_wait", return_value=0) as run_wait, \
-                mock.patch("platforms.launch_argv", return_value=0) as launch_argv:
+                mock.patch(
+                    "platforms.run_wait", side_effect=child_launch_double()
+                ) as run_wait, \
+                mock.patch(
+                    "platforms.launch_argv", side_effect=child_launch_double()
+                ) as launch_argv:
             result = runner.run(plan, store=self.store)
 
         self.assertEqual(result, 0)

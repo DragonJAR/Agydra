@@ -23,6 +23,7 @@ import runner
 from conftest import (
     BaseCase,
     _make_jwt,
+    child_launch_double,
     macos_only,
     simulated_macos_keychain,
     write_fake_binary,
@@ -384,7 +385,10 @@ class TestA4RandomCandidateErrorHandling(BaseCase):
             return original_build_overlay(profile, data_dir, store_root, engine=engine)
 
         with mock.patch.object(isolation, "build_overlay", side_effect=fail_alpha_overlay), \
-                mock.patch.object(platforms, "launch_argv", side_effect=lambda argv, env: launched.append(argv) or 0):
+                mock.patch.object(
+                    platforms, "launch_argv",
+                    side_effect=child_launch_double(lambda argv, env: launched.append(argv) or 0),
+                ):
             rc = runner.run(plan, store=self.store)
             self.assertEqual(rc, 0)
             self.assertEqual(len(launched), 1)
