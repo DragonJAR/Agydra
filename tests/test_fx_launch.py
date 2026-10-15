@@ -160,9 +160,9 @@ class TestUsageNetworkErrors(BaseCase):
         self.assertEqual(res.error, "offline (network unreachable)")
         self.assertIsNone(res.plan)
 
-    @mock.patch("account.detect_grok_plan", return_value=None)
+    @mock.patch("usage._usage_auth_snapshot", return_value=({"auth_type": "oauth", "key": "k"}, None, "g@test.com"))
     @mock.patch("usage.fetch_grok_billing_payload")
-    def test_grok_usage_http_error_returns_ok_false_and_no_fake_plan(self, mock_fetch, mock_detect):
+    def test_grok_usage_http_error_returns_ok_false_and_no_fake_plan(self, mock_fetch, mock_snapshot):
         import io
         import json
         import urllib.error

@@ -75,6 +75,7 @@ py-modules = [
     "resolver",
     "runner",
     "store",
+    "text",
     "ui",
     "usage",
     "usage_agy",

@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from agydra import __version__
 import account
 import banner
+from text import module_text
 import engines
 import i18n
 import isolation
@@ -417,7 +418,11 @@ def _consume_launch_flags(
         for key, inline, width in matched:
             if width == 2:
                 if i >= n:
-                    raise StoreError(f"{token} requires a value")
+                    raise StoreError(module_text(
+                        'cli.requires_value',
+                        '{token} requires a value',
+                        token=token,
+                    ))
                 inline = argv[i]
                 i += 1
             values[key] = inline if inline is not None else True
@@ -484,28 +489,60 @@ def _warn_late_flags(
             return
 
 
-def _assert_free(store: Store, name: str, action: str = "modifying the profile") -> None:
+def _assert_free(store: Store, name: str, action: Optional[str] = None) -> None:
     """Refuse to mutate a profile that a live session is using.
 
     Diagnostics come only from the validated ``locks.lease_holders``
     result: a PID is named (with a ``kill`` hint) only for a holder whose
     process start token was recorded. A busy lock without a registered
     lease, or with an unreadable registry, is reported as unverified."""
+    action = action if action is not None else module_text("cli.action_modify", "modifying the profile")
     _require_no_pending_import(store, name)
     if locks.is_locked(store, name):
         holders = locks.lease_holders(store, name) or []
         verified = [holder for holder in holders if holder.start]
         if not holders:
-            session = "a session whose holder state could not be verified (treated as busy)"
+            session = module_text(
+                'cli.session_unverified',
+                'a session whose holder state could not be verified (treated as busy)',
+            )
         elif not verified:
-            noun = "a live session" if len(holders) == 1 else f"{len(holders)} live sessions"
-            session = f"{noun} (process identity unverified)"
+            noun = module_text(
+                'cli.session_single',
+                'a live session',
+            ) if len(holders) == 1 else module_text(
+                'cli.sessions_plural',
+                '{count} live sessions',
+                count=len(holders),
+            )
+            session = module_text(
+                'cli.session_identity_unverified',
+                '{session} (process identity unverified)',
+                session=noun,
+            )
         elif len(holders) > 1:
-            session = f"{len(holders)} live sessions (first PID {verified[0].pid}; kill {verified[0].pid})"
+            session = module_text(
+                'cli.sessions_verified',
+                '{count} live sessions (first PID {pid}; kill {kill_pid})',
+                count=len(holders),
+                pid=verified[0].pid,
+                kill_pid=verified[0].pid,
+            )
         else:
-            session = f"a live session (PID {verified[0].pid}; kill {verified[0].pid})"
+            session = module_text(
+                'cli.session_verified',
+                'a live session (PID {pid}; kill {kill_pid})',
+                pid=verified[0].pid,
+                kill_pid=verified[0].pid,
+            )
         raise ProfileBusyError(
-            f"profile {name!r} has {session}; end it before {action}"
+            module_text(
+                'cli.profile_busy',
+                'profile {name!r} has {session}; end it before {action}',
+                name=name,
+                session=session,
+                action=action,
+            )
         )
 
 
@@ -519,8 +556,12 @@ def _ensure_ref_unchanged(store: Store, ref: object, expected_name: str, action:
     """
     if store.resolve_ref(ref) != expected_name:
         raise StoreError(
-            f"profile reference {ref!r} changed while acquiring its lock; "
-            f"retry {action}"
+            module_text(
+                'cli.reference_changed',
+                'profile reference {ref!r} changed while acquiring its lock; retry {action}',
+                ref=ref,
+                action=action,
+            )
         )
 
 
@@ -534,12 +575,21 @@ def _acquire_profile_lock(
         handle = locks.try_mutation_lock(store, name)
     except locks.LockError as exc:
         raise StoreError(
-            cannot_safely_proceed_message(action, f"profile {name!r}", exc)
+            cannot_safely_proceed_message(action, module_text(
+                "cli.profile_subject",
+                "profile {name!r}",
+                name=name,
+            ), exc)
         ) from exc
     if handle is None:
         _assert_free(store, name, action)
         raise ProfileBusyError(
-            f"profile {name!r} became busy before {action}; retry when it is idle"
+            module_text(
+                'cli.profile_became_busy',
+                'profile {name!r} became busy before {action}; retry when it is idle',
+                name=name,
+                action=action,
+            )
         )
     return handle
 
@@ -553,11 +603,20 @@ def _acquire_profile_read_lock(
         )
     except locks.LockError as exc:
         raise StoreError(
-            cannot_safely_proceed_message(action, f"profile {name!r}", exc)
+            cannot_safely_proceed_message(action, module_text(
+                "cli.profile_subject",
+                "profile {name!r}",
+                name=name,
+            ), exc)
         ) from exc
     if handle is None:
         raise ProfileBusyError(
-            f"profile {name!r} is busy with a concurrent operation; retry {action}"
+            module_text(
+                'cli.profile_operation_busy',
+                'profile {name!r} is busy with a concurrent operation; retry {action}',
+                name=name,
+                action=action,
+            )
         )
     return handle
 
@@ -947,16 +1006,27 @@ def _enable_claude_capture(store: Store, profile) -> str:
         current = store.get_readonly(profile.name)
         if current.engine != "claude" or current.seq != profile.seq:
             raise StoreError(
-                f"profile {profile.name!r} identity changed while enabling usage capture"
+                module_text(
+                    'cli.capture_identity_changed',
+                    'profile {name!r} identity changed while enabling usage capture',
+                    name=profile.name,
+                )
             )
         current_config_dir = store.claude_config_dir_for_seq(current.seq)
         if current_config_dir != expected_config_dir:
             raise StoreError(
-                f"profile {profile.name!r} config path changed while enabling usage capture"
+                module_text(
+                    'cli.capture_path_changed',
+                    'profile {name!r} config path changed while enabling usage capture',
+                    name=profile.name,
+                )
             )
         return isolation.validate_claude_config_dir(current_config_dir)
 
-    handle = _acquire_profile_lock(store, profile.name, "enabling Claude usage capture")
+    handle = _acquire_profile_lock(store, profile.name, module_text(
+        'cli.action_enable_capture',
+        'enabling Claude usage capture',
+    ))
     try:
         config_dir = verified_config_dir()
         settings_path = config_dir / "settings.json"
@@ -967,8 +1037,12 @@ def _enable_claude_capture(store: Store, profile) -> str:
                 raw = read_json_object(settings_path)
             except (ValueError, OSError) as exc:
                 raise StoreError(
-                    f"cannot enable capture: {settings_path} is not valid JSON "
-                    f"({exc}); fix it manually, then retry"
+                    module_text(
+                        'cli.capture_invalid_json',
+                        'cannot enable capture: {path} is not valid JSON ({error}); fix it manually, then retry',
+                        path=settings_path,
+                        error=exc,
+                    )
                 ) from exc
             existing = raw
             current_status = raw.get("statusLine")
@@ -980,21 +1054,31 @@ def _enable_claude_capture(store: Store, profile) -> str:
                 )
             if current_status is not None:
                 raise StoreError(
-                    f"{settings_path} already defines a statusLine; agydra refuses "
-                    "to overwrite an existing one. Compose manually: keep your "
-                    "statusLine command and add the agydra capture writer to a "
-                    "sidecar, or remove the existing key and re-run."
+                    module_text(
+                        'cli.capture_existing_statusline',
+                        '{path} already defines a statusLine; agydra refuses to overwrite an existing one. Compose manually: keep your statusLine command and add the agydra capture writer to a sidecar, or remove the existing key and re-run.',
+                        path=settings_path,
+                    )
                 )
         merged = {**existing, "statusLine": payload["statusLine"]}
         if verified_config_dir() != config_dir:
             raise StoreError(
-                f"profile {profile.name!r} config path changed while enabling usage capture"
+                module_text(
+                    'cli.capture_path_changed',
+                    'profile {name!r} config path changed while enabling usage capture',
+                    name=profile.name,
+                )
             )
         try:
             atomic_write_text(settings_path, json.dumps(merged, indent=2) + "\n")
         except OSError as exc:
             raise StoreError(
-                f"failed to write {settings_path}: {exc}"
+                module_text(
+                    'cli.capture_write_failed',
+                    'failed to write {path}: {error}',
+                    path=settings_path,
+                    error=exc,
+                )
             ) from exc
         return i18n.t(
             "claude.capture_enabled",
@@ -1037,7 +1121,11 @@ def parse_finite_number(
     try:
         shown = repr(value)
     except (ValueError, OverflowError):
-        shown = f"<{type(value).__name__} outside display range>"
+        shown = module_text(
+            'cli.number_display_range',
+            '<{type} outside display range>',
+            type=type(value).__name__,
+        )
     try:
         parsed = float(value)
         if not math.isfinite(parsed):
@@ -1102,7 +1190,8 @@ def _restore_cached_groups(cached_groups: Any) -> List[usage.UsageGroup]:
 
 
 def _find_previous_entry(
-    previous: Optional[Mapping[str, Any]], profile: Any
+    previous: Optional[Mapping[str, Any]], profile: Any,
+    *, index: Optional[Mapping[Any, List[Mapping[str, Any]]]] = None,
 ) -> Optional[Mapping[str, Any]]:
     """Locate the profile's prior entry in the previous snapshot document.
 
@@ -1115,7 +1204,7 @@ def _find_previous_entry(
     seq = getattr(profile, "seq", 0) or 0
     engine = getattr(profile, "engine", "") or ""
     name = getattr(profile, "name", None)
-    return usage_snapshot._matching_entry(previous, seq, engine, name)
+    return usage_snapshot._matching_entry(previous, seq, engine, name, index=index)
 
 
 def _format_age(
@@ -1173,11 +1262,12 @@ def _record_usage_snapshot(
     if store.has_pending_rename():
         return list(results)
     previous = usage_snapshot.read_snapshot(store)
+    index = usage_snapshot.snapshot_identity_index(previous)
     updated_results = list(results)
     if isinstance(previous, dict) and previous.get("profiles"):
         for idx, (p, r) in enumerate(zip(profiles, results)):
             if not r.ok and getattr(r, "authentication_state", None) != "unauthenticated":
-                prev_entry = _find_previous_entry(previous, p)
+                prev_entry = _find_previous_entry(previous, p, index=index)
                 if prev_entry:
                     cached_groups = _restore_cached_groups(prev_entry.get("groups"))
                     if cached_groups:
@@ -1299,7 +1389,10 @@ def _claude_table_result(result: "usage.UsageResult") -> "usage.UsageResult":
     """Only a fully observed reading fills the shared quota columns; anything
     else renders as the standard ``unavailable`` cell (details: ``usage <profile>``)."""
     if result.ok and result.quality != "observed":
-        return dataclasses.replace(result, groups=[], error=result.error or "unavailable")
+        return dataclasses.replace(result, groups=[], error=result.error or module_text(
+            'cli.unavailable',
+            'unavailable',
+        ))
     return result
 
 
@@ -1523,7 +1616,7 @@ def _cmd_usage_compact(store: Store, _args) -> int:
                     err_cell = _usage_error_cell(result)
                 print(row + _plan_separated(err_cell, quota_width) + plan)
             elif not result.groups:
-                if result.error == usage.PLAN_WITHOUT_QUOTA:
+                if usage.is_plan_without_quota(result):
                     cell = paint("─ " + i18n.t("usage.plan_no_quota"), "dim")
                 elif result.error:
                     cell = paint("─ " + i18n.t("usage.unavailable", default="unavailable"), "dim")
@@ -1587,7 +1680,8 @@ def _cmd_usage_compact(store: Store, _args) -> int:
         if best_grok_val > 0:
             recs.append(f"Grok → {best_grok_name} {round(best_grok_val * 100)}%")
         elif best_grok_val < 0:
-            recs.append(f"Grok → {best_grok_name} ({best_grok_plan or 'Active'})")
+            grok_plan_label = best_grok_plan or module_text("usage.active", "Active")
+            recs.append(f"Grok → {best_grok_name} ({grok_plan_label})")
 
     if recs:
         print()
@@ -1641,7 +1735,7 @@ def _cmd_usage_detail(store: Store, args) -> int:
         )
         if not result.ok:
             if not result.groups:
-                if result.error and result.error.strip().lower() not in ("not authenticated", "not-authenticated", "unauthenticated"):
+                if result.error and result.error_code != "not_authenticated":
                     _error(i18n.t("usage.unavailable_with_error", error=result.error, default=f"usage unavailable: {result.error}"))
                 return 1
             age = _format_age(result.observed_at)
@@ -1658,7 +1752,7 @@ def _cmd_usage_detail(store: Store, args) -> int:
             )
             _warn(msg)
             print(paint(i18n.t("usage.warning_label", msg=msg, default=f"warning   : {msg}"), "yellow"))
-        elif result.error == usage.PLAN_WITHOUT_QUOTA:
+        elif usage.is_plan_without_quota(result):
             print(i18n.t("usage.usage_label", value=i18n.t("usage.plan_no_quota"), default=f"usage     : {i18n.t('usage.plan_no_quota')}"))
         elif result.error:
             _error(i18n.t("usage.unavailable_with_error", error=result.error, default=f"usage unavailable: {result.error}"))
@@ -1667,7 +1761,7 @@ def _cmd_usage_detail(store: Store, args) -> int:
             return 0
 
     if not result.ok and not result.groups:
-        if result.error and result.error != usage.PLAN_WITHOUT_QUOTA:
+        if result.error and not usage.is_plan_without_quota(result):
             _error(i18n.t("usage.unavailable_with_error", error=result.error, default=f"usage unavailable: {result.error}"))
         return 1
     for group in result.groups:
@@ -1705,7 +1799,7 @@ def _register_keychain_rename_recovery(store: Store) -> None:
 def cmd_rename(store: Store, args) -> int:
     _register_keychain_rename_recovery(store)
     old = store.resolve_ref(args.old)
-    _assert_free(store, old, "renaming the profile")
+    _assert_free(store, old, module_text('cli.action_rename', 'renaming the profile'))
     current = store.get(old)
 
     if not engines.get_engine(current.engine).needs_keychain:
@@ -1757,7 +1851,7 @@ def _print_cancelled(*, file: Any = None) -> None:
 
 def _finish_delete(store: Store, name: str, no_backup: bool) -> int:
     """Shared tail for both the normal and the corrupt-profile delete paths."""
-    _assert_free(store, name, "deleting the profile")
+    _assert_free(store, name, module_text('cli.action_delete', 'deleting the profile'))
 
     try:
         engine = store.get(name).engine
@@ -1803,7 +1897,7 @@ def cmd_delete(store: Store, args) -> int:
     except StoreError:
         if args.ref not in store.unreadable_profiles():
             raise
-        _assert_free(store, args.ref, "deleting the profile")
+        _assert_free(store, args.ref, module_text('cli.action_delete', 'deleting the profile'))
         prompt = i18n.t(
             "cmd.delete.confirm_unreadable",
             name=args.ref,
@@ -1816,7 +1910,7 @@ def cmd_delete(store: Store, args) -> int:
             _print_cancelled()
             return 1
         return _finish_delete(store, args.ref, args.no_backup)
-    _assert_free(store, name, "deleting the profile")
+    _assert_free(store, name, module_text('cli.action_delete', 'deleting the profile'))
     profile = store.get(name)
     email = account.display_email(store, profile) or "?"
     prompt = i18n.t(
@@ -1850,24 +1944,40 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
         seen.add(target_name)
         resolved.append(target_name)
     with ExitStack() as stack:
-        stack.enter_context(_acquire_profile_read_lock(store, src, "sharing config"))
+        stack.enter_context(_acquire_profile_read_lock(store, src, module_text(
+            'cli.action_share',
+            'sharing config',
+        )))
         for name in sorted(resolved):
-            stack.enter_context(_acquire_profile_lock(store, name, "sharing config"))
+            stack.enter_context(_acquire_profile_lock(store, name, module_text(
+                'cli.action_share',
+                'sharing config',
+            )))
         for reference, expected_name in references:
-            _ensure_ref_unchanged(store, reference, expected_name, "sharing config")
+            _ensure_ref_unchanged(store, reference, expected_name, module_text(
+                'cli.action_share',
+                'sharing config',
+            ))
         src_profile = store.get(src)
         _require_no_pending_import(store, src)
         if src_profile.name != src:
             raise StoreError(
-                f"cannot safely share config from {src!r}: profile metadata "
-                f"names a different owner ({src_profile.name!r})"
+                module_text(
+                    'cli.share_source_owner_changed',
+                    'cannot safely share config from {name!r}: profile metadata names a different owner ({owner!r})',
+                    name=src,
+                    owner=src_profile.name,
+                )
             )
         src_dir = store.profile_data_dir(src, engine=src_profile.engine, profile=src_profile)
         target_profiles = {name: store.get(name) for name in resolved}
         for name in target_profiles:
             _require_no_pending_import(store, name)
         if any(profile.name != name for name, profile in target_profiles.items()):
-            raise StoreError("cannot safely share config: target profile owner changed")
+            raise StoreError(module_text(
+                'cli.share_owner_changed',
+                'cannot safely share config: target profile owner changed',
+            ))
         if src_profile.engine == "claude" or any(
             profile.engine == "claude" for profile in target_profiles.values()
         ):
@@ -1941,9 +2051,27 @@ def _summarize_import_failure(exc: "shutil.Error", source: Path) -> str:
     """
     entries = exc.args[0] if exc.args and isinstance(exc.args[0], list) else []
     count = len(entries)
-    unit = "entry" if count == 1 else "entries"
-    detail = f"; first: {entries[0][0]} — {entries[0][2]}" if entries else f"; {exc}"
-    return f"import failed: {count} {unit} could not be copied from {source}{detail}"
+    unit = module_text(
+        'cli.import_entry',
+        'entry',
+    ) if count == 1 else module_text(
+        'cli.import_entries',
+        'entries',
+    )
+    detail = module_text(
+        'cli.import_first_failure',
+        '; first: {path} — {error}',
+        path=entries[0][0],
+        error=entries[0][2],
+    ) if entries else f"; {exc}"
+    return module_text(
+        'cli.import_failed',
+        'import failed: {count} {unit} could not be copied from {source}{detail}',
+        count=count,
+        unit=unit,
+        source=source,
+        detail=detail,
+    )
 
 
 _IMPORT_JOURNAL = ".import-state.json"
@@ -2059,7 +2187,10 @@ def _recover_import_transaction(store: Store, profile: Any) -> bool:
     )
     if not valid:
         raise StoreError(i18n.t(
-            "cmd.import.invalid_journal", path=journal, error="invalid identity or state",
+            "cmd.import.invalid_journal", path=journal, error=module_text(
+                "import.invalid_identity_state",
+                "invalid identity or state",
+            ),
             default="cannot recover import journal {path} ({error}); state retained",
         ))
     data = journal.parent / "data"
@@ -2158,14 +2289,21 @@ def cmd_import(store: Store, args) -> int:
             )
         )
     name = store.resolve_ref(ref)
-    with _acquire_profile_lock(store, name, "importing into it"), ExitStack() as guards:
+    with _acquire_profile_lock(store, name, module_text(
+        'cli.action_import',
+        'importing into it',
+    )), ExitStack() as guards:
         _ensure_ref_unchanged(store, ref, name, "import")
         profile = store.get(name)
         _recover_import_transaction(store, profile)
         if profile.name != name:
             raise StoreError(
-                f"cannot safely import into {name!r}: profile metadata names "
-                f"a different owner ({profile.name!r})"
+                module_text(
+                    'cli.import_owner_changed',
+                    'cannot safely import into {name!r}: profile metadata names a different owner ({owner!r})',
+                    name=name,
+                    owner=profile.name,
+                )
             )
         engine = profile.engine
         if engine == "claude":
@@ -2174,13 +2312,19 @@ def cmd_import(store: Store, args) -> int:
         if args.source is not None:
             real = Path(args.source).expanduser()
             if not real.is_dir():
-                raise StoreError(f"source directory not found: {real}")
+                raise StoreError(module_text(
+                    'cli.import_source_missing',
+                    'source directory not found: {path}',
+                    path=real,
+                ))
         else:
             real = platforms.real_home() / driver.data_dir_name
         if not real.is_dir():
             raise StoreError(
-                f"no generic {driver.binary_name} data directory found at {real} — log in once with "
-                f"plain `{driver.binary_name}` to create it, then retry: agydra import " + name
+                module_text("import.generic_data_missing",
+                            "no generic {engine} data directory found at {path} — log in once with "
+                            "plain `{engine}` to create it, then retry: agydra import {name}",
+                            engine=driver.binary_name, path=real, name=name)
             )
         data_dir = store.profile_data_dir(name, engine=engine, profile=profile)
         if data_dir.exists():
@@ -2189,8 +2333,10 @@ def cmd_import(store: Store, args) -> int:
             ]
             if unexpected:
                 raise StoreError(
-                    f"profile {name!r} already has data ({data_dir}); "
-                    "delete it first (agydra delete " + name + ") or pick an empty profile."
+                    module_text("import.profile_has_data",
+                                "profile {name!r} already has data ({path}); "
+                                "delete it first (agydra delete {name}) or pick an empty profile.",
+                                name=name, path=data_dir)
                 )
         if driver.needs_keychain:
             guards.enter_context(keychain.serialized_access(store))
@@ -2267,13 +2413,17 @@ def cmd_export(store: Store, args) -> int:
     expected = store.get(name)
     if expected.name != name:
         raise StoreError(
-            f"cannot safely export {name!r}: profile metadata names a "
-            f"different owner ({expected.name!r})"
+            module_text(
+                'cli.export_owner_changed',
+                'cannot safely export {name!r}: profile metadata names a different owner ({owner!r})',
+                name=name,
+                owner=expected.name,
+            )
         )
-    with _acquire_profile_read_lock(store, name, "exporting it"):
-        _ensure_ref_unchanged(store, args.ref, name, "export")
+    with _acquire_profile_read_lock(store, name, module_text('cli.action_export', 'exporting it')):
+        _ensure_ref_unchanged(store, args.ref, name, module_text('cli.action_export_retry', 'export'))
         profile = store.get(name)
-        _require_profile_identity(profile, expected, "export")
+        _require_profile_identity(profile, expected, module_text('cli.action_export_retry', 'export'))
         _require_no_pending_import(store, name)
         driver = engines.get_engine(profile.engine)
         engine_excluded = list(driver.export_credential_ignore())

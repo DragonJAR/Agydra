@@ -72,6 +72,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, List, Literal, Optional, Tuple
 
+from text import module_text
 import engines
 import platforms
 import usage_agy
@@ -123,8 +124,13 @@ class UsageResult:
     quality: Optional[str] = None
     identity_verified: Optional[bool] = None
     authentication_state: Optional[AuthenticationState] = None
+    error_code: Optional[str] = None
 
     def __post_init__(self) -> None:
+        if self.error_code is None and self.error and self.error.strip().lower() in (
+            "not authenticated", "not-authenticated", "unauthenticated"
+        ):
+            self.error_code = "not_authenticated"
         if self.authentication_state is None:
             if self.ok:
                 self.authentication_state = "authenticated"
@@ -147,7 +153,8 @@ def _is_ineligible_message(text: object) -> bool:
     if not isinstance(text, str):
         return False
     lowered = text.lower()
-    return "eligibility" in lowered or "not eligible" in lowered
+    return ("eligibility" in lowered or "not eligible" in lowered
+            or lowered == module_text("usage.eligibility_rejected", "not eligible").lower())
 
 
 def _is_finite_number(value: object) -> bool:
@@ -302,9 +309,17 @@ def _read_json_object_response(response, source: str) -> dict:
     try:
         payload = json.loads(response.read().decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
-        raise UsageResponseError(f"{source} returned invalid JSON") from exc
+        raise UsageResponseError(module_text(
+            'usage.response_invalid_json',
+            '{source} returned invalid JSON',
+            source=source,
+        )) from exc
     if not isinstance(payload, dict):
-        raise UsageResponseError(f"{source} returned a non-object JSON response")
+        raise UsageResponseError(module_text(
+            'usage.response_not_object',
+            '{source} returned a non-object JSON response',
+            source=source,
+        ))
     return payload
 
 
@@ -328,7 +343,10 @@ def _post_token_refresh(
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = _read_json_object_response(resp, "token refresh endpoint")
+            data = _read_json_object_response(resp, module_text(
+                'usage.refresh_endpoint',
+                'token refresh endpoint',
+            ))
             if isinstance(data, dict) and (data.get("access_token") or data.get("key")):
                 return data
     except Exception as exc:
@@ -380,7 +398,7 @@ def fetch_codex_usage_payload(
         headers=headers,
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return _read_json_object_response(resp, "OpenAI usage endpoint")
+        return _read_json_object_response(resp, module_text('usage.openai_endpoint', 'OpenAI usage endpoint'))
 
 
 def parse_codex_usage_payload(
@@ -416,7 +434,7 @@ def parse_codex_usage_payload(
         b_5h = _parse_window_bucket(
             rate_limit.get("primary_window"),
             bucket_id="codex-5h",
-            name="5 Hours",
+            name=module_text('usage.five_hours', '5 Hours'),
             window="5h",
         )
         if b_5h:
@@ -425,7 +443,7 @@ def parse_codex_usage_payload(
         b_wk = _parse_window_bucket(
             rate_limit.get("secondary_window"),
             bucket_id="codex-weekly",
-            name="Weekly",
+            name=module_text('usage.weekly', 'Weekly'),
             window="weekly",
         )
         if b_wk:
@@ -454,7 +472,7 @@ def parse_codex_usage_payload(
                 bw = _parse_window_bucket(
                     item_rl.get("secondary_window"),
                     bucket_id=f"codex-{slug}-weekly",
-                    name=f"{clean_name} Weekly",
+                    name=module_text('usage.named_weekly', '{name} Weekly', name=clean_name),
                     window="weekly",
                 )
                 if bw:
@@ -483,7 +501,7 @@ def parse_codex_usage_payload(
             buckets.append(
                 UsageBucket(
                     id="codex-spend",
-                    name="Spend Limit",
+                    name=module_text('usage.spend_limit', 'Spend Limit'),
                     window="monthly",
                     remaining_fraction=rem_fraction,
                     reset_time=reset_dt,
@@ -494,6 +512,97 @@ def parse_codex_usage_payload(
         return [], detected_plan, detected_email
 
     return [UsageGroup(name="OpenAI Codex", buckets=buckets)], detected_plan, detected_email
+
+
+def _usage_auth_snapshot(
+    data_dir: Path, engine: str
+) -> Tuple[Optional[dict], Optional[str], Optional[str]]:
+    """Derive auth, plan and email from one immutable on-disk payload.
+
+    Account currently exposes only path-based inspection facades. Reuse its
+    credential selection and JWT parsers until payload-based facades exist.
+    A refresh/CAS conflict intentionally takes a new snapshot separately.
+    """
+    import store as store_module
+
+    path = Path(data_dir) / "auth.json"
+    raw = store_module.read_json_object(path, tolerant=True) if path.is_file() else {}
+    raw = raw if isinstance(raw, dict) else {}
+    if engine == "codex":
+        tokens = raw.get("tokens")
+        tokens = tokens if isinstance(tokens, dict) else {}
+        id_token = tokens.get("id_token")
+        claims = account._decode_jwt_payload(id_token) if _has_credential(id_token) else {}
+        auth_claim = claims.get("https://api.openai.com/auth")
+        auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
+        plan_type = auth_claim.get("chatgpt_plan_type")
+        detected_plan = None
+        if isinstance(plan_type, str) and plan_type:
+            detected_plan = CHATGPT_PLAN_NAMES.get(plan_type.lower(), f"ChatGPT {plan_type.capitalize()}")
+        elif _has_credential(raw.get("OPENAI_API_KEY")):
+            detected_plan = module_text("usage.openai_api_key", "OpenAI API Key")
+        detected_email = normalize_email(claims.get("email"))
+        if any(_has_credential(tokens.get(key)) for key in ("access_token", "id_token", "refresh_token")):
+            account_id = None
+            for key in ("account_id", "accountId"):
+                value = tokens.get(key) or raw.get(key)
+                if _has_credential(value):
+                    account_id = value.strip()
+                    break
+            if not account_id:
+                value = auth_claim.get("chatgpt_account_id") or auth_claim.get("account_id")
+                if _has_credential(value):
+                    account_id = value.strip()
+            if not account_id:
+                for key in ("chatgpt_account_id", "account_id", "org_id"):
+                    value = claims.get(key)
+                    if _has_credential(value):
+                        account_id = value.strip()
+                        break
+            auth = {"auth_type": "chatgpt", "account_id": account_id}
+            auth.update({
+                key: tokens.get(key) if _has_credential(tokens.get(key)) else None
+                for key in ("access_token", "id_token", "refresh_token")
+            })
+            return auth, detected_plan, detected_email
+        key = raw.get("OPENAI_API_KEY")
+        auth = {"auth_type": "api_key", "api_key": key} if _has_credential(key) else None
+        return auth, detected_plan, detected_email
+    credential = account._first_grok_credential(raw)
+    if credential is not None:
+        key = credential.get("key")
+        claims = account._decode_jwt_payload(key) if _has_credential(key) else {}
+        detected_email = normalize_email(credential.get("email")) or normalize_email(claims.get("email"))
+        tier = credential.get("subscription_tier")
+        if _has_credential(tier):
+            detected_plan = tier.capitalize() if not tier.lower().startswith("super") else "SuperGrok"
+        elif claims.get("tier") is not None:
+            tier = str(claims["tier"])
+            tier_names = {"4": "SuperGrok", "3": "Grok Pro", "2": "Grok Basic", "1": "Grok Free"}
+            detected_plan = tier_names.get(tier) or module_text(
+                "usage.grok_tier", "Grok Tier {tier}", tier=tier
+            )
+        else:
+            detected_plan = "Grok (xAI)"
+        refresh = credential.get("refresh_token")
+        auth = {
+            "auth_type": credential.get("auth_mode") or "oidc",
+            "key": key if _has_credential(key) else None,
+            "token": key if _has_credential(key) else None,
+            "refresh_token": refresh if _has_credential(refresh) else None,
+            "email": normalize_email(credential.get("email")),
+        }
+        auth.update({
+            field: credential.get(field)
+            for field in ("user_id", "first_name", "oidc_issuer", "oidc_client_id", "expires_at")
+        })
+        return auth, detected_plan, detected_email
+    key = raw.get("XAI_API_KEY")
+    if not _has_credential(key):
+        key = account.grok_config_api_key(data_dir)
+    if _has_credential(key):
+        return {"auth_type": "api_key", "api_key": key}, module_text("usage.xai_api_key", "xAI API Key"), None
+    return None, None, None
 
 
 def query_codex_usage(
@@ -507,9 +616,9 @@ def query_codex_usage(
     """Query OpenAI Codex usage via backend-api/wham/usage. Never raises."""
     import account
 
-    auth_info = account.inspect_codex_auth(data_dir)
-    detected_plan = plan or account.detect_codex_plan(data_dir)
-    detected_email = normalize_email(email) or account.detect_codex_email(data_dir)
+    auth_info, snapshot_plan, snapshot_email = _usage_auth_snapshot(data_dir, "codex")
+    detected_plan = plan or snapshot_plan
+    detected_email = normalize_email(email) or snapshot_email
 
     if auth_info is None:
         return UsageResult(
@@ -518,7 +627,8 @@ def query_codex_usage(
             engine="codex",
             email=detected_email,
             plan=detected_plan,
-            error="not authenticated",
+            error=module_text('usage.not_authenticated', 'not authenticated'),
+            error_code="not_authenticated",
             authentication_state="unauthenticated",
         )
 
@@ -528,7 +638,7 @@ def query_codex_usage(
             ok=True,
             engine="codex",
             email=detected_email,
-            plan=detected_plan or "OpenAI API Key",
+            plan=detected_plan or module_text("usage.openai_api_key", "OpenAI API Key"),
             authentication_state="authenticated",
         )
 
@@ -542,7 +652,7 @@ def query_codex_usage(
             engine="codex",
             email=detected_email,
             plan=detected_plan,
-            error="missing access token",
+            error=module_text('usage.missing_access_token', 'missing access token'),
             authentication_state="unauthenticated",
         )
 
@@ -558,7 +668,7 @@ def query_codex_usage(
                 engine="codex",
                 email=detected_email,
                 plan=detected_plan,
-                error="session expired (401)",
+                error=module_text('usage.session_expired', 'session expired (401)'),
                 authentication_state="unauthenticated",
             )
         else:
@@ -568,7 +678,7 @@ def query_codex_usage(
                 engine="codex",
                 email=detected_email,
                 plan=detected_plan,
-                error=f"usage unavailable (HTTP {exc.code})",
+                error=module_text('usage.http_unavailable', 'usage unavailable (HTTP {code})', code=exc.code),
                 authentication_state="authenticated",
             )
     except UsageResponseError as exc:
@@ -578,7 +688,7 @@ def query_codex_usage(
             engine="codex",
             email=detected_email,
             plan=detected_plan,
-            error=f"invalid usage response ({exc})",
+            error=module_text('usage.invalid_response', 'invalid usage response ({error})', error=exc),
             authentication_state="authenticated",
         )
     except Exception as exc:
@@ -589,7 +699,7 @@ def query_codex_usage(
             engine="codex",
             email=detected_email,
             plan=detected_plan,
-            error=f"offline ({exc})",
+            error=module_text('usage.offline', 'offline ({error})', error=exc),
             authentication_state="authenticated",
         )
 
@@ -600,7 +710,7 @@ def query_codex_usage(
             engine="codex",
             email=detected_email,
             plan=detected_plan,
-            error="no usage data in response",
+            error=module_text('usage.no_data', 'no usage data in response'),
             authentication_state="authenticated",
         )
 
@@ -615,7 +725,7 @@ def query_codex_usage(
             engine="codex",
             email=final_email,
             plan=final_plan,
-            error="no usage data in response",
+            error=module_text('usage.no_data', 'no usage data in response'),
             authentication_state="authenticated",
         )
 
@@ -642,7 +752,10 @@ def fetch_grok_billing_payload(token: str, *, timeout: float = 10.0) -> Optional
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return _read_json_object_response(resp, "xAI billing endpoint")
+        return _read_json_object_response(resp, module_text(
+            'usage.xai_billing_endpoint',
+            'xAI billing endpoint',
+        ))
 
 
 def fetch_grok_settings_payload(token: str, *, timeout: float = 4.0) -> Optional[dict]:
@@ -658,7 +771,10 @@ def fetch_grok_settings_payload(token: str, *, timeout: float = 4.0) -> Optional
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return _read_json_object_response(resp, "xAI settings endpoint")
+            return _read_json_object_response(resp, module_text(
+                'usage.xai_settings_endpoint',
+                'xAI settings endpoint',
+            ))
     except Exception as exc:
         _close_http_error(exc)
         return None
@@ -712,7 +828,7 @@ def parse_grok_billing_payload(
 
     bucket = UsageBucket(
         id="grok-weekly",
-        name="Weekly",
+        name=module_text('usage.weekly', 'Weekly'),
         window="weekly",
         remaining_fraction=rem,
         reset_time=reset_dt,
@@ -770,6 +886,11 @@ GROK_PLANS_WITHOUT_QUOTA = frozenset({"x premium"})
 PLAN_WITHOUT_QUOTA = "plan without usage quota"
 
 
+def is_plan_without_quota(result: UsageResult) -> bool:
+    """Recognize quota absence independently of the displayed language."""
+    return result.error_code == "plan_without_quota" or result.error == PLAN_WITHOUT_QUOTA
+
+
 def _refresh_grok_profile_tokens(
     auth_info: dict,
     data_dir: Path,
@@ -777,6 +898,9 @@ def _refresh_grok_profile_tokens(
     name: str,
     timeout: float,
     used_previous: Optional[str],
+    *,
+    email: Optional[str] = None,
+    plan: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[UsageResult]]:
     import locks
 
@@ -799,9 +923,9 @@ def _refresh_grok_profile_tokens(
             name=name,
             ok=False,
             engine="grok",
-            email=account.detect_grok_email(data_dir),
-            plan=account.detect_grok_plan(data_dir),
-            error="session expired (401)",
+            email=email or normalize_email(auth_info.get("email")),
+            plan=plan,
+            error=module_text('usage.session_expired', 'session expired (401)'),
             authentication_state="authenticated",
         )
     with handle:
@@ -832,9 +956,9 @@ def _refresh_grok_profile_tokens(
                     name=name,
                     ok=False,
                     engine="grok",
-                    email=account.detect_grok_email(data_dir),
-                    plan=account.detect_grok_plan(data_dir),
-                    error="failed to persist refreshed tokens",
+                    email=email or normalize_email(auth_info.get("email")),
+                    plan=plan,
+                    error=module_text('usage.refresh_persist_failed', 'failed to persist refreshed tokens'),
                     authentication_state="authenticated",
                 )
             return new_access, None
@@ -856,7 +980,14 @@ def _grok_empty_usage_result(
         engine="grok",
         email=email,
         plan=plan or "Grok (xAI)",
-        error="no usage data in response" if metered else PLAN_WITHOUT_QUOTA,
+        error=module_text(
+            'usage.no_data',
+            'no usage data in response',
+        ) if metered else module_text(
+            "usage.plan_without_quota",
+            PLAN_WITHOUT_QUOTA,
+        ),
+        error_code=None if metered else "plan_without_quota",
         authentication_state="authenticated",
     )
 
@@ -873,9 +1004,9 @@ def query_grok_usage(
     """Query xAI Grok usage and billing via cli-chat-proxy. Never raises."""
     import account
 
-    auth_info = account.inspect_grok_auth(data_dir)
-    detected_plan = plan or account.detect_grok_plan(data_dir)
-    detected_email = normalize_email(email) or account.detect_grok_email(data_dir)
+    auth_info, snapshot_plan, snapshot_email = _usage_auth_snapshot(data_dir, "grok")
+    detected_plan = plan or snapshot_plan
+    detected_email = normalize_email(email) or snapshot_email
 
     if auth_info is None:
         return UsageResult(
@@ -884,7 +1015,8 @@ def query_grok_usage(
             engine="grok",
             email=detected_email,
             plan=detected_plan,
-            error="not authenticated",
+            error=module_text('usage.not_authenticated', 'not authenticated'),
+            error_code="not_authenticated",
             authentication_state="unauthenticated",
         )
 
@@ -894,7 +1026,7 @@ def query_grok_usage(
             ok=True,
             engine="grok",
             email=detected_email,
-            plan=detected_plan or "xAI API Key",
+            plan=detected_plan or module_text("usage.xai_api_key", "xAI API Key"),
             authentication_state="authenticated",
         )
 
@@ -903,15 +1035,14 @@ def query_grok_usage(
     used_previous = auth_info.get("key") if auth_info else None
 
     if not used_token:
-        state = account.auth_state(data_dir, engine="grok")
-        auth_state_val = "authenticated" if state == "authenticated" else "unauthenticated"
+        auth_state_val = "authenticated" if auth_info is not None else "unauthenticated"
         return UsageResult(
             name=name,
             ok=False,
             engine="grok",
             email=detected_email,
             plan=detected_plan,
-            error="missing access token",
+            error=module_text('usage.missing_access_token', 'missing access token'),
             authentication_state=auth_state_val,
         )
 
@@ -929,12 +1060,17 @@ def query_grok_usage(
                     engine="grok",
                     email=detected_email,
                     plan=detected_plan,
-                    error=f"usage unavailable (HTTP {exc.code})",
+                    error=module_text(
+                        'usage.http_unavailable',
+                        'usage unavailable (HTTP {code})',
+                        code=exc.code,
+                    ),
                     authentication_state="authenticated",
                 )
             if attempt == 0 and (auth_info or {}).get("refresh_token"):
                 new_token, fail_res = _refresh_grok_profile_tokens(
-                    auth_info, data_dir, store, name, timeout, used_previous
+                    auth_info, data_dir, store, name, timeout, used_previous,
+                    email=detected_email, plan=detected_plan,
                 )
                 if fail_res is not None:
                     return fail_res
@@ -948,10 +1084,9 @@ def query_grok_usage(
                 engine="grok",
                 email=detected_email,
                 plan=detected_plan,
-                error=(
-                    "session expired (401); re-login required: agydra login "
-                    + name
-                ),
+                error=module_text("usage.relogin_required",
+                                  "session expired (401); re-login required: agydra login {name}",
+                                  name=name),
                 authentication_state="unauthenticated",
             )
         except UsageResponseError as exc:
@@ -961,7 +1096,7 @@ def query_grok_usage(
                 engine="grok",
                 email=detected_email,
                 plan=detected_plan,
-                error=f"invalid usage response ({exc})",
+                error=module_text('usage.invalid_response', 'invalid usage response ({error})', error=exc),
                 authentication_state="authenticated",
             )
         except Exception as exc:
@@ -972,7 +1107,7 @@ def query_grok_usage(
                 engine="grok",
                 email=detected_email,
                 plan=detected_plan,
-                error=f"offline ({exc})",
+                error=module_text('usage.offline', 'offline ({error})', error=exc),
                 authentication_state="authenticated",
             )
 
@@ -1022,13 +1157,13 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
                 source="claude_status_line",
                 quality="unknown",
                 identity_verified=False,
-                error="profile rename recovery pending",
+                error=module_text('usage.rename_pending', 'profile rename recovery pending'),
             )
         return UsageResult(
             name=name,
             ok=False,
             engine=engine,
-            error="profile rename recovery pending",
+            error=module_text('usage.rename_pending', 'profile rename recovery pending'),
             quality="unknown",
         )
 
@@ -1041,7 +1176,7 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
         return UsageResult(
             name=name,
             ok=False,
-            error="profile metadata unavailable",
+            error=module_text('usage.metadata_unavailable', 'profile metadata unavailable'),
             quality="unknown",
         )
 
@@ -1081,7 +1216,11 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
             ok=False,
             engine=engine,
             email=profile.email,
-            error=f"unsupported usage engine: {engine}",
+            error=module_text(
+                'usage.unsupported_engine',
+                'unsupported usage engine: {engine}',
+                engine=engine,
+            ),
         )
 
     state = auth_state(data_dir, store, name, engine=engine)
@@ -1092,7 +1231,8 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
             ok=False,
             engine=engine,
             email=profile.email,
-            error="not authenticated",
+            error=module_text('usage.not_authenticated', 'not authenticated'),
+            error_code="not_authenticated",
             authentication_state="unauthenticated",
         )
 
@@ -1101,7 +1241,11 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     if binary is None:
         return UsageResult(
             name=name, ok=False, engine=engine, email=profile.email,
-            error=f"agy binary not found (set {platforms.AGY_BIN_ENV} or PATH)",
+            error=module_text(
+                'usage.agy_binary_missing',
+                'agy binary not found (set {env} or PATH)',
+                env=platforms.AGY_BIN_ENV,
+            ),
             authentication_state="authenticated",
         )
 
@@ -1109,7 +1253,10 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     if token_bytes is None:
         return UsageResult(
             name=name, ok=False, engine=engine, email=profile.email,
-            error="credential not found or identity unverified in profile data/keychain backup (launch once or re-login to refresh)",
+            error=module_text(
+                'usage.credential_unavailable',
+                'credential not found or identity unverified in profile data/keychain backup (launch once or re-login to refresh)',
+            ),
             authentication_state="unauthenticated",
         )
 
@@ -1119,14 +1266,25 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
             timeout=timeout, config=config,
         )
     except subprocess.TimeoutExpired:
-        return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error="timed out")
+        return UsageResult(
+            name=name, ok=False, engine=engine, email=profile.email,
+            error=module_text("usage.timed_out", "timed out"),
+        )
     except (OSError, ValueError) as exc:
-        return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error=f"could not run agy: {exc}")
+        return UsageResult(
+            name=name, ok=False, engine=engine, email=profile.email,
+            error=module_text("usage.agy_run_failed", "could not run agy: {error}", error=exc),
+        )
 
     if proc.returncode != 0:
         detail_lines = (proc.stderr or "").strip().splitlines()
         suffix = f": {detail_lines[0]}" if detail_lines else ""
-        err_msg = f"agy exited {proc.returncode}{suffix}"
+        err_msg = module_text(
+            'usage.agy_exited',
+            'agy exited {code}{detail}',
+            code=proc.returncode,
+            detail=suffix,
+        )
         return UsageResult(
             name=name, ok=False, engine=engine, email=profile.email,
             error=err_msg, is_ineligible=_is_ineligible_message(err_msg),
@@ -1135,11 +1293,14 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     try:
         payload = json.loads(proc.stdout)
     except (json.JSONDecodeError, TypeError, RecursionError):
-        return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error="non-JSON response")
+        return UsageResult(
+            name=name, ok=False, engine=engine, email=profile.email,
+            error=module_text("usage.non_json", "non-JSON response"),
+        )
 
     if not isinstance(payload, dict) or payload.get("status") != "SUCCESS":
         message = payload.get("error") if isinstance(payload, dict) else None
-        err_msg = str(message) if message else "not eligible"
+        err_msg = str(message) if message else module_text('usage.eligibility_rejected', 'not eligible')
         return UsageResult(
             name=name, ok=False, engine=engine, email=profile.email,
             error=err_msg, is_ineligible=_is_ineligible_message(err_msg),
@@ -1150,7 +1311,10 @@ def query_profile_usage(store, name: str, *, timeout: float = DEFAULT_TIMEOUT_S)
     groups_raw = data.get("groups") if isinstance(data, dict) else None
     groups = _parse_groups(groups_raw)
     if not groups:
-        return UsageResult(name=name, ok=False, engine=engine, email=profile.email, error="no usage data in response")
+        return UsageResult(
+            name=name, ok=False, engine=engine, email=profile.email,
+            error=module_text("usage.no_data", "no usage data in response"),
+        )
 
     return UsageResult(name=name, ok=True, engine=engine, email=profile.email, groups=groups, source="cli")
 
@@ -1197,11 +1361,11 @@ def gather_usage_report(
                 known["engine"] = _get_profile_readonly(store, name).engine
             except Exception:
                 pass
-            results.append(
-
-                UsageResult(name=name, ok=False,
-                            error=f"unexpected error: {exc}", **known)
-            )
+            results.append(UsageResult(
+                name=name, ok=False,
+                error=module_text("usage.unexpected_error", "unexpected error: {error}", error=exc),
+                **known,
+            ))
     return results
 
 
@@ -1376,7 +1540,7 @@ def format_countdown(reset_time: Optional[datetime], *, now: Optional[datetime] 
         now = now.replace(tzinfo=timezone.utc)
     total_seconds = int((reset_time - now).total_seconds())
     if total_seconds <= 0:
-        return "now"
+        return module_text('usage.now', 'now')
     days, remainder = divmod(total_seconds, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes, _ = divmod(remainder, 60)

@@ -31,6 +31,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import os
 from models import profile_identity
+from text import module_text
 import store as store_module
 import usage
 
@@ -190,7 +191,7 @@ def _sorted_entries(
         entry.update(_result_entry(result) if result is not None else {
             "ok": False,
             "groups": [],
-            "error": "no result for this profile",
+            "error": module_text('usage.snapshot_missing_result', 'no result for this profile'),
         })
         if result is not None:
             entry["summary"] = _summary_entry(result)
@@ -403,8 +404,26 @@ def _normalized_engine(value: Any) -> Optional[str]:
     return text or None
 
 
+def snapshot_identity_index(
+    document: Optional[Mapping[str, Any]]
+) -> Dict[Any, List[Mapping[str, Any]]]:
+    """Index once, preserving duplicate ambiguity and failing closed on bad identities."""
+    index: Dict[Any, List[Mapping[str, Any]]] = {}
+    entries = document.get("profiles") if isinstance(document, Mapping) else None
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict):
+                try:
+                    identity = _entry_identity(entry)
+                except (AttributeError, KeyError, OverflowError, TypeError, ValueError):
+                    return {}
+                index.setdefault(identity, []).append(entry)
+    return index
+
+
 def _matching_entry(
-    document: Mapping[str, Any], seq: int, engine: str, name: Optional[str]
+    document: Mapping[str, Any], seq: int, engine: str, name: Optional[str],
+    *, index: Optional[Mapping[Any, List[Mapping[str, Any]]]] = None,
 ) -> Optional[Mapping[str, Any]]:
     """The single snapshot entry for the profile, else ``None``.
 
@@ -413,15 +432,10 @@ def _matching_entry(
     matches only a ``seq == 0`` entry with the same normalized engine and
     name. Two candidates are ambiguous and match nothing.
     """
-    entries = document.get("profiles")
-    if not isinstance(entries, list):
-        return None
+    if index is None:
+        index = snapshot_identity_index(document)
     target_id = profile_identity(seq, engine, name)
-    matches = [
-        entry
-        for entry in entries
-        if isinstance(entry, dict) and _entry_identity(entry) == target_id
-    ]
+    matches = index.get(target_id, [])
     if len(matches) != 1:
         return None
     entry = matches[0]
@@ -492,7 +506,8 @@ def _snapshot_context(
 
 
 def _availability_in_snapshot(
-    document: Mapping[str, Any], generated: datetime, current: datetime, profile: Any
+    document: Mapping[str, Any], generated: datetime, current: datetime, profile: Any,
+    *, index: Optional[Mapping[Any, List[Mapping[str, Any]]]] = None,
 ) -> Optional[float]:
     """One profile's remaining fraction from an already-read snapshot."""
     try:
@@ -501,7 +516,7 @@ def _availability_in_snapshot(
         families = _QUOTA_SUMMARY_FAMILIES.get(engine or "")
         if type(seq) is not int or seq < 0 or families is None:
             return None
-        entry = _matching_entry(document, seq, engine, getattr(profile, "name", None))
+        entry = _matching_entry(document, seq, engine, getattr(profile, "name", None), index=index)
         if entry is None or not _entry_is_trustworthy(entry, engine, generated, current):
             return None
         readings = [
@@ -537,8 +552,9 @@ def profile_quota_availabilities(
     if context is None:
         return [None] * len(candidates)
     document, generated, current = context
+    index = snapshot_identity_index(document)
     return [
-        _availability_in_snapshot(document, generated, current, profile)
+        _availability_in_snapshot(document, generated, current, profile, index=index)
         for profile in candidates
     ]
 
