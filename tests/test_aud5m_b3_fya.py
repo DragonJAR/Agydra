@@ -6,6 +6,7 @@ import sys
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import isolation
@@ -180,30 +181,53 @@ class TestBatch3Contracts(BaseCase):
                  "[features]\ndaemon_auto_start = false\nx = ???\n",
                  "features = { daemon_auto_start = true, daemon_auto_start = false }\n",
                  "[features]\n[features]\n", "x = [1 2]\n")
-        for content in cases:
-            with self.subTest(content=content):
-                raw = content.encode()
-                config.write_bytes(raw)
-                with self.assertRaises(isolation.IsolationError):
-                    isolation._disable_codex_daemon_auto_start(self.store_root)
-                self.assertEqual(config.read_bytes(), raw)
+        parsers = [SimpleNamespace(loads=mock.Mock(side_effect=ValueError("invalid TOML")))]
+        try:
+            import tomllib
+        except ImportError:
+            pass
+        else:
+            parsers.append(tomllib)
+        for parser in parsers:
+            for content in cases:
+                with self.subTest(content=content, parser=parser):
+                    raw = content.encode()
+                    config.write_bytes(raw)
+                    with mock.patch.dict(sys.modules, {"tomllib": parser}):
+                        with self.assertRaises(isolation.IsolationError):
+                            isolation._disable_codex_daemon_auto_start(self.store_root)
+                    self.assertEqual(config.read_bytes(), raw)
+        raw = b"[features]\ndaemon_auto_start = true\n"
+        config.write_bytes(raw)
+        parser = SimpleNamespace(loads=mock.Mock(side_effect=[{}, ValueError("invalid output")]))
+        with mock.patch.dict(sys.modules, {"tomllib": parser}):
+            with self.assertRaises(isolation.IsolationError):
+                isolation._disable_codex_daemon_auto_start(self.store_root)
+        self.assertEqual(parser.loads.call_count, 2)
+        self.assertEqual(config.read_bytes(), raw)
 
-    def test_missing_toml_validator_refuses_existing_config(self):
+    def test_missing_toml_validator_edits_existing_config(self):
         config = self.store_root / "config.toml"
         raw = b"[features]\ndaemon_auto_start = true\n"
         config.write_bytes(raw)
         with mock.patch.dict(sys.modules, {"tomllib": None}):
-            with self.assertRaises(isolation.IsolationError):
-                isolation._disable_codex_daemon_auto_start(self.store_root)
-        self.assertEqual(config.read_bytes(), raw)
-
-    def test_deep_toml_refuses_without_parser_traceback(self):
-        config = self.store_root / "config.toml"
-        raw = b"x = " + b"[" * 2000 + b"0" + b"]" * 2000
-        config.write_bytes(raw)
-        with self.assertRaises(isolation.IsolationError):
             isolation._disable_codex_daemon_auto_start(self.store_root)
-        self.assertEqual(config.read_bytes(), raw)
+            updated = config.read_bytes()
+            isolation._disable_codex_daemon_auto_start(self.store_root)
+        self.assertEqual(updated, b"[features]\ndaemon_auto_start = false\n")
+        self.assertEqual(config.read_bytes(), updated)
+
+    def test_deep_malformed_toml_refuses_without_parser_traceback(self):
+        config = self.store_root / "config.toml"
+        raw = b"x = " + b"[" * 2000 + b"0" + b"]" * 1999
+        parser = SimpleNamespace(loads=mock.Mock(side_effect=RecursionError))
+        for available_parser in (None, parser):
+            with self.subTest(parser=available_parser):
+                config.write_bytes(raw)
+                with mock.patch.dict(sys.modules, {"tomllib": available_parser}):
+                    with self.assertRaises(isolation.IsolationError):
+                        isolation._disable_codex_daemon_auto_start(self.store_root)
+                self.assertEqual(config.read_bytes(), raw)
 
     def test_dangling_only_delete_has_verified_backup(self):
         directory = self.s.profile_dir("damaged") / "data"

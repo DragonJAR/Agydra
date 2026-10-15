@@ -1233,14 +1233,11 @@ def _inline_table_with_daemon_disabled(text: str, statement: _TomlStatement) -> 
 
 
 def _validate_codex_toml(text: str) -> None:
-    """Require semantic validation; older stdlib runtimes fail closed."""
+    """Add semantic validation when available; retain token checks on Python 3.9."""
     try:
         import tomllib
     except ImportError:
-        raise ValueError(module_text(
-            'isolation.toml_validation_unavailable',
-            'validating an existing Codex config requires Python 3.11 or newer',
-        )) from None
+        return
     try:
         tomllib.loads(text)
     except (ValueError, RecursionError):
@@ -1304,9 +1301,11 @@ def _disable_codex_daemon_auto_start(data_dir: Path) -> None:
 
     The edit is a token-aware pass over standard TOML (tables, quoted keys,
     dotted keys, inline tables, multi-line strings and arrays, CRLF and BOM)
-    that only touches the setting itself. A config that is not valid UTF-8 or
-    TOML, or where ``features`` is not a table, raises ``IsolationError``
-    instead of being rewritten, because Codex could not load it either. Read
+    that only touches the setting itself. Invalid UTF-8, token structure, or
+    a non-table ``features`` raises ``IsolationError`` without rewriting.
+    When stdlib ``tomllib`` is available, semantic TOML validation additionally
+    runs before editing and before publishing. Python 3.9/3.10 retains the
+    token-aware checks without requiring a semantic parser. Read
     and required write failures also raise so Codex cannot launch without the
     daemon setting being established.
     """
