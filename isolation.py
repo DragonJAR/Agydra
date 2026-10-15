@@ -1232,9 +1232,27 @@ def _inline_table_with_daemon_disabled(text: str, statement: _TomlStatement) -> 
     return text[: start + 1] + " " + _DAEMON_SETTING + " = false," + text[start + 1 :]
 
 
+def _validate_codex_toml(text: str) -> None:
+    """Require semantic validation; older stdlib runtimes fail closed."""
+    try:
+        import tomllib
+    except ImportError:
+        raise ValueError(module_text(
+            'isolation.toml_validation_unavailable',
+            'validating an existing Codex config requires Python 3.11 or newer',
+        )) from None
+    try:
+        tomllib.loads(text)
+    except (ValueError, RecursionError):
+        raise ValueError(module_text(
+            'isolation.invalid_toml_document', 'invalid TOML document'
+        )) from None
+
+
 def _with_daemon_auto_start_disabled(content: str) -> str:
     bom = "\ufeff" if content.startswith("\ufeff") else ""
     text = content[len(bom) :]
+    _validate_codex_toml(text)
     newline = "\r\n" if "\r\n" in text else "\n"
     table: Tuple[str, ...] = ()
     setting: Optional[_TomlStatement] = None
@@ -1331,6 +1349,8 @@ def _disable_codex_daemon_auto_start(data_dir: Path) -> None:
     try:
         content = raw.decode("utf-8")
         updated = _with_daemon_auto_start_disabled(content)
+        if updated != content:
+            _validate_codex_toml(updated.lstrip("\ufeff"))
     except ValueError as exc:
         raise IsolationError(
             module_text(

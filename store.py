@@ -144,7 +144,9 @@ def _atomic_replace(path: Path, write_payload, verify=None) -> None:
     )
     tmp = Path(tmp_name)
     try:
-        with os.fdopen(fd, "wb") as fh:
+        fh = os.fdopen(fd, "wb")
+        fd = None
+        with fh:
             write_payload(fh, tmp)
             fh.flush()
             os.fsync(fh.fileno())
@@ -158,6 +160,9 @@ def _atomic_replace(path: Path, write_payload, verify=None) -> None:
         except OSError:
             pass
         raise
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -613,7 +618,7 @@ def _has_backup_worthy_content(
     Empty subdirectories without files do not count (preventing 0-file empty
     backup zips).
     """
-    if path.is_dir() and any(p.is_file() for p in path.rglob("*")):
+    if _tree_has_entries(path):
         return True
     for tree in extra_trees:
         if _tree_has_entries(tree):
@@ -1104,13 +1109,24 @@ class Store:
         return index < len(profiles) and profiles[index].name in conflicted
 
     def _repair_rename_state(self) -> bool:
+        """Serialize corrupt-only repair, then recover valid intents in lock order."""
         path = self.rename_journal_path
-        try:
-            journal = self._read_rename_journal()
-        except StoreError:
-            self._quarantine_state_file(path)
-            path.unlink()
+
+        def quarantine_corrupt() -> bool:
+            try:
+                self._read_rename_journal()
+            except StoreError:
+                self._quarantine_state_file(path)
+                path.unlink()
+                return True
+            return False
+
+        repaired = self._with_sequence_lock(
+            "recovering rename", quarantine_corrupt, read_only=True
+        )
+        if repaired:
             return True
+        journal = self._read_rename_journal()
         if journal is None:
             return False
         if self._rename_paths_conflict(journal):
@@ -2781,16 +2797,28 @@ class Store:
         try:
             import locks
 
-            data = locks.json_loads_utf8(roster.read_bytes())
+            data = locks.json_loads_utf8(platforms.read_regular_file_no_follow(roster))
         except (OSError, ValueError, RecursionError) as exc:
             raise StoreError(_store_text(
                 "store.claude.roster_read_failed", path=roster, error=exc
             )) from exc
         if isinstance(data, list):
-            return len(data)
-        if not isinstance(data, dict):
+            workers = data
+        elif isinstance(data, dict):
+            if set(data) - {"version", "workers"} or (
+                "version" in data and (type(data["version"]) is not int or data["version"] != 1)
+            ):
+                raise StoreError(_store_text("store.claude.roster_shape", path=roster))
+            workers = data.get("workers")
+        else:
             raise StoreError(_store_text("store.claude.roster_shape", path=roster))
-        return sum(len(v) for v in data.values() if isinstance(v, (list, dict)))
+        if not isinstance(workers, (list, dict)):
+            raise StoreError(_store_text("store.claude.roster_shape", path=roster))
+        if any(not isinstance(worker, dict) for worker in (
+            workers.values() if isinstance(workers, dict) else workers
+        )):
+            raise StoreError(_store_text("store.claude.roster_shape", path=roster))
+        return len(workers)
 
     def _guard_claude_supervisor(self, name: str, config_dir: Path, action: str = "deleting") -> None:
         """Fail closed while a claude background supervisor may own this profile.
@@ -2853,7 +2881,16 @@ class Store:
                 name=name,
                 action=action,
             ))
-        roster = config_dir / "daemon" / "roster.json"
+        daemon = config_dir / "daemon"
+        if os.path.lexists(daemon):
+            try:
+                if platforms.is_link(daemon, strict=True) or not stat.S_ISDIR(daemon.lstat().st_mode):
+                    raise StoreError(_store_text("store.claude.roster_shape", path=daemon))
+            except OSError as exc:
+                raise StoreError(_store_text(
+                    "store.claude.roster_read_failed", path=daemon, error=exc
+                )) from exc
+        roster = daemon / "roster.json"
         if os.path.lexists(roster) and self._claude_roster_workers(roster) > 0:
             raise StoreError(_store_text(
                 "store.claude.workers_running", name=name, stop_hint=stop_hint

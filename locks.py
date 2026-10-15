@@ -93,6 +93,7 @@ cheap), but it is not expected to ever fire there.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -301,7 +302,8 @@ def _parse_holders(raw: bytes) -> Optional[List[Holder]]:
         if len(stripped) > 10:
             return None
         try:
-            return [Holder(int(stripped), None)]
+            pid = int(stripped)
+            return [Holder(pid, None)] if platforms._process_id_is_representable(pid) else None
         except ValueError:
             return None
     try:
@@ -321,9 +323,9 @@ def _parse_holders(raw: bytes) -> Optional[List[Holder]]:
         start_explicit = "start" in entry
         kind = entry.get("kind", "session")
         reader_id = entry.get("reader_id")
-        if not isinstance(pid, int) or isinstance(pid, bool):
+        if not platforms._process_id_is_representable(pid):
             return None
-        if start is not None and not isinstance(start, str):
+        if start is not None and (not isinstance(start, str) or not start.strip()):
             return None
         if not isinstance(keychain, bool):
             return None
@@ -376,14 +378,60 @@ def _prune_holders(holders: List[Holder]) -> List[Holder]:
 
 
 def _read_all(fd: int) -> bytes:
+    """Bound registry reads even when another process grows the locked inode."""
+    limit = platforms.MAX_REGULAR_FILE_BYTES
+    if os.fstat(fd).st_size > limit:
+        raise platforms.FileTooLargeError(errno.EFBIG, module_text(
+            "locks.registry_size_limit", "lease registry exceeds size limit"
+        ))
     chunks: List[bytes] = []
+    remaining = limit + 1
     os.lseek(fd, 0, os.SEEK_SET)
-    while True:
-        chunk = os.read(fd, 65536)
+    while remaining:
+        chunk = os.read(fd, min(65536, remaining))
         if not chunk:
-            break
+            return b"".join(chunks)
         chunks.append(chunk)
-    return b"".join(chunks)
+        remaining -= len(chunk)
+    raise platforms.FileTooLargeError(errno.EFBIG, module_text(
+            "locks.registry_size_limit", "lease registry exceeds size limit"
+        ))
+
+
+def _open_registry_path(path: Path, *, writable: bool = False, create: bool = False) -> int:
+    """Own a regular, no-follow descriptor on the verified registry inode.
+
+    The shared opener validates existing entries. Writable flock operations
+    reopen nonblocking and verify the same inode before any read or write.
+    Creation is exclusive, so a planted FIFO or link is never opened as new.
+    """
+    if create:
+        try:
+            return os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+    with platforms.open_regular_file_no_follow(path) as source:
+        if not writable:
+            return os.dup(source.fileno())
+        flags = os.O_RDWR | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        transferred = False
+        try:
+            opened = os.fstat(fd)
+            verified = os.fstat(source.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise platforms.NonRegularFileError(errno.EINVAL, module_text(
+                    "locks.is_not_a_regular_file", "{path} is not a regular file", path=path
+                ), str(path))
+            if (opened.st_dev, opened.st_ino) != (verified.st_dev, verified.st_ino):
+                raise platforms.FileLinkError(errno.ELOOP, module_text(
+                    "locks.changed_during_validation", "{path} changed during validation", path=path
+                ), str(path))
+            transferred = True
+            return fd
+        finally:
+            if not transferred:
+                os.close(fd)
 
 
 def _write_in_place(fd: int, payload: bytes) -> None:
@@ -470,9 +518,8 @@ def lease_registry_state_issue(store, name: str) -> Optional[str]:
         return module_text('locks.cannot_inspect', 'cannot inspect {path} ({exc})', path=path, exc=exc)
     if not stat.S_ISREG(info.st_mode) or platforms.is_link(path, strict=True):
         return module_text('locks.is_not_a_regular_file', '{path} is not a regular file', path=path)
-    flags = os.O_RDWR if platforms.is_windows() else os.O_RDONLY
     try:
-        fd = os.open(path, flags)
+        fd = _open_registry_path(path, writable=platforms.is_windows())
     except OSError as exc:
         return module_text('locks.cannot_open', 'cannot open {path} ({exc})', path=path, exc=exc)
     locked = False
@@ -538,9 +585,8 @@ def lease_holders(store, name: str) -> Optional[List[Holder]]:
     never as free.
     """
     path = lock_path(store, name)
-    flags = os.O_RDWR if platforms.is_windows() else os.O_RDONLY
     try:
-        fd = os.open(path, flags)
+        fd = _open_registry_path(path, writable=platforms.is_windows())
     except FileNotFoundError:
         return []
     except OSError:
@@ -553,6 +599,8 @@ def lease_holders(store, name: str) -> Optional[List[Holder]]:
             return None
         try:
             parsed = _parse_holders(_read_all(fd))
+        except OSError:
+            return None
         finally:
             _unlock_fd(fd)
     finally:
@@ -596,8 +644,13 @@ def wait_for(
 def _open_lease_fd(store, name: str) -> int:
     """Open the lease file for an acquire attempt. Caller owns the fd."""
     path = lock_path(store, name)
-    platforms.ensure_dir(path.parent)
-    return os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        platforms.ensure_dir(path.parent)
+        return _open_registry_path(path, writable=True, create=True)
+    except OSError as exc:
+        raise LockError(module_text(
+            'locks.cannot_open_lease', 'cannot open lease {path} ({exc})', path=path, exc=exc
+        )) from exc
 
 
 def acquire_lease(
@@ -718,7 +771,7 @@ def release_lease(store, name: str, patience_s: float = 0.0) -> None:
 
     def leave() -> Optional[bool]:
         try:
-            fd = os.open(path, os.O_RDWR)
+            fd = _open_registry_path(path, writable=True)
         except FileNotFoundError:
             return True
         except OSError as exc:
@@ -797,7 +850,7 @@ def release_read_lease(
 
     def leave_reader() -> Optional[bool]:
         try:
-            fd = os.open(path, os.O_RDWR)
+            fd = _open_registry_path(path, writable=True)
         except FileNotFoundError:
             return True
         except OSError as exc:
@@ -900,7 +953,7 @@ def _try_lock_path(
         transferred = False
         try:
             platforms.ensure_dir(path.parent)
-            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            fd = _open_registry_path(path, writable=True, create=True)
             if platforms.is_windows():
                 if os.fstat(fd).st_size == 0:
                     os.write(fd, b"\0")
@@ -1008,15 +1061,18 @@ def try_mutation_lock(
         handle = _try_lock_path(path, module_text('locks.description.session_lock', 'session lock'), False)
         if handle is None:
             return None
+        transferred = False
         try:
             parsed = _parse_holders(_read_all(handle._fd))
             if parsed is None or _prune_holders(parsed):
-                handle.release()
                 return False
+            transferred = True
             return handle
         except OSError:
-            handle.release()
             return False
+        finally:
+            if not transferred:
+                handle.release()
 
     result = wait_for(inspect, patience_s)
     return result if isinstance(result, LockHandle) else None
@@ -1109,7 +1165,7 @@ def lock_holder_pid(store, name: str) -> Optional[int]:
         return holders[0].pid
     path = lock_path(store, name)
     try:
-        raw = path.read_bytes()
+        raw = platforms.read_regular_file_no_follow(path)
     except OSError:
         return None
     parsed = _parse_holders(raw)
@@ -1127,9 +1183,8 @@ def _flock_probe_locked(store, name: str) -> bool:
     / do not delete".
     """
     path = lock_path(store, name)
-    flags = os.O_RDWR if platforms.is_windows() else os.O_RDONLY
     try:
-        fd = os.open(path, flags)
+        fd = _open_registry_path(path, writable=platforms.is_windows())
     except FileNotFoundError:
         return False
     except OSError:

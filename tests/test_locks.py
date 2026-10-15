@@ -448,7 +448,7 @@ class TestMutationLock(BaseCase):
         handle.release()
         self.assertEqual(self.path.read_bytes(), b"\0")
 
-    def test_legacy_pid_and_large_json_pid_are_handled_safely(self):
+    def test_legacy_pid_is_valid_but_large_json_pid_is_unknown_busy(self):
         legacy = str(os.getpid()).encode("ascii")
         self.assertEqual(
             locks._parse_holders(legacy),
@@ -460,8 +460,9 @@ class TestMutationLock(BaseCase):
             b'{"holders":[{"pid":' + impossible_pid + b',"start":null}]}'
         )
 
-        self.assertEqual(locks.lease_holders(self.store, "work"), [])
-        self.assertFalse(locks.is_locked(self.store, "work"))
+        self.assertIsNone(locks._parse_holders(self.path.read_bytes()))
+        self.assertIsNone(locks.lease_holders(self.store, "work"))
+        self.assertTrue(locks.is_locked(self.store, "work"))
 
     def test_maximum_width_legacy_pid_is_parsed(self):
         self.assertEqual(
@@ -489,17 +490,17 @@ class TestMutationLock(BaseCase):
                 self.assertIsNone(locks.lease_holders(self.store, "work"))
                 self.assertTrue(locks.is_locked(self.store, "work"))
 
-    def test_json_zero_and_negative_pids_are_dead_and_pruned(self):
-        for encoded_pid, pid in ((b"0", 0), (b"-1", -1)):
+    def test_json_zero_and_negative_pids_remain_unknown_and_busy(self):
+        for pid in (0, -1):
             with self.subTest(pid=pid):
-                raw = b'{"holders":[{"pid":' + encoded_pid + b',"start":null}]}'
+                raw = json.dumps({"holders": [{"pid": pid, "start": None}]}).encode()
                 self.path.write_bytes(raw)
 
-                self.assertEqual(
-                    locks._parse_holders(raw), [locks.Holder(pid, None)]
-                )
-                self.assertEqual(locks.lease_holders(self.store, "work"), [])
-                self.assertFalse(locks.is_locked(self.store, "work"))
+                self.assertIsNone(locks._parse_holders(raw))
+                self.assertIsNone(locks.lease_holders(self.store, "work"))
+                self.assertTrue(locks.is_locked(self.store, "work"))
+                self.assertIsNone(locks.try_mutation_lock(self.store, "work", patience_s=0))
+                self.assertEqual(self.path.read_bytes(), raw)
 
     def test_json_pid_over_4300_digits_has_a_safe_parser_and_liveness_result(self):
         raw = b'{"holders":[{"pid":' + (b"9" * 4301) + b',"start":null}]}'
