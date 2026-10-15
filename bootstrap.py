@@ -151,6 +151,43 @@ def python_ok(version_info: Sequence[int]) -> bool:
     return tuple(version_info[:2]) >= MIN_PYTHON
 
 
+_VERSION_MAX_PART_DIGITS = 9
+"""Upper bound on digits per version part, guarding int() from oversized inputs."""
+
+_VERSION_MAX_TOKEN_LENGTH = 64
+"""Upper bound on the raw version token length (before any trimming)."""
+
+
+def parse_version_pair(token: object) -> Optional[Tuple[int, int]]:
+    """Parse the leading ``X.Y`` of a version string into an ``(X, Y)`` tuple.
+
+    Accepts only ASCII digits and a single ``.`` separator between the first
+    two numeric parts. Each part may have an ASCII letter suffix (e.g. ``1b1``,
+    ``3.dev0``); the leading numeric run is consumed and parsed. A whole-part
+    match is required: a leading sign, non-ASCII digit, or empty segment is
+    rejected. Per-part and total length are bounded to keep ``int()`` safe on
+    adversarial input. Returns ``None`` for any malformed, oversized, or
+    non-string input rather than raising.
+    """
+    if not isinstance(token, str):
+        return None
+    raw = token.strip()
+    if not raw or len(raw) > _VERSION_MAX_TOKEN_LENGTH:
+        return None
+    pieces = raw.split(".")
+    if len(pieces) < 2:
+        return None
+    out: List[int] = []
+    for piece in pieces[:2]:
+        if not piece or len(piece) > _VERSION_MAX_PART_DIGITS or not piece.isascii():
+            return None
+        match = re.match(r"\d+", piece)
+        if not match:
+            return None
+        out.append(int(match.group(0)))
+    return (out[0], out[1])
+
+
 def is_source_checkout(root: Path) -> bool:
     """True when ``root`` holds the project sources (pyproject.toml + agydra.py)."""
     return (Path(root) / "pyproject.toml").is_file() and (Path(root) / "agydra.py").is_file()
@@ -424,14 +461,11 @@ def _pip_version(vpy: Path) -> Optional[tuple]:
     if proc.returncode != 0:
         return None
     for tok in (proc.stdout or "").split():
-        if tok and tok[0].isdigit() and "." in tok:
-            parts = []
-            for piece in tok.split(".")[:2]:
-                match = re.match(r"\d+", piece)
-                if not match:
-                    return None
-                parts.append(int(match.group(0)))
-            return tuple(parts)
+        if not tok or not tok[0].isascii() or not tok[0].isdigit() or "." not in tok:
+            continue
+        parsed = parse_version_pair(tok)
+        if parsed is not None:
+            return parsed
     return None
 
 
@@ -467,11 +501,10 @@ def _setuptools_floor_ok(vpy: Path) -> bool:
     )
     if proc.returncode != 0:
         return False
-    version = proc.stdout or ""
-    pieces = version.strip().split(".")
-    if len(pieces) < 2 or not all(piece.isdigit() for piece in pieces[:2]):
+    parsed = parse_version_pair(proc.stdout or "")
+    if parsed is None:
         return False
-    return (int(pieces[0]), int(pieces[1])) >= SETUPTOOLS_FLOOR
+    return parsed >= SETUPTOOLS_FLOOR
 
 
 def ensure_build_backend(vpy: Path, out: Callable[[str], None]) -> None:
