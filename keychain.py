@@ -588,7 +588,7 @@ def decode_go_keyring_secret(data: Optional[bytes]) -> Optional[dict]:
         return None
     try:
         decoded = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return None
     return decoded if isinstance(decoded, dict) else None
 
@@ -1685,7 +1685,7 @@ def describe(store, names: Optional[List[str]] = None) -> Dict[str, object]:
             try:
                 parsed = json.loads(normalized)
                 shared_format = "json" if isinstance(parsed, dict) else "other"
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 envelope_secret = decode_go_keyring_secret(normalized)
                 if envelope_secret is not None and isinstance(envelope_secret, dict):
                     shared_format = "json"

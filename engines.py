@@ -64,6 +64,13 @@ CLAUDE_FOREGROUND_ENV = (
     ("CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF", "1"),
 )
 
+CLAUDE_INACTIVE_ENV = (
+    CLAUDE_FOREIGN_AUTH_ENV
+    + CLAUDE_INHERITED_STATE_ENV
+    + (platforms.CLAUDE_CONFIG_ENV,)
+    + tuple(name for name, value in CLAUDE_FOREGROUND_ENV)
+)
+
 
 @dataclass(frozen=True)
 class EngineDriver:
@@ -98,10 +105,14 @@ class EngineDriver:
     def scrub_env(self, env: MutableMapping[str, str]) -> List[str]:
         """Drop inherited identity-bearing variables; returns the names removed.
 
-        Only this driver's own ``foreign_auth_env`` is touched, so scrubbing
-        for one engine never alters the environment contract of another.
+        Scrub this driver's foreign authentication and all inactive Claude
+        provider/config/session state. Claude itself retains its isolated
+        configuration, explicitly injected usage state and pinned flags.
         """
-        removed = [name for name in self.foreign_auth_env if name in env]
+        names = self.foreign_auth_env
+        if self.name != "claude":
+            names += CLAUDE_INACTIVE_ENV
+        removed = [name for name in names if name in env]
         for name in removed:
             del env[name]
         return removed

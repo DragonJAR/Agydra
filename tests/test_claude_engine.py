@@ -269,13 +269,13 @@ class TestEnvironment(ClaudeBase):
         self.assertEqual(env["HOME"], os.environ["HOME"])
         self.assertEqual(env.get("XDG_CONFIG_HOME"), os.environ.get("XDG_CONFIG_HOME"))
 
-    def test_other_engines_keep_inherited_variables(self):
+    def test_other_engines_scrub_inherited_claude_variables(self):
         data = self._tmp / "data"
         data.mkdir()
         with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk"}):
             overlay = isolation.build_overlay("p", data, self.store_root, engine="codex")
             env = isolation.isolated_env(overlay, {}, engine="codex")
-        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk")
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertEqual(env[platforms.home_redirect_var()], str(overlay))
 
     def test_driver_reports_inherited_names(self):
@@ -1488,12 +1488,13 @@ class TestInheritedUsageState(ClaudeBase):
         self.assertEqual(injected["AGYDRA_CLAUDE_USAGE_SEQ"], "3")
         self.assertEqual(injected["AGYDRA_CLAUDE_USAGE_GENERATION"], "5")
 
-    def test_other_engines_keep_their_inherited_environment(self):
+    def test_other_engines_scrub_inherited_claude_usage_environment(self):
         data = self._tmp / "data"
         data.mkdir()
         overlay = isolation.build_overlay("p", data, self.store_root, engine="codex")
         env = isolation.isolated_env(overlay, {}, engine="codex")
-        self.assertEqual(env["AGYDRA_CLAUDE_USAGE_SEQ"], "9")
+        for name in self.USAGE:
+            self.assertNotIn(name, env)
 
     def test_corrupt_generation_never_falls_back_to_inherited_values(self):
         profile = self.make_profile("work")
