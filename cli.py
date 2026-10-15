@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import os
@@ -1023,6 +1024,44 @@ def cmd_usage(store: Store, args) -> int:
     return _cmd_usage_compact(store, args)
 
 
+def parse_finite_number(
+    value: Any, *, name: str, lo: Optional[float] = None, hi: Optional[float] = None
+) -> float:
+    """Parse a finite float, translating conversion and inclusive-bound errors."""
+    try:
+        shown = repr(value)
+    except (ValueError, OverflowError):
+        shown = f"<{type(value).__name__} outside display range>"
+    try:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("non-finite number")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise argparse.ArgumentTypeError(i18n.t(
+            "cli.invalid_finite_number", name=name, value=shown,
+            default="{name} must be a finite number, got {value}",
+        )) from exc
+    if (lo is not None and parsed < lo) or (hi is not None and parsed > hi):
+        raise argparse.ArgumentTypeError(i18n.t(
+            "cli.number_out_of_range", name=name,
+            lo=lo if lo is not None else "-inf",
+            hi=hi if hi is not None else "inf", value=shown,
+            default="{name} must be between {lo} and {hi}, got {value}",
+        ))
+    return parsed
+
+
+def _parse_columns(value: str) -> int:
+    """Accept stripped ASCII decimal widths in 1..10000; otherwise use 100."""
+    value = value.strip()
+    if not re.fullmatch(r"[0-9]+", value):
+        return 100
+    try:
+        return int(parse_finite_number(value, name="COLUMNS", lo=1, hi=10000))
+    except argparse.ArgumentTypeError:
+        return 100
+
+
 def _restore_cached_groups(cached_groups: Any) -> List[usage.UsageGroup]:
     """Restore structured UsageGroup objects from serialized snapshot entries."""
     restored: List[usage.UsageGroup] = []
@@ -1038,8 +1077,10 @@ def _restore_cached_groups(cached_groups: Any) -> List[usage.UsageGroup]:
             reset_at = b.get("reset_at")
             reset_dt = usage.parse_iso_utc(reset_at) if reset_at else None
             try:
-                frac = float(b.get("remaining_fraction") or 0.0)
-            except (TypeError, ValueError):
+                frac = parse_finite_number(
+                    b.get("remaining_fraction"), name="remaining_fraction", lo=0, hi=1
+                )
+            except argparse.ArgumentTypeError:
                 frac = 0.0
             buckets.append(
                 usage.UsageBucket(
@@ -1301,8 +1342,8 @@ def _cmd_usage_compact(store: Store, _args) -> int:
     is_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
     term_width = None
     col_env = os.environ.get("COLUMNS")
-    if col_env and col_env.isdigit():
-        term_width = int(col_env)
+    if col_env is not None:
+        term_width = _parse_columns(col_env)
         is_tty = True
     elif is_tty:
         term_width = shutil.get_terminal_size((120, 24)).columns
