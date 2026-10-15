@@ -121,6 +121,19 @@ class KeychainBusyError(KeychainError):
         self.owner = owner
 
 
+class CorruptSlotLeaseError(KeychainError):
+    """An existing shared-slot lease cannot safely establish ownership."""
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        from i18n import t
+
+        super().__init__(t(
+            "keychain.lease.corrupt",
+            default="shared-slot lease is unreadable or invalid; refusing uncoordinated access: {path}",
+            path=path if path is not None else "slot-lease.json",
+        ))
+
+
 class SwapSectionError(KeychainError):
     """The swap lock itself could not be MANAGED (open/create/lock failure).
 
@@ -164,11 +177,10 @@ allowance for a human to respond.
 
 
 def _feed_pipe(write_fd: int, payload: bytes) -> None:
-    try:
-        with os.fdopen(write_fd, "wb") as writer:
-            writer.write(payload)
-    except OSError:
-        return
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(write_fd, remaining)
+        remaining = remaining[written:]
 
 
 def _run(
@@ -176,53 +188,74 @@ def _run(
     timeout: float = KEYCHAIN_TIMEOUT_S,
     input_bytes: Optional[bytes] = None,
 ) -> subprocess.CompletedProcess:
-    out_fh = tempfile.TemporaryFile()
-    err_fh = tempfile.TemporaryFile()
+    import contextlib
+
     read_fd = write_fd = None
     feeder: Optional[threading.Thread] = None
-    try:
-        if input_bytes is not None:
-            read_fd, write_fd = os.pipe()
-            feeder = threading.Thread(
-                target=_feed_pipe, args=(write_fd, input_bytes), daemon=True
-            )
-            feeder.start()
-            write_fd = None
+    failed = threading.Event()
+
+    def feed() -> None:
+        nonlocal write_fd
         try:
-            result = platforms.run_with_group_kill(
-                ["security", *args],
-                timeout=timeout,
-                stdin=read_fd if read_fd is not None else subprocess.DEVNULL,
-                stdout=out_fh,
-                stderr=err_fh,
-            )
-        except subprocess.TimeoutExpired:
+            _feed_pipe(write_fd, input_bytes)
+        except Exception:
+            failed.set()
+        finally:
+            try:
+                os.close(write_fd)
+            except OSError:
+                failed.set()
+            else:
+                write_fd = None
+
+    with contextlib.ExitStack() as resources:
+        out_fh = resources.enter_context(tempfile.TemporaryFile())
+        err_fh = resources.enter_context(tempfile.TemporaryFile())
+        try:
+            if input_bytes is not None:
+                read_fd, write_fd = os.pipe()
+                feeder = threading.Thread(target=feed, daemon=True)
+                feeder.start()
+            try:
+                result = platforms.run_with_group_kill(
+                    ["security", *args],
+                    timeout=timeout,
+                    stdin=read_fd if read_fd is not None else subprocess.DEVNULL,
+                    stdout=out_fh,
+                    stderr=err_fh,
+                )
+            except subprocess.TimeoutExpired:
+                return subprocess.CompletedProcess(
+                    args, returncode=-1, stdout=b"", stderr=b"security timed out"
+                )
+        except OSError as exc:
+            return subprocess.CompletedProcess(args, returncode=-1, stderr=str(exc).encode())
+        finally:
+            if read_fd is not None:
+                try:
+                    os.close(read_fd)
+                except OSError:
+                    pass
+                read_fd = None
+            if feeder is not None:
+                try:
+                    feeder.join()
+                except RuntimeError:
+                    pass
+                feeder = None
+            if write_fd is not None:
+                try:
+                    os.close(write_fd)
+                except OSError:
+                    pass
+                write_fd = None
+        if failed.is_set():
             return subprocess.CompletedProcess(
-                args, returncode=-1, stdout=b"", stderr=b"security timed out"
+                args, returncode=-1, stdout=b"", stderr=b"security input failed"
             )
         out_fh.seek(0)
         err_fh.seek(0)
         return subprocess.CompletedProcess(args, result.returncode, out_fh.read(), err_fh.read())
-    except OSError as exc:
-        return subprocess.CompletedProcess(args, returncode=-1, stderr=str(exc).encode())
-    finally:
-        if read_fd is not None:
-            try:
-                os.close(read_fd)
-            except OSError:
-                pass
-        if write_fd is not None:
-            try:
-                os.close(write_fd)
-            except OSError:
-                pass
-        if feeder is not None:
-            try:
-                feeder.join(timeout=2.0)
-            except RuntimeError:
-                pass
-        out_fh.close()
-        err_fh.close()
 
 
 _MAX_HEX_PEEL_LAYERS = 5
@@ -863,12 +896,12 @@ def _slot_lease_path(store) -> Path:
 
 
 def _decode_shared(encoded: Optional[str]) -> Optional[bytes]:
-    if not encoded:
+    if encoded is None:
         return None
     try:
-        return base64.b64decode(encoded, validate=False)
-    except (binascii.Error, ValueError):
-        return None
+        return base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError, TypeError) as exc:
+        raise CorruptSlotLeaseError() from exc
 
 
 def _nonblank_text(value: object) -> Optional[str]:
@@ -926,38 +959,45 @@ def _shared_still_owned(current: Optional[bytes], credential: Optional[OwnerCred
 
 
 def _load_slot_lease(store) -> SlotLeaseState:
-    """Read the slot lease, expiring an owner with no live registry entry.
+    """Read validated ownership; only an absent file means no saved lease.
 
-    The profile's holder registry is the single liveness oracle (DRY):
-    this state file only caches WHICH live profile owns the slot. A None
-    or corrupt file means "no owner" — the next launch simply takes
-    ownership, which is always safe because entry re-swaps the slot from
-    the profile's own private slot under ``swap.lock``.
-
-    An unreadable registry (``lease_holders`` is ``None``: a writer holds it
-    or its content is undecodable) is "owned, liveness unknown" and keeps the
-    owner: expiring it on a guess would let another profile overwrite the
-    shared slot under a live session.
+    Unknown holder liveness retains ownership. Malformed ownership or baseline
+    fails closed without rewriting the evidence or touching the shared slot.
     """
     path = _slot_lease_path(store)
     try:
         raw = path.read_bytes()
-    except OSError:
+    except FileNotFoundError:
         return SlotLeaseState(owner=None, had_shared=None)
+    except OSError as exc:
+        raise CorruptSlotLeaseError(path) from exc
     import locks as locks_module
 
     try:
         data = locks_module.json_loads_utf8(raw)
-    except (RecursionError, ValueError, UnicodeDecodeError):
+    except (RecursionError, ValueError, UnicodeDecodeError) as exc:
+        raise CorruptSlotLeaseError(path) from exc
+    if not isinstance(data, dict) or not {"owner", "had_shared"}.issubset(data):
+        raise CorruptSlotLeaseError(path)
+    owner = data["owner"]
+    had_shared = data["had_shared"]
+    if owner is not None and (not isinstance(owner, str) or not owner.strip()):
+        raise CorruptSlotLeaseError(path)
+    if owner is not None:
+        from store import Store
+
+        try:
+            Store.validate_name(owner)
+        except StoreError as exc:
+            raise CorruptSlotLeaseError(path) from exc
+    if had_shared is not None and not isinstance(had_shared, str):
+        raise CorruptSlotLeaseError(path)
+    _decode_shared(had_shared)
+    had_shared = had_shared or None
+    if owner is None:
+        if had_shared is not None:
+            raise CorruptSlotLeaseError(path)
         return SlotLeaseState(owner=None, had_shared=None)
-    if not isinstance(data, dict):
-        return SlotLeaseState(owner=None, had_shared=None)
-    owner = data.get("owner")
-    had_shared = data.get("had_shared")
-    if not isinstance(owner, str) or not owner:
-        return SlotLeaseState(owner=None, had_shared=None)
-    if not isinstance(had_shared, str) or not had_shared:
-        had_shared = None
     credential = _parse_owner_credential(data.get("owner_credential"))
     holders = locks_module.lease_keychain_holders(store, owner)
     if holders is not None and not holders:
@@ -1167,7 +1207,7 @@ def launch_guard(
                             owner=state.owner,
                         )
                     self._begin_ownership(inherited=state)
-            except KeychainBusyError:
+            except (KeychainBusyError, CorruptSlotLeaseError):
                 self._abandon_membership()
                 raise
             except SwapSectionError:

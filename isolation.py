@@ -411,13 +411,22 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
             dir=destination_path.parent,
             prefix=".agydra-copy-",
         )
-        os.close(descriptor)
         temporary_path = Path(temporary_name)
+        descriptor_open = True
         try:
+            os.close(descriptor)
+            descriptor_open = False
             shutil.copy2(source_path, temporary_path)
             os.replace(temporary_path, destination_path)
         finally:
-            temporary_path.unlink(missing_ok=True)
+            try:
+                if descriptor_open:
+                    os.close(descriptor)
+            finally:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    temporary_path.unlink(missing_ok=True)
         return str(destination_path)
 
     try:
@@ -1135,7 +1144,7 @@ def _disable_codex_daemon_auto_start(data_dir: Path) -> None:
             f"cannot inspect Codex config {cfg} ({_safe_os_error_reason(exc)})"
         ) from None
     try:
-        raw = cfg.read_bytes()
+        raw = platforms.read_regular_file_no_follow(cfg)
     except OSError as exc:
         raise IsolationError(
             f"cannot read Codex config {cfg} ({_safe_os_error_reason(exc)})"
