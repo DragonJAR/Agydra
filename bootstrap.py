@@ -39,6 +39,7 @@ from typing import Callable, List, Optional, Sequence
 
 import platforms
 import store
+import ui
 
 MIN_PYTHON = (3, 9)
 VENV_DIRNAME = ".venv"
@@ -114,7 +115,7 @@ def _t(key: str, **kwargs: object) -> str:
 
     return i18n.t(key, **kwargs)
 
-BOOTSTRAP_TIMEOUT_S = 600.0
+BOOTSTRAP_TIMEOUT_S = 60.0
 SHIM_MARKER = "Managed by agydra setup"
 INSTALLED_NOTICE = (
     "agydra is installed as a package: pip/pipx manages this installation, so "
@@ -822,18 +823,16 @@ def report_state(root: Optional[Path] = None) -> None:
     installed CLI subcommand and the repo-root launcher pre-install path
     so both spellings can never render different facts.
     """
-    from ui import console_print
-
     resolve_language()
     state = check_state(project_root() if root is None else root)
-    console_print(_t("setup.dry_run_state_header"))
+    ui.console_print(_t("setup.dry_run_state_header"))
     for key, present in ((_t("setup.item.venv"), state["venv"]), (_t("setup.item.console_script"), state["console"])):
-        console_print(f"  {'[ok]' if present else '[--]'} {key}")
+        ui.console_print(f"  {'[ok]' if present else '[--]'} {key}")
     raw_state = str(state["shim_state"]).replace("-", "_")
     localized_state = _t(f"setup.shim_state.{raw_state}")
-    console_print(_t("setup.report_shim", mark="ok" if state["shim_ok"] else "!!", state=localized_state))
-    console_print(_t("setup.report_path", mark="ok" if state["on_path"] else "!!", on_path=state["on_path"]))
-    console_print(_t("setup.dry_run_footer"))
+    ui.console_print(_t("setup.report_shim", mark="ok" if state["shim_ok"] else "!!", state=localized_state))
+    ui.console_print(_t("setup.report_path", mark="ok" if state["on_path"] else "!!", on_path=state["on_path"]))
+    ui.console_print(_t("setup.dry_run_footer"))
 
 
 def perform_install(
@@ -895,7 +894,7 @@ def run(
     is returned.
     """
     resolve_language()
-    say = out if out is not None else (lambda line: print(line))
+    say = out if out is not None else (lambda line: ui.console_print(line))
     target_root = platforms.canonical_path(root) if root is not None else project_root()
     if not is_source_checkout(target_root):
         say(INSTALLED_NOTICE)

@@ -190,7 +190,7 @@ def _enable_windows_vt() -> None:
     _vt_done = True
     try:
         enable_windows_console_vt()
-    except Exception:
+    except (OSError, AttributeError, ValueError):
         pass
 
 

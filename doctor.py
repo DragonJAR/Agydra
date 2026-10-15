@@ -162,7 +162,9 @@ def _check_profiles(store: Store, ctx: "_DoctorContext"):
         return FAIL, "\n".join(lines)
     for p in profiles:
         if store.pending_rename_involves(p.name):
-            lines.append(i18n.t("doctor.profiles.pending_rename", name=p.name))
+            msg = i18n.t("doctor.profiles.pending_rename", name=p.name)
+            problems.append(msg.strip())
+            lines.append(msg)
             continue
         engine = getattr(p, "engine", "agy") or "agy"
         data_dir = store.profile_data_dir(p.name, engine=engine, profile=p)
@@ -287,10 +289,10 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
         link_name = driver.data_dir_name
         overlay = store.overlays_dir / name
         data_link = overlay / link_name
-        if not data_link.exists() and not isolation._is_link(data_link):
+        if not data_link.exists() and not platforms.is_link(data_link, strict=True):
             pending.append(name)
             continue
-        if data_link.exists() and not isolation._is_link(data_link):
+        if data_link.exists() and not platforms.is_link(data_link, strict=True):
             recoverable.append(name)
             continue
         if not isolation.link_points_to(data_link, data_dir):
@@ -671,7 +673,7 @@ def _preview_fixables(store: Store, ctx: "_DoctorContext") -> List[str]:
         if not driver.uses_overlay:
             continue
         link = store.overlays_dir / name / driver.data_dir_name
-        if link.exists() and not isolation._is_link(link):
+        if link.exists() and not platforms.is_link(link, strict=True):
             lines.append(i18n.t(
                 "doctor.fix.preview_overlay", name=name, link=driver.data_dir_name
             ))
@@ -754,13 +756,13 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
         metadata_path = store.profile_meta_path(name)
         try:
             if (
-                isolation._is_link(profile_dir)
+                platforms.is_link(profile_dir, strict=True)
                 or not profile_dir.is_dir()
-                or isolation._is_link(metadata_path)
+                or platforms.is_link(metadata_path, strict=True)
                 or not metadata_path.is_file()
-                or isolation._is_link(store.overlays_dir)
+                or platforms.is_link(store.overlays_dir, strict=True)
                 or not store.overlays_dir.is_dir()
-                or isolation._is_link(overlay)
+                or platforms.is_link(overlay, strict=True)
                 or not overlay.is_dir()
             ):
                 warn(i18n.t(
@@ -769,7 +771,7 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
                     reason=i18n.t("doctor.fix.reason.safe_owner"),
                 ))
                 continue
-            if not link.exists() or isolation._is_link(link):
+            if not link.exists() or platforms.is_link(link, strict=True):
                 continue
             if not link.is_dir():
                 warn(i18n.t(
@@ -816,16 +818,16 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
                     ))
                     continue
                 if (
-                    isolation._is_link(profile_dir)
+                    platforms.is_link(profile_dir, strict=True)
                     or not profile_dir.is_dir()
-                    or isolation._is_link(metadata_path)
+                    or platforms.is_link(metadata_path, strict=True)
                     or not metadata_path.is_file()
-                    or isolation._is_link(store.overlays_dir)
+                    or platforms.is_link(store.overlays_dir, strict=True)
                     or not store.overlays_dir.is_dir()
-                    or isolation._is_link(overlay)
+                    or platforms.is_link(overlay, strict=True)
                     or not overlay.is_dir()
                     or not link.is_dir()
-                    or isolation._is_link(link)
+                    or platforms.is_link(link, strict=True)
                     or _directory_identity(profile_dir) != profile_identity
                     or _directory_identity(overlay) != overlay_identity
                     or _directory_identity(link) != link_identity
@@ -838,7 +840,7 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
                     continue
                 current_driver = engines.get_engine(current.engine)
                 link = overlay / current_driver.data_dir_name
-                if not link.exists() or isolation._is_link(link):
+                if not link.exists() or platforms.is_link(link, strict=True):
                     continue
                 if not link.is_dir():
                     warn(i18n.t(

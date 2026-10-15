@@ -21,7 +21,7 @@ import shutil
 import sys
 from typing import Optional
 
-from ui import RESET, color_enabled
+from ui import RESET, color_enabled, console_print
 
 _PALETTE: dict[str, tuple[tuple[int, int, int], str]] = {
     "K": ((0, 0, 0), " "),
@@ -196,7 +196,7 @@ def print_banner(stream: Optional[object] = None) -> None:
     """Print the banner unconditionally (manual preview: python -m agydra.banner)."""
     if stream is None:
         stream = sys.stdout
-    print(render(stream) + "\n", file=stream, flush=True)
+    console_print(render(stream) + "\n", file=stream, flush=True)
 
 
 _shown = False

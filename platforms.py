@@ -973,7 +973,7 @@ def run_with_group_kill(
             if stream is not None:
                 try:
                     stream.close()
-                except Exception:
+                except (OSError, ValueError):
                     pass
     return subprocess.CompletedProcess(list(argv), proc.returncode, out, err)
 

@@ -1919,7 +1919,7 @@ def _locale_lang() -> str:
         if loc and loc.lower().startswith("es"):
             return "es"
         return DEFAULT_LANG
-    except Exception:
+    except (locale.Error, ValueError):
         return DEFAULT_LANG
 
 
@@ -1954,6 +1954,10 @@ Retorna el código del idioma resuelto (``'en'`` o ``'es'``).
             return resolved
     if store is not None:
         try:
+            from store import StoreError
+        except ImportError:
+            StoreError = ()
+        try:
             config = store.load_config()
             settings_lang = config.settings.get(_SETTINGS_KEY)
             resolved = _normalize(str(settings_lang)) if settings_lang else None
@@ -1964,7 +1968,7 @@ Retorna el código del idioma resuelto (``'en'`` o ``'es'``).
             if resolved:
                 _set_active(resolved)
                 return resolved
-        except Exception:
+        except (StoreError, OSError, AttributeError, TypeError, ValueError):
             pass
     resolved = _locale_lang()
     _set_active(resolved)
