@@ -166,15 +166,29 @@ class TestBatch3Contracts(BaseCase):
     def test_atomic_writer_handoff_closes_fd(self):
         fds = []
         original = store.tempfile.mkstemp
+        original_unlink = Path.unlink
         def tracked(*args, **kwargs):
             fd, path = original(*args, **kwargs)
             fds.append(fd)
             return fd, path
+        def windows_unlink(path, *args, **kwargs):
+            if path.name.startswith("write.") and path.suffix == ".tmp":
+                try:
+                    os.fstat(fds[-1])
+                except OSError:
+                    pass
+                else:
+                    raise PermissionError("simulated Windows sharing violation: raw fd is open")
+            return original_unlink(path, *args, **kwargs)
         for error in (KeyboardInterrupt, OSError):
             with self.subTest(error=error):
-                with mock.patch.object(store.tempfile, "mkstemp", side_effect=tracked), mock.patch.object(store.os, "fdopen", side_effect=error):
+                target = self.store_root / "write"
+                target.write_bytes(b"previous durable value")
+                with mock.patch.object(store.tempfile, "mkstemp", side_effect=tracked), \
+                        mock.patch.object(store.os, "fdopen", side_effect=error), \
+                        mock.patch.object(Path, "unlink", autospec=True, side_effect=windows_unlink):
                     with self.assertRaises(error):
-                        store.atomic_write_bytes(self.store_root / "write", b"synthetic")
+                        store.atomic_write_bytes(target, b"synthetic")
                 try:
                     with self.assertRaises(OSError):
                         os.fstat(fds[-1])
@@ -184,6 +198,7 @@ class TestBatch3Contracts(BaseCase):
                     except OSError:
                         pass
                 self.assertEqual(list(self.store_root.glob("write.*.tmp")), [])
+                self.assertEqual(target.read_bytes(), b"previous durable value")
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX FIFO probe")
     def test_fifo_operations_are_bounded_and_fail_closed(self):

@@ -144,12 +144,16 @@ def _atomic_replace(path: Path, write_payload, verify=None) -> None:
     )
     tmp = Path(tmp_name)
     try:
-        fh = os.fdopen(fd, "wb")
-        fd = None
-        with fh:
-            write_payload(fh, tmp)
-            fh.flush()
-            os.fsync(fh.fileno())
+        try:
+            fh = os.fdopen(fd, "wb")
+            fd = None
+            with fh:
+                write_payload(fh, tmp)
+                fh.flush()
+                os.fsync(fh.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
         if verify is not None:
             verify(tmp)
         _replace_with_retry(tmp_name, path)
@@ -160,9 +164,6 @@ def _atomic_replace(path: Path, write_payload, verify=None) -> None:
         except OSError:
             pass
         raise
-    finally:
-        if fd is not None:
-            os.close(fd)
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
