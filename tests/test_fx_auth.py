@@ -346,30 +346,16 @@ class TestA4RandomCandidateErrorHandling(BaseCase):
     def test_random_pick_replans_when_candidate_binary_missing(self):
         import engines
 
-        # Make alpha have an engine whose binary cannot be resolved
-        alpha_driver = engines.get_engine("agy")
-        original_resolve = alpha_driver.resolve_binary
-
-        def resolve_binary_patch(override):
-            # Beta resolves, alpha does not
-            return None
-
-        # When alpha is picked, if its binary is missing, -r must replan to beta
-        with mock.patch.object(alpha_driver, "resolve_binary", side_effect=lambda *a, **kw: None if (a and a[0] == "missing") or kw.get("explicit") == "missing" else original_resolve(*a, **kw)):
-            called_alpha = False
-            fallback_binary = write_fake_binary(self.bin_dir, "agy-fallback")
-
-            def mock_resolve_binary(*_a, **_kw):
-                nonlocal called_alpha
-                if not called_alpha:
-                    called_alpha = True
-                    return None
-                return fallback_binary
-
-            with mock.patch.object(alpha_driver, "resolve_binary", side_effect=mock_resolve_binary):
-                plan = runner.build_plan(self.store, [], random_pick=True, engine="agy")
-                self.assertIsNotNone(plan)
-                self.assertEqual(plan.profile, "beta")
+        driver = engines.get_engine("agy")
+        fallback_binary = write_fake_binary(self.bin_dir, "agy-fallback")
+        responses = [
+            platforms.BinaryResult(reason="not_found"),
+            platforms.BinaryResult(found=fallback_binary),
+        ]
+        with mock.patch.object(driver, "resolve_configured_binary_result", side_effect=responses):
+            plan = runner.build_plan(self.store, [], random_pick=True, engine="agy")
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.profile, "beta")
 
     def test_random_pick_replans_when_candidate_overlay_fails(self):
         # In _run_prepared, if build_overlay raises IsolationError on alpha, it replans to beta

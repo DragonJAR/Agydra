@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import cli
 import locks
+import platforms
 import runner
 from conftest import BaseCase, write_fake_binary
 from store import Store, StoreError
@@ -118,7 +119,7 @@ class TestCreateAliasDispatchesConsistent(BaseCase):
         for engine_args in (["-c"], ["create", "a", "REST", "API"], ["c"]):
             with self.subTest(engine_args=engine_args):
                 out = io.StringIO()
-                with mock.patch("platforms.resolve_binary", return_value=echo_binary), \
+                with mock.patch("platforms.resolve_binary_result", return_value=platforms.BinaryResult(found=echo_binary)), \
                         contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
                     ret = cli.main(["-n", "-p", "active_claude", *engine_args])
                 self.assertEqual(ret, 0)

@@ -8,6 +8,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import resolver
+import platforms
 import runner
 from store import Store, StoreError
 
@@ -491,7 +492,7 @@ class TestF2StoreErrorPropagation(BaseCase):
         import engines
         driver = engines.get_engine("agy")
         with mock.patch("resolver.pick_free_profile", side_effect=fake_pick), \
-             mock.patch.object(driver, "resolve_binary", side_effect=[None, Path("/bin/echo")]):
+             mock.patch.object(driver, "resolve_configured_binary_result", side_effect=[platforms.BinaryResult(reason="not_found"), platforms.BinaryResult(found=Path("/bin/echo"))]):
             with self.assertRaises(StoreError) as cm:
                 runner.build_plan(self.store, [], random_pick=True)
             self.assertEqual(str(cm.exception), "FATAL ROOT PERMISSION FAILURE")

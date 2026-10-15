@@ -10,14 +10,14 @@ import base64
 import errno
 import os
 import shlex
-import shutil
 import signal
 import stat
 import subprocess
 import sys
 from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Iterator, Mapping, Optional, Sequence, Union
+from typing import Any, BinaryIO, Callable, Iterator, Literal, Mapping, Optional, Sequence, Union
 
 APP_NAME = "agydra"
 
@@ -250,23 +250,14 @@ def _pathext_suffixes() -> list[str]:
     return [ext for ext in pathext.split(";") if ext]
 
 
-def _probe_pathext(p: Path) -> Optional[Path]:
-    """Probe PATHEXT-suffixed variants of an extension-less Windows path.
+def _pathext_candidates(path: Path, suffixes: Optional[Sequence[str]] = None) -> Iterator[Path]:
+    for suffix in _pathext_suffixes() if suffixes is None else suffixes:
+        yield Path(str(path) + suffix)
 
-    ``shutil.which`` on Python < 3.12 short-circuits to a literal existence
-    check as soon as the candidate has a directory component, skipping
-    PATHEXT entirely (verified against CPython's own ``shutil.which``
-    source: the pre-3.12 implementation returns right after
-    ``_access_check(cmd, mode)`` when ``os.path.dirname(cmd)`` is truthy;
-    3.12+ rewrote it to also try PATHEXT in that case). Always splits on
-    ``;`` — real Windows PATHEXT is semicolon-delimited regardless of
-    ``os.pathsep``.
-    """
-    for ext in _pathext_suffixes():
-        candidate = Path(str(p) + ext)
-        if candidate.is_file():
-            return candidate
-    return None
+
+def _probe_pathext(p: Path) -> Optional[Path]:
+    """Compatibility helper for the first existing PATHEXT-suffixed file."""
+    return next((candidate for candidate in _pathext_candidates(p) if candidate.is_file()), None)
 
 
 def clean_path_value(value: str) -> str:
@@ -310,21 +301,156 @@ def is_executable_file(p: Path) -> bool:
     return os.access(p, os.X_OK)
 
 
+@dataclass(frozen=True)
+class BinaryResult:
+    """One resolution with diagnostics restricted to source names and paths."""
+
+    found: Optional[Path] = None
+    reason: Optional[Literal["not_found", "not_executable"]] = None
+    last_candidate: Optional[Path] = None
+    env_chain: list[str] = field(default_factory=list)
+
+    @property
+    def exit_code(self) -> int:
+        if self.found is not None:
+            return 0
+        return 126 if self.reason == "not_executable" else 127
+
+
+def _inspect_binary_path(path: Path) -> BinaryResult:
+    try:
+        if is_executable_file(path):
+            return BinaryResult(found=path, last_candidate=path)
+        if path.exists():
+            return BinaryResult(reason="not_executable", last_candidate=path)
+    except (OSError, ValueError):
+        return BinaryResult(reason="not_found", last_candidate=path)
+    return BinaryResult(reason="not_found", last_candidate=path)
+
+
+def _binary_variants(path: Path, *, search: bool = False) -> Iterator[Path]:
+    yield path
+    if not is_windows():
+        return
+    suffixes = _pathext_suffixes()
+    if path.suffix.lower() in {suffix.lower() for suffix in suffixes}:
+        return
+    if path.suffix and not search:
+        return
+    yield from _pathext_candidates(path, suffixes)
+
+
+def _probe_binary_variants(path: Path, *, search: bool = False) -> BinaryResult:
+    unavailable = None
+    result = BinaryResult(reason="not_found", last_candidate=path)
+    for candidate in _binary_variants(path, search=search):
+        result = _inspect_binary_path(candidate)
+        if result.found is not None:
+            return result
+        if unavailable is None and result.reason == "not_executable":
+            unavailable = result
+    return unavailable or result
+
+
+def _search_binary_path(names: Sequence[str]) -> dict[str, BinaryResult]:
+    """Walk PATH once for all priority names, retaining each name's first match."""
+    raw_path = _sanitized_path_env()
+    search_path = os.defpath if raw_path is None else raw_path
+    results = {name: BinaryResult(reason="not_found") for name in names}
+    seen = set()
+    for entry in search_path.split(os.pathsep) if search_path else ():
+        if not entry and is_windows():
+            continue
+        directory = Path(entry) if entry else Path(os.curdir)
+        normalized = os.path.normcase(str(directory))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        for name in names:
+            if results[name].found is not None:
+                continue
+            result = _probe_binary_variants(directory / name, search=True)
+            previous = results[name]
+            if result.found is not None or previous.reason != "not_executable":
+                results[name] = result
+        if names and results[names[0]].found is not None:
+            break
+    return results
+
+
+def resolve_binary_result(
+    binary_name: str,
+    env_var: Optional[str] = None,
+    explicit: Optional[str] = None,
+    *,
+    config_val: Optional[str] = None,
+    config_key: Optional[str] = None,
+) -> BinaryResult:
+    """Resolve explicit/env/config/PATH once, preserving binding inputs and 126/127."""
+    chain: list[str] = []
+    selected = explicit
+    binding = bool(explicit)
+    if binding:
+        chain.append("explicit")
+    elif env_var:
+        chain.append(env_var)
+        selected = os.environ.get(env_var)
+        binding = bool(selected)
+    if not binding and config_val:
+        chain.append(config_key or f"{binary_name}_binary")
+        selected = config_val
+    candidate = None
+    direct = BinaryResult(reason="not_found")
+    if selected:
+        try:
+            cleaned = clean_path_value(selected)
+            candidate = Path(cleaned).expanduser() if cleaned else None
+            if candidate is not None:
+                direct = _probe_binary_variants(candidate)
+        except (OSError, ValueError):
+            candidate = None
+        if direct.found is not None:
+            return replace(direct, env_chain=chain)
+    names = []
+    if candidate is not None and not os.path.dirname(str(candidate)):
+        names.append(str(candidate))
+    if not binding and binary_name and binary_name not in names:
+        names.append(binary_name)
+    if names:
+        chain.append("PATH")
+        searched = _search_binary_path(names)
+    else:
+        searched = {}
+    if selected and candidate is not None:
+        result = searched.get(str(candidate), direct)
+        if result.found is not None:
+            return replace(result, env_chain=chain)
+        if direct.reason == "not_executable":
+            result = direct
+    else:
+        result = direct
+    if binding:
+        return replace(result, env_chain=chain)
+    if config_val:
+        import i18n
+        import ui
+
+        key_name = config_key or f"{binary_name}_binary"
+        ui.warn(i18n.t(
+            "platforms.invalid_config_binary",
+            cfg_key=key_name,
+            val=config_val,
+            default=f"invalid {key_name} {config_val!r}; falling through to PATH",
+        ))
+    fallback = searched.get(binary_name, BinaryResult(reason="not_found"))
+    if fallback.found is not None or result.reason != "not_executable":
+        result = fallback
+    return replace(result, env_chain=chain)
+
+
 def _validate_binary_candidate(candidate: str) -> Optional[Path]:
-    candidate_clean = clean_path_value(candidate)
-    if not candidate_clean:
-        return None
-    p = Path(candidate_clean).expanduser()
-    if is_executable_file(p):
-        return p
-    if is_windows() and os.path.dirname(str(p)):
-        if not p.suffix:
-            return _probe_pathext(p)
-        return None
-    which_p = shutil.which(str(p), path=_sanitized_path_env())
-    if which_p:
-        return Path(which_p)
-    return None
+    """Compatibility facade for a binding binary candidate."""
+    return resolve_binary_result("", explicit=candidate).found
 
 
 def resolve_binary(
@@ -335,36 +461,10 @@ def resolve_binary(
     config_val: Optional[str] = None,
     config_key: Optional[str] = None,
 ) -> Optional[Path]:
-    """Locate an executable binary without fragile heuristics.
-
-    Order: explicit flag (-b) → env var → config_val → shutil.which(binary_name).
-    An invalid explicit path returns None immediately (stays an error).
-    An invalid env var returns None immediately.
-    An invalid config_val warns and falls through to PATH.
-    """
-    if explicit:
-        return _validate_binary_candidate(explicit)
-    if env_var:
-        env_val = os.environ.get(env_var)
-        if env_val:
-            return _validate_binary_candidate(env_val)
-    if config_val:
-        cand = _validate_binary_candidate(config_val)
-        if cand:
-            return cand
-        import i18n
-        import ui
-        key_name = config_key or f"{binary_name}_binary"
-        ui.warn(
-            i18n.t(
-                "platforms.invalid_config_binary",
-                cfg_key=key_name,
-                val=config_val,
-                default=f"invalid {key_name} {config_val!r}; falling through to PATH",
-            )
-        )
-    found = shutil.which(binary_name, path=_sanitized_path_env())
-    return Path(found) if found else None
+    """Compatibility facade returning only the resolved executable path."""
+    return resolve_binary_result(
+        binary_name, env_var, explicit, config_val=config_val, config_key=config_key
+    ).found
 
 
 def resolve_agy_binary(
@@ -374,7 +474,7 @@ def resolve_agy_binary(
 ) -> Optional[Path]:
     """Locate the real agy binary without fragile heuristics.
 
-    Order: explicit flag → ``AGYDRA_AGY_BIN`` → config → ``shutil.which("agy")``.
+    Order: explicit flag → ``AGYDRA_AGY_BIN`` → config → PATH lookup for ``agy``.
     Returns ``None`` when not found.
     """
     return resolve_binary(
@@ -393,7 +493,7 @@ def resolve_codex_binary(
 ) -> Optional[Path]:
     """Locate the real codex binary without fragile heuristics.
 
-    Order: explicit flag → ``AGYDRA_CODEX_BIN`` → config → ``shutil.which("codex")``.
+    Order: explicit flag → ``AGYDRA_CODEX_BIN`` → config → PATH lookup for ``codex``.
     Returns ``None`` when not found.
     """
     return resolve_binary(
@@ -417,7 +517,7 @@ def resolve_grok_binary(
 ) -> Optional[Path]:
     """Locate the real grok binary without fragile heuristics.
 
-    Order: explicit flag → ``AGYDRA_GROK_BIN`` → config → ``shutil.which("grok")``.
+    Order: explicit flag → ``AGYDRA_GROK_BIN`` → config → PATH lookup for ``grok``.
     Returns ``None`` when not found.
     """
     return resolve_binary(
@@ -441,7 +541,7 @@ def resolve_claude_binary(
 ) -> Optional[Path]:
     """Locate the real claude binary without fragile heuristics.
 
-    Order: explicit flag → ``AGYDRA_CLAUDE_BIN`` → config → ``shutil.which("claude")``.
+    Order: explicit flag → ``AGYDRA_CLAUDE_BIN`` → config → PATH lookup for ``claude``.
     Returns ``None`` when not found.
     """
     return resolve_binary(

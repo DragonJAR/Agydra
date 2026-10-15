@@ -686,6 +686,7 @@ def _resolve_profile_auth_and_email(
     *,
     sync_email: bool = True,
     data_dir: Optional[Path] = None,
+    payload: Optional[account.AuthSnapshot] = None,
 ) -> Tuple[str, Optional[str], Any]:
     _require_no_pending_import(store, profile.name)
     engine = profile.engine
@@ -701,8 +702,9 @@ def _resolve_profile_auth_and_email(
         synced = account.record_profile_email(store, name)
         if synced and not profile.email:
             profile.email = synced
-    email = account.display_email(store, profile)
-    state = account.auth_state(data_dir, store, name, engine=engine)
+    payload_args = {"payload": payload} if payload is not None else {}
+    email = account.display_email(store, profile, **payload_args)
+    state = account.auth_state(data_dir, store, name, engine=engine, **payload_args)
     return state, email, None
 
 
@@ -896,7 +898,10 @@ def cmd_status(store: Store, args) -> int:
     profile = resolution.profile if getattr(resolution, "profile", None) is not None else store.get(name)
     engine = profile.engine
     data_dir = store.profile_data_dir(name, engine=engine, profile=profile)
-    state, email, native = _resolve_profile_auth_and_email(store, profile, sync_email=False, data_dir=data_dir)
+    payload = account.auth_snapshot(data_dir, engine) if engine in ("codex", "grok") else None
+    state, email, native = _resolve_profile_auth_and_email(
+        store, profile, sync_email=False, data_dir=data_dir, payload=payload
+    )
     print(i18n.t("cmd.status.profile", name=name))
     print(i18n.t("cmd.status.engine", engine=engine))
     print(i18n.t("cmd.status.reason", reason=resolution.reason))

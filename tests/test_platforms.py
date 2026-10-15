@@ -589,18 +589,17 @@ class TestPathHelpers(unittest.TestCase):
         self.assertEqual(platforms.clean_path_value("   "), "")
         self.assertEqual(platforms._clean_path_entry('  "C:\\Path"  '), "C:\\Path")
 
-    def test_runner_binary_candidates_handle_quoted_values(self):
-        import runner
+    def test_binary_results_handle_quoted_values(self):
         with tempfile.TemporaryDirectory(prefix="agydra-runner-") as directory:
             bin_path = Path(directory) / "custom-bin"
             bin_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             bin_path.chmod(0o755)
             self.assertEqual(
-                runner._existing_binary_candidate(f'"{bin_path}"'),
+                platforms.resolve_binary_result("custom-bin", explicit=f'"{bin_path}"').last_candidate,
                 bin_path,
             )
             self.assertEqual(
-                runner._existing_binary_candidate(f"'{bin_path}'"),
+                platforms.resolve_binary_result("custom-bin", explicit=f"'{bin_path}'").last_candidate,
                 bin_path,
             )
 

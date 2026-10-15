@@ -15,7 +15,6 @@ is built inside ``run`` exclusively.
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -34,9 +33,13 @@ from ui import warn
 
 
 class BinaryUnavailableError(StoreError):
-    def __init__(self, message: str, exit_code: int = 127):
+    def __init__(
+        self, message: str, exit_code: int = 127,
+        *, result: Optional[platforms.BinaryResult] = None,
+    ):
         super().__init__(message)
-        self.exit_code = exit_code
+        self.exit_code = result.exit_code if result is not None else exit_code
+        self.result = result
 
 
 class LaunchIdentityChangedError(StoreError):
@@ -54,62 +57,6 @@ class LaunchIdentityChangedError(StoreError):
             engine=current.engine,
             seq=current.seq,
         ))
-
-
-def _existing_binary_candidate(value: str) -> Optional[Path]:
-    cleaned = platforms.clean_path_value(value)
-    if not cleaned:
-        return None
-    try:
-        candidate = Path(cleaned).expanduser()
-        if candidate.exists():
-            return candidate
-        if platforms.is_windows() and not candidate.suffix:
-            return platforms._probe_pathext(candidate)
-    except (OSError, ValueError):
-        return None
-    return None
-
-
-def _path_binary_candidate(binary_name: str) -> Optional[Path]:
-    raw_path = platforms._sanitized_path_env()
-    search_path = os.defpath if raw_path is None else raw_path
-    for entry in search_path.split(os.pathsep):
-        if not entry and platforms.is_windows():
-            continue
-        directory = Path(entry) if entry else Path(os.curdir)
-        candidate = _existing_binary_candidate(str(directory / binary_name))
-        if candidate is not None:
-            return candidate
-    return None
-
-
-def _unavailable_binary_candidate(
-    driver: engines.EngineDriver, config: Config, explicit: Optional[str]
-) -> Optional[Path]:
-    if explicit:
-        candidate = _existing_binary_candidate(explicit)
-        if candidate is not None:
-            return candidate
-        cleaned = platforms.clean_path_value(explicit)
-        if not os.path.dirname(cleaned):
-            return _path_binary_candidate(cleaned)
-        return None
-    env_value = os.environ.get(driver.env_bin_var) if driver.env_bin_var else None
-    if env_value:
-        candidate = _existing_binary_candidate(env_value)
-        if candidate is not None:
-            return candidate
-        cleaned = platforms.clean_path_value(env_value)
-        if not os.path.dirname(cleaned):
-            return _path_binary_candidate(cleaned)
-        return None
-    config_value = getattr(config, driver.config_binary_attr, None)
-    if config_value:
-        candidate = _existing_binary_candidate(str(config_value))
-        if candidate is not None:
-            return candidate
-    return _path_binary_candidate(driver.binary_name)
 
 
 _PLAN_ENV_DISPLAY = (
@@ -336,24 +283,20 @@ def build_plan(
         driver = engines.get_engine(profile.engine)
 
         config = rotation.config() if rotation is not None else store.load_config()
-        binary = driver.resolve_configured_binary(config, binary_override)
+        binary_result = driver.resolve_configured_binary_result(config, binary_override)
+        binary = binary_result.found
         if binary is None:
-            unavailable_candidate = _unavailable_binary_candidate(
-                driver, config, binary_override
-            )
-            if unavailable_candidate is not None:
+            unavailable_candidate = binary_result.last_candidate
+            if binary_result.reason == "not_executable":
                 message = f"binary {str(unavailable_candidate)!r} is not executable"
-                exit_code = 126
             elif binary_override:
                 message = f"could not find binary {binary_override!r}"
-                exit_code = 127
             else:
                 message = (
                     f"could not find the {driver.binary_name} binary; install {driver.binary_name} first, "
                     f"or point agydra to it with --binary <path> or the {driver.env_bin_var} env var"
                 )
-                exit_code = 127
-            err = BinaryUnavailableError(message, exit_code=exit_code)
+            err = BinaryUnavailableError(message, result=binary_result)
             if not random_pick:
                 raise err
             excluded.add(profile.name)
@@ -434,9 +377,9 @@ def _plan_redirections(
         if driver.env_home_var:
             destinations[driver.env_home_var] = str(overlay / driver.data_dir_name)
         if driver.name == "grok":
-            destinations["GROK_LEADER_SOCKET"] = _grok_socket_destination(
+            destinations["GROK_LEADER_SOCKET"] = str(isolation.grok_leader_socket_target(
                 overlay, driver.data_dir_name
-            )
+            ))
     else:
         for name in ("HOME", "USERPROFILE"):
             if name in env:
@@ -444,15 +387,6 @@ def _plan_redirections(
         if driver.env_home_var:
             destinations[driver.env_home_var] = str(overlay)
     return destinations
-
-
-def _grok_socket_destination(overlay: Path, data_dir_name: str) -> str:
-    preferred = overlay / data_dir_name / "leader.sock"
-    preferred_value = str(preferred)
-    if platforms.is_windows() or len(os.fsencode(preferred_value)) <= 103:
-        return preferred_value
-    digest = hashlib.sha256(os.fsencode(preferred_value)).hexdigest()[:16]
-    return str(Path(f"/tmp/agydra-{os.getuid()}") / f"{digest}.sock")
 
 
 def _next_random_plan(

@@ -16,13 +16,14 @@ import binascii
 import json
 import stat
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Literal, Mapping, Optional, Tuple, Union
 
 import platforms
 import store
 from models import Profile
+from text import module_text
 
 AGY_CLI_DIR = "antigravity-cli"
 TOKEN_FILE = "antigravity-oauth-token"
@@ -410,96 +411,96 @@ CODEX_AUTH_FILE = "auth.json"
 CODEX_CONFIG_FILE = "config.toml"
 
 
-def inspect_codex_auth(data_dir: Path) -> Optional[dict]:
-    """Inspect auth details for a Codex profile, or None if unauthenticated."""
-    path = Path(data_dir) / CODEX_AUTH_FILE
-    if not path.is_file():
-        return None
-    raw = store.read_json_object(path, tolerant=True)
-    if not isinstance(raw, dict):
-        return None
+def codex_auth_from_payload(raw: dict) -> Tuple[Optional[dict], Optional[str], Optional[str]]:
+    """Derive auth, plan and email from a single caller-owned Codex payload."""
+    raw = raw if isinstance(raw, dict) else {}
     tokens = raw.get("tokens")
-    if isinstance(tokens, dict) and any(
-        _has_credential(tokens.get(key))
-        for key in ("access_token", "id_token", "refresh_token")
-    ):
-        access_token = tokens.get("access_token")
-        id_token = tokens.get("id_token")
-        refresh_token = tokens.get("refresh_token")
+    tokens = tokens if isinstance(tokens, dict) else {}
+    id_token = tokens.get("id_token")
+    claims = _decode_jwt_payload(id_token) if _has_credential(id_token) else {}
+    auth_claim = claims.get("https://api.openai.com/auth")
+    auth_claim = auth_claim if isinstance(auth_claim, dict) else {}
+    plan_type = auth_claim.get("chatgpt_plan_type")
+    detected_plan = None
+    if isinstance(plan_type, str) and plan_type:
+        detected_plan = CHATGPT_PLAN_NAMES.get(plan_type.lower(), f"ChatGPT {plan_type.capitalize()}")
+    elif _has_credential(raw.get("OPENAI_API_KEY")):
+        detected_plan = module_text("usage.openai_api_key", "OpenAI API Key")
+    detected_email = normalize_email(claims.get("email"))
+    if any(_has_credential(tokens.get(key)) for key in ("access_token", "id_token", "refresh_token")):
         account_id = None
         for key in ("account_id", "accountId"):
-            val = tokens.get(key) or raw.get(key)
-            if isinstance(val, str) and val.strip():
-                account_id = val.strip()
+            value = tokens.get(key) or raw.get(key)
+            if _has_credential(value):
+                account_id = value.strip()
                 break
         if not account_id:
-            if _has_credential(id_token):
-                claims = _decode_jwt_payload(id_token)
-                auth_claim = claims.get("https://api.openai.com/auth")
-                if isinstance(auth_claim, dict):
-                    cid = auth_claim.get("chatgpt_account_id") or auth_claim.get("account_id")
-                    if isinstance(cid, str) and cid.strip():
-                        account_id = cid.strip()
-                if not account_id:
-                    for cid_key in ("chatgpt_account_id", "account_id", "org_id"):
-                        cid = claims.get(cid_key)
-                        if isinstance(cid, str) and cid.strip():
-                            account_id = cid.strip()
-                            break
-        return {
-            "auth_type": "chatgpt",
-            "access_token": access_token if _has_credential(access_token) else None,
-            "refresh_token": refresh_token if _has_credential(refresh_token) else None,
-            "id_token": id_token if _has_credential(id_token) else None,
-            "account_id": account_id,
-        }
-    api_key = raw.get("OPENAI_API_KEY")
-    if _has_credential(api_key):
-        return {
-            "auth_type": "api_key",
-            "api_key": api_key,
-        }
-    return None
+            value = auth_claim.get("chatgpt_account_id") or auth_claim.get("account_id")
+            if _has_credential(value):
+                account_id = value.strip()
+        if not account_id:
+            for key in ("chatgpt_account_id", "account_id", "org_id"):
+                value = claims.get(key)
+                if _has_credential(value):
+                    account_id = value.strip()
+                    break
+        auth = {"auth_type": "chatgpt", "account_id": account_id}
+        auth.update({
+            key: tokens.get(key) if _has_credential(tokens.get(key)) else None
+            for key in ("access_token", "id_token", "refresh_token")
+        })
+        return auth, detected_plan, detected_email
+    key = raw.get("OPENAI_API_KEY")
+    auth = {"auth_type": "api_key", "api_key": key} if _has_credential(key) else None
+    return auth, detected_plan, detected_email
+
+
+@dataclass(frozen=True)
+class AuthSnapshot:
+    """Per-operation inspection; never cache or display credential contents."""
+
+    engine: str
+    auth_info: Optional[dict] = field(repr=False)
+    plan: Optional[str]
+    email: Optional[str]
+
+
+def _read_auth_payload(data_dir: Path) -> dict:
+    raw = store.read_json_object(Path(data_dir) / CODEX_AUTH_FILE, tolerant=True)
+    return raw if isinstance(raw, dict) else {}
+
+
+def auth_snapshot(
+    data_dir: Path, engine: str, *, payload: Optional[Union[dict, AuthSnapshot]] = None
+) -> AuthSnapshot:
+    """Share one parsed and decoded inspection within an operation only."""
+    if isinstance(payload, AuthSnapshot):
+        if payload.engine != engine:
+            raise ValueError("authentication snapshot engine mismatch")
+        return payload
+    raw = _read_auth_payload(data_dir) if payload is None else payload
+    if engine == "codex":
+        auth, plan, email = codex_auth_from_payload(raw)
+    elif engine == "grok":
+        auth, plan, email = grok_auth_from_payload(raw, data_dir)
+    else:
+        raise ValueError("authentication snapshot requires codex or grok")
+    return AuthSnapshot(engine, auth, plan, email)
+
+
+def inspect_codex_auth(data_dir: Path) -> Optional[dict]:
+    """Read-on-demand compatibility facade for Codex credentials."""
+    return codex_auth_from_payload(_read_auth_payload(data_dir))[0]
 
 
 def detect_codex_email(data_dir: Path) -> Optional[str]:
-    """Extract email claim from Codex auth.json id_token JWT if present."""
-    path = Path(data_dir) / CODEX_AUTH_FILE
-    if not path.is_file():
-        return None
-    raw = store.read_json_object(path, tolerant=True)
-    if not isinstance(raw, dict):
-        return None
-    tokens = raw.get("tokens")
-    if isinstance(tokens, dict):
-        id_token = tokens.get("id_token")
-        if _has_credential(id_token):
-            claims = _decode_jwt_payload(id_token)
-            return normalize_email(claims.get("email"))
-    return None
+    """Read-on-demand compatibility facade for Codex email."""
+    return codex_auth_from_payload(_read_auth_payload(data_dir))[2]
 
 
 def detect_codex_plan(data_dir: Path) -> Optional[str]:
-    """Extract ChatGPT plan type or API key status from Codex auth.json."""
-    path = Path(data_dir) / CODEX_AUTH_FILE
-    if not path.is_file():
-        return None
-    raw = store.read_json_object(path, tolerant=True)
-    if not isinstance(raw, dict):
-        return None
-    tokens = raw.get("tokens")
-    if isinstance(tokens, dict):
-        id_token = tokens.get("id_token")
-        if _has_credential(id_token):
-            claims = _decode_jwt_payload(id_token)
-            auth_claim = claims.get("https://api.openai.com/auth")
-            if isinstance(auth_claim, dict):
-                plan_type = auth_claim.get("chatgpt_plan_type")
-                if isinstance(plan_type, str) and plan_type:
-                    return CHATGPT_PLAN_NAMES.get(plan_type.lower(), f"ChatGPT {plan_type.capitalize()}")
-    if _has_credential(raw.get("OPENAI_API_KEY")):
-        return "OpenAI API Key"
-    return None
+    """Read-on-demand compatibility facade for Codex plan."""
+    return codex_auth_from_payload(_read_auth_payload(data_dir))[1]
 
 
 GROK_AUTH_FILE = "auth.json"
@@ -611,90 +612,62 @@ def _first_grok_credential(raw: dict) -> Optional[dict]:
     return next((credential for _key, credential in _grok_credentials(raw)), None)
 
 
+def grok_auth_from_payload(
+    raw: dict, data_dir: Path
+) -> Tuple[Optional[dict], Optional[str], Optional[str]]:
+    """Derive Grok auth, plan and email, reusing its native config fallback."""
+    raw = raw if isinstance(raw, dict) else {}
+    credential = _first_grok_credential(raw)
+    if credential is not None:
+        key = credential.get("key")
+        claims = _decode_jwt_payload(key) if _has_credential(key) else {}
+        detected_email = normalize_email(credential.get("email")) or normalize_email(claims.get("email"))
+        tier = credential.get("subscription_tier")
+        if _has_credential(tier):
+            detected_plan = tier.capitalize() if not tier.lower().startswith("super") else "SuperGrok"
+        elif claims.get("tier") is not None:
+            tier = str(claims["tier"])
+            tier_names = {"4": "SuperGrok", "3": "Grok Pro", "2": "Grok Basic", "1": "Grok Free"}
+            detected_plan = tier_names.get(tier) or module_text(
+                "usage.grok_tier", "Grok Tier {tier}", tier=tier
+            )
+        else:
+            detected_plan = "Grok (xAI)"
+        refresh = credential.get("refresh_token")
+        auth = {
+            "auth_type": credential.get("auth_mode") or "oidc",
+            "key": key if _has_credential(key) else None,
+            "token": key if _has_credential(key) else None,
+            "refresh_token": refresh if _has_credential(refresh) else None,
+            "email": normalize_email(credential.get("email")),
+        }
+        auth.update({
+            field: credential.get(field)
+            for field in ("user_id", "first_name", "oidc_issuer", "oidc_client_id", "expires_at")
+        })
+        return auth, detected_plan, detected_email
+    key = raw.get("XAI_API_KEY")
+    if not _has_credential(key):
+        key = grok_config_api_key(data_dir)
+    if _has_credential(key):
+        return {"auth_type": "api_key", "api_key": key}, module_text("usage.xai_api_key", "xAI API Key"), None
+    return None, None, None
+
+
+
 def inspect_grok_auth(data_dir: Path) -> Optional[dict]:
-    """Inspect auth details for a Grok profile, or None if unauthenticated."""
-    path = Path(data_dir) / GROK_AUTH_FILE
-    if path.is_file():
-        raw = store.read_json_object(path, tolerant=True)
-        cred = _first_grok_credential(raw)
-        if cred is not None:
-            key = cred.get("key")
-            refresh_token = cred.get("refresh_token")
-            email = cred.get("email")
-            return {
-                "auth_type": cred.get("auth_mode") or "oidc",
-                "key": key if _has_credential(key) else None,
-                "token": key if _has_credential(key) else None,
-                "refresh_token": (
-                    refresh_token if _has_credential(refresh_token) else None
-                ),
-                "email": normalize_email(email),
-                "user_id": cred.get("user_id"),
-                "first_name": cred.get("first_name"),
-                "oidc_issuer": cred.get("oidc_issuer"),
-                "oidc_client_id": cred.get("oidc_client_id"),
-                "expires_at": cred.get("expires_at"),
-            }
-        api_key = raw.get("XAI_API_KEY") if isinstance(raw, dict) else None
-        if _has_credential(api_key):
-            return {
-                "auth_type": "api_key",
-                "api_key": api_key,
-            }
-    api_key = grok_config_api_key(data_dir)
-    if api_key is not None:
-        return {"auth_type": "api_key", "api_key": api_key}
-    return None
+    """Read-on-demand compatibility facade for Grok credentials."""
+    return grok_auth_from_payload(_read_auth_payload(data_dir), data_dir)[0]
 
 
 def detect_grok_email(data_dir: Path) -> Optional[str]:
-    """Extract email from Grok auth.json."""
-    path = Path(data_dir) / GROK_AUTH_FILE
-    if not path.is_file():
-        return None
-    raw = store.read_json_object(path, tolerant=True)
-    cred = _first_grok_credential(raw)
-    if cred is not None:
-        email = cred.get("email")
-        normalized_email = normalize_email(email)
-        if normalized_email is not None:
-            return normalized_email
-        key = cred.get("key")
-        if _has_credential(key):
-            claims = _decode_jwt_payload(key)
-            return normalize_email(claims.get("email"))
-    return None
+    """Read-on-demand compatibility facade for Grok email."""
+    return grok_auth_from_payload(_read_auth_payload(data_dir), data_dir)[2]
 
 
 def detect_grok_plan(data_dir: Path) -> Optional[str]:
-    """Extract Grok subscription plan or tier."""
-    path = Path(data_dir) / GROK_AUTH_FILE
-    if path.is_file():
-        raw = store.read_json_object(path, tolerant=True)
-        cred = _first_grok_credential(raw)
-        if cred is not None:
-            sub_tier = cred.get("subscription_tier")
-            if _has_credential(sub_tier):
-                return sub_tier.capitalize() if not sub_tier.lower().startswith("super") else "SuperGrok"
-            key = cred.get("key")
-            if _has_credential(key):
-                claims = _decode_jwt_payload(key)
-                tier = claims.get("tier")
-                if tier is not None:
-                    tier_str = str(tier)
-                    tier_map = {
-                        "4": "SuperGrok",
-                        "3": "Grok Pro",
-                        "2": "Grok Basic",
-                        "1": "Grok Free",
-                    }
-                    return tier_map.get(tier_str, f"Grok Tier {tier_str}")
-            return "Grok (xAI)"
-        if isinstance(raw, dict) and _has_credential(raw.get("XAI_API_KEY")):
-            return "xAI API Key"
-    if grok_config_api_key(data_dir) is not None:
-        return "xAI API Key"
-    return None
+    """Read-on-demand compatibility facade for Grok plan."""
+    return grok_auth_from_payload(_read_auth_payload(data_dir), data_dir)[1]
 
 
 
@@ -926,7 +899,10 @@ def detect_email(
     return email
 
 
-def display_email(store: Optional[store.Store], profile: Profile) -> Optional[str]:
+def display_email(
+    store: Optional[store.Store], profile: Profile, *,
+    payload: Optional[Union[dict, AuthSnapshot]] = None,
+) -> Optional[str]:
     """Read-only email for UI display: recorded email, else detected via detect_email.
 
     Never persists metadata and never takes locks.
@@ -941,6 +917,8 @@ def display_email(store: Optional[store.Store], profile: Profile) -> Optional[st
 
     try:
         data_dir = store.profile_data_dir(profile.name, engine=engine)
+        if payload is not None and engine in ("codex", "grok"):
+            return auth_snapshot(data_dir, engine, payload=payload).email
         return detect_email(data_dir, store, profile.name, engine=engine)
     except (StoreError, OSError) as exc:
         from i18n import t
@@ -971,11 +949,15 @@ def auth_state(
     store=None,
     name: Optional[str] = None,
     engine: str = "agy",
+    *, payload: Optional[Union[dict, AuthSnapshot]] = None,
 ) -> str:
     """'authenticated' | 'not-authenticated' from whichever backend is live.
 
     Supports Google agy (disk/keychain), OpenAI Codex (auth.json), and xAI Grok (auth.json).
     """
+    if payload is not None and engine in ("codex", "grok"):
+        snapshot = auth_snapshot(data_dir, engine, payload=payload)
+        return "authenticated" if snapshot.auth_info is not None else "not-authenticated"
     if engine == "codex":
         return "authenticated" if inspect_codex_auth(data_dir) is not None else "not-authenticated"
     if engine == "grok":

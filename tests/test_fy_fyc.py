@@ -496,32 +496,33 @@ class TestFYCBugFixes(BaseCase):
             with mock.patch.dict(os.environ, {"PATH": "  ;  ;  "}):
                 self.assertEqual(platforms._sanitized_path_env(), "")
 
-    def test_runner_path_binary_candidate_os_defpath_fallback(self):
+    def test_binary_result_os_defpath_fallback(self):
         defdir = self._tmp / "defpath_dir"
         defdir.mkdir()
         target = defdir / "my_engine"
         target.write_text("bin", encoding="utf-8")
 
         with mock.patch.object(platforms, "_sanitized_path_env", return_value=None), mock.patch("os.defpath", str(defdir)):
-            candidate = runner._path_binary_candidate("my_engine")
-            self.assertEqual(candidate, target)
+            candidate = platforms.resolve_binary_result("my_engine")
+            self.assertEqual(candidate.last_candidate, target)
 
         with mock.patch.object(platforms, "_sanitized_path_env", return_value=None), mock.patch("os.defpath", str(defdir)):
-            self.assertIsNone(runner._path_binary_candidate("nonexistent_binary"))
+            self.assertEqual("not_found", platforms.resolve_binary_result("nonexistent_binary").reason)
 
-    def test_runner_path_binary_candidate_windows_skips_empty_path_entries(self):
+    def test_binary_result_windows_skips_empty_path_entries(self):
         calls = []
 
         def fake_existing(path_str):
-            calls.append(path_str)
-            return None
+            calls.append(str(path_str))
+            return platforms.BinaryResult(reason="not_found", last_candidate=Path(path_str))
 
         with mock.patch("platforms.is_windows", return_value=True), \
              mock.patch("os.pathsep", ";"), \
              mock.patch.object(platforms, "_sanitized_path_env", return_value=";C:\\tools;;"), \
-             mock.patch.object(runner, "_existing_binary_candidate", side_effect=fake_existing):
-            res = runner._path_binary_candidate("engine.exe")
-            self.assertIsNone(res)
+             mock.patch.object(platforms, "_inspect_binary_path", side_effect=fake_existing):
+            res = platforms.resolve_binary_result("engine.exe")
+            self.assertIsNone(res.found)
+            self.assertEqual(res.reason, "not_found")
             self.assertEqual(len(calls), 1)
             self.assertIn("tools", calls[0])
             self.assertNotIn(str(Path(os.curdir)), calls)
@@ -529,18 +530,18 @@ class TestFYCBugFixes(BaseCase):
         posix_calls = []
 
         def fake_posix_existing(path_str):
-            posix_calls.append(path_str)
-            return None
+            posix_calls.append(str(path_str))
+            return platforms.BinaryResult(reason="not_found", last_candidate=Path(path_str))
 
         with mock.patch("platforms.is_windows", return_value=False), \
              mock.patch("os.pathsep", ":"), \
              mock.patch.object(platforms, "_sanitized_path_env", return_value=":/usr/bin:"), \
-             mock.patch.object(runner, "_existing_binary_candidate", side_effect=fake_posix_existing):
-            res = runner._path_binary_candidate("engine")
-            self.assertIsNone(res)
+             mock.patch.object(platforms, "_inspect_binary_path", side_effect=fake_posix_existing):
+            res = platforms.resolve_binary_result("engine")
+            self.assertIsNone(res.found)
             self.assertIn(str(Path(os.curdir) / "engine"), posix_calls)
 
-    def test_runner_path_binary_candidate_pathsep_split_windows_vs_posix(self):
+    def test_binary_result_pathsep_split_windows_vs_posix(self):
         dir_a = self._tmp / "dir_a"
         dir_b = self._tmp / "dir_b"
         dir_a.mkdir()
@@ -552,8 +553,8 @@ class TestFYCBugFixes(BaseCase):
         with mock.patch("platforms.is_windows", return_value=True), \
              mock.patch("os.pathsep", ";"), \
              mock.patch.dict(os.environ, {"PATH": path_win}):
-            candidate_win = runner._path_binary_candidate("engine_bin")
-            self.assertEqual(candidate_win, target)
+            candidate_win = platforms.resolve_binary_result("engine_bin")
+            self.assertEqual(candidate_win.last_candidate, target)
 
         if os.name == "nt":
             posix_target = Path("/custom/bin/engine_bin")
@@ -561,18 +562,21 @@ class TestFYCBugFixes(BaseCase):
                  mock.patch("os.pathsep", ":"), \
                  mock.patch.dict(os.environ, {"PATH": "/other/bin:/custom/bin"}), \
                  mock.patch.object(
-                     runner,
-                     "_existing_binary_candidate",
-                     side_effect=lambda p: posix_target if p == str(Path("/custom/bin") / "engine_bin") else None,
+                     platforms,
+                     "_inspect_binary_path",
+                     side_effect=lambda p: platforms.BinaryResult(
+                         reason="not_executable" if p == posix_target else "not_found",
+                         last_candidate=p,
+                     ),
                  ):
-                candidate_posix = runner._path_binary_candidate("engine_bin")
-                self.assertEqual(candidate_posix, posix_target)
+                candidate_posix = platforms.resolve_binary_result("engine_bin")
+                self.assertEqual(candidate_posix.last_candidate, posix_target)
         else:
             path_posix = f"{dir_a}:{dir_b}"
             with mock.patch("platforms.is_windows", return_value=False), \
                  mock.patch("os.pathsep", ":"), \
                  mock.patch.dict(os.environ, {"PATH": path_posix}):
-                candidate_posix = runner._path_binary_candidate("engine_bin")
-                self.assertEqual(candidate_posix, target)
+                candidate_posix = platforms.resolve_binary_result("engine_bin")
+                self.assertEqual(candidate_posix.last_candidate, target)
 
 

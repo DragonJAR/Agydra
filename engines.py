@@ -142,6 +142,18 @@ class EngineDriver:
             config_val=getattr(config, self.config_binary_attr, None) if config is not None else None,
         )
 
+    def resolve_configured_binary_result(
+        self, config, explicit: Optional[str] = None
+    ) -> platforms.BinaryResult:
+        """Expose the canonical structured search without replaying its cascade."""
+        return platforms.resolve_binary_result(
+            self.binary_name,
+            env_var=self.env_bin_var,
+            explicit=explicit,
+            config_val=getattr(config, self.config_binary_attr, None) if config is not None else None,
+            config_key=self.config_binary_attr,
+        )
+
     def prepare_args(self, args: Sequence[str]) -> List[str]:
         return self.translate_universal_flags(args)
 
