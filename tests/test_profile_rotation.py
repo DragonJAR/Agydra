@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import account
+import i18n
 import keychain
 import locks
 import platforms
@@ -328,7 +330,13 @@ class TestProfileRotation(BaseCase):
     def test_all_engine_rotation_lock_coordinates_with_engine_scopes(self):
         with profile_rotation.Rotation(self.store, None):
             with mock.patch.object(profile_rotation, "LOCK_PATIENCE_S", 0.1), \
-                    self.assertRaisesRegex(StoreError, "codex profile rotation is busy"):
+                    self.assertRaisesRegex(
+                        StoreError,
+                        re.escape(i18n.t(
+                            "profile_rotation.profile_rotation_is_busy_retry_in_a_moment",
+                            scope="codex",
+                        )),
+                    ):
                 profile_rotation.Rotation(self.store, "codex").__enter__()
 
         with profile_rotation.Rotation(self.store, "codex") as codex_rotation, \

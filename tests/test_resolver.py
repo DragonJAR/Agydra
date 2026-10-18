@@ -1,5 +1,6 @@
 """Resolver cascade: flag → env → marker → default → first → none."""
 import os
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -7,6 +8,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import i18n
 import resolver
 import platforms
 import runner
@@ -171,7 +173,10 @@ class TestResolver(BaseCase):
             "_recover_pending_rename",
             side_effect=AssertionError("read-only planning must not recover state"),
         ):
-            with self.assertRaisesRegex(StoreError, "recovery is pending|unreadable or malformed"):
+            with self.assertRaisesRegex(
+                StoreError,
+                re.escape(i18n.t("store.rename.readonly_unreadable", path=journal)),
+            ):
                 runner.build_plan(
                     self.store, [], flag_ref="work", read_only=True
                 )

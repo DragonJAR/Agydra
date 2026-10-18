@@ -17,6 +17,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import i18n
 import keychain
 import locks
 import platforms
@@ -1574,8 +1575,9 @@ class TestKeychainCheckFlagsStaleSharedFormat(unittest.TestCase):
                                   return_value=[]):
             status, message = doctor._check_keychain(store, ctx)
         self.assertEqual(status, doctor.WARN)
-        self.assertIn("not valid JSON", message)
-        self.assertIn("rewrites the slot", message)
+        self.assertIn(
+            i18n.t("doctor.keychain.bad_format", format="invalid"), message
+        )
 
 
 class TestPersistClassification(unittest.TestCase):

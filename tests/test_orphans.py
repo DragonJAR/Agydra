@@ -9,6 +9,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import doctor
+import i18n
 import keychain
 import locks
 import orphans
@@ -371,7 +372,7 @@ class TestDoctorOrphansCheck(BaseCase):
         self.store.create("solo")
         status, message = doctor._check_orphans(self.store, self._ctx())
         self.assertEqual(status, doctor.OK)
-        self.assertIn("none found", message)
+        self.assertIn(i18n.t("doctor.orphans.none"), message)
 
     def test_warn_lists_orphaned_overlay(self):
         self.store.create("solo")

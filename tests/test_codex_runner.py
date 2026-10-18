@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cli
+import i18n
 import platforms
 import resolver
 import runner
@@ -257,8 +258,10 @@ class TestCodexRunner(BaseCase):
         with mock.patch.dict(os.environ, {"AGYDRA_AGY_BIN": "/nonexistent/agy"}):
             status, msg = doctor._check_binary(codex_store, ctx)
             self.assertEqual(status, doctor.OK)
-            self.assertIn("codex binary:", msg)
-            self.assertNotIn("agy binary not found", msg)
+            self.assertIn(i18n.t("doctor.binary.codex_ok", path=""), msg)
+            self.assertNotIn(
+                i18n.t("doctor.binary.fail", env_var="AGYDRA_AGY_BIN"), msg
+            )
 
 
 if __name__ == "__main__":

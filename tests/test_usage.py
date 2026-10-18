@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import i18n
 import keychain
 import platforms
 import usage
@@ -207,7 +208,7 @@ class TestQueryProfileUsageFailureModes(_UsageBase):
         os.environ["FAKE_AGY_USAGE_SLEEP"] = "2"
         result = usage.query_profile_usage(self.store, "alpha", timeout=0.2)
         self.assertFalse(result.ok)
-        self.assertIn("timed out", result.error)
+        self.assertIn(i18n.t("usage.timed_out"), result.error)
 
     def test_not_authenticated_short_circuits_without_subprocess(self):
         self.store.create("beta")
@@ -250,7 +251,7 @@ class TestQueryProfileUsageCredentialUnavailable(_UsageBase):
             with mock.patch.object(platforms, "run_with_group_kill") as mock_run:
                 result = usage.query_profile_usage(self.store, "alpha")
         self.assertFalse(result.ok)
-        self.assertIn("credential not found", result.error)
+        self.assertIn(i18n.t("usage.credential_unavailable"), result.error)
         mock_run.assert_not_called()
 
 
@@ -274,7 +275,7 @@ class TestGatherUsageReportSurvivesPerProfileFailures(_UsageBase):
 
         self.assertEqual([r.name for r in results], ["alpha", "beta"])
         self.assertFalse(results[0].ok)
-        self.assertIn("credential not found", results[0].error)
+        self.assertIn(i18n.t("usage.credential_unavailable"), results[0].error)
         self.assertTrue(results[1].ok, results[1].error)
 
     def test_query_profile_usage_gracefully_handles_codex_engine(self):
@@ -1006,7 +1007,13 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
             res = usage.query_codex_usage(data_dir, "cx_bad_response")
 
         self.assertFalse(res.ok)
-        self.assertIn("invalid usage response", res.error)
+        self.assertIn(i18n.t(
+            "usage.invalid_response",
+            error=i18n.t(
+                "usage.response_invalid_json",
+                source=i18n.t("usage.openai_endpoint"),
+            ),
+        ), res.error)
         self.assertNotIn("secret-token", res.error)
 
     def test_query_grok_usage_rejects_non_object_external_json(self):
@@ -1024,7 +1031,13 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
             res = usage.query_grok_usage(data_dir, "grok_bad_response")
 
         self.assertFalse(res.ok)
-        self.assertIn("non-object JSON response", res.error)
+        self.assertIn(i18n.t(
+            "usage.invalid_response",
+            error=i18n.t(
+                "usage.response_not_object",
+                source=i18n.t("usage.xai_billing_endpoint"),
+            ),
+        ), res.error)
         self.assertNotIn("grok-token", res.error)
 
     def test_account_id_detection_and_header(self):

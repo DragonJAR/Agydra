@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -12,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import i18n
 from conftest import BaseCase
 from models import Profile
 from store import Config, Store, StoreError
@@ -71,7 +73,9 @@ class TestStoreUpdateConfig(BaseCase):
         self.assertIsNotNone(handle)
         called = []
         try:
-            with self.assertRaisesRegex(StoreError, "sequence lock is busy"):
+            with self.assertRaisesRegex(
+                StoreError, re.escape(i18n.t("store.sequence.busy_detail"))
+            ):
                 store.update_config(lambda config: called.append(config))
         finally:
             handle.release()
@@ -171,7 +175,9 @@ class TestDeleteSequenceLockScope(BaseCase):
                 "_write_backup",
                 side_effect=create_backup_then_hold_sequence_lock,
             ):
-                with self.assertRaisesRegex(StoreError, "sequence lock is busy"):
+                with self.assertRaisesRegex(
+                    StoreError, re.escape(i18n.t("store.sequence.busy_detail"))
+                ):
                     store.delete("victim")
         finally:
             for handle in sequence_handles:

@@ -299,6 +299,8 @@ class TestUsageCli(BaseCase):
         from types import SimpleNamespace
         from unittest import mock
         import cli
+        import i18n
+        import re
         import usage
 
         self.store.create("gx", engine="grok")
@@ -311,9 +313,9 @@ class TestUsageCli(BaseCase):
                 contextlib.redirect_stdout(io.StringIO()) as out:
             cli.cmd_usage(self.store, SimpleNamespace(ref=None))
         row = next(line for line in out.getvalue().splitlines() if "gx" in line and "X Premium" in line)
-        self.assertIn("no quota on plan", row)
-        self.assertNotIn("no usage data", row)
-        self.assertRegex(row, r"no quota on plan\s+X Premium")
+        self.assertIn(i18n.t("usage.plan_no_quota"), row)
+        self.assertNotIn(i18n.t("usage.no_data"), row)
+        self.assertRegex(row, re.escape(i18n.t("usage.plan_no_quota")) + r"\s+X Premium")
         failed = [usage.UsageResult("gx", False, engine="grok", plan="SuperGrok", error="no usage data in response")]
         results[-1] = failed[0]
         with mock.patch.object(usage, "gather_usage_report", return_value=results), \

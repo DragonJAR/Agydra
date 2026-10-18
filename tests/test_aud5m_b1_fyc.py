@@ -9,6 +9,7 @@ from unittest import mock
 
 from conftest import BaseCase, run_python_child
 import cli
+import i18n
 import store
 
 
@@ -309,10 +310,15 @@ class TestImportTransaction(BatchBase):
             with self.assertRaisesRegex(OSError, 'copy denied'):
                 cli.cmd_import(self.store, self.args)
         self.assert_original()
-        self.assertIn('cleanup denied', warn.call_args.args[0])
-        self.assertIn('manual cleanup', warn.call_args.args[0])
+        self.assertIn(
+            i18n.t(
+                "cmd.import.cleanup_failed",
+                path=next(self.data.parent.glob('.import-*')),
+                error="cleanup denied",
+            ),
+            warn.call_args.args[0],
+        )
         for path in self.data.parent.glob('.import-*'):
-            self.assertIn(str(path), warn.call_args.args[0])
             remover(path)
         self.assert_no_import_artifacts()
 

@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import account
+import i18n
 import keychain
 import platforms
 import usage
@@ -286,7 +287,7 @@ class TestQueryProfileUsageScoped(_ScopedBase):
                 mock.patch.object(platforms, "run_with_group_kill") as mock_run:
             result = usage.query_profile_usage(self.store, "alpha", timeout=10)
         self.assertFalse(result.ok)
-        self.assertIn("credential not found", result.error)
+        self.assertIn(i18n.t("usage.credential_unavailable"), result.error)
         mock_run.assert_not_called()
 
     @posix_only("swap.lock contention requires POSIX fcntl")

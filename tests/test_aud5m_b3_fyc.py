@@ -46,9 +46,10 @@ class TestBatch3FYC(BaseCase):
         self.assertIs(raised.exception, original)
         stage = next(data.parent.glob('.import-alpha.*'))
         warn.assert_called_once()
-        self.assertIn(str(stage), warn.call_args.args[0])
-        self.assertIn('cleanup denied', warn.call_args.args[0])
-        self.assertIn('manual cleanup', warn.call_args.args[0])
+        self.assertIn(
+            i18n.t("cmd.import.cleanup_failed", path=stage, error="cleanup denied"),
+            warn.call_args.args[0],
+        )
         self.assertEqual(json.loads((data / 'settings.json').read_text()), {'saved': True})
 
     def test_f03_retained_transaction_is_reported_and_replayable(self):
@@ -58,8 +59,15 @@ class TestBatch3FYC(BaseCase):
                 cli.cmd_import(self.store, args)
         journal = data.parent / '.import-state.json'
         self.assertTrue(journal.exists())
-        self.assertIn(str(journal), str(raised.exception))
-        self.assertIn('retry', str(raised.exception))
+        self.assertIn(
+            i18n.t(
+                "cmd.import.rollback_failed",
+                error="publish denied",
+                recovery_error="cleanup denied",
+                path=journal,
+            ),
+            str(raised.exception),
+        )
         with cli._acquire_profile_lock(self.store, profile.name, 'recovering'):
             self.assertTrue(cli._recover_import_transaction(self.store, profile))
         self.assertFalse(journal.exists())
@@ -198,7 +206,8 @@ class TestBatch3FYC(BaseCase):
             with self.subTest(value=value):
                 result = usage.UsageResult('alpha', True, engine='claude', observed_at=value, quality='observed', identity_verified=True)
                 self.assertEqual(cli._claude_usage_lines(result, 10)[0], expected)
-        self.assertNotIn('observed: -', expected)
+        concrete = usage.parse_iso_utc(observed.isoformat()).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        self.assertIn(concrete, expected)
 
     def test_f08_datetime_normalization_respects_strict_utc(self):
         naive = datetime(2026, 10, 15, 6)
