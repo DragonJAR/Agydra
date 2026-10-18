@@ -17,7 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import conftest
 
 
-HANG_PROBE_MODULE = """import sys
+HANG_PROBE_MODULE = """import contextlib
+import io
+import sys
 import time
 import unittest
 
@@ -28,6 +30,10 @@ import conftest
 class HangProbe(unittest.TestCase):
     def test_ticks_slowly(self):
         time.sleep(2.5)
+
+    def test_redirects_stderr_slowly(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            time.sleep(2.5)
 
     def test_hangs_forever(self):
         time.sleep(30)
@@ -81,19 +87,50 @@ class TestPerTestWatchdog(unittest.TestCase):
             events.append(("cancel",))
 
         with mock.patch.object(conftest, "_PER_TEST_HANG_SECONDS", 7):
-            with mock.patch.object(conftest.faulthandler, "dump_traceback_later", side_effect=record_arm):
-                with mock.patch.object(conftest.faulthandler, "cancel_dump_traceback_later", side_effect=record_cancel):
-                    result = conftest.WatchdogTestResult(io.StringIO(), True, 0)
-                    probe = unittest.FunctionTestCase(lambda: None)
-                    result.startTest(probe)
-                    result.stopTest(probe)
-                    result.startTest(probe)
-                    result.stopTest(probe)
+            with mock.patch.object(conftest, "_WATCHDOG_ARM_DEPTH", 0):
+                with mock.patch.object(conftest.faulthandler, "dump_traceback_later", side_effect=record_arm):
+                    with mock.patch.object(conftest.faulthandler, "cancel_dump_traceback_later", side_effect=record_cancel):
+                        result = conftest.WatchdogTestResult(io.StringIO(), True, 0)
+                        probe = unittest.FunctionTestCase(lambda: None)
+                        result.startTest(probe)
+                        result.stopTest(probe)
+                        result.startTest(probe)
+                        result.stopTest(probe)
         self.assertEqual([event[0] for event in events], ["arm", "cancel", "arm", "cancel"])
         self.assertEqual(events[0][1], (7,))
         self.assertEqual(events[0][2], {"exit": True})
         self.assertEqual(events[2][1], (7,))
         self.assertEqual(events[2][2], {"exit": True})
+
+    def test_a_nested_runner_neither_arms_nor_cancels_the_outer_watchdog(self):
+        events = []
+
+        def record_arm(*args, **kwargs):
+            events.append(("arm", args, kwargs))
+
+        def record_cancel(*args, **kwargs):
+            events.append(("cancel",))
+
+        with mock.patch.object(conftest, "_PER_TEST_HANG_SECONDS", 7):
+            with mock.patch.object(conftest, "_WATCHDOG_ARM_DEPTH", 1):
+                with mock.patch.object(conftest.faulthandler, "dump_traceback_later", side_effect=record_arm):
+                    with mock.patch.object(conftest.faulthandler, "cancel_dump_traceback_later", side_effect=record_cancel):
+                        result = conftest.WatchdogTestResult(io.StringIO(), True, 0)
+                        probe = unittest.FunctionTestCase(lambda: None)
+                        result.startTest(probe)
+                        result.stopTest(probe)
+                        result.startTest(probe)
+                        result.stopTest(probe)
+                        self.assertEqual(conftest._WATCHDOG_ARM_DEPTH, 1)
+        self.assertEqual(events, [])
+
+    def test_oversized_budgets_cap_instead_of_crashing_the_parser(self):
+        huge = "9" * 5000
+        self.assertEqual(conftest.parse_hang_dump_seconds(huge), conftest.MAX_HANG_DUMP_SECONDS)
+        self.assertEqual(conftest.parse_per_test_hang_seconds(huge), conftest.MAX_HANG_DUMP_SECONDS)
+        self.assertIsNone(conftest.parse_hang_dump_seconds("0" * 5000))
+        self.assertIsNone(conftest.parse_per_test_hang_seconds("0" * 5000))
+        self.assertEqual(conftest.parse_per_test_hang_seconds("0007"), 7)
 
     def test_slow_but_healthy_tests_whose_total_exceeds_the_budget_all_pass(self):
         class SlowCases(unittest.TestCase):
@@ -108,9 +145,10 @@ class TestPerTestWatchdog(unittest.TestCase):
 
         suite = unittest.TestSuite(SlowCases(name) for name in ("test_a", "test_b", "test_c"))
         with mock.patch.object(conftest, "_PER_TEST_HANG_SECONDS", 0.5):
-            stream = io.StringIO()
-            runner = unittest.TextTestRunner(stream=stream, resultclass=conftest.WatchdogTestResult, verbosity=0)
-            result = runner.run(suite)
+            with mock.patch.object(conftest, "_WATCHDOG_ARM_DEPTH", 0):
+                stream = io.StringIO()
+                runner = unittest.TextTestRunner(stream=stream, resultclass=conftest.WatchdogTestResult, verbosity=0)
+                result = runner.run(suite)
         self.assertEqual(result.testsRun, 3)
         self.assertEqual(len(result.failures) + len(result.errors), 0)
 
@@ -140,6 +178,39 @@ class TestPerTestWatchdog(unittest.TestCase):
         self.assertEqual(child.returncode, 0, msg=child.stderr)
         self.assertIn("[watchdog] global suite budget", child.stderr)
         self.assertIn("most recent call first", child.stderr)
+        self.assertIn("\nOK", child.stderr)
+
+    def test_the_global_diagnostic_does_not_disarm_the_fatal_per_test_watchdog(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            write_hang_probe(tmp_dir)
+            child = run_probe_child(
+                tmp_dir,
+                "test_ticks_slowly",
+                {
+                    conftest.HANG_DUMP_ENV: "1",
+                    conftest.PER_TEST_HANG_ENV: "2",
+                },
+            )
+        self.assertEqual(child.returncode, 1, msg=child.stderr)
+        self.assertIn("[watchdog] global suite budget", child.stderr)
+        self.assertIn("Timeout", child.stderr)
+        self.assertIn("in test_ticks_slowly", child.stderr)
+
+    def test_the_global_diagnostic_writes_to_a_stable_stream_under_redirect(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            write_hang_probe(tmp_dir)
+            child = run_probe_child(
+                tmp_dir,
+                "test_redirects_stderr_slowly",
+                {
+                    conftest.HANG_DUMP_ENV: "1",
+                    conftest.PER_TEST_HANG_ENV: "30",
+                },
+            )
+        self.assertEqual(child.returncode, 0, msg=child.stderr)
+        self.assertIn("[watchdog] global suite budget", child.stderr)
+        self.assertIn("most recent call first", child.stderr)
+        self.assertNotIn("Traceback (most recent call last)", child.stderr)
         self.assertIn("\nOK", child.stderr)
 
 

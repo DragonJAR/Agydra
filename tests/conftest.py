@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import faulthandler
+import io
 import json
 import os
 import shutil
@@ -21,7 +22,6 @@ MAX_HANG_DUMP_SECONDS = 86400
 HANG_DUMP_ENV = "AGYDRA_TEST_HANG_DUMP_SECONDS"
 PER_TEST_HANG_ENV = "AGYDRA_TEST_HANG_PER_TEST_SECONDS"
 PER_TEST_HANG_SECONDS_DEFAULT = 240
-GLOBAL_DIAGNOSTIC_DUMP_DELAY_S = 0.05
 
 
 def parse_hang_dump_seconds(
@@ -47,7 +47,10 @@ def parse_hang_dump_seconds(
         else:
             sys.stderr.write(msg)
         return None
-    seconds = int(val)
+    normalized = val.lstrip("0")
+    if len(normalized) > 10:
+        return max_seconds
+    seconds = int(normalized) if normalized else 0
     if seconds <= 0:
         return None
     return min(seconds, max_seconds)
@@ -57,16 +60,20 @@ _parse_hang_dump_seconds = parse_hang_dump_seconds
 
 def parse_per_test_hang_seconds(raw: str | None, warn=None) -> int | None:
     """Parse the per-test watchdog budget: unset values keep the 240 s default,
-    "0" disables the detector, and any other invalid value warns and keeps the
-    default so hang detection never silently disarms."""
+    an all-digit value that parses to zero disables the detector, and any other
+    invalid value warns and keeps the default so hang detection never silently
+    disarms."""
     if raw is None or not raw.strip():
         return PER_TEST_HANG_SECONDS_DEFAULT
     parsed = parse_hang_dump_seconds(raw, warn=warn, env_name=PER_TEST_HANG_ENV)
     if parsed is not None:
         return parsed
-    if raw.strip() == "0":
+    if raw.strip().isascii() and raw.strip().isdigit():
         return None
     return PER_TEST_HANG_SECONDS_DEFAULT
+
+
+_WATCHDOG_ARM_DEPTH = 0
 
 
 class WatchdogTestResult(unittest.TextTestResult):
@@ -77,15 +84,40 @@ class WatchdogTestResult(unittest.TextTestResult):
     running when the budget expires. Re-arming the timer when each test starts
     and cancelling it when the test ends makes the fatal dump name the exact
     hanging test, no matter how long the rest of the suite took before it.
+
+    Only the outermost running test owns the fatal timer: a nested runner
+    (a suite executed inside a test) neither re-arms nor cancels it, so inner
+    results can never disarm or restart the watchdog of the test that is
+    actually being timed.
     """
 
     def startTest(self, test):
         super().startTest(test)
-        faulthandler.dump_traceback_later(_PER_TEST_HANG_SECONDS, exit=True)
+        global _WATCHDOG_ARM_DEPTH
+        _WATCHDOG_ARM_DEPTH += 1
+        if _WATCHDOG_ARM_DEPTH == 1:
+            faulthandler.dump_traceback_later(_PER_TEST_HANG_SECONDS, exit=True)
 
     def stopTest(self, test):
-        faulthandler.cancel_dump_traceback_later()
+        global _WATCHDOG_ARM_DEPTH
+        if _WATCHDOG_ARM_DEPTH == 1:
+            faulthandler.cancel_dump_traceback_later()
+        _WATCHDOG_ARM_DEPTH = max(0, _WATCHDOG_ARM_DEPTH - 1)
         super().stopTest(test)
+
+
+def _diagnostic_output_stream():
+    """Duplicate the harness stderr so a test-level redirect cannot misplace the diagnostic.
+
+    The duplicated descriptor stays valid for the whole process even while a
+    test redirects ``sys.stderr`` to an in-memory buffer, and ``faulthandler``
+    needs a real file descriptor to dump thread stacks.
+    """
+    try:
+        duplicate = os.dup(sys.stderr.fileno())
+    except (OSError, ValueError, AttributeError):
+        return None
+    return os.fdopen(duplicate, "w", encoding="utf-8", errors="replace")
 
 
 def _schedule_global_diagnostic_dump(seconds: int) -> threading.Timer:
@@ -93,18 +125,21 @@ def _schedule_global_diagnostic_dump(seconds: int) -> threading.Timer:
 
     The CI step timeout stays the hard outer bound; this timer only labels and
     dumps where the suite stands once the configured global budget is exhausted,
-    without killing healthy-but-slow runs. Its dump replaces any pending
-    per-test timer for the remainder of that one test; the next test re-arms
-    its own watchdog.
+    without killing healthy-but-slow runs. The callback writes to the duplicated
+    harness stderr and dumps stacks directly, so it never touches the single
+    fatal-timer slot owned by the per-test watchdog.
     """
+    stream = _diagnostic_output_stream()
 
     def dump_suite_progress_once():
-        sys.stderr.write(
+        if stream is None:
+            return
+        stream.write(
             f"[watchdog] global suite budget of {seconds} s exceeded; "
             "one-time diagnostic dump follows and the suite continues\n"
         )
-        sys.stderr.flush()
-        faulthandler.dump_traceback_later(GLOBAL_DIAGNOSTIC_DUMP_DELAY_S, exit=False)
+        stream.flush()
+        faulthandler.dump_traceback(file=stream, all_threads=True)
 
     timer = threading.Timer(seconds, dump_suite_progress_once)
     timer.daemon = True
