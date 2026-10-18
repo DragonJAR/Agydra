@@ -1,4 +1,4 @@
-"""Tests for AUD-5M Batch 3: F1..F6 verification."""
+"""Tests for AUD-5M Batch 3: F1..F6 verification and FYA review regressions."""
 from __future__ import annotations
 
 import ast
@@ -16,9 +16,12 @@ from conftest import BaseCase
 import banner
 import bootstrap
 import doctor
+import engines
 import i18n
+import isolation
 import platforms
-from store import Store
+import store
+from store import Store, StoreError
 import ui
 
 
@@ -28,22 +31,44 @@ class TestAud5mB3F1BootstrapTimeout(unittest.TestCase):
 
 
 class TestAud5mB3F2DoctorPendingRename(BaseCase):
-    def test_doctor_warns_on_pending_rename_recovery(self):
-        store = Store(self.store_root)
-        profile = store.create("p1", engine="agy")
-        journal = store.rename_journal_path
+    def test_doctor_warns_on_valid_pending_rename_and_preserves_state(self):
+        st = Store(self.store_root)
+        st.create("p1", engine="agy")
+        st.create("other", engine="agy")
+        st._write_rename_journal("p1", "p2", False)
+        journal_bytes = st.rename_journal_path.read_bytes()
+        p1_dir_state = list((st.profile_dir("p1")).iterdir())
+        other_dir_state = list((st.profile_dir("other")).iterdir())
+
+        self.assertTrue(st.pending_rename_involves("p1"))
+        self.assertFalse(st.pending_rename_involves("other"))
+
+        ctx = doctor._build_ctx(st)
+        status, message = doctor._check_profiles(st, ctx)
+        self.assertEqual(status, doctor.WARN)
+        self.assertIn("p1", message)
+        self.assertNotIn("other: pending rename", message)
+        self.assertNotIn("other: recuperación de cambio de nombre", message)
+        self.assertEqual(st.rename_journal_path.read_bytes(), journal_bytes)
+        self.assertEqual(list((st.profile_dir("p1")).iterdir()), p1_dir_state)
+        self.assertEqual(list((st.profile_dir("other")).iterdir()), other_dir_state)
+
+    def test_doctor_warns_on_corrupt_rename_journal_conservatively(self):
+        st = Store(self.store_root)
+        st.create("p1", engine="agy")
+        journal = st.rename_journal_path
         journal.write_text(
             '{"old": "p1", "new": "p2", "stage": "metadata_moved"}',
             encoding="utf-8",
         )
-        ctx = doctor._build_ctx(store)
-        status, message = doctor._check_profiles(store, ctx)
+        ctx = doctor._build_ctx(st)
+        status, message = doctor._check_profiles(st, ctx)
         self.assertEqual(status, doctor.WARN)
-        self.assertIn("rename recovery", message)
+        self.assertTrue(st.pending_rename_involves("p1"))
 
 
-class TestAud5mB3F3DoctorLinkPrimitive(unittest.TestCase):
-    def test_doctor_uses_platforms_is_link_strict(self):
+class TestAud5mB3F3DoctorLinkPrimitive(BaseCase):
+    def test_doctor_uses_platforms_is_link_strict_structurally(self):
         doctor_path = Path(doctor.__file__).resolve()
         source = doctor_path.read_text(encoding="utf-8")
         self.assertNotIn("isolation._is_link", source)
@@ -52,6 +77,87 @@ class TestAud5mB3F3DoctorLinkPrimitive(unittest.TestCase):
             if isinstance(node, ast.Attribute) and node.attr == "_is_link":
                 if isinstance(node.value, ast.Name) and node.value.id == "isolation":
                     self.fail("Found isolation._is_link in doctor.py")
+
+        target_functions = {"_check_isolation", "_preview_fixables", "_apply_fixes"}
+        checked_calls = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in target_functions:
+                for child in ast.walk(node):
+                    if isinstance(child, ast.FunctionDef) and child.name == "_fix_orphans":
+                        continue
+                    if isinstance(child, ast.Call):
+                        func = child.func
+                        is_target = False
+                        if isinstance(func, ast.Attribute) and func.attr == "is_link":
+                            is_target = True
+                        elif isinstance(func, ast.Name) and func.id == "is_link":
+                            is_target = True
+                        if is_target and child.lineno not in {901, 921}:
+                            strict_kwargs = [k for k in child.keywords if k.arg == "strict"]
+                            self.assertTrue(
+                                strict_kwargs,
+                                f"Line {child.lineno}: is_link missing strict keyword in {node.name}",
+                            )
+                            val = strict_kwargs[0].value
+                            self.assertTrue(
+                                isinstance(val, ast.Constant) and val.value is True,
+                                f"Line {child.lineno}: strict is not True in {node.name}",
+                            )
+                            checked_calls += 1
+        self.assertEqual(checked_calls, 14)
+
+    def test_doctor_check_isolation_fails_closed_on_link_inspection_error(self):
+        st = Store(self.store_root)
+        st.create("p1", engine="agy")
+        ctx = doctor._build_ctx(st)
+        real_is_link = platforms.is_link
+
+        def fail_is_link(path, strict=False):
+            if "overlays" in str(path):
+                raise PermissionError("injected lstat permission denied")
+            return real_is_link(path, strict=strict)
+
+        with mock.patch.object(platforms, "is_link", side_effect=fail_is_link):
+            results = doctor._run_check_pass(st, ctx)
+            isolation_results = [r for r in results if r[0] == "isolation"]
+            self.assertTrue(isolation_results)
+            self.assertEqual(isolation_results[0][1], doctor.FAIL)
+
+    def test_doctor_apply_fixes_zero_mutations_on_link_or_lstat_failure(self):
+        st = Store(self.store_root)
+        st.create("p1", engine="agy")
+        overlay_dir = st.overlays_dir / "p1"
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+        ctx = doctor._build_ctx(st)
+        real_is_link = platforms.is_link
+
+        def fail_is_link(path, strict=False):
+            if Path(path) == overlay_dir:
+                raise PermissionError("injected safe owner lstat failure")
+            return real_is_link(path, strict=strict)
+
+        with mock.patch.object(platforms, "is_link", side_effect=fail_is_link):
+            with mock.patch.object(isolation, "migrate_real_dir_to_store") as mock_migrate:
+                with mock.patch.object(isolation, "build_overlay") as mock_build:
+                    with mock.patch.object(doctor, "warn") as mock_warn:
+                        doctor._apply_fixes(st, ctx)
+                        mock_migrate.assert_not_called()
+                        mock_build.assert_not_called()
+                        mock_warn.assert_called()
+
+        def symlink_is_link(path, strict=False):
+            if Path(path) == overlay_dir:
+                return True
+            return real_is_link(path, strict=strict)
+
+        with mock.patch.object(platforms, "is_link", side_effect=symlink_is_link):
+            with mock.patch.object(isolation, "migrate_real_dir_to_store") as mock_migrate:
+                with mock.patch.object(isolation, "build_overlay") as mock_build:
+                    with mock.patch.object(doctor, "warn") as mock_warn:
+                        doctor._apply_fixes(st, ctx)
+                        mock_migrate.assert_not_called()
+                        mock_build.assert_not_called()
+                        mock_warn.assert_called()
 
 
 class TestAud5mB3F4BannerConsolePrint(unittest.TestCase):
@@ -96,6 +202,31 @@ class TestAud5mB3F6NarrowExcepts(unittest.TestCase):
                     if node.type is not None:
                         if isinstance(node.type, ast.Name) and node.type.id == "Exception":
                             self.fail(f"Found bare except Exception in {path.name} at line {node.lineno}")
+
+    def test_i18n_fallback_recovers_from_oserror_when_store_import_fails(self):
+        class FailingStore:
+            def load_config(self):
+                raise OSError("simulated disk error")
+
+        with mock.patch.dict(sys.modules, {"store": None}):
+            lang = i18n.resolve_language(FailingStore())
+            self.assertIn(lang, i18n.SUPPORTED_LANGS)
+
+    def test_i18n_fallback_catches_real_store_error(self):
+        class StoreErrorStore:
+            def load_config(self):
+                raise StoreError("corrupt store config")
+
+        lang = i18n.resolve_language(StoreErrorStore())
+        self.assertIn(lang, i18n.SUPPORTED_LANGS)
+
+    def test_i18n_fallback_propagates_unrecoverable_programming_error(self):
+        class BuggyStore:
+            def load_config(self):
+                raise RuntimeError("unexpected programming error")
+
+        with self.assertRaises(RuntimeError):
+            i18n.resolve_language(BuggyStore())
 
 
 if __name__ == "__main__":

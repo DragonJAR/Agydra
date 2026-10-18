@@ -1963,10 +1963,14 @@ Retorna el código del idioma resuelto (``'en'`` o ``'es'``).
             _set_active(resolved)
             return resolved
     if store is not None:
+        recoverable: tuple[type[BaseException], ...] = (
+            OSError, AttributeError, TypeError, ValueError
+        )
         try:
             from store import StoreError
+            recoverable = (StoreError,) + recoverable
         except ImportError:
-            StoreError = ()
+            pass
         try:
             config = store.load_config()
             settings_lang = config.settings.get(_SETTINGS_KEY)
@@ -1978,7 +1982,7 @@ Retorna el código del idioma resuelto (``'en'`` o ``'es'``).
             if resolved:
                 _set_active(resolved)
                 return resolved
-        except (StoreError, OSError, AttributeError, TypeError, ValueError):
+        except recoverable:
             pass
     resolved = _locale_lang()
     _set_active(resolved)
