@@ -1117,8 +1117,37 @@ class Store:
             try:
                 self._read_rename_journal()
             except StoreError:
-                self._quarantine_state_file(path)
-                path.unlink()
+                try:
+                    before = path.lstat()
+                    raw = platforms.read_regular_file_no_follow(
+                        path, max_bytes=platforms.MAX_REGULAR_FILE_BYTES
+                    )
+
+                    def require_unchanged() -> None:
+                        current = path.lstat()
+                        if (
+                            not stat.S_ISREG(current.st_mode)
+                            or platforms.is_link(path, strict=True)
+                            or any(
+                                getattr(current, field) != getattr(before, field)
+                                for field in (
+                                    "st_dev", "st_ino", "st_size",
+                                    "st_mtime_ns", "st_ctime_ns",
+                                )
+                            )
+                        ):
+                            raise StoreError(
+                                f"{_store_text('store.rename.journal_changed')}: {path}"
+                            )
+
+                    require_unchanged()
+                    self.quarantine_state_bytes(path, raw)
+                    require_unchanged()
+                    path.unlink()
+                except OSError as exc:
+                    raise StoreError(_store_text(
+                        "store.state.quarantine_read_failed", path=path, error=exc
+                    )) from exc
                 return True
             return False
 

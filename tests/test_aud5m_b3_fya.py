@@ -373,6 +373,136 @@ class TestBatch3Contracts(BaseCase):
             self.assertEqual(self.s.rename_journal_path.read_bytes(), b"{")
             self.assertEqual(list(self.store_root.glob("profile-rename.json.corrupt-*")), [])
 
+    def test_unsafe_rename_journals_fail_without_quarantine_or_retained_lock(self) -> None:
+        cases = ["link", "directory", "oversized", "read_failure"]
+        if hasattr(os, "mkfifo"):
+            cases.insert(0, "fifo")
+        code = '''
+import os, sys
+from pathlib import Path
+from unittest import mock
+import locks, platforms, store
+s = store.Store(sys.argv[1])
+kind = sys.argv[2]
+path = s.rename_journal_path
+before = path.lstat()
+reader = platforms.read_regular_file_no_follow
+def read(target, **kwargs):
+    if kind == "read_failure" and Path(target) == path:
+        raise PermissionError(13, "simulated journal read refusal", str(path))
+    return reader(target, **kwargs)
+with mock.patch.object(platforms, "read_regular_file_no_follow", side_effect=read):
+    try:
+        s.recover_pending_rename()
+    except store.StoreError as exc:
+        assert str(path) in str(exc), str(exc)
+    else:
+        raise AssertionError("unsafe journal was accepted")
+after = path.lstat()
+assert (before.st_dev, before.st_ino, before.st_mode, before.st_size) == (after.st_dev, after.st_ino, after.st_mode, after.st_size)
+assert not list(s.root.glob("profile-rename.json.corrupt-*"))
+handle = locks.try_sequence_lock(s)
+assert handle is not None, "sequence lock retained after refusal"
+handle.release()
+'''
+        for kind in cases:
+            with self.subTest(kind=kind):
+                root = self.store_root / kind
+                root.mkdir()
+                path = root / "profile-rename.json"
+                target = root / "target"
+                if kind == "fifo":
+                    os.mkfifo(path)
+                elif kind == "link":
+                    target.write_bytes(b"{")
+                    path.symlink_to(target)
+                elif kind == "directory":
+                    path.mkdir()
+                elif kind == "oversized":
+                    with path.open("wb") as output:
+                        output.truncate(platforms.MAX_REGULAR_FILE_BYTES + 1)
+                else:
+                    path.write_bytes(b"{")
+                before = path.lstat()
+                try:
+                    result = subprocess.run(
+                        [sys.executable, "-B", "-c", code, str(root), kind],
+                        timeout=2, capture_output=True,
+                    )
+                except subprocess.TimeoutExpired:
+                    self.fail("rename recovery blocked on " + kind)
+                self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+                self.assertEqual(path.lstat().st_ino, before.st_ino)
+                self.assertEqual(list(root.glob("profile-rename.json.corrupt-*")), [])
+                if kind == "link":
+                    self.assertTrue(path.is_symlink())
+                    self.assertEqual(target.read_bytes(), b"{")
+                elif kind == "read_failure":
+                    self.assertEqual(path.read_bytes(), b"{")
+                handle = locks.try_sequence_lock(store.Store(root))
+                self.assertIsNotNone(handle)
+                handle.release()
+
+    def test_rename_quarantine_refuses_replacement_during_read(self) -> None:
+        path = self.s.rename_journal_path
+        path.write_bytes(b"{")
+        replacement = path.with_name("replacement")
+        replacement.write_bytes(b"replacement preserved")
+        reader = platforms.read_regular_file_no_follow
+        def replace_after_read(target, **kwargs):
+            raw = reader(target, **kwargs)
+            if Path(target) == path:
+                os.replace(replacement, path)
+            return raw
+        with mock.patch.object(self.s, "_read_rename_journal", side_effect=store.StoreError("corrupt journal")), \
+                mock.patch.object(platforms, "read_regular_file_no_follow", side_effect=replace_after_read):
+            with self.assertRaises(store.StoreError):
+                self.s.recover_pending_rename()
+        self.assertEqual(path.read_bytes(), b"replacement preserved")
+        self.assertEqual(list(self.store_root.glob("profile-rename.json.corrupt-*")), [])
+        handle = locks.try_sequence_lock(self.s)
+        self.assertIsNotNone(handle)
+        handle.release()
+
+    def test_regular_corrupt_rename_quarantine_keeps_lock_order(self) -> None:
+        path = self.s.rename_journal_path
+        path.write_bytes(b"{")
+        preserve = self.s.quarantine_state_bytes
+        def preserve_locked(target, raw):
+            self.assertIsNone(locks.try_sequence_lock(self.s))
+            return preserve(target, raw)
+        with mock.patch.object(self.s, "_with_profile_locks", side_effect=AssertionError("profile locks inside quarantine")), \
+                mock.patch.object(self.s, "quarantine_state_bytes", side_effect=preserve_locked):
+            self.s.recover_pending_rename()
+        self.assertFalse(path.exists())
+        backups = list(self.store_root.glob("profile-rename.json.corrupt-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), b"{")
+        handle = locks.try_sequence_lock(self.s)
+        self.assertIsNotNone(handle)
+        handle.release()
+
+    def test_rename_quarantine_rechecks_identity_before_removal(self) -> None:
+        path = self.s.rename_journal_path
+        path.write_bytes(b"{")
+        replacement = path.with_name("replacement")
+        replacement.write_bytes(b"replacement preserved")
+        preserve = self.s.quarantine_state_bytes
+        def replace_after_preserving(target, raw):
+            destination = preserve(target, raw)
+            os.replace(replacement, path)
+            return destination
+        with mock.patch.object(self.s, "quarantine_state_bytes", side_effect=replace_after_preserving):
+            with self.assertRaises(store.StoreError):
+                self.s.recover_pending_rename()
+        self.assertEqual(path.read_bytes(), b"replacement preserved")
+        backups = list(self.store_root.glob("profile-rename.json.corrupt-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), b"{")
+        handle = locks.try_sequence_lock(self.s)
+        self.assertIsNotNone(handle)
+        handle.release()
+
     def test_bad_journal_recheck_preserves_new_valid_intent(self):
         self.s.create("alpha")
         self.s.rename_journal_path.write_bytes(b"{")
