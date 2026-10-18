@@ -1006,6 +1006,14 @@ def _enable_claude_capture(store: Store, profile) -> str:
     Returns a short human summary that the CLI surfaces verbatim.
     """
     expected_config_dir = store.claude_config_dir_for_seq(profile.seq)
+    settings_path = expected_config_dir / "settings.json"
+
+    def invalid_settings(exc: Exception) -> StoreError:
+        return StoreError(module_text(
+            'cli.capture_invalid_json',
+            'cannot enable capture: {path} is not valid JSON ({error}); fix it manually, then retry',
+            path=settings_path, error=type(exc).__name__,
+        ))
 
     def verified_config_dir() -> Path:
         current = store.get_readonly(profile.name)
@@ -1026,7 +1034,12 @@ def _enable_claude_capture(store: Store, profile) -> str:
                     name=profile.name,
                 )
             )
-        return isolation.validate_claude_config_dir(current_config_dir)
+        try:
+            return isolation.validate_claude_config_dir(current_config_dir)
+        except IsolationError as exc:
+            if platforms.is_link(settings_path, strict=True):
+                raise invalid_settings(exc) from exc
+            raise
 
     handle = _acquire_profile_lock(store, profile.name, module_text(
         'cli.action_enable_capture',
@@ -1034,37 +1047,28 @@ def _enable_claude_capture(store: Store, profile) -> str:
     ))
     try:
         config_dir = verified_config_dir()
-        settings_path = config_dir / "settings.json"
         payload = _claude_settings_payload(store, profile)
-        existing: dict = {}
-        if settings_path.is_file():
-            try:
-                raw = read_json_object(settings_path)
-            except (ValueError, OSError) as exc:
-                raise StoreError(
-                    module_text(
-                        'cli.capture_invalid_json',
-                        'cannot enable capture: {path} is not valid JSON ({error}); fix it manually, then retry',
-                        path=settings_path,
-                        error=exc,
-                    )
-                ) from exc
-            existing = raw
-            current_status = raw.get("statusLine")
-            if current_status == payload["statusLine"]:
-                return i18n.t(
-                    "claude.capture_already_enabled",
-                    name=profile.name,
-                    default=f"capture already enabled for profile {profile.name!r} (no change)",
+        try:
+            existing = read_json_object(settings_path)
+        except FileNotFoundError:
+            existing = {}
+        except (ValueError, OSError) as exc:
+            raise invalid_settings(exc) from exc
+        current_status = existing.get("statusLine")
+        if current_status == payload["statusLine"]:
+            return i18n.t(
+                "claude.capture_already_enabled",
+                name=profile.name,
+                default=f"capture already enabled for profile {profile.name!r} (no change)",
+            )
+        if current_status is not None:
+            raise StoreError(
+                module_text(
+                    'cli.capture_existing_statusline',
+                    '{path} already defines a statusLine; agydra refuses to overwrite an existing one. Compose manually: keep your statusLine command and add the agydra capture writer to a sidecar, or remove the existing key and re-run.',
+                    path=settings_path,
                 )
-            if current_status is not None:
-                raise StoreError(
-                    module_text(
-                        'cli.capture_existing_statusline',
-                        '{path} already defines a statusLine; agydra refuses to overwrite an existing one. Compose manually: keep your statusLine command and add the agydra capture writer to a sidecar, or remove the existing key and re-run.',
-                        path=settings_path,
-                    )
-                )
+            )
         merged = {**existing, "statusLine": payload["statusLine"]}
         if verified_config_dir() != config_dir:
             raise StoreError(
@@ -2009,14 +2013,14 @@ def _share_config(store: Store, src: str, targets: Sequence[str]) -> List[str]:
             if name.endswith(".json"):
                 try:
                     locks.json_loads_utf8(raw)
-                except (ValueError, UnicodeDecodeError) as exc:
+                except (ValueError, UnicodeDecodeError, RecursionError) as exc:
                     _note(
                         i18n.t(
                             "cmd.share_config.skip_invalid_json",
                             name=name,
                             src=src,
-                            exc=exc,
-                            default=f"skipping invalid JSON {name} in {src}: {exc}",
+                            exc=type(exc).__name__,
+                            default="skipping invalid JSON {name} in {src}: {exc}",
                         )
                     )
                     continue

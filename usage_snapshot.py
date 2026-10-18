@@ -16,7 +16,7 @@ file's ``generated_at`` (plus ``age_seconds``) is the only clock a consumer
 needs, and "how old is this data" is answered by the snapshot itself rather
 than by inspecting file mtimes.
 
-Every write goes through ``store._atomic_write_json``, so a reader always
+Every write goes through ``store.atomic_write_bytes``, so a reader always
 observes either the previous complete document or the new one, never a
 half-written file (R5). Writes are best-effort by design: a quota report is
 a read-only inspection whose user-visible output must never depend on
@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
+import json
 import os
 from models import profile_identity
 from text import module_text
@@ -64,8 +65,8 @@ def _iso_or_none(value: Optional[datetime]) -> Optional[str]:
     """
     if not isinstance(value, datetime):
         return None
-    aware = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-    return _utc_iso(aware)
+    normalized = usage.parse_iso_utc(value)
+    return _utc_iso(normalized) if normalized is not None else None
 
 
 def _finite_or_none(value: Any) -> Optional[float]:
@@ -98,6 +99,12 @@ def _profile_entry(profile: Any) -> Dict[str, Any]:
     }
 
 
+def _fraction_or_none(value: Any) -> Optional[float]:
+    """A finite quota fraction within its domain, otherwise unknown."""
+    fraction = _finite_or_none(value)
+    return fraction if fraction is not None and 0.0 <= fraction <= 1.0 else None
+
+
 def _bucket_entry(bucket: Any) -> Dict[str, Any]:
     """One quota window: remaining fraction in 0..1 plus its reset instant.
 
@@ -105,7 +112,7 @@ def _bucket_entry(bucket: Any) -> Dict[str, Any]:
     engine's parser, so consumers never re-derive availability from a
     percentage. ``used_percentage`` is provided as a convenience mirror.
     """
-    fraction = _finite_or_none(getattr(bucket, "remaining_fraction", None))
+    fraction = _fraction_or_none(getattr(bucket, "remaining_fraction", None))
     entry: Dict[str, Any] = {
         "id": getattr(bucket, "id", None),
         "name": getattr(bucket, "name", None),
@@ -161,9 +168,9 @@ def _summary_entry(result: Any) -> Dict[str, Any]:
     summary = extract_model_summary(getattr(result, "groups", None) or [])
     return {
         family: {
-            "available": _finite_or_none(values.get("available")),
-            "weekly": _finite_or_none(values.get("weekly")),
-            "five_hour": _finite_or_none(values.get("five_h")),
+            "available": _fraction_or_none(values.get("available")),
+            "weekly": _fraction_or_none(values.get("weekly")),
+            "five_hour": _fraction_or_none(values.get("five_h")),
             "reset_at": _iso_or_none(values.get("reset_time")),
         }
         for family, values in summary.items()
@@ -366,8 +373,9 @@ def write_snapshot(
             now=now,
         )
         try:
-            store_module._atomic_write_json(snapshot_path(store), document)
-        except OSError:
+            payload = (json.dumps(document, indent=2, allow_nan=False) + "\n").encode("utf-8")
+            store_module.atomic_write_bytes(snapshot_path(store), payload)
+        except (OSError, ValueError):
             return None
         return document
 
@@ -475,8 +483,8 @@ def _family_availability(summary: Any, family: str, now: datetime) -> Optional[f
     values = summary.get(family)
     if not isinstance(values, Mapping):
         return None
-    available = _finite_or_none(values.get("available"))
-    if available is None or not 0.0 <= available <= 1.0:
+    available = _fraction_or_none(values.get("available"))
+    if available is None:
         return None
     reset = values.get("reset_at")
     if reset is not None:

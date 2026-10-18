@@ -533,7 +533,7 @@ class SnapshotStoreIntegrationTests(BaseCase):
         self._write([Profile(name="neto", seq=1)], [_agy_result(fraction=0.9)])
         original = self.path.read_text(encoding="utf-8")
         with mock.patch.object(
-            usage_snapshot.store_module, "_atomic_write_json",
+            usage_snapshot.store_module, "atomic_write_bytes",
             side_effect=OSError("disk full"),
         ):
             self.assertIsNone(usage_snapshot.write_snapshot(
@@ -544,7 +544,7 @@ class SnapshotStoreIntegrationTests(BaseCase):
 
     def test_failed_write_on_empty_store_leaves_no_partial_file(self):
         with mock.patch.object(
-            usage_snapshot.store_module, "_atomic_write_json",
+            usage_snapshot.store_module, "atomic_write_bytes",
             side_effect=OSError("disk full"),
         ):
             self.assertIsNone(usage_snapshot.write_snapshot(
@@ -649,7 +649,7 @@ class SnapshotCliWiringTests(BaseCase):
         with mock.patch.object(
             usage_snapshot, "_atomic_write_json_raises", create=True
         ), mock.patch.object(
-            usage_snapshot.store_module, "_atomic_write_json", side_effect=OSError("read-only fs")
+            usage_snapshot.store_module, "atomic_write_bytes", side_effect=OSError("read-only fs")
         ), mock.patch.object(
             usage, "gather_usage_report", return_value=[_agy_result("neto")]
         ), mock.patch("sys.stdout"):
