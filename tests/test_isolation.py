@@ -377,7 +377,7 @@ class TestMigrateRealDir(BaseCase):
         profile_mtime = profile_file.stat().st_mtime_ns
 
         original_iterdir = Path.iterdir
-        original_copytree = isolation.shutil.copytree
+        original_copy = isolation.store.atomic_copy
         copied_sources = []
 
         def ordered_iterdir(path):
@@ -386,20 +386,15 @@ class TestMigrateRealDir(BaseCase):
             return original_iterdir(path)
 
         def fail_after_first_copy(source, destination, *args, **kwargs):
-            original_copy = kwargs.get("copy_function", isolation.shutil.copy2)
-
-            def copy_with_failure(source_path, destination_path):
+            if Path(source).parent == source_dir:
                 if copied_sources:
                     raise OSError("injected copy failure")
-                copied_sources.append(Path(source_path))
-                return original_copy(source_path, destination_path)
-
-            kwargs["copy_function"] = copy_with_failure
-            return original_copytree(source, destination, *args, **kwargs)
+                copied_sources.append(Path(source))
+            return original_copy(source, destination, *args, **kwargs)
 
         with mock.patch.object(Path, "iterdir", ordered_iterdir):
             with mock.patch.object(
-                isolation.shutil, "copytree", side_effect=fail_after_first_copy
+                isolation.store, "atomic_copy", side_effect=fail_after_first_copy
             ):
                 with self.assertRaises(isolation.IsolationError):
                     isolation.migrate_real_dir_to_store(real_dir, self.data_dir)

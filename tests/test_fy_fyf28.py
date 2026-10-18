@@ -9,6 +9,7 @@ from unittest import mock
 from conftest import BaseCase
 import isolation
 import keychain
+import store
 from store import Store
 
 
@@ -31,7 +32,7 @@ class TestFYF28(BaseCase):
                     keychain._load_slot_lease(self.store)
 
     def test_unreadable_lease_is_not_absent(self):
-        with mock.patch.object(Path, 'read_bytes', side_effect=PermissionError('denied')):
+        with mock.patch.object(keychain.platforms, 'read_regular_file_no_follow', side_effect=PermissionError('denied')):
             with self.assertRaises(keychain.CorruptSlotLeaseError):
                 keychain._load_slot_lease(self.store)
 
@@ -101,11 +102,11 @@ class TestFYF28(BaseCase):
         real_unlink = Path.unlink
         failed = []
         def unlink(path, *args, **kwargs):
-            if path.name.startswith('.agydra-copy-') and not failed:
+            if path.name.endswith('.tmp') and path.parent == target and not failed:
                 failed.append(str(path))
                 raise PermissionError('transient cleanup failure')
             return real_unlink(path, *args, **kwargs)
-        with mock.patch.object(isolation.shutil, 'copy2', side_effect=OSError('synthetic copy failure')), \
+        with mock.patch.object(store.shutil, 'copyfileobj', side_effect=OSError('synthetic copy failure')), \
              mock.patch.object(Path, 'unlink', new=unlink):
             with self.assertRaises(isolation.IsolationError):
                 isolation.migrate_real_dir_to_store(source, target)
@@ -150,7 +151,7 @@ class TestFYF28(BaseCase):
         source.mkdir()
         target.mkdir()
         (source / 'file').write_text('source data')
-        real_close, real_mkstemp = os.close, isolation.tempfile.mkstemp
+        real_close, real_mkstemp = os.close, store.tempfile.mkstemp
         opened, failed = [], []
         def mkstemp(*args, **kwargs):
             result = real_mkstemp(*args, **kwargs)
@@ -161,8 +162,9 @@ class TestFYF28(BaseCase):
                 failed.append(fd)
                 raise OSError('synthetic close failure')
             return real_close(fd)
-        with mock.patch.object(isolation.tempfile, 'mkstemp', side_effect=mkstemp), \
-             mock.patch.object(isolation.os, 'close', side_effect=close):
+        with mock.patch.object(store.tempfile, 'mkstemp', side_effect=mkstemp), \
+             mock.patch.object(store.os, 'fdopen', side_effect=OSError('synthetic fdopen failure')), \
+             mock.patch.object(store.os, 'close', side_effect=close):
             with self.assertRaises(isolation.IsolationError):
                 isolation.migrate_real_dir_to_store(source, target)
         self.assertEqual(list(target.iterdir()), [])

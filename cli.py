@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import dataclasses
 import json
 from contextlib import ExitStack
@@ -2128,6 +2129,33 @@ def _import_directory_identity(path: Path) -> Optional[List[int]]:
     return [metadata.st_dev, metadata.st_ino]
 
 
+def _import_source_metadata(path: Path) -> os.stat_result:
+    """Accept real entries or explicit symlinks, never opaque reparse objects."""
+    linked = platforms.is_link(path, strict=True)
+    if linked and not path.is_symlink():
+        raise platforms.FileLinkError(errno.ELOOP, str(path), str(path))
+    metadata = path.stat() if linked else path.lstat()
+    if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)):
+        raise platforms.NonRegularFileError(errno.EINVAL, str(path), str(path))
+    return metadata
+
+
+def _resolve_import_source(path: Path) -> Path:
+    """Resolve intentional import aliases after inspecting their ancestor chain."""
+    path = path.absolute()
+    for entry in (path, *path.parents):
+        _import_source_metadata(entry)
+    try:
+        return path.resolve(strict=True)
+    except RuntimeError as exc:
+        raise OSError(errno.ELOOP, str(path), str(path)) from exc
+
+
+def _copy_import_file(source: str, destination: str) -> None:
+    """Resolve intentional import aliases before the strict regular-file copy."""
+    atomic_copy(_resolve_import_source(Path(source)), Path(destination))
+
+
 def _sync_import_directory(path: Path) -> None:
     """Make journal and directory moves durable on POSIX; Windows closes each move."""
     if platforms.is_windows():
@@ -2332,6 +2360,7 @@ def cmd_import(store: Store, args) -> int:
                             "plain `{engine}` to create it, then retry: agydra import {name}",
                             engine=driver.binary_name, path=real, name=name)
             )
+        real = _resolve_import_source(real)
         data_dir = store.profile_data_dir(name, engine=engine, profile=profile)
         if data_dir.exists():
             unexpected = [
@@ -2348,12 +2377,22 @@ def cmd_import(store: Store, args) -> int:
             guards.enter_context(keychain.serialized_access(store))
         platforms.ensure_dir(data_dir.parent)
         tmp = Path(tempfile.mkdtemp(prefix=f".import-{name}.", dir=data_dir.parent))
+        ignore = shutil.ignore_patterns(*driver.import_ignore)
+
+        def safe_ignore(directory: str, names: List[str]) -> set[str]:
+            excluded = set(ignore(directory, names))
+            _resolve_import_source(Path(directory))
+            for entry in names:
+                if entry not in excluded:
+                    _import_source_metadata(Path(directory) / entry)
+            return excluded
+
         try:
             try:
                 shutil.copytree(
                     real, tmp, dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns(*driver.import_ignore),
-                    copy_function=atomic_copy,
+                    ignore=safe_ignore,
+                    copy_function=_copy_import_file,
                 )
             except shutil.Error as exc:
                 raise StoreError(_summarize_import_failure(exc, real)) from exc

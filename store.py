@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import AbstractSet, Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, TypeVar, Union
+from typing import AbstractSet, Any, BinaryIO, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, TypeVar, Union
 
 from text import module_text
 import platforms
@@ -32,6 +32,7 @@ from ui import warn
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z")
 _Result = TypeVar("_Result")
+MAX_STATE_QUARANTINE_BYTES = 1024 * 1024
 
 _WINDOWS_RESERVED_NAMES = {
     "con", "prn", "aux", "nul",
@@ -125,6 +126,19 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     atomic_write_bytes(path, payload)
 
 
+def _unlink_with_retry(path: Path) -> None:
+    """Remove a temporary sibling with one transient retry.
+
+    A transient holder (Windows AV/indexer, a still-closing descriptor) must
+    never orphan a temp next to durable state; a persistent failure
+    propagates so the caller's cleanup swallow keeps it from masking the
+    original write error."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        path.unlink(missing_ok=True)
+
+
 def _atomic_replace(path: Path, write_payload, verify=None) -> None:
     """Shared skeleton for every durable write in the store: unique tmp in
     ``path``'s dir, payload written and fsync'd, then a Windows-backoff
@@ -133,7 +147,10 @@ def _atomic_replace(path: Path, write_payload, verify=None) -> None:
     so the crash-atomicity discipline can never drift between writers.
     ``verify(tmp)``, when given, runs after the tmp file is closed but before
     the replace (backup zip integrity); a raise removes the tmp and
-    propagates so the final name never holds an unverified write.
+    propagates so the final name never holds an unverified write. The raw
+    descriptor close and the failure-path unlink each get one transient
+    retry so a momentarily-held handle leaks neither a descriptor nor a
+    temp file.
 
     The tmp keeps mkstemp's 0600 (never widened) because backups written
     through this skeleton embed ``.secret`` material."""
@@ -153,14 +170,17 @@ def _atomic_replace(path: Path, write_payload, verify=None) -> None:
                 os.fsync(fh.fileno())
         finally:
             if fd is not None:
-                os.close(fd)
+                try:
+                    os.close(fd)
+                except OSError:
+                    os.close(fd)
         if verify is not None:
             verify(tmp)
         _replace_with_retry(tmp_name, path)
     except BaseException:
         try:
             os.chmod(tmp, 0o600)
-            tmp.unlink()
+            _unlink_with_retry(tmp)
         except OSError:
             pass
         raise
@@ -253,25 +273,131 @@ def read_json_object(path: Path, *, tolerant: bool = False, max_bytes: Optional[
     return data
 
 
-def atomic_copy(source: Path, dest: Path) -> None:
-    """Copy a file atomically (``_atomic_replace`` skeleton).
+def _changed_file_error(path: Path) -> OSError:
+    return OSError(errno.EBUSY, module_text(
+        'locks.changed_during_validation', '{path} changed during validation', path=path
+    ), str(path))
 
-    Streams through copyfileobj + fsync instead of plain ``shutil.copy2``,
-    which never forces the copy to disk before returning — without fsync a
-    crash right after ``share-config``/``create`` could lose the copy despite
-    it looking committed. ``copystat`` restores the source's mode/mtime
-    (copy2 semantics) on the tmp file before the replace.
+
+class _SnapshotReader:
+    """Limit streaming to the captured file length plus one growth probe byte."""
+
+    def __init__(self, stream: BinaryIO, size: int, path: Path) -> None:
+        self.stream = stream
+        self.remaining = size
+        self.path = path
+
+    def read(self, size: int) -> bytes:
+        if size == 0:
+            return b""
+        if not self.remaining:
+            if self.stream.read(1):
+                raise _changed_file_error(self.path)
+            return b""
+        requested = self.remaining if size < 0 else min(size, self.remaining)
+        chunk = self.stream.read(requested)
+        if not chunk or len(chunk) > requested:
+            raise _changed_file_error(self.path)
+        self.remaining -= len(chunk)
+        return chunk
+
+
+def _require_matching_file_snapshot(
+    path: Path, expected: os.stat_result, current: os.stat_result
+) -> None:
+    if any(
+        getattr(current, field) != getattr(expected, field)
+        for field in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    ):
+        raise _changed_file_error(path)
+
+
+def regular_file_snapshot(path: Path) -> os.stat_result:
+    """Inspect a regular leaf without following links or reparse points."""
+    path = Path(path)
+    if platforms.is_link(path, strict=True):
+        raise platforms.FileLinkError(errno.ELOOP, str(path), str(path))
+    snapshot = path.lstat()
+    if not stat.S_ISREG(snapshot.st_mode):
+        raise platforms.NonRegularFileError(errno.EINVAL, str(path), str(path))
+    return snapshot
+
+
+def require_file_snapshot(path: Path, expected: os.stat_result) -> None:
+    """Reject a replaced or modified regular source before using its bytes."""
+    _require_matching_file_snapshot(Path(path), expected, regular_file_snapshot(path))
+
+
+def regular_files_equal(
+    source: Path,
+    target: Path,
+    *,
+    expected_source: os.stat_result,
+    expected_target: os.stat_result,
+) -> bool:
+    """Compare bounded chunks from verified descriptors, never aliased paths."""
+    require_file_snapshot(source, expected_source)
+    require_file_snapshot(target, expected_target)
+    equal = True
+    with platforms.open_regular_file_no_follow(source) as left, \
+            platforms.open_regular_file_no_follow(target) as right:
+        for path, snapshot, stream in (
+            (source, expected_source, left), (target, expected_target, right)
+        ):
+            _require_matching_file_snapshot(path, snapshot, os.fstat(stream.fileno()))
+        bounded_left = _SnapshotReader(left, expected_source.st_size, source)
+        bounded_right = _SnapshotReader(right, expected_target.st_size, target)
+        while True:
+            left_chunk = bounded_left.read(65536)
+            right_chunk = bounded_right.read(65536)
+            if left_chunk != right_chunk:
+                equal = False
+                break
+            if not left_chunk:
+                break
+        for path, snapshot, stream in (
+            (source, expected_source, left), (target, expected_target, right)
+        ):
+            _require_matching_file_snapshot(path, snapshot, os.fstat(stream.fileno()))
+    require_file_snapshot(source, expected_source)
+    require_file_snapshot(target, expected_target)
+    return equal
+
+
+def atomic_copy(
+    source: Path,
+    dest: Path,
+    *,
+    expected_source: Optional[os.stat_result] = None,
+    before_publish: Optional[Callable[[], None]] = None,
+) -> None:
+    """Stream a verified regular source through the shared atomic writer.
+
+    Import callers resolve legitimate source aliases explicitly. Source
+    identity and metadata are rechecked before publication; no source path
+    is silently followed and all descriptors close before replace/cleanup.
     """
-    def payload(fh, tmp: Path) -> None:
-        """Flush BEFORE copystat: the skeleton's own flush comes later and
-        would write buffered bytes after the utime, clobbering the source
-        mtime this function's docstring promises to preserve."""
-        with open(source, "rb") as src_fh:
-            shutil.copyfileobj(src_fh, fh)
-        fh.flush()
-        shutil.copystat(source, tmp)
+    source = Path(source)
+    snapshot = regular_file_snapshot(source) if expected_source is None else expected_source
 
-    _atomic_replace(dest, payload)
+    def validate_source() -> None:
+        require_file_snapshot(source, snapshot)
+        if before_publish is not None:
+            before_publish()
+
+    def payload(fh: BinaryIO, tmp: Path) -> None:
+        validate_source()
+        with platforms.open_regular_file_no_follow(source) as src_fh:
+            _require_matching_file_snapshot(source, snapshot, os.fstat(src_fh.fileno()))
+            shutil.copyfileobj(_SnapshotReader(src_fh, snapshot.st_size, source), fh, length=65536)
+            _require_matching_file_snapshot(source, snapshot, os.fstat(src_fh.fileno()))
+        validate_source()
+        fh.flush()
+        shutil.copystat(source, tmp, follow_symlinks=False)
+        validate_source()
+
+    validate_source()
+    _atomic_replace(dest, payload, lambda _tmp: validate_source())
 
 
 def _chmod_path_without_following(
@@ -974,14 +1100,44 @@ class Store:
             )) from exc
         return destination
 
-    def _quarantine_state_file(self, path: Path) -> Path:
+    def _quarantine_state_file(
+        self,
+        path: Path,
+        validate: Callable[[dict], Any],
+        mutate: Callable[[], None],
+    ) -> bool:
+        """Preserve only captured regular corrupt JSON before a guarded mutation.
+
+        The owning policy holds its existing lock. Read/inspection failures
+        are not corruption: they propagate without a backup or active change.
+        """
+        import locks
+
         try:
-            raw = path.read_bytes()
+            snapshot = regular_file_snapshot(path)
+            raw = platforms.read_regular_file_no_follow(
+                path, max_bytes=MAX_STATE_QUARANTINE_BYTES
+            )
+            require_file_snapshot(path, snapshot)
+            try:
+                document = locks.json_loads_utf8(raw)
+                if isinstance(document, dict):
+                    validate(document)
+                else:
+                    raise ValueError("state must be a JSON object")
+            except (ValueError, TypeError, AttributeError, RecursionError, StoreError):
+                pass
+            else:
+                return False
+            require_file_snapshot(path, snapshot)
+            self.quarantine_state_bytes(path, raw)
+            require_file_snapshot(path, snapshot)
+            mutate()
         except OSError as exc:
             raise StoreError(_store_text(
                 "store.state.quarantine_read_failed", path=path, error=exc
             )) from exc
-        return self.quarantine_state_bytes(path, raw)
+        return True
 
     def _read_validated_config(self) -> Tuple[Config, Optional[str]]:
         """Return one validated snapshot and its diagnostic without rereading JSON."""
@@ -1007,10 +1163,10 @@ class Store:
         issue = self._configuration_state_issue()
         if issue is None:
             return False
-        self._quarantine_state_file(self.config_path)
         config = replacement if isinstance(replacement, Config) else Config()
-        self._write_config(config)
-        return True
+        return self._quarantine_state_file(
+            self.config_path, Config.from_dict, lambda: self._write_config(config)
+        )
 
     def _sequence_state_issue(self) -> Optional[str]:
         try:
@@ -1117,38 +1273,9 @@ class Store:
             try:
                 self._read_rename_journal()
             except StoreError:
-                try:
-                    before = path.lstat()
-                    raw = platforms.read_regular_file_no_follow(
-                        path, max_bytes=platforms.MAX_REGULAR_FILE_BYTES
-                    )
-
-                    def require_unchanged() -> None:
-                        current = path.lstat()
-                        if (
-                            not stat.S_ISREG(current.st_mode)
-                            or platforms.is_link(path, strict=True)
-                            or any(
-                                getattr(current, field) != getattr(before, field)
-                                for field in (
-                                    "st_dev", "st_ino", "st_size",
-                                    "st_mtime_ns", "st_ctime_ns",
-                                )
-                            )
-                        ):
-                            raise StoreError(
-                                f"{_store_text('store.rename.journal_changed')}: {path}"
-                            )
-
-                    require_unchanged()
-                    self.quarantine_state_bytes(path, raw)
-                    require_unchanged()
-                    path.unlink()
-                except OSError as exc:
-                    raise StoreError(_store_text(
-                        "store.state.quarantine_read_failed", path=path, error=exc
-                    )) from exc
-                return True
+                return self._quarantine_state_file(
+                    path, self._validate_rename_journal, path.unlink
+                )
             return False
 
         repaired = self._with_sequence_lock(
@@ -1175,9 +1302,11 @@ class Store:
             issue = self._rotation_state_issue(path)
         if issue is None:
             return False
-        self._quarantine_state_file(path)
-        path.unlink()
-        return True
+        import profile_rotation
+
+        return self._quarantine_state_file(
+            path, lambda raw: profile_rotation._validate_rotation_doc(raw, path), path.unlink
+        )
 
     def _lease_registry_state_issue(self, name: str) -> Optional[str]:
         import locks
@@ -1240,11 +1369,16 @@ class Store:
             if issue is None:
                 self._write_config(config)
             else:
-                self.repair_persistent_state(
+                repaired = self.repair_persistent_state(
                     self.config_path,
                     replacement=config,
                     sequence_locked=True,
                 )
+                if not repaired:
+                    raise StoreError(module_text(
+                        'locks.changed_during_validation',
+                        '{path} changed during validation', path=self.config_path,
+                    ))
             return config
 
         if sequence_locked:
@@ -1766,6 +1900,11 @@ class Store:
             raise StoreError(_store_text(
                 "store.rename.journal_unreadable", path=path, error=exc
             )) from exc
+        return self._validate_rename_journal(data)
+
+    def _validate_rename_journal(self, data: dict) -> dict:
+        """Validate captured intent bytes without a second filesystem read."""
+        path = self.rename_journal_path
         version = data.get("version")
         if type(version) is not int or version not in (
             _LEGACY_RENAME_JOURNAL_VERSION,

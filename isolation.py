@@ -26,7 +26,7 @@ import stat
 import string
 import tempfile
 from pathlib import Path
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from text import module_text
 import platforms
@@ -303,207 +303,183 @@ def _mirror_dir(real_dir: Path, overlay_dir: Path, level: int, ctx: _MirrorConte
 
 
 def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
-    """Merge a real directory that replaced the overlay ``.gemini`` link
-    into the profile data dir, then remove it so ``build_overlay`` can
-    relink (see ``doctor --fix``).
+    """Merge verified regular overlay entries without following replaced paths.
 
-    Recovers the "refusing to break isolation" state without data loss:
-    entries are copied into ``data_dir``, same-named directories are merged,
-    and byte-identical destination files are retained so an interrupted copy
-    can be retried. Different-content file collisions are rejected before any
-    copy, and the source is removed only after every copy succeeds.
-    Refuses when ``real_dir`` is a link (nothing to recover), ``data_dir``
-    does not exist (no profile store to receive the data), an entry is itself
-    a link (symlink or Windows junction; a real-dir recovery should never
-    legitimately contain one, and copying it verbatim would become a
-    permanent, unchecked escape from isolation), or a type mismatch collides
-    between file and directory at the target.
+    The plan holds only metadata. Comparisons and copies stream descriptors;
+    changes preserve the complete source so a partial copy is retryable.
     """
     real_dir = Path(real_dir)
     data_dir = Path(data_dir)
-    if _is_link(real_dir) or not real_dir.is_dir():
-        raise IsolationError(
-            module_text(
-                'isolation.cannot_migrate_expected_a_real_directory_a_link_there',
-                'cannot migrate {real_dir}: expected a real directory (a link there means nothing needs recovering)',
-                real_dir=real_dir,
-            )
-        )
-    if not data_dir.is_dir():
-        raise IsolationError(
-            module_text(
-                'isolation.cannot_migrate_profile_data_dir_does_not_exist_yet',
-                'cannot migrate {real_dir}: profile data dir {data_dir} does not exist yet (create the profile first)',
-                real_dir=real_dir,
-                data_dir=data_dir,
-            )
-        )
-    if _is_link(data_dir):
-        raise IsolationError(
-            module_text(
-                'isolation.cannot_migrate_profile_data_dir_must_not_be_a',
-                'cannot migrate {real_dir}: profile data dir {data_dir} must not be a symlink or junction',
-                real_dir=real_dir,
-                data_dir=data_dir,
-            )
-        )
+
+    def inspect(path: Path) -> os.stat_result:
+        if platforms.is_link(path, strict=True):
+            raise platforms.FileLinkError(errno.ELOOP, str(path), str(path))
+        metadata = path.lstat()
+        if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+            raise platforms.NonRegularFileError(errno.EINVAL, str(path), str(path))
+        return metadata
+
+    def directory_unchanged(path: Path, expected: os.stat_result) -> None:
+        current = inspect(path)
+        if not stat.S_ISDIR(current.st_mode) or not os.path.samestat(current, expected):
+            raise OSError(errno.EBUSY, module_text(
+                'locks.changed_during_validation', '{path} changed during validation', path=path
+            ), str(path))
+
+    def tree_snapshot(root: Path) -> Dict[Path, os.stat_result]:
+        entries: Dict[Path, os.stat_result] = {}
+        pending = [root]
+        while pending:
+            path = pending.pop()
+            metadata = inspect(path)
+            entries[path] = metadata
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.extend(reversed(sorted(path.iterdir())))
+        return entries
 
     try:
-        entries = list(real_dir.iterdir())
-    except OSError as exc:
-        raise IsolationError(
-            module_text(
-                'isolation.could_not_list_entries_in',
-                'could not list entries in {real_dir}: {exc}',
-                real_dir=real_dir,
-                exc=exc,
-            )
-        ) from exc
-
-    def files_are_identical(source: Path, target: Path) -> bool:
-        with source.open("rb") as source_file, target.open("rb") as target_file:
-            while True:
-                source_chunk = source_file.read(65536)
-                target_chunk = target_file.read(65536)
-                if source_chunk != target_chunk:
-                    return False
-                if not source_chunk:
-                    return True
-
-    try:
-        for entry in real_dir.rglob("*"):
-            if _is_link(entry):
-                raise IsolationError(
-                    module_text(
-                        'isolation.cannot_migrate_real_dir_must_not_contain_symlinks_or',
-                        'cannot migrate {entry}: real_dir must not contain symlinks or junctions (isolation invariant); remove it manually and re-run `agydra doctor --fix`',
-                        entry=entry,
-                    )
-                )
-            target = data_dir / entry.relative_to(real_dir)
-            if _is_link(target):
-                raise IsolationError(
-                    module_text(
-                        'isolation.cannot_migrate_profile_data_target_is_a_symlink_or',
-                        'cannot migrate {entry}: profile data target {target} is a symlink or junction (isolation invariant)',
-                        entry=entry,
-                        target=target,
-                    )
-                )
-            if not target.exists():
+        source_root = inspect(real_dir)
+        target_root = inspect(data_dir)
+        if not stat.S_ISDIR(source_root.st_mode) or not stat.S_ISDIR(target_root.st_mode):
+            raise OSError(errno.ENOTDIR, str(real_dir), str(data_dir))
+        source_resolved = real_dir.resolve(strict=True)
+        target_resolved = data_dir.resolve(strict=True)
+        if (
+            os.path.samestat(source_root, target_root)
+            or source_resolved.is_relative_to(target_resolved)
+            or target_resolved.is_relative_to(source_resolved)
+        ):
+            raise IsolationError(module_text(
+                'isolation.migration_roots_overlap',
+                'cannot migrate overlapping source {source} and destination {destination}',
+                source=real_dir, destination=data_dir,
+            ))
+        source_plan = tree_snapshot(real_dir)
+        directory_unchanged(real_dir, source_root)
+        target_directories = {data_dir: target_root}
+        target_files: Dict[Path, os.stat_result] = {}
+        scanned_targets = set()
+        for source, metadata in source_plan.items():
+            if source == real_dir:
                 continue
-            if entry.is_dir() != target.is_dir():
-                target_type = module_text('isolation.entry_type.directory', 'directory') if target.is_dir() else module_text('isolation.entry_type.file', 'file')
-                source_type = module_text('isolation.entry_type.directory', 'directory') if entry.is_dir() else module_text('isolation.entry_type.file', 'file')
-                raise IsolationError(
-                    module_text(
-                        'isolation.cannot_migrate_a_already_exists_at_type_mismatch_with',
-                        'cannot migrate {entry}: a {target_type} already exists at {target} (type mismatch with source {source_type}); resolve manually and re-run `agydra doctor --fix`',
-                        entry=entry,
-                        target_type=target_type,
-                        target=target,
-                        source_type=source_type,
-                    )
-                )
-            if (
-                entry.is_file()
-                and target.is_file()
-                and not files_are_identical(entry, target)
-            ):
-                raise IsolationError(
-                    module_text(
-                        'isolation.cannot_migrate_a_file_with_different_contents_already_exists',
-                        'cannot migrate {entry}: a file with different contents already exists at {target} (file-to-file collision); resolve manually and re-run `agydra doctor --fix`',
-                        entry=entry,
-                        target=target,
-                    )
-                )
-
-        for entry in entries:
-            target = data_dir / entry.name
-            if entry.is_dir() and target.is_dir():
-                for descendant in target.rglob("*"):
-                    if _is_link(descendant):
-                        raise IsolationError(
-                            module_text(
-                                'isolation.cannot_migrate_profile_data_target_contains_symlink_or_junction',
-                                'cannot migrate {entry}: profile data target contains symlink or junction {descendant}',
-                                entry=entry,
-                                descendant=descendant,
-                            )
-                        )
-    except OSError as exc:
-        raise IsolationError(
-            module_text(
-                'isolation.could_not_validate_overlay_data_in_no_migration_data',
-                'could not validate overlay data in {real_dir} ({exc}); no migration data was changed',
-                real_dir=real_dir,
-                exc=exc,
-            )
-        ) from exc
-
-    def copy_file(source: str, destination: str) -> str:
-        source_path = Path(source)
-        destination_path = Path(destination)
-        if destination_path.exists():
-            if (
-                source_path.is_file()
-                and destination_path.is_file()
-                and files_are_identical(source_path, destination_path)
-            ):
-                return str(destination_path)
-            raise IsolationError(
-                module_text(
-                    'isolation.cannot_migrate_conflicting_data_exists_at_resolve_manually_and',
-                    'cannot migrate {source_path}: conflicting data exists at {destination_path}; resolve manually and re-run `agydra doctor --fix`',
-                    source_path=source_path,
-                    destination_path=destination_path,
-                )
-            )
-
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=destination_path.parent,
-            prefix=".agydra-copy-",
-        )
-        temporary_path = Path(temporary_name)
-        descriptor_open = True
-        try:
-            os.close(descriptor)
-            descriptor_open = False
-            shutil.copy2(source_path, temporary_path)
-            os.replace(temporary_path, destination_path)
-        finally:
+            target = data_dir / source.relative_to(real_dir)
             try:
-                if descriptor_open:
-                    os.close(descriptor)
-            finally:
-                try:
-                    temporary_path.unlink(missing_ok=True)
-                except OSError:
-                    temporary_path.unlink(missing_ok=True)
-        return str(destination_path)
+                existing = inspect(target)
+            except FileNotFoundError:
+                continue
+            source_is_dir = stat.S_ISDIR(metadata.st_mode)
+            target_is_dir = stat.S_ISDIR(existing.st_mode)
+            if source_is_dir != target_is_dir:
+                raise IsolationError(module_text(
+                    'isolation.cannot_migrate_a_already_exists_at_type_mismatch_with',
+                    'cannot migrate {entry}: a {target_type} already exists at {target} (type mismatch with source {source_type}); resolve manually and re-run `agydra doctor --fix`',
+                    entry=source, target=target,
+                    source_type=module_text('isolation.entry_type.directory', 'directory') if source_is_dir else module_text('isolation.entry_type.file', 'file'),
+                    target_type=module_text('isolation.entry_type.directory', 'directory') if target_is_dir else module_text('isolation.entry_type.file', 'file'),
+                ))
+            if source_is_dir:
+                if target not in scanned_targets:
+                    for directory, snapshot in tree_snapshot(target).items():
+                        if stat.S_ISDIR(snapshot.st_mode):
+                            target_directories[directory] = snapshot
+                            scanned_targets.add(directory)
+                continue
+            if not store.regular_files_equal(
+                source, target, expected_source=metadata, expected_target=existing
+            ):
+                raise IsolationError(module_text(
+                    'isolation.cannot_migrate_a_file_with_different_contents_already_exists',
+                    'cannot migrate {entry}: a file with different contents already exists at {target} (file-to-file collision); resolve manually and re-run `agydra doctor --fix`',
+                    entry=source, target=target,
+                ))
+            target_files[target] = existing
+    except OSError as exc:
+        raise IsolationError(module_text(
+            'isolation.could_not_validate_overlay_data_in_no_migration_data',
+            'could not validate overlay data in {real_dir} ({exc}); no migration data was changed',
+            real_dir=real_dir, exc=exc,
+        )) from exc
+
+    def validate_source_parents(path: Path) -> None:
+        current = path
+        while True:
+            expected = source_plan[current]
+            if stat.S_ISDIR(expected.st_mode):
+                directory_unchanged(current, expected)
+            else:
+                store.require_file_snapshot(current, expected)
+            if current == real_dir:
+                break
+            current = current.parent
+
+    def validate_target_parents(path: Path) -> None:
+        current = path
+        while True:
+            directory_unchanged(current, target_directories[current])
+            if current == data_dir:
+                break
+            current = current.parent
+
+    def validate_source_tree() -> None:
+        current = tree_snapshot(real_dir)
+        if current.keys() != source_plan.keys():
+            raise OSError(errno.EBUSY, module_text(
+                'locks.changed_during_validation', '{path} changed during validation', path=real_dir
+            ), str(real_dir))
+        for path, metadata in source_plan.items():
+            if stat.S_ISDIR(metadata.st_mode):
+                directory_unchanged(path, metadata)
+            else:
+                store.require_file_snapshot(path, metadata)
 
     try:
-        for entry in entries:
-            target = data_dir / entry.name
-            if entry.is_dir():
-                shutil.copytree(
-                    entry,
-                    target,
-                    dirs_exist_ok=True,
-                    copy_function=copy_file,
+        validate_source_tree()
+        for source, metadata in source_plan.items():
+            if source == real_dir:
+                continue
+            target = data_dir / source.relative_to(real_dir)
+            validate_source_parents(source)
+            validate_target_parents(target.parent)
+            if stat.S_ISDIR(metadata.st_mode):
+                if target not in target_directories:
+                    target.mkdir()
+                    target_directories[target] = inspect(target)
+                directory_unchanged(target, target_directories[target])
+                continue
+
+            def before_publish(source: Path = source, target: Path = target) -> None:
+                validate_source_parents(source)
+                validate_target_parents(target.parent)
+                if target in target_files:
+                    store.require_file_snapshot(target, target_files[target])
+                elif os.path.lexists(target):
+                    raise OSError(errno.EEXIST, str(target), str(target))
+
+            before_publish()
+            if target not in target_files:
+                store.atomic_copy(
+                    source, target, expected_source=metadata, before_publish=before_publish
                 )
-            else:
-                copy_file(str(entry), str(target))
+                target_files[target] = store.regular_file_snapshot(target)
+        for source, metadata in reversed(list(source_plan.items())):
+            if source != real_dir and stat.S_ISDIR(metadata.st_mode):
+                target = data_dir / source.relative_to(real_dir)
+                validate_source_parents(source)
+                validate_target_parents(target)
+                shutil.copystat(source, target, follow_symlinks=False)
+                validate_source_parents(source)
+                validate_target_parents(target)
+        validate_source_tree()
+        for directory, metadata in target_directories.items():
+            directory_unchanged(directory, metadata)
+        for target, metadata in target_files.items():
+            store.require_file_snapshot(target, metadata)
     except OSError as exc:
-        raise IsolationError(
-            module_text(
-                'isolation.could_not_copy_overlay_data_from_into_the_profile',
-                'could not copy overlay data from {real_dir} into the profile store ({exc}); the source remains intact — fix the cause and re-run `agydra doctor --fix`',
-                real_dir=real_dir,
-                exc=exc,
-            )
-        ) from exc
+        raise IsolationError(module_text(
+            'isolation.could_not_copy_overlay_data_from_into_the_profile',
+            'could not copy overlay data from {real_dir} into the profile store ({exc}); the source remains intact — fix the cause and re-run `agydra doctor --fix`',
+            real_dir=real_dir, exc=exc,
+        )) from exc
 
     removal_error = ""
     try:
@@ -511,15 +487,11 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
     except OSError as exc:
         removal_error = f" ({exc})"
     if os.path.lexists(real_dir):
-        raise IsolationError(
-            module_text(
-                'isolation.all_overlay_data_was_copied_into_but_source_cleanup',
-                'all overlay data was copied into {data_dir}, but source cleanup failed for {real_dir}{removal_error}; fix the cause and re-run `agydra doctor --fix`',
-                data_dir=data_dir,
-                real_dir=real_dir,
-                removal_error=removal_error,
-            )
-        )
+        raise IsolationError(module_text(
+            'isolation.all_overlay_data_was_copied_into_but_source_cleanup',
+            'all overlay data was copied into {data_dir}, but source cleanup failed for {real_dir}{removal_error}; fix the cause and re-run `agydra doctor --fix`',
+            data_dir=data_dir, real_dir=real_dir, removal_error=removal_error,
+        ))
 
 
 CLAUDE_OWNED_STATE_FILES = (".claude.json", "settings.json", ".credentials.json")
