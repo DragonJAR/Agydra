@@ -11,28 +11,35 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 os.environ["AGYDRA_NO_KEYCHAIN"] = "1"
 
 MAX_HANG_DUMP_SECONDS = 86400
+HANG_DUMP_ENV = "AGYDRA_TEST_HANG_DUMP_SECONDS"
+PER_TEST_HANG_ENV = "AGYDRA_TEST_HANG_PER_TEST_SECONDS"
+PER_TEST_HANG_SECONDS_DEFAULT = 240
+GLOBAL_DIAGNOSTIC_DUMP_DELAY_S = 0.05
 
 
 def parse_hang_dump_seconds(
     raw: str | None,
     max_seconds: int = MAX_HANG_DUMP_SECONDS,
     warn=None,
+    env_name: str = HANG_DUMP_ENV,
 ) -> int | None:
-    """Parse AGYDRA_TEST_HANG_DUMP_SECONDS with whitespace trimming, strict ASCII digits,
-    capping to max_seconds, and a one-line warning on non-empty invalid values."""
+    """Parse a watchdog-seconds environment value with whitespace trimming, strict
+    ASCII digits, capping to max_seconds, and a one-line warning that names
+    env_name on non-empty invalid values."""
     if raw is None:
         return None
     val = raw.strip()
     if not val:
         return None
     if not (val.isascii() and val.isdigit()):
-        msg = f"warning: AGYDRA_TEST_HANG_DUMP_SECONDS must be ASCII digits, got {val!r}\n"
+        msg = f"warning: {env_name} must be ASCII digits, got {val!r}\n"
         if callable(warn):
             warn(msg.rstrip("\n"))
         elif warn is not None and hasattr(warn, "write"):
@@ -48,11 +55,72 @@ def parse_hang_dump_seconds(
 
 _parse_hang_dump_seconds = parse_hang_dump_seconds
 
-_HANG_DUMP_SECONDS = parse_hang_dump_seconds(
-    os.environ.get("AGYDRA_TEST_HANG_DUMP_SECONDS", "")
+def parse_per_test_hang_seconds(raw: str | None, warn=None) -> int | None:
+    """Parse the per-test watchdog budget: unset values keep the 240 s default,
+    "0" disables the detector, and any other invalid value warns and keeps the
+    default so hang detection never silently disarms."""
+    if raw is None or not raw.strip():
+        return PER_TEST_HANG_SECONDS_DEFAULT
+    parsed = parse_hang_dump_seconds(raw, warn=warn, env_name=PER_TEST_HANG_ENV)
+    if parsed is not None:
+        return parsed
+    if raw.strip() == "0":
+        return None
+    return PER_TEST_HANG_SECONDS_DEFAULT
+
+
+class WatchdogTestResult(unittest.TextTestResult):
+    """Test result whose fatal hang watchdog restarts at every single test.
+
+    ``faulthandler.dump_traceback_later`` holds one pending timer per process,
+    so a whole-suite budget misattributes a hang to whichever healthy test is
+    running when the budget expires. Re-arming the timer when each test starts
+    and cancelling it when the test ends makes the fatal dump name the exact
+    hanging test, no matter how long the rest of the suite took before it.
+    """
+
+    def startTest(self, test):
+        super().startTest(test)
+        faulthandler.dump_traceback_later(_PER_TEST_HANG_SECONDS, exit=True)
+
+    def stopTest(self, test):
+        faulthandler.cancel_dump_traceback_later()
+        super().stopTest(test)
+
+
+def _schedule_global_diagnostic_dump(seconds: int) -> threading.Timer:
+    """Schedule a one-time non-fatal stack dump for a suite that exceeds its budget.
+
+    The CI step timeout stays the hard outer bound; this timer only labels and
+    dumps where the suite stands once the configured global budget is exhausted,
+    without killing healthy-but-slow runs. Its dump replaces any pending
+    per-test timer for the remainder of that one test; the next test re-arms
+    its own watchdog.
+    """
+
+    def dump_suite_progress_once():
+        sys.stderr.write(
+            f"[watchdog] global suite budget of {seconds} s exceeded; "
+            "one-time diagnostic dump follows and the suite continues\n"
+        )
+        sys.stderr.flush()
+        faulthandler.dump_traceback_later(GLOBAL_DIAGNOSTIC_DUMP_DELAY_S, exit=False)
+
+    timer = threading.Timer(seconds, dump_suite_progress_once)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+_PER_TEST_HANG_SECONDS = parse_per_test_hang_seconds(
+    os.environ.get(PER_TEST_HANG_ENV, "")
 )
+if _PER_TEST_HANG_SECONDS is not None:
+    unittest.TextTestRunner.resultclass = WatchdogTestResult
+
+_HANG_DUMP_SECONDS = parse_hang_dump_seconds(os.environ.get(HANG_DUMP_ENV, ""))
 if _HANG_DUMP_SECONDS is not None:
-    faulthandler.dump_traceback_later(_HANG_DUMP_SECONDS, exit=True)
+    _GLOBAL_DIAGNOSTIC_TIMER = _schedule_global_diagnostic_dump(_HANG_DUMP_SECONDS)
 
 os.environ["LC_ALL"] = "C.UTF-8"
 os.environ.pop("LC_MESSAGES", None)

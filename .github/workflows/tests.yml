@@ -70,9 +70,13 @@ jobs:
           TMP: C:\tmp
           TEMP: C:\tmp
           AGYDRA_TEST_HANG_DUMP_SECONDS: '420'
+          AGYDRA_TEST_HANG_PER_TEST_SECONDS: '240'
           AGYDRA_SKIP_WIN32_BATCH: '1'
         run: mkdir C:\tmp 2>nul & python -m unittest discover -s tests -p "test_*.py" -v
       - name: Full standard-library suite (POSIX)
         if: ${{ !cancelled() && steps.python.outcome == 'success' && runner.os != 'Windows' }}
         timeout-minutes: 10
+        env:
+          AGYDRA_TEST_HANG_DUMP_SECONDS: '420'
+          AGYDRA_TEST_HANG_PER_TEST_SECONDS: '240'
         run: python -m unittest discover -s tests -p "test_*.py" -v
