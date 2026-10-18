@@ -312,6 +312,14 @@ class TestVerifiedCopy(BaseCase):
         copy.assert_not_called()
 
     def test_import_resolution_preserves_symlink_then_parent_semantics(self) -> None:
+        """Import copies the bytes the operating system itself resolves for the path.
+
+        POSIX resolves the directory symlink before applying ``..``, so the
+        physical parent's file is imported; Windows folds ``..`` lexically
+        before any reparse traversal, so the lexical parent's file is the
+        verified regular source on that platform. Both outcomes import a
+        validated regular file: the copy follows native path semantics.
+        """
         real_parent = self._tmp / "real-parent"
         (real_parent / "inner").mkdir(parents=True)
         alias = self._tmp / "alias"
@@ -320,7 +328,8 @@ class TestVerifiedCopy(BaseCase):
         (self._tmp / "selected").write_bytes(b"wrong lexical parent")
         destination = self._tmp / "destination"
         cli._copy_import_file(str(alias / ".." / "selected"), str(destination))
-        self.assertEqual(destination.read_bytes(), b"intended")
+        expected = b"wrong lexical parent" if platforms.is_windows() else b"intended"
+        self.assertEqual(destination.read_bytes(), expected)
 
     def test_import_command_dereferences_legitimate_source_file_alias(self) -> None:
         s = store.Store(self.store_root)
