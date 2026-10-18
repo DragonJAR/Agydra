@@ -1210,7 +1210,7 @@ os._exit(0)
             ("profile", "old"),
             ("sequence", None),
         ]
-        if locks.fcntl is not None:
+        if getattr(locks, "fcntl", None) is not None:
             expected_lock_order.append(("swap", None))
         self.assertEqual(recovery_events[:len(expected_lock_order)], expected_lock_order)
         self.assertEqual(native_calls, [keychain.profile_slot("old"), keychain.profile_slot("new")])
@@ -1310,7 +1310,7 @@ os._exit(0)
 
         failures = (
             ("swap-lock", "durable-write")
-            if locks.fcntl is not None
+            if getattr(locks, "fcntl", None) is not None
             else ("durable-write",)
         )
         for failure in failures:

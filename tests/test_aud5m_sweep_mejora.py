@@ -67,6 +67,13 @@ class TestStoreProbeCleanup(BaseCase):
         self.store = Store(self.store_root)
 
     def test_probe_unlink_runs_even_when_the_descriptor_close_fails(self):
+        """The probe temp is always unlink-attempted when close fails.
+
+        Windows cannot remove a file whose descriptor is still open, so a
+        genuinely failed close keeps the probe until process exit there;
+        POSIX removes it, and both platforms still report the close error
+        as the store-check failure.
+        """
         with mock.patch.object(
             doctor.os, "close", side_effect=OSError("close denied")
         ):
@@ -80,7 +87,11 @@ class TestStoreProbeCleanup(BaseCase):
             ),
             message,
         )
-        self.assertEqual(list(self.store.root.glob(".write-probe.*")), [])
+        leftovers = list(self.store.root.glob(".write-probe.*"))
+        if sys.platform == "win32":
+            self.assertEqual(len(leftovers), 1)
+        else:
+            self.assertEqual(leftovers, [])
 
     def test_probe_unlink_retries_once_through_a_transient_holder(self):
         original = Path.unlink
