@@ -493,13 +493,14 @@ def _keep_file_login(store: Store, name: str, data_dir: Path):
     yield
     try:
         path = account.agy_token_path(data_dir)
-        if path.is_file():
-            raw = path.read_bytes()
-            keychain.adopt_login_credential(store, name, data_dir, raw)
+        raw = account.read_private_credential_bytes(path)
+        keychain.adopt_login_credential(store, name, data_dir, raw)
+    except FileNotFoundError:
+        return
     except (keychain.KeychainError, OSError, StoreError) as exc:
         warn(
             f"could not back up the new Antigravity credential of profile "
-            f"{name!r} for explicit launches ({exc}); random launches still use it"
+            f"{name!r} for explicit launches ({type(exc).__name__}); random launches still use it"
         )
 
 

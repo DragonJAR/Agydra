@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import os
 import stat
 import subprocess
 from dataclasses import dataclass, field
@@ -238,6 +239,35 @@ def _require_private_credential_path(path: Path, *, directory: bool = False) -> 
         raise store.StoreError(f"credential path must be a private real entry: {path}")
 
 
+def private_credential_snapshot(path: Path) -> os.stat_result:
+    """Inspect a private leaf and its parent without permitting aliases."""
+    _require_private_credential_path(path.parent, directory=True)
+    _require_private_credential_path(path)
+    return path.lstat()
+
+
+def require_private_credential_unchanged(path: Path, before: os.stat_result) -> None:
+    """Refuse replacement or modification before publishing or removing bytes."""
+    current = private_credential_snapshot(path)
+    if any(
+        getattr(current, field) != getattr(before, field)
+        for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    ):
+        raise store.StoreError(f"credential changed during validation: {path}")
+
+
+def read_private_credential_bytes(
+    path: Path, *, snapshot: Optional[os.stat_result] = None
+) -> bytes:
+    """Read bounded no-follow bytes bound to one private credential snapshot."""
+    before = private_credential_snapshot(path) if snapshot is None else snapshot
+    raw = platforms.read_regular_file_no_follow(
+        path, max_bytes=platforms.MAX_REGULAR_FILE_BYTES
+    )
+    require_private_credential_unchanged(path, before)
+    return raw
+
+
 def agy_token_path(data_dir: Path, *, create_parent: bool = False) -> Path:
     """Validate the native credential path and optionally create its parent."""
     data_dir = Path(data_dir)
@@ -297,9 +327,7 @@ def identity_anchor_for(
 
     path = keychain.slot_backup_path(profile_store, profile_name)
     try:
-        _require_private_credential_path(path.parent, directory=True)
-        _require_private_credential_path(path)
-        secret = platforms.read_regular_file_no_follow(path)
+        secret = read_private_credential_bytes(path)
         decoded = keychain.decode_go_keyring_secret(secret)
     except FileNotFoundError:
         return IdentityAnchor(None, "missing")
@@ -538,11 +566,11 @@ def _grok_config_value(raw: str) -> Optional[str]:
 def grok_config_api_key(data_dir: Path) -> Optional[str]:
     """Last exact ``api_key`` assignment across Grok's config.toml wins."""
     cfg_path = Path(data_dir) / GROK_CONFIG_FILE
-    if not cfg_path.is_file():
-        return None
     try:
-        content = cfg_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        content = platforms.read_regular_file_no_follow(
+            cfg_path, max_bytes=platforms.MAX_REGULAR_FILE_BYTES
+        ).decode("utf-8")
+    except (OSError, UnicodeError):
         return None
     result = None
     for line in content.splitlines():
@@ -717,7 +745,7 @@ def _claude_unknown(reason: str, **fields) -> ClaudeAuthStatus:
 def _same_directory(left: str, right: Path) -> bool:
     try:
         return Path(left).resolve() == Path(right).resolve()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         return False
 
 

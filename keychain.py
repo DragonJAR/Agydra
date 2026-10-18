@@ -364,10 +364,7 @@ def _verified_keychain_arg(keychain_path: Path) -> str:
         raise KeychainError(f"keychain path {path} does not name a keychain file; refusing to use it")
     try:
         resolved = path.resolve(strict=True)
-        info = resolved.stat()
-        if not stat.S_ISREG(info.st_mode):
-            raise KeychainError(f"keychain path {path} is not a regular file; refusing to use it")
-        with open(resolved, "rb") as handle:
+        with platforms.open_regular_file_no_follow(resolved) as handle:
             magic = handle.read(len(KEYCHAIN_FILE_MAGIC))
     except (OSError, RuntimeError) as exc:
         raise KeychainError(
@@ -524,9 +521,7 @@ def load_profile_slot(store, name: str) -> Optional[bytes]:
     try:
         import account
 
-        account._require_private_credential_path(path.parent, directory=True)
-        account._require_private_credential_path(path)
-        return path.read_bytes()
+        return account.read_private_credential_bytes(path)
     except (OSError, StoreError):
         return None
 
@@ -588,7 +583,7 @@ def decode_go_keyring_secret(data: Optional[bytes]) -> Optional[dict]:
         return None
     try:
         decoded = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+    except (ValueError, RecursionError):
         return None
     return decoded if isinstance(decoded, dict) else None
 
@@ -924,7 +919,12 @@ def _credential_fingerprint(data: bytes) -> str:
     decoded = decode_go_keyring_secret(_as_envelope(data))
     token = decoded.get("token") if decoded is not None else None
     refresh = token.get("refresh_token") if isinstance(token, dict) else None
-    basis = refresh.encode("utf-8") if isinstance(refresh, str) and refresh else data
+    basis = data
+    if isinstance(refresh, str) and refresh:
+        try:
+            basis = refresh.encode("utf-8")
+        except UnicodeError:
+            pass
     return hashlib.sha256(basis).hexdigest()
 
 
@@ -966,7 +966,9 @@ def _load_slot_lease(store) -> SlotLeaseState:
     """
     path = _slot_lease_path(store)
     try:
-        raw = path.read_bytes()
+        raw = platforms.read_regular_file_no_follow(
+            path, max_bytes=platforms.MAX_REGULAR_FILE_BYTES
+        )
     except FileNotFoundError:
         return SlotLeaseState(owner=None, had_shared=None)
     except OSError as exc:
@@ -1436,7 +1438,7 @@ def rename_profile_slot(
                 keychain_supported,
                 source_present,
             )
-    except (KeychainError, OSError, AttributeError) as exc:
+    except (KeychainError, OSError, StoreError, AttributeError) as exc:
         if strict:
             raise
         warn(
@@ -1454,14 +1456,14 @@ def rename_profile_slot_recovery_data(store, old_name: str, new_name: str) -> di
 
 
 def _regular_slot_present(path: Path, name: str) -> bool:
+    import account
+
     try:
-        info = path.lstat()
+        account.private_credential_snapshot(path)
     except FileNotFoundError:
         return False
     except OSError as exc:
         raise KeychainError(f"cannot inspect keychain slot for {name!r} ({exc})") from exc
-    if not stat.S_ISREG(info.st_mode):
-        raise KeychainError(f"keychain slot for {name!r} is not a regular file")
     return True
 
 
@@ -1496,9 +1498,13 @@ def _rename_profile_slot_unlocked(
     actual_source_present = _regular_slot_present(old, old_name)
     if source_present:
         if actual_source_present:
-            data = old.read_bytes()
+            import account
+
+            before = account.private_credential_snapshot(old)
+            data = account.read_private_credential_bytes(old, snapshot=before)
             platforms.ensure_dir(new.parent)
             atomic_write_bytes(new, data)
+            account.require_private_credential_unchanged(old, before)
             old.unlink()
         elif not _regular_slot_present(new, new_name):
             raise KeychainError(
