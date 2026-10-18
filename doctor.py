@@ -898,7 +898,14 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
         except StoreError as exc:
             warn(i18n.t("doctor.fix.safe_purge_failed", name=orphan, error=exc))
             continue
-        if profile_dir.exists() or platforms.is_link(profile_dir):
+        try:
+            profile_present = profile_dir.exists() or platforms.is_link(
+                profile_dir, strict=True
+            )
+        except OSError as exc:
+            warn(i18n.t("doctor.fix.safe_purge_failed", name=orphan, error=exc))
+            continue
+        if profile_present:
             warn(i18n.t(
                 "doctor.fix.skip_keychain",
                 name=orphan,
@@ -918,7 +925,14 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
             ))
             continue
         try:
-            if profile_dir.exists() or platforms.is_link(profile_dir):
+            try:
+                profile_present = profile_dir.exists() or platforms.is_link(
+                    profile_dir, strict=True
+                )
+            except OSError as exc:
+                warn(i18n.t("doctor.fix.safe_purge_failed", name=orphan, error=exc))
+                continue
+            if profile_present:
                 warn(i18n.t(
                     "doctor.fix.skip_keychain",
                     name=orphan,

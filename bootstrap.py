@@ -355,6 +355,14 @@ def _shim_content(target: Path) -> str:
 
 
 
+def _read_shim_safe(path: Path) -> Optional[str]:
+    try:
+        raw = platforms.read_regular_file_no_follow(path, max_bytes=64 * 1024)
+        return raw.decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
 def shim_target(shim: Optional[Path] = None) -> Optional[Path]:
     """Parse the delegate target from a managed agydra PATH shim.
 
@@ -367,11 +375,8 @@ def shim_target(shim: Optional[Path] = None) -> Optional[Path]:
     target_shim = shim_path() if shim is None else Path(shim)
     if not _shim_entry_exists(target_shim):
         return None
-    try:
-        body = target_shim.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    if SHIM_MARKER not in body:
+    body = _read_shim_safe(target_shim)
+    if body is None or SHIM_MARKER not in body:
         return None
     for line in body.splitlines():
         line = line.strip()
@@ -616,16 +621,23 @@ def _atomic_write_text(path: Path, content: str, mode: int) -> None:
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
     )
+    tmp = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
-            fh.flush()
-            os.chmod(tmp_name, mode)
-            os.fsync(fh.fileno())
+        try:
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+            fd = None
+            with fh:
+                fh.write(content)
+                fh.flush()
+                os.chmod(tmp_name, mode)
+                os.fsync(fh.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
         os.replace(tmp_name, path)
     except BaseException:
         try:
-            os.unlink(tmp_name)
+            tmp.unlink()
         except OSError:
             pass
         raise
@@ -661,14 +673,13 @@ def ensure_path_shim(
             out(_t("setup.step.replacing_dangling_shim", shim=shim))
             _remove_shim_link_entry(shim)
         elif _shim_entry_exists(shim):
-            try:
-                body = shim.read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
+            body = _read_shim_safe(shim)
+            if body is None:
                 if not force:
                     raise BootstrapError(
                         f"refusing to overwrite foreign file at {shim}; "
                         "inspect it and remove it manually, then re-run setup (or use --force)"
-                    ) from exc
+                    )
                 body = ""
             if body == content and os.access(shim, os.X_OK):
                 out(_t("setup.step.shim_installed", shim=shim, target=target))
@@ -771,9 +782,8 @@ def check_state(root: Path) -> dict:
         if _is_dangling_link(shim):
             state["shim_state"] = "dead"
         else:
-            try:
-                body = shim.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+            body = _read_shim_safe(shim)
+            if body is None:
                 state["shim_state"] = "foreign"
             else:
                 if body == _shim_content(script) and os.access(shim, os.X_OK):

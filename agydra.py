@@ -42,10 +42,23 @@ graceful message this check exists to print. Keep this in sync with
 exception to the module's own DRY rule."""
 
 
+def _console_print(
+    *values: object,
+    file: object = None,
+    flush: bool = False,
+    **kwargs: object,
+) -> None:
+    try:
+        import ui
+        ui.console_print(*values, file=file, flush=flush, **kwargs)
+    except (ImportError, SyntaxError, AttributeError):
+        print(*values, file=file, flush=flush, **kwargs)
+
+
 def _fail(msg: str, hint: str = "") -> int:
-    print(f"agydra.py: {msg}", file=sys.stderr)
+    _console_print(f"agydra.py: {msg}", file=sys.stderr)
     if hint:
-        print(f"hint: {hint}", file=sys.stderr)
+        _console_print(f"hint: {hint}", file=sys.stderr)
     return 1
 
 
@@ -133,7 +146,7 @@ def main() -> int:
         if setup_args.dry_run:
             if not os.path.isfile(script):
                 bootstrap.report_state(repo)
-                print(_t("launcher.dry_run_hint"))
+                _console_print(_t("launcher.dry_run_hint"))
                 return 0
             return _launch(script)
         return bootstrap.run(root=repo, force=setup_args.force, explicit=True)
@@ -156,9 +169,9 @@ def main() -> int:
             else ("launcher.reason_broken_venv" if not vpy.exists() else "launcher.reason_unimportable_modules")
         )
         reason = _t(reason_key)
-        print(_t("launcher.running_setup", reason=reason))
+        _console_print(_t("launcher.running_setup", reason=reason))
         result = bootstrap.perform_install(
-            lambda line: print(line), root=repo, explicit=False
+            lambda line: _console_print(line), root=repo, explicit=False
         )
         if not result.essential_ok:
             return result.code

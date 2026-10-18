@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import doctor
+import i18n
 import isolation
 import keychain
 import platforms
@@ -173,18 +174,30 @@ class TestDoctor(BaseCase):
         self.store.create("work")
         handle = locks.try_lock(self.store, "work")
         try:
-            status, message = doctor._check_locks(self.store, self._ctx())
+            for lang in ("en", "es"):
+                original = i18n._get_active()
+                try:
+                    i18n._set_active(lang)
+                    status, message = doctor._check_locks(self.store, self._ctx())
+                    self.assertEqual(status, doctor.WARN)
+                    self.assertIn(i18n.t("doctor.locks.live", names="work"), message)
+                    self.assertNotIn("unreadable", message)
+                finally:
+                    i18n._set_active(original)
         finally:
             handle.release()
-        self.assertEqual(status, doctor.WARN)
-        self.assertIn("live sessions: work", message)
-        self.assertNotIn("unreadable", message)
 
     def test_locks_check_passes_when_free(self):
         self.store.create("work")
-        status, message = doctor._check_locks(self.store, self._ctx())
-        self.assertEqual(status, doctor.OK)
-        self.assertIn("no live sessions", message)
+        for lang in ("en", "es"):
+            original = i18n._get_active()
+            try:
+                i18n._set_active(lang)
+                status, message = doctor._check_locks(self.store, self._ctx())
+                self.assertEqual(status, doctor.OK)
+                self.assertIn(i18n.t("doctor.locks.none"), message)
+            finally:
+                i18n._set_active(original)
 
     def test_locks_check_transition_from_write_contention_to_clean(self):
         import locks
@@ -193,11 +206,17 @@ class TestDoctor(BaseCase):
         with mock.patch.object(locks, "lease_holders", return_value=None), \
                 mock.patch.object(locks, "lease_registry_state_issue", return_value=None), \
                 mock.patch.object(locks, "is_locked", return_value=False):
-            status, message = doctor._check_locks(self.store, self._ctx())
-        self.assertEqual(status, doctor.OK)
-        self.assertIn("no live sessions", message)
-        self.assertNotIn("unreadable", message)
-        self.assertNotIn("live sessions: work", message)
+            for lang in ("en", "es"):
+                original = i18n._get_active()
+                try:
+                    i18n._set_active(lang)
+                    status, message = doctor._check_locks(self.store, self._ctx())
+                    self.assertEqual(status, doctor.OK)
+                    self.assertIn(i18n.t("doctor.locks.none"), message)
+                    self.assertNotIn("unreadable", message)
+                    self.assertNotIn(i18n.t("doctor.locks.live", names="work"), message)
+                finally:
+                    i18n._set_active(original)
 
     def test_locks_check_transition_from_write_contention_to_still_locked(self):
         import locks
@@ -206,10 +225,16 @@ class TestDoctor(BaseCase):
         with mock.patch.object(locks, "lease_holders", return_value=None), \
                 mock.patch.object(locks, "lease_registry_state_issue", return_value=None), \
                 mock.patch.object(locks, "is_locked", return_value=True):
-            status, message = doctor._check_locks(self.store, self._ctx())
-        self.assertEqual(status, doctor.WARN)
-        self.assertIn("live sessions: work", message)
-        self.assertNotIn("unreadable", message)
+            for lang in ("en", "es"):
+                original = i18n._get_active()
+                try:
+                    i18n._set_active(lang)
+                    status, message = doctor._check_locks(self.store, self._ctx())
+                    self.assertEqual(status, doctor.WARN)
+                    self.assertIn(i18n.t("doctor.locks.live", names="work"), message)
+                    self.assertNotIn("unreadable", message)
+                finally:
+                    i18n._set_active(original)
 
     def _secret_for(self, email):
         jwt = _make_jwt({"email": email})
@@ -644,14 +669,21 @@ class TestIsolationRecovery(BaseCase):
         isolation.build_overlay("alpha", self.store.profile_data_dir("alpha"), self.store.root)
         self.assertTrue(isolation._is_link(link))
 
-        output = io.StringIO()
-        with mock.patch.object(keychain, "supported", return_value=False), \
-                mock.patch.object(isolation, "migrate_real_dir_to_store") as migrate, \
-                contextlib.redirect_stderr(output):
-            doctor._apply_fixes(self.store, self._ctx())
+        for lang in ("en", "es"):
+            original = i18n._get_active()
+            try:
+                i18n._set_active(lang)
+                output = io.StringIO()
+                with mock.patch.object(keychain, "supported", return_value=False), \
+                        mock.patch.object(isolation, "migrate_real_dir_to_store") as migrate, \
+                        contextlib.redirect_stderr(output):
+                    doctor._apply_fixes(self.store, self._ctx())
 
-        migrate.assert_not_called()
-        self.assertNotIn("skipping overlay recovery", output.getvalue())
+                migrate.assert_not_called()
+                skip_prefix = i18n.t("doctor.fix.skip_overlay", name="alpha", reason="").split(":")[0].strip()
+                self.assertNotIn(skip_prefix, output.getvalue())
+            finally:
+                i18n._set_active(original)
 
     def test_fix_skips_overlay_recovery_when_profile_lock_is_held(self):
         import locks
