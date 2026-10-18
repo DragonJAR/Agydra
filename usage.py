@@ -322,9 +322,19 @@ def _close_http_error(exc: BaseException) -> None:
             pass
 
 
+MAX_USAGE_RESPONSE_BYTES = 1 << 20
+
+
 def _read_json_object_response(response, source: str) -> dict:
+    raw = response.read(MAX_USAGE_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_USAGE_RESPONSE_BYTES:
+        raise UsageResponseError(module_text(
+            'usage.response_too_large',
+            '{source} returned an oversized JSON response',
+            source=source,
+        ))
     try:
-        payload = json.loads(response.read().decode("utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise UsageResponseError(module_text(
             'usage.response_invalid_json',

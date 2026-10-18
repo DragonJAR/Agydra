@@ -139,7 +139,11 @@ def _unlink_with_retry(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def _atomic_replace(path: Path, write_payload, verify=None) -> None:
+def _atomic_replace(
+    path: Path,
+    write_payload: Callable[[BinaryIO, Path], None],
+    verify: Optional[Callable[[Path], None]] = None,
+) -> None:
     """Shared skeleton for every durable write in the store: unique tmp in
     ``path``'s dir, payload written and fsync'd, then a Windows-backoff
     ``os.replace``. ``write_payload(fh, tmp)`` fills the open tmp file; the

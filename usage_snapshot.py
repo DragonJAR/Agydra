@@ -397,12 +397,11 @@ def _parse_instant(value: Any) -> Optional[datetime]:
     Delegates to ``usage.parse_iso_utc``, the single timestamp parser every
     Agydra reader shares, so snapshot stamps can never drift from the
     quota reset and capture stamps the same document must stay comparable
-    with.
+    with. ``parse_iso_utc`` already normalizes every result to aware UTC,
+    so a second normalization pass here would only re-render the same
+    instant.
     """
-    parsed = usage.parse_iso_utc(value)
-    if parsed is None:
-        return None
-    return _aware_utc(parsed)
+    return usage.parse_iso_utc(value)
 
 
 def _normalized_engine(value: Any) -> Optional[str]:

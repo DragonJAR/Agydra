@@ -75,11 +75,6 @@ import platforms
 from store import StoreError, atomic_write_bytes
 from ui import warn
 
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
-
 SHARED_SERVICE = "gemini"
 SHARED_ACCOUNT = "antigravity"
 _SLOT_SERVICE_PREFIX = "gemini/agydra/"

@@ -103,7 +103,7 @@ class TestAud5mB3F3DoctorLinkPrimitive(BaseCase):
                                 f"Line {child.lineno}: strict is not True in {node.name}",
                             )
                             checked_calls += 1
-        self.assertEqual(checked_calls, 16)
+        self.assertEqual(checked_calls, 15)
 
     def test_doctor_check_isolation_fails_closed_on_link_inspection_error(self):
         st = Store(self.store_root)

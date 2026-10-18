@@ -220,9 +220,7 @@ class TestKeychainLoginCapture(unittest.TestCase):
                 keychain, "write_slot"
             ), mock.patch.object(
                 keychain, "save_profile_slot"
-            ) as save, mock.patch.object(
-                keychain, "fcntl"
-            ), mock.patch("account.record_profile_email") as record_email:
+            ) as save, mock.patch("account.record_profile_email") as record_email:
                 with keychain.launch_guard(store, "work", capture=True):
                     pass
             save.assert_called_once_with(

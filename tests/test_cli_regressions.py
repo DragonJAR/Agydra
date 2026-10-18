@@ -1210,7 +1210,7 @@ os._exit(0)
             ("profile", "old"),
             ("sequence", None),
         ]
-        if keychain.fcntl is not None:
+        if locks.fcntl is not None:
             expected_lock_order.append(("swap", None))
         self.assertEqual(recovery_events[:len(expected_lock_order)], expected_lock_order)
         self.assertEqual(native_calls, [keychain.profile_slot("old"), keychain.profile_slot("new")])
@@ -1305,11 +1305,12 @@ os._exit(0)
     def test_required_keychain_failures_keep_the_rename_intent(self):
         import cli
         import keychain
+        import locks
         from unittest import mock
 
         failures = (
             ("swap-lock", "durable-write")
-            if keychain.fcntl is not None
+            if locks.fcntl is not None
             else ("durable-write",)
         )
         for failure in failures:

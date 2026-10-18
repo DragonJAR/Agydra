@@ -984,7 +984,7 @@ def _usage_reset_time(raw: str, now: datetime) -> Optional[datetime]:
             if candidate <= local_now:
                 candidate += timedelta(days=1)
         return candidate.astimezone(timezone.utc)
-    except Exception:
+    except (ValueError, OverflowError, OSError, KeyError):
         return None
 
 

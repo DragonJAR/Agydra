@@ -99,11 +99,19 @@ def _check_store(store: Store, _ctx: "_DoctorContext"):
         fd, probe_name = _tempfile.mkstemp(
             dir=str(store.root), prefix=".write-probe.", suffix=".tmp"
         )
+        probe = Path(probe_name)
         try:
-            pass
-        finally:
             os.close(fd)
-            Path(probe_name).unlink()
+        except OSError:
+            try:
+                probe.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            probe.unlink(missing_ok=True)
     except OSError as exc:
         return FAIL, i18n.t("doctor.store.fail", path=store.root, error=exc)
     return OK, i18n.t("doctor.store.ok", path=store.root)
@@ -289,10 +297,12 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
         link_name = driver.data_dir_name
         overlay = store.overlays_dir / name
         data_link = overlay / link_name
-        if not data_link.exists() and not platforms.is_link(data_link, strict=True):
+        link_present = data_link.exists()
+        link_is_alias = platforms.is_link(data_link, strict=True)
+        if not link_present and not link_is_alias:
             pending.append(name)
             continue
-        if data_link.exists() and not platforms.is_link(data_link, strict=True):
+        if link_present and not link_is_alias:
             recoverable.append(name)
             continue
         if not isolation.link_points_to(data_link, data_dir):
@@ -313,28 +323,31 @@ def _check_isolation(store: Store, ctx: "_DoctorContext"):
     claude_orphans = store.claude_config_orphans(ctx.scan[0])
     if failures:
         return FAIL, i18n.t("doctor.isolation.broken", details="; ".join(failures))
+    warnings = []
     if claude_orphans:
-        return WARN, i18n.t(
+        warnings.append(i18n.t(
             "doctor.isolation.claude_orphans",
             entries=", ".join(
                 store_mod.store_relative_path("claude-config", n)
                 for n in claude_orphans
             ),
-        )
+        ))
     if recoverable:
-        return WARN, i18n.t(
+        warnings.append(i18n.t(
             "doctor.isolation.recoverable", names=", ".join(recoverable)
-        )
+        ))
     overlay_profiles = [
         n for n in profiles
         if getattr(profiles_by_name.get(n), "engine", "agy") != "claude"
     ]
+    if pending and len(pending) == len(overlay_profiles):
+        warnings.append(i18n.t(
+            "doctor.isolation.pending", names=", ".join(pending)
+        ))
+    if warnings:
+        return WARN, "\n".join(warnings)
     if not overlay_profiles:
         return OK, i18n.t("doctor.isolation.claude_only", count=len(profiles))
-    if pending and len(pending) == len(overlay_profiles):
-        return WARN, i18n.t(
-            "doctor.isolation.pending", names=", ".join(pending)
-        )
     note = (
         i18n.t("doctor.isolation.pending_note", names=", ".join(pending))
         if pending else ""
@@ -710,7 +723,7 @@ def _apply_fixes(store: Store, ctx: "_DoctorContext") -> None:
             continue
         try:
             repaired = store.repair_persistent_state(declaration.path)
-        except Exception as exc:
+        except (OSError, StoreError, ValueError, RecursionError) as exc:
             warn(i18n.t(
                 "doctor.fix.repair_failed",
                 name=_persistent_state_name(declaration.name),
