@@ -2173,7 +2173,7 @@ def _inspect_import_source_components(
             identity = (link_metadata.st_dev, link_metadata.st_ino)
             if identity in followed_links:
                 raise OSError(errno.ELOOP, str(current), str(current))
-            target = Path(os.readlink(current))
+            target = Path(platforms.read_link_target(current))
             destination = target if target.is_absolute() else current.parent / target
             _inspect_import_source_components(
                 destination, followed_links | frozenset((identity,))

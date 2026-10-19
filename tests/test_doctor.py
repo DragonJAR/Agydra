@@ -409,7 +409,7 @@ class TestDoctor(BaseCase):
         finally:
             holder.release()
         self.assertEqual(status, doctor.WARN)
-        hint = f"identify the holder with: lsof {lock_path}"
+        hint = keychain.lock_holder_hint(lock_path)
         self.assertIn(i18n.t("doctor.keychain.swap_held", hint=hint), message)
 
     def test_keychain_check_warns_when_swap_lock_probe_raises(self):
@@ -422,7 +422,7 @@ class TestDoctor(BaseCase):
                 ):
             status, message = doctor._check_keychain(self.store, self._ctx())
         self.assertEqual(status, doctor.WARN)
-        hint = f"identify the holder with: lsof {lock_path}"
+        hint = keychain.lock_holder_hint(lock_path)
         self.assertIn(i18n.t("doctor.keychain.swap_held", hint=hint), message)
 
     def test_keychain_check_reports_bridge_disabled_via_env(self):

@@ -1,4 +1,5 @@
 """Read and copy boundary regressions for the FYA sweep fix wave."""
+import ast
 import contextlib
 import io
 import json
@@ -396,6 +397,31 @@ class TestVerifiedCopy(BaseCase):
             result = cli.main(["import", "target", "--source", str(source)])
         self.assertEqual(result, 1)
         self.assertEqual(list(s.profile_data_dir("target", engine="codex").iterdir()), [])
+
+    def test_import_alias_walker_resolves_targets_through_the_shared_helper(self) -> None:
+        """Windows reads link targets with the extended-length prefix.
+
+        ``platforms.read_link_target`` owns that normalization, so the walker
+        must inspect the destination it yields: a raw ``os.readlink`` hands a
+        ``\\\\?\\`` path to the opaque-reparse guard as well as to every path
+        comparison downstream.
+        """
+        tree = ast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
+        walker = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_inspect_import_source_components"
+        )
+        owners = [
+            (child.func.value.id, child.func.attr)
+            for child in ast.walk(walker)
+            if isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and isinstance(child.func.value, ast.Name)
+        ]
+        self.assertEqual([pair for pair in owners if pair[1] == "readlink"], [])
+        self.assertEqual([pair for pair in owners if pair[1] == "read_link_target"],
+                         [("platforms", "read_link_target")])
 
     def test_import_alias_loop_is_a_clean_io_refusal(self) -> None:
         source = self._tmp / "loop"
