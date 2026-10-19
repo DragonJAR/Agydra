@@ -131,8 +131,8 @@ def _unlink_with_retry(path: Path) -> None:
 
     A transient holder (Windows AV/indexer, a still-closing descriptor) must
     never orphan a temp next to durable state; a persistent failure
-    propagates so the caller's cleanup swallow keeps it from masking the
-    original write error."""
+    propagates so ``_atomic_replace`` can chain it to the original write
+    error without replacing the primary failure."""
     try:
         path.unlink(missing_ok=True)
     except OSError:
@@ -143,6 +143,7 @@ def _atomic_replace(
     path: Path,
     write_payload: Callable[[BinaryIO, Path], None],
     verify: Optional[Callable[[Path], None]] = None,
+    before_replace: Optional[Callable[[], None]] = None,
 ) -> None:
     """Shared skeleton for every durable write in the store: unique tmp in
     ``path``'s dir, payload written and fsync'd, then a Windows-backoff
@@ -154,7 +155,9 @@ def _atomic_replace(
     propagates so the final name never holds an unverified write. The raw
     descriptor close and the failure-path unlink each get one transient
     retry so a momentarily-held handle leaks neither a descriptor nor a
-    temp file.
+    temp file. A persistent close retry failure never masks the active
+    fdopen error. ``before_replace``, when supplied, runs immediately before
+    every replace attempt.
 
     The tmp keeps mkstemp's 0600 (never widened) because backups written
     through this skeleton embed ``.secret`` material."""
@@ -177,16 +180,22 @@ def _atomic_replace(
                 try:
                     os.close(fd)
                 except OSError:
-                    os.close(fd)
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
         if verify is not None:
             verify(tmp)
-        _replace_with_retry(tmp_name, path)
-    except BaseException:
+        _replace_with_retry(tmp_name, path, before_attempt=before_replace)
+    except BaseException as original_error:
         try:
             os.chmod(tmp, 0o600)
-            _unlink_with_retry(tmp)
         except OSError:
             pass
+        try:
+            _unlink_with_retry(tmp)
+        except OSError as cleanup_error:
+            raise original_error from cleanup_error
         raise
 
 
@@ -205,11 +214,21 @@ def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
     atomic_write_bytes(path, text.encode(encoding))
 
 
-def _replace_with_retry(src: str, dst: Path, attempts: int = 3) -> None:
+def _replace_with_retry(
+    src: str,
+    dst: Path,
+    attempts: int = 3,
+    *,
+    before_attempt: Optional[Callable[[], None]] = None,
+) -> None:
     """os.replace with short retries: Windows AV/indexers transiently hold
     freshly written files with PermissionError; a brief backoff avoids a
     spurious failure that POSIX never sees."""
-    _retry_backoff(attempts, lambda: os.replace(src, dst))
+    _retry_backoff(
+        attempts,
+        lambda: os.replace(src, dst),
+        before_attempt=before_attempt,
+    )
 
 
 def rename_dir_with_retry(src: Path, dst: Path, attempts: int = 3) -> None:
@@ -224,12 +243,20 @@ def rename_dir_with_retry(src: Path, dst: Path, attempts: int = 3) -> None:
     _retry_backoff(attempts, lambda: os.rename(src, dst))
 
 
-def _retry_backoff(attempts: int, op, delay: float = 0.05) -> None:
+def _retry_backoff(
+    attempts: int,
+    op,
+    delay: float = 0.05,
+    *,
+    before_attempt: Optional[Callable[[], None]] = None,
+) -> None:
     """Shared transient-PermissionError policy for every rename/replace in
     the store: N attempts, linear backoff, re-raise on the last attempt.
     One place to tune backoff so file writes and dir renames never diverge
     (they hit the same Windows AV/indexer behavior)."""
     for attempt in range(attempts):
+        if before_attempt is not None:
+            before_attempt()
         try:
             op()
             return
@@ -401,7 +428,12 @@ def atomic_copy(
         validate_source()
 
     validate_source()
-    _atomic_replace(dest, payload, lambda _tmp: validate_source())
+    _atomic_replace(
+        dest,
+        payload,
+        lambda _tmp: validate_source(),
+        before_replace=validate_source,
+    )
 
 
 def _chmod_path_without_following(
@@ -757,7 +789,11 @@ def _has_backup_worthy_content(
     if store is not None and name is not None:
         import keychain
 
-        return keychain.slot_backup_path(store, name).is_file()
+        try:
+            keychain._require_keychain_dir(store, error_cls=StoreError)
+            return keychain.slot_backup_path(store, name).is_file()
+        except (keychain.KeychainError, StoreError):
+            return False
     return False
 
 
@@ -1123,23 +1159,30 @@ class Store:
                 path, max_bytes=MAX_STATE_QUARANTINE_BYTES
             )
             require_file_snapshot(path, snapshot)
-            try:
-                document = locks.json_loads_utf8(raw)
-                if isinstance(document, dict):
-                    validate(document)
-                else:
-                    raise ValueError("state must be a JSON object")
-            except (ValueError, TypeError, AttributeError, RecursionError, StoreError):
-                pass
+        except OSError as exc:
+            raise StoreError(_store_text(
+                "store.state.quarantine_read_failed", path=path, error=exc
+            )) from exc
+        try:
+            document = locks.json_loads_utf8(raw)
+            if isinstance(document, dict):
+                validate(document)
             else:
-                return False
+                raise ValueError("state must be a JSON object")
+        except (ValueError, TypeError, AttributeError, RecursionError, StoreError):
+            pass
+        else:
+            return False
+        try:
             require_file_snapshot(path, snapshot)
             self.quarantine_state_bytes(path, raw)
             require_file_snapshot(path, snapshot)
             mutate()
+        except StoreError:
+            raise
         except OSError as exc:
             raise StoreError(_store_text(
-                "store.state.quarantine_read_failed", path=path, error=exc
+                "store.state.quarantine_mutation_failed", path=path, error=exc
             )) from exc
         return True
 
@@ -3170,6 +3213,7 @@ class Store:
                 elif claude_config is None and "_keychain" not in excluded_set:
                     import keychain
 
+                    keychain._require_keychain_dir(self, error_cls=StoreError)
                     secret = keychain.slot_backup_path(self, name)
                     if secret.is_file():
                         _zip_add_file(

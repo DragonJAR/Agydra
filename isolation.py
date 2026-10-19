@@ -432,6 +432,22 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
             else:
                 store.require_file_snapshot(path, metadata)
 
+    def require_migrated_file_matches_source(
+        source: Path, target: Path, source_metadata: os.stat_result,
+        target_metadata: os.stat_result,
+    ) -> None:
+        if not store.regular_files_equal(
+            source,
+            target,
+            expected_source=source_metadata,
+            expected_target=target_metadata,
+        ):
+            raise OSError(errno.EIO, module_text(
+                'isolation.migrated_file_does_not_match_source',
+                'migrated file {target} does not match source {entry}',
+                entry=source, target=target,
+            ), str(target))
+
     try:
         validate_source_tree()
         for source, metadata in source_plan.items():
@@ -460,7 +476,11 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
                 store.atomic_copy(
                     source, target, expected_source=metadata, before_publish=before_publish
                 )
-                target_files[target] = store.regular_file_snapshot(target)
+                target_metadata = store.regular_file_snapshot(target)
+                require_migrated_file_matches_source(
+                    source, target, metadata, target_metadata
+                )
+                target_files[target] = target_metadata
         for source, metadata in reversed(list(source_plan.items())):
             if source != real_dir and stat.S_ISDIR(metadata.st_mode):
                 target = data_dir / source.relative_to(real_dir)
@@ -473,7 +493,10 @@ def migrate_real_dir_to_store(real_dir: Path, data_dir: Path) -> None:
         for directory, metadata in target_directories.items():
             directory_unchanged(directory, metadata)
         for target, metadata in target_files.items():
-            store.require_file_snapshot(target, metadata)
+            source = real_dir / target.relative_to(data_dir)
+            require_migrated_file_matches_source(
+                source, target, source_plan[source], metadata
+            )
     except OSError as exc:
         raise IsolationError(module_text(
             'isolation.could_not_copy_overlay_data_from_into_the_profile',

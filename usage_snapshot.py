@@ -52,7 +52,8 @@ _TRUSTED_QUALITIES = frozenset({None, "observed"})
 
 def _utc_iso(value: datetime) -> str:
     """ISO-8601 UTC with millisecond precision, matching the store's stamps."""
-    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+    utc_value = value if value.tzinfo is timezone.utc else value.astimezone(timezone.utc)
+    return utc_value.isoformat(timespec="milliseconds")
 
 
 def _iso_or_none(value: Optional[datetime]) -> Optional[str]:

@@ -60,7 +60,6 @@ import os
 import re
 import shlex
 import shutil
-import stat
 import subprocess
 import tempfile
 import threading
@@ -475,8 +474,28 @@ def _slots_dir(store) -> Path:
     return store.root / "keychain"
 
 
+def _require_keychain_dir(
+    store, *, create: bool = False, error_cls: type[Exception] = KeychainError
+) -> Path:
+    path = _slots_dir(store)
+    try:
+        linked = platforms.is_link(path, strict=True)
+    except OSError as exc:
+        raise error_cls(
+            f"cannot inspect keychain directory ({type(exc).__name__})"
+        ) from None
+    if linked:
+        raise error_cls(f"keychain directory must not be a symlink or junction: {path}")
+    if path.exists() and not path.is_dir():
+        raise error_cls(f"keychain directory must be a directory: {path}")
+    if create:
+        platforms.ensure_dir(path)
+    return path
+
+
 def swap_lock_path(store) -> Path:
     """The one file every shared-slot swap section serializes on."""
+    _require_keychain_dir(store)
     return _slots_dir(store) / "swap.lock"
 
 
@@ -508,6 +527,7 @@ def slot_backup_path(store, name: str) -> Path:
 
 
 def save_profile_slot(store, name: str, data: bytes) -> None:
+    _require_keychain_dir(store, create=True)
     atomic_write_bytes(slot_backup_path(store, name), data)
 
 
@@ -649,6 +669,11 @@ def _quarantine_profile_slot(store, name: str) -> Optional[Path]:
     exist. Fail-open like the rest of the module: an OSError here warns
     and leaves the original file in place rather than raising.
     """
+    try:
+        _require_keychain_dir(store)
+    except KeychainError as exc:
+        warn(f"could not quarantine keychain slot for {name!r} ({exc})")
+        return None
     path = slot_backup_path(store, name)
     if not path.exists():
         return None
@@ -961,6 +986,10 @@ def _load_slot_lease(store) -> SlotLeaseState:
     """
     path = _slot_lease_path(store)
     try:
+        _require_keychain_dir(store)
+    except KeychainError as exc:
+        raise CorruptSlotLeaseError(path) from exc
+    try:
         raw = platforms.read_regular_file_no_follow(
             path, max_bytes=platforms.MAX_REGULAR_FILE_BYTES
         )
@@ -1017,6 +1046,7 @@ def _save_slot_lease(
     """Persist the slot lease atomically. Caller must hold ``swap.lock``:
     the swap lock is the write mutex, ``atomic_write_bytes`` only keeps
     the file itself from ever being observed half-written."""
+    _require_keychain_dir(store, create=True)
     record = {
         "owner": owner,
         "had_shared": (
@@ -1442,9 +1472,42 @@ def rename_profile_slot(
         )
 
 
+def _retire_validated_slot(path: Path, before: os.stat_result, name: str) -> None:
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    retired = path.with_name(f"{path.name}.retire-{stamp}")
+    counter = 2
+    while retired.exists():
+        retired = path.with_name(f"{path.name}.retire-{stamp}.{counter}")
+        counter += 1
+    path.replace(retired)
+    try:
+        current = retired.lstat()
+        match = (
+            current.st_dev == before.st_dev
+            and current.st_ino == before.st_ino
+            and current.st_size == before.st_size
+            and current.st_mtime_ns == before.st_mtime_ns
+        )
+    except OSError as exc:
+        raise KeychainError(
+            f"cannot verify retired keychain slot for {name!r} ({type(exc).__name__})"
+        ) from exc
+    if not match:
+        if not path.exists():
+            try:
+                retired.replace(path)
+            except OSError:
+                pass
+        raise KeychainError(
+            f"keychain slot state for {name!r} changed before removal"
+        )
+    retired.unlink()
+
+
 def rename_profile_slot_recovery_data(store, old_name: str, new_name: str) -> dict:
     if old_name == new_name:
         raise KeychainError("cannot recover a keychain slot rename to the same name")
+    _require_keychain_dir(store)
     old = slot_backup_path(store, old_name)
     source_present = _regular_slot_present(old, old_name)
     return {"source_present": source_present}
@@ -1484,6 +1547,7 @@ def _rename_profile_slot_unlocked(
     keychain_supported: bool,
     source_present: Optional[bool],
 ) -> None:
+    _require_keychain_dir(store)
     old = slot_backup_path(store, old_name)
     new = slot_backup_path(store, new_name)
     if source_present is None:
@@ -1500,7 +1564,7 @@ def _rename_profile_slot_unlocked(
             platforms.ensure_dir(new.parent)
             atomic_write_bytes(new, data)
             account.require_private_credential_unchanged(old, before)
-            old.unlink()
+            _retire_validated_slot(old, before, old_name)
         elif not _regular_slot_present(new, new_name):
             raise KeychainError(
                 f"migrated keychain slot for {new_name!r} is missing"
@@ -1524,8 +1588,9 @@ def purge_profile_slot(store, name: str) -> None:
     keychain entry. delete must not leak either — leaving the system keychain
     entry behind after a profile wipe was a silent leak until now."""
     try:
+        _require_keychain_dir(store)
         slot_backup_path(store, name).unlink(missing_ok=True)
-    except OSError as exc:
+    except (KeychainError, OSError) as exc:
         warn(f"could not purge keychain slot for {name!r} ({exc})")
     if supported():
         try:

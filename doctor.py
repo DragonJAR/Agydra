@@ -106,7 +106,10 @@ def _check_store(store: Store, _ctx: "_DoctorContext"):
             try:
                 probe.unlink(missing_ok=True)
             except OSError:
-                pass
+                try:
+                    probe.unlink(missing_ok=True)
+                except OSError:
+                    pass
             raise
         try:
             probe.unlink(missing_ok=True)

@@ -979,6 +979,8 @@ def _usage_reset_time(raw: str, now: datetime) -> Optional[datetime]:
             candidate = datetime(year, month, int(match.group("day")), hour, minute, tzinfo=zone)
             if not match.group("year") and candidate < local_now - timedelta(days=1):
                 candidate = candidate.replace(year=year + 1)
+            if not match.group("year") and candidate <= local_now:
+                return None
         else:
             candidate = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if candidate <= local_now:

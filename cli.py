@@ -935,7 +935,15 @@ def _usage_progress_width(names: Sequence[str]) -> int:
         60,
         max(
             (
-                len(f"checking {name}... ({index}/{len(names)})")
+                len(
+                    i18n.t(
+                        "usage.progress_checking",
+                        name=name,
+                        index=index,
+                        total=len(names),
+                        default=f"checking {name}... ({index}/{len(names)})",
+                    )
+                )
                 for index, name in enumerate(names, start=1)
             ),
             default=0,
@@ -2144,11 +2152,39 @@ def _import_source_metadata(path: Path) -> os.stat_result:
     return metadata
 
 
+def _inspect_import_source_components(
+    path: Path, followed_links: frozenset[object] = frozenset()
+) -> None:
+    path = Path(path)
+    if not path.is_absolute():
+        path = path.absolute()
+    current = Path(path.anchor)
+    _import_source_metadata(current)
+    for component in path.parts[1:]:
+        if component == "..":
+            current = current / component
+            continue
+        current = current / component
+        linked = platforms.is_link(current, strict=True)
+        if linked:
+            if not current.is_symlink():
+                raise platforms.FileLinkError(errno.ELOOP, str(current), str(current))
+            link_metadata = current.lstat()
+            identity = (link_metadata.st_dev, link_metadata.st_ino)
+            if identity in followed_links:
+                raise OSError(errno.ELOOP, str(current), str(current))
+            target = Path(os.readlink(current))
+            destination = target if target.is_absolute() else current.parent / target
+            _inspect_import_source_components(
+                destination, followed_links | frozenset((identity,))
+            )
+        _import_source_metadata(current)
+
+
 def _resolve_import_source(path: Path) -> Path:
     """Resolve intentional import aliases after inspecting their ancestor chain."""
     path = path.absolute()
-    for entry in (path, *path.parents):
-        _import_source_metadata(entry)
+    _inspect_import_source_components(path)
     try:
         return path.resolve(strict=True)
     except RuntimeError as exc:
@@ -2388,7 +2424,7 @@ def cmd_import(store: Store, args) -> int:
             _resolve_import_source(Path(directory))
             for entry in names:
                 if entry not in excluded:
-                    _import_source_metadata(Path(directory) / entry)
+                    _resolve_import_source(Path(directory) / entry)
             return excluded
 
         try:

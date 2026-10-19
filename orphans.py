@@ -104,7 +104,12 @@ class OrphanScan:
 
 
 def _real_directory(path: Path) -> bool:
-    return path.is_dir() and not platforms.is_link(path)
+    try:
+        if platforms.is_link(path, strict=True):
+            return False
+    except OSError:
+        return False
+    return path.is_dir()
 
 
 def find_orphans(store, names: Iterable[str]) -> OrphanScan:
@@ -133,8 +138,12 @@ def find_orphans(store, names: Iterable[str]) -> OrphanScan:
             if entry.name not in known:
                 scan.overlays.append(entry.name)
 
-    keychain_dir = keychain._slots_dir(store)
-    if _real_directory(keychain_dir):
+    try:
+        keychain_dir = keychain._require_keychain_dir(store)
+        keychain_ok = _real_directory(keychain_dir)
+    except (keychain.KeychainError, store_mod.StoreError):
+        keychain_ok = False
+    if keychain_ok:
         for entry in sorted(keychain_dir.glob(f"*{_SECRET_SUFFIX}")):
             name = entry.name[: -len(_SECRET_SUFFIX)]
             if _valid_profile_name(store, name) and name not in known:
@@ -184,7 +193,11 @@ def remove_orphans(store, scan: OrphanScan) -> List[str]:
     earlier holder still owns the original inode.
     """
     removed: List[str] = []
-    keychain_root_ok = _real_directory(keychain._slots_dir(store))
+    try:
+        keychain._require_keychain_dir(store)
+        keychain_root_ok = _real_directory(keychain._slots_dir(store))
+    except (keychain.KeychainError, store_mod.StoreError):
+        keychain_root_ok = False
     scan = OrphanScan(
         overlays=scan.overlays if _real_directory(store.overlays_dir) else [],
         keychain_secrets=scan.keychain_secrets if keychain_root_ok else [],
@@ -246,17 +259,25 @@ def remove_orphans(store, scan: OrphanScan) -> List[str]:
             if not keychain_supported or keychain_lock is not None:
                 try:
                     if name in scan.keychain_secrets:
-                        _unlink_if_present(
-                            keychain.slot_backup_path(store, name),
-                            f"keychain secret: {name}",
-                            removed,
-                        )
+                        try:
+                            keychain._require_keychain_dir(store)
+                            _unlink_if_present(
+                                keychain.slot_backup_path(store, name),
+                                f"keychain secret: {name}",
+                                removed,
+                            )
+                        except (keychain.KeychainError, store_mod.StoreError):
+                            pass
                     for filename in quarantine_names:
-                        _unlink_if_present(
-                            keychain._slots_dir(store) / filename,
-                            f"keychain quarantine: {filename}",
-                            removed,
-                        )
+                        try:
+                            keychain._require_keychain_dir(store)
+                            _unlink_if_present(
+                                keychain._slots_dir(store) / filename,
+                                f"keychain quarantine: {filename}",
+                                removed,
+                            )
+                        except (keychain.KeychainError, store_mod.StoreError):
+                            pass
                 finally:
                     if keychain_lock is not None:
                         keychain_lock.release()

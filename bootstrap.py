@@ -674,22 +674,15 @@ def ensure_path_shim(
             _remove_shim_link_entry(shim)
         elif _shim_entry_exists(shim):
             body = _read_shim_safe(shim)
-            if body is None:
-                if not force:
-                    raise BootstrapError(
-                        f"refusing to overwrite foreign file at {shim}; "
-                        "inspect it and remove it manually, then re-run setup (or use --force)"
-                    )
-                body = ""
+            if (body is None or SHIM_MARKER not in body) and not force:
+                raise BootstrapError(
+                    f"refusing to overwrite foreign file at {shim}; "
+                    "inspect it and remove it manually, then re-run setup (or use --force)"
+                )
             if body == content and os.access(shim, os.X_OK):
                 out(_t("setup.step.shim_installed", shim=shim, target=target))
                 return shim
             if body != content:
-                if SHIM_MARKER not in body and not force:
-                    raise BootstrapError(
-                        f"refusing to overwrite foreign file at {shim}; "
-                        "inspect it and remove it manually, then re-run setup (or use --force)"
-                    )
                 curr_target = shim_target(shim)
                 if curr_target is not None and curr_target.exists():
                     if not explicit and not force:
