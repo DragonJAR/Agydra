@@ -39,7 +39,14 @@ import usage
 SNAPSHOT_FILENAME = "usage-latest.json"
 SCHEMA_VERSION = 1
 MAX_QUOTA_AGE_SECONDS = 900
-"""Oldest observation :func:`profile_quota_availability` still trusts."""
+"""Oldest observation :func:`profile_quota_availability` still trusts for five-hour windows."""
+MAX_WEEKLY_QUOTA_AGE_SECONDS = 86400
+"""Oldest observation :func:`profile_quota_availability` still trusts for weekly windows.
+
+The weekly window moves slowly and carries its own reset, so it remains
+trustworthy until its reset (bounded by one day), while the five-hour window
+retains 900 seconds.
+"""
 
 _QUOTA_SUMMARY_FAMILIES = {
     "agy": ("gemini", "claude"),
@@ -158,11 +165,13 @@ def _result_entry(result: Any) -> Dict[str, Any]:
 
 
 def _summary_entry(result: Any) -> Dict[str, Any]:
-    """The one availability figure the CLI's own recommendation uses.
+    """The availability figures and window resets used for profile rotation and display.
 
-    Reuses ``usage.extract_model_summary`` rather than re-deriving the
-    min(weekly, 5h) bottleneck, so the snapshot and the terminal output can
-    never disagree about which account to use.
+    Stores the CLI's bottleneck availability alongside per-window fractions,
+    individual reset instants ('weekly_reset_at' and 'five_hour_reset_at'),
+    and the 'weekly_seeded' boolean flag extracted from
+    ``usage.extract_model_summary``, preserving the combined 'reset_at' for
+    compatibility and terminal rendering.
     """
     from usage import extract_model_summary
 
@@ -173,6 +182,9 @@ def _summary_entry(result: Any) -> Dict[str, Any]:
             "weekly": _fraction_or_none(values.get("weekly")),
             "five_hour": _fraction_or_none(values.get("five_h")),
             "reset_at": _iso_or_none(values.get("reset_time")),
+            "weekly_reset_at": _iso_or_none(values.get("weekly_reset")),
+            "five_hour_reset_at": _iso_or_none(values.get("five_h_reset")),
+            "weekly_seeded": bool(values.get("weekly_seeded", False)),
         }
         for family, values in summary.items()
     }
@@ -452,6 +464,18 @@ def _matching_entry(
     return entry
 
 
+def _has_window_reset_keys(summary: Any) -> bool:
+    """True when at least one family in ``summary`` includes window reset fields."""
+    if not isinstance(summary, Mapping):
+        return False
+    for values in summary.values():
+        if isinstance(values, Mapping) and (
+            "weekly_reset_at" in values or "five_hour_reset_at" in values
+        ):
+            return True
+    return False
+
+
 def _entry_is_trustworthy(
     entry: Mapping[str, Any], engine: str, generated: datetime, now: datetime
 ) -> bool:
@@ -459,7 +483,10 @@ def _entry_is_trustworthy(
 
     A Claude reading additionally needs ``identity_verified`` to be exactly
     ``True``: statusLine snapshots never identify the account, so only a
-    verified live reading may drive a recommendation.
+    verified live reading may drive a recommendation. The observation must
+    not be future-dated and must satisfy the ceiling of its document schema:
+    up to ``MAX_WEEKLY_QUOTA_AGE_SECONDS`` when window reset fields are
+    present, or ``MAX_QUOTA_AGE_SECONDS`` for legacy snapshots.
     """
     if entry.get("stale") is not False or entry.get("ok") is not True:
         return False
@@ -473,25 +500,97 @@ def _entry_is_trustworthy(
     instant = _parse_instant(observed) if observed is not None else generated
     if instant is None or instant > now:
         return False
-    return now - instant <= timedelta(seconds=MAX_QUOTA_AGE_SECONDS)
+    max_age_seconds = (
+        MAX_WEEKLY_QUOTA_AGE_SECONDS
+        if _has_window_reset_keys(entry.get("summary"))
+        else MAX_QUOTA_AGE_SECONDS
+    )
+    return now - instant <= timedelta(seconds=max_age_seconds)
 
 
-def _family_availability(summary: Any, family: str, now: datetime) -> Optional[float]:
-    """One family's remaining fraction from the stored summary, if still valid."""
+def _window_is_useful(
+    fraction: Optional[float],
+    reset_raw: Any,
+    fallback_reset_raw: Any,
+    age: timedelta,
+    max_age_seconds: int,
+    now: datetime,
+) -> bool:
+    """True when a quota window fraction exists, is not expired, and is fresh."""
+    if fraction is None or age > timedelta(seconds=max_age_seconds):
+        return False
+    reset_to_check = reset_raw if reset_raw is not None else fallback_reset_raw
+    if reset_to_check is not None:
+        reset_instant = _parse_instant(reset_to_check)
+        if reset_instant is None or reset_instant <= now:
+            return False
+    return True
+
+
+def _family_availability(
+    summary: Any,
+    family: str,
+    now: datetime,
+    instant: Optional[datetime] = None,
+) -> Optional[float]:
+    """One family's remaining fraction from the stored summary, if still valid.
+
+    Evaluates each window independently against its freshness ceiling
+    (five-hour at 900 seconds, weekly at 86400 seconds for explicit readings
+    or 900 seconds when derived/seeded) and reset instant. Returns the minimum
+    remaining fraction across useful windows, or None when no window remains
+    useful. For legacy snapshots without window reset keys, retains the
+    legacy 900-second rule across all windows.
+    """
     if not isinstance(summary, Mapping):
         return None
     values = summary.get(family)
     if not isinstance(values, Mapping):
         return None
-    available = _fraction_or_none(values.get("available"))
-    if available is None:
+    observation_instant = instant if instant is not None else now
+    if observation_instant > now:
         return None
-    reset = values.get("reset_at")
-    if reset is not None:
-        reset_instant = _parse_instant(reset)
-        if reset_instant is None or reset_instant <= now:
+    age = now - observation_instant
+    has_window_keys = "weekly_reset_at" in values or "five_hour_reset_at" in values
+    if not has_window_keys:
+        if age > timedelta(seconds=MAX_QUOTA_AGE_SECONDS):
             return None
-    return available
+        available = _fraction_or_none(values.get("available"))
+        if available is None:
+            return None
+        reset = values.get("reset_at")
+        if reset is not None:
+            reset_instant = _parse_instant(reset)
+            if reset_instant is None or reset_instant <= now:
+                return None
+        return available
+    useful = []
+    five_h = _fraction_or_none(values.get("five_hour"))
+    if _window_is_useful(
+        five_h,
+        values.get("five_hour_reset_at"),
+        values.get("reset_at"),
+        age,
+        MAX_QUOTA_AGE_SECONDS,
+        now,
+    ):
+        useful.append(five_h)
+    weekly = _fraction_or_none(values.get("weekly"))
+    weekly_max_age = (
+        MAX_QUOTA_AGE_SECONDS
+        if values.get("weekly_seeded") is True
+        else MAX_WEEKLY_QUOTA_AGE_SECONDS
+    )
+    if _window_is_useful(
+        weekly,
+        values.get("weekly_reset_at"),
+        values.get("reset_at"),
+        age,
+        weekly_max_age,
+        now,
+    ):
+        useful.append(weekly)
+    return min(useful) if useful else None
 
 
 def _snapshot_context(
@@ -527,10 +626,14 @@ def _availability_in_snapshot(
         entry = _matching_entry(document, seq, engine, getattr(profile, "name", None), index=index)
         if entry is None or not _entry_is_trustworthy(entry, engine, generated, current):
             return None
+        observed = entry.get("observed_at")
+        instant = _parse_instant(observed) if observed is not None else generated
+        if instant is None or instant > current:
+            return None
         readings = [
             reading
             for reading in (
-                _family_availability(entry.get("summary"), family, current)
+                _family_availability(entry.get("summary"), family, current, instant)
                 for family in families
             )
             if reading is not None
@@ -572,17 +675,17 @@ def profile_quota_availability(
 ) -> Optional[float]:
     """Remaining quota fraction (0..1) for ``profile``, or ``None`` if unknown.
 
-    Reads only ``usage-latest.json`` and reuses the stored ``summary``
-    figures (the CLI's own min(weekly, 5h) bottleneck) instead of
-    re-deriving them. The profile is matched by immutable ``seq`` and
-    normalized engine; a legacy ``seq == 0`` profile matches the single
+    Reads only ``usage-latest.json`` and evaluates availability per window
+    instead of re-deriving it. The profile is matched by immutable ``seq``
+    and normalized engine; a legacy ``seq == 0`` profile matches the single
     ``seq == 0`` entry with the same normalized engine and name. Anything
     unusable is unknown, never a guess: a missing, malformed or mismatched
     document or entry, an error or ineligible result, an explicitly stale
-    carried entry, an untrusted quality, a non-finite or out-of-range
-    figure, a future-dated or expired-window reading, or an observation
-    older than ``MAX_QUOTA_AGE_SECONDS``. ``agy`` takes the best valid
-    family among its gemini/claude summaries. Claude additionally needs
-    ``identity_verified is True``.
+    carried entry, an untrusted quality, a non-finite or out-of-range figure,
+    a future-dated observation, or windows exceeding their freshness ceilings
+    (900 seconds for the five-hour window, seeded weekly windows, and legacy
+    snapshots; 86400 seconds for explicit weekly windows) or whose reset has
+    passed. ``agy`` takes the best valid family among its gemini/claude
+    summaries. Claude additionally needs ``identity_verified is True``.
     """
     return profile_quota_availabilities(store, [profile], now)[0]

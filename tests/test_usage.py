@@ -548,6 +548,65 @@ class TestUsageRenderingHelpers(unittest.TestCase):
         self.assertEqual(summary["grok"]["weekly"], 0.0)
         self.assertEqual(summary["grok"]["available"], 0.0)
 
+    def test_extract_model_summary_weekly_seeded_when_five_hour_alone(self):
+        """A lone five-hour bucket seeds the weekly window with weekly_seeded=True."""
+        groups = [
+            usage.UsageGroup(
+                name="Gemini Models",
+                buckets=[
+                    usage.UsageBucket("gemini-5h", "5H", "5h", 0.72, None),
+                ],
+            ),
+        ]
+        summary = usage.extract_model_summary(groups)
+        self.assertEqual(summary["gemini"]["five_h"], 0.72)
+        self.assertEqual(summary["gemini"]["weekly"], 0.72)
+        self.assertIs(summary["gemini"].get("weekly_seeded"), True)
+
+    def test_extract_model_summary_explicit_weekly_clears_seeded_flag_in_any_order(self):
+        """Explicit weekly arrival clears weekly_seeded to False regardless of arrival order."""
+        groups_five_h_first = [
+            usage.UsageGroup(
+                name="Gemini Models",
+                buckets=[
+                    usage.UsageBucket("gemini-5h", "5H", "5h", 0.40, None),
+                    usage.UsageBucket("gemini-weekly", "W", "weekly", 0.85, None),
+                ],
+            ),
+        ]
+        summary_five_h_first = usage.extract_model_summary(groups_five_h_first)
+        self.assertEqual(summary_five_h_first["gemini"]["five_h"], 0.40)
+        self.assertEqual(summary_five_h_first["gemini"]["weekly"], 0.85)
+        self.assertIs(summary_five_h_first["gemini"].get("weekly_seeded"), False)
+
+        groups_weekly_first = [
+            usage.UsageGroup(
+                name="Gemini Models",
+                buckets=[
+                    usage.UsageBucket("gemini-weekly", "W", "weekly", 0.85, None),
+                    usage.UsageBucket("gemini-5h", "5H", "5h", 0.40, None),
+                ],
+            ),
+        ]
+        summary_weekly_first = usage.extract_model_summary(groups_weekly_first)
+        self.assertEqual(summary_weekly_first["gemini"]["five_h"], 0.40)
+        self.assertEqual(summary_weekly_first["gemini"]["weekly"], 0.85)
+        self.assertIs(summary_weekly_first["gemini"].get("weekly_seeded"), False)
+
+    def test_extract_model_summary_direct_explicit_weekly_seeded_flag(self):
+        """A direct explicit weekly reading has weekly_seeded False or absent."""
+        groups = [
+            usage.UsageGroup(
+                name="Gemini Models",
+                buckets=[
+                    usage.UsageBucket("gemini-weekly", "W", "weekly", 0.90, None),
+                ],
+            ),
+        ]
+        summary = usage.extract_model_summary(groups)
+        self.assertEqual(summary["gemini"]["weekly"], 0.90)
+        self.assertIn(summary["gemini"].get("weekly_seeded"), (False, None))
+
 
     def test_parse_codex_usage_payload_success(self):
         payload = {

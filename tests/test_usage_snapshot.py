@@ -205,6 +205,27 @@ class SnapshotDocumentTests(unittest.TestCase):
         self.assertEqual(summary["available"], 0.3)
         self.assertEqual(summary["weekly"], 0.9)
         self.assertEqual(summary["five_hour"], 0.3)
+        self.assertIn("weekly_reset_at", summary)
+        self.assertIn("five_hour_reset_at", summary)
+        self.assertIn("reset_at", summary)
+
+    def test_summary_includes_strict_json_boolean_weekly_seeded(self):
+        """Every family summary persists weekly_seeded as strict bool."""
+        document = usage_snapshot.build_snapshot(
+            self.store,
+            profiles=[
+                Profile(name="neto", seq=1, engine="agy"),
+                Profile(name="cc", seq=2, engine="claude"),
+            ],
+            results=[_agy_result("neto"), _claude_result("cc")],
+            now=NOW,
+        )
+        serialized = json.dumps(document)
+        parsed = json.loads(serialized)
+        for profile_entry in parsed["profiles"]:
+            for family_name, family_vals in profile_entry["summary"].items():
+                self.assertIn("weekly_seeded", family_vals)
+                self.assertIsInstance(family_vals["weekly_seeded"], bool)
 
     def test_non_finite_values_are_dropped_not_serialized(self):
         """NaN/inf would break a strict JSON parser downstream."""
@@ -521,6 +542,312 @@ class SnapshotStoreIntegrationTests(BaseCase):
                 [],
             )
             read_snapshot.assert_not_called()
+
+    def test_window_freshness_and_usability(self):
+        """Weekly window remains trustworthy up to 86400s until reset; 5h retains 900s."""
+        p_weekly = self.store.create("p-weekly", engine="codex")
+        p_expired_reset = self.store.create("p-expired-reset", engine="codex")
+        p_legacy = self.store.create("p-legacy", engine="codex")
+        p_edge_86400 = self.store.create("p-edge-86400", engine="codex")
+        p_edge_86401 = self.store.create("p-edge-86401", engine="codex")
+        p_edge_reset_now = self.store.create("p-edge-reset-now", engine="codex")
+        p_five_h_unusable = self.store.create("p-five-h-unusable", engine="codex")
+
+        obs_1h = NOW - timedelta(hours=1)
+        obs_5m = NOW - timedelta(minutes=5)
+        reset_3d = NOW + timedelta(days=3)
+        reset_past = NOW - timedelta(minutes=10)
+
+        entries = [
+            {
+                "name": p_weekly.name,
+                "seq": p_weekly.seq,
+                "engine": "codex",
+                "ok": True,
+                "error": None,
+                "stale": False,
+                "quality": "observed",
+                "observed_at": obs_1h.isoformat(),
+                "summary": {
+                    "codex": {
+                        "available": 0.4,
+                        "weekly": 0.4,
+                        "five_hour": 1.0,
+                        "reset_at": reset_3d.isoformat(),
+                        "weekly_reset_at": reset_3d.isoformat(),
+                        "five_hour_reset_at": (obs_1h + timedelta(hours=5)).isoformat(),
+                    }
+                },
+            },
+            {
+                "name": p_expired_reset.name,
+                "seq": p_expired_reset.seq,
+                "engine": "codex",
+                "ok": True,
+                "error": None,
+                "stale": False,
+                "quality": "observed",
+                "observed_at": obs_1h.isoformat(),
+                "summary": {
+                    "codex": {
+                        "available": 0.4,
+                        "weekly": 0.4,
+                        "five_hour": 1.0,
+                        "reset_at": reset_past.isoformat(),
+                        "weekly_reset_at": reset_past.isoformat(),
+                        "five_hour_reset_at": (obs_1h + timedelta(hours=5)).isoformat(),
+                    }
+                },
+            },
+            {
+                "name": p_edge_86400.name,
+                "seq": p_edge_86400.seq,
+                "engine": "codex",
+                "ok": True,
+                "error": None,
+                "stale": False,
+                "quality": "observed",
+                "observed_at": (NOW - timedelta(seconds=86400)).isoformat(),
+                "summary": {
+                    "codex": {
+                        "available": 0.4,
+                        "weekly": 0.4,
+                        "five_hour": 1.0,
+                        "reset_at": reset_3d.isoformat(),
+                        "weekly_reset_at": reset_3d.isoformat(),
+                        "five_hour_reset_at": reset_3d.isoformat(),
+                    }
+                },
+            },
+            {
+                "name": p_edge_86401.name,
+                "seq": p_edge_86401.seq,
+                "engine": "codex",
+                "ok": True,
+                "error": None,
+                "stale": False,
+                "quality": "observed",
+                "observed_at": (NOW - timedelta(seconds=86401)).isoformat(),
+                "summary": {
+                    "codex": {
+                        "available": 0.4,
+                        "weekly": 0.4,
+                        "five_hour": 1.0,
+                        "reset_at": reset_3d.isoformat(),
+                        "weekly_reset_at": reset_3d.isoformat(),
+                        "five_hour_reset_at": reset_3d.isoformat(),
+                    }
+                },
+            },
+            {
+                "name": p_edge_reset_now.name,
+                "seq": p_edge_reset_now.seq,
+                "engine": "codex",
+                "ok": True,
+                "error": None,
+                "stale": False,
+                "quality": "observed",
+                "observed_at": obs_1h.isoformat(),
+                "summary": {
+                    "codex": {
+                        "available": 0.4,
+                        "weekly": 0.4,
+                        "five_hour": 1.0,
+                        "reset_at": NOW.isoformat(),
+                        "weekly_reset_at": NOW.isoformat(),
+                        "five_hour_reset_at": NOW.isoformat(),
+                    }
+                },
+            },
+            {
+                "name": p_five_h_unusable.name,
+                "seq": p_five_h_unusable.seq,
+                "engine": "codex",
+                "ok": True,
+                "error": None,
+                "stale": False,
+                "quality": "observed",
+                "observed_at": obs_1h.isoformat(),
+                "summary": {
+                    "codex": {
+                        "available": 0.2,
+                        "weekly": 0.8,
+                        "five_hour": 0.2,
+                        "reset_at": reset_3d.isoformat(),
+                        "weekly_reset_at": reset_3d.isoformat(),
+                        "five_hour_reset_at": (NOW + timedelta(hours=2)).isoformat(),
+                    }
+                },
+            },
+        ]
+        self.path.write_text(
+            json.dumps({
+                "schema_version": usage_snapshot.SCHEMA_VERSION,
+                "generated_at": NOW.isoformat(),
+                "command": "usage",
+                "scope": "all",
+                "profiles": entries,
+            }),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            usage_snapshot.profile_quota_availability(self.store, p_weekly, now=NOW),
+            0.4,
+        )
+        self.assertIsNone(
+            usage_snapshot.profile_quota_availability(self.store, p_expired_reset, now=NOW)
+        )
+        self.assertEqual(
+            usage_snapshot.profile_quota_availability(self.store, p_edge_86400, now=NOW),
+            0.4,
+        )
+        self.assertIsNone(
+            usage_snapshot.profile_quota_availability(self.store, p_edge_86401, now=NOW)
+        )
+        self.assertIsNone(
+            usage_snapshot.profile_quota_availability(self.store, p_edge_reset_now, now=NOW)
+        )
+        self.assertEqual(
+            usage_snapshot.profile_quota_availability(self.store, p_five_h_unusable, now=NOW),
+            0.8,
+        )
+
+        def write_legacy(obs_time):
+            self.path.write_text(
+                json.dumps({
+                    "schema_version": usage_snapshot.SCHEMA_VERSION,
+                    "generated_at": obs_time.isoformat(),
+                    "command": "usage",
+                    "scope": "all",
+                    "profiles": [{
+                        "name": p_legacy.name,
+                        "seq": p_legacy.seq,
+                        "engine": "codex",
+                        "ok": True,
+                        "error": None,
+                        "stale": False,
+                        "quality": "observed",
+                        "observed_at": obs_time.isoformat(),
+                        "summary": {
+                            "codex": {
+                                "available": 0.5,
+                                "weekly": 0.5,
+                                "five_hour": 0.5,
+                                "reset_at": reset_3d.isoformat(),
+                            }
+                        },
+                    }],
+                }),
+                encoding="utf-8",
+            )
+
+        write_legacy(obs_5m)
+        self.assertEqual(
+            usage_snapshot.profile_quota_availability(self.store, p_legacy, now=NOW),
+            0.5,
+        )
+        write_legacy(obs_1h)
+        self.assertIsNone(
+            usage_snapshot.profile_quota_availability(self.store, p_legacy, now=NOW)
+        )
+
+    def test_seeded_weekly_window_uses_five_hour_freshness_ceiling(self):
+        """A derived weekly window uses 900s freshness; explicit weekly keeps 86400s."""
+        p_seeded_old = self.store.create("p-seeded-old", engine="codex")
+        p_seeded_fresh = self.store.create("p-seeded-fresh", engine="codex")
+        p_explicit_old = self.store.create("p-explicit-old", engine="codex")
+
+        obs_1h = NOW - timedelta(hours=1)
+        obs_5m = NOW - timedelta(minutes=5)
+        reset_3d = NOW + timedelta(days=3)
+
+        entries = [
+            {
+                "name": p_seeded_old.name,
+                "seq": p_seeded_old.seq,
+                "engine": "codex",
+                "ok": True,
+                "error": None,
+                "stale": False,
+                "quality": "observed",
+                "observed_at": obs_1h.isoformat(),
+                "summary": {
+                    "codex": {
+                        "available": 0.4,
+                        "weekly": 0.4,
+                        "five_hour": 0.4,
+                        "reset_at": reset_3d.isoformat(),
+                        "weekly_reset_at": reset_3d.isoformat(),
+                        "five_hour_reset_at": (obs_1h + timedelta(hours=5)).isoformat(),
+                        "weekly_seeded": True,
+                    }
+                },
+            },
+            {
+                "name": p_seeded_fresh.name,
+                "seq": p_seeded_fresh.seq,
+                "engine": "codex",
+                "ok": True,
+                "error": None,
+                "stale": False,
+                "quality": "observed",
+                "observed_at": obs_5m.isoformat(),
+                "summary": {
+                    "codex": {
+                        "available": 0.4,
+                        "weekly": 0.4,
+                        "five_hour": 0.4,
+                        "reset_at": reset_3d.isoformat(),
+                        "weekly_reset_at": reset_3d.isoformat(),
+                        "five_hour_reset_at": (obs_5m + timedelta(hours=5)).isoformat(),
+                        "weekly_seeded": True,
+                    }
+                },
+            },
+            {
+                "name": p_explicit_old.name,
+                "seq": p_explicit_old.seq,
+                "engine": "codex",
+                "ok": True,
+                "error": None,
+                "stale": False,
+                "quality": "observed",
+                "observed_at": obs_1h.isoformat(),
+                "summary": {
+                    "codex": {
+                        "available": 0.4,
+                        "weekly": 0.4,
+                        "five_hour": 1.0,
+                        "reset_at": reset_3d.isoformat(),
+                        "weekly_reset_at": reset_3d.isoformat(),
+                        "five_hour_reset_at": (obs_1h + timedelta(hours=5)).isoformat(),
+                        "weekly_seeded": False,
+                    }
+                },
+            },
+        ]
+        self.path.write_text(
+            json.dumps({
+                "schema_version": usage_snapshot.SCHEMA_VERSION,
+                "generated_at": NOW.isoformat(),
+                "command": "usage",
+                "scope": "all",
+                "profiles": entries,
+            }),
+            encoding="utf-8",
+        )
+        self.assertIsNone(
+            usage_snapshot.profile_quota_availability(self.store, p_seeded_old, now=NOW)
+        )
+        self.assertEqual(
+            usage_snapshot.profile_quota_availability(self.store, p_seeded_fresh, now=NOW),
+            0.4,
+        )
+        self.assertEqual(
+            usage_snapshot.profile_quota_availability(self.store, p_explicit_old, now=NOW),
+            0.4,
+        )
 
     def test_reader_tolerates_absent_and_corrupt_documents(self):
         self.assertIsNone(usage_snapshot.read_snapshot(self.store))

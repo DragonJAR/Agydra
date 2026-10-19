@@ -1504,11 +1504,14 @@ def _apply_to_summary(summary: dict, key: str, bucket) -> None:
         summary[key]["weekly"] = bucket.remaining_fraction
         summary[key]["weekly_reset"] = bucket.reset_time
         summary[key]["weekly_explicit"] = True
+        summary[key]["weekly_seeded"] = False
         return
     if not already_explicit:
         summary[key][destination] = bucket.remaining_fraction
         summary[key][f"{destination}_reset"] = bucket.reset_time
         summary[key][f"{destination}_explicit"] = True
+        if destination == "weekly":
+            summary[key]["weekly_seeded"] = False
         if destination == "five_h" and summary[key]["weekly"] is None:
             summary[key]["weekly"] = bucket.remaining_fraction
             summary[key]["weekly_reset"] = bucket.reset_time

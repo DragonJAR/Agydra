@@ -153,6 +153,61 @@ class TestProfileRotation(BaseCase):
         self.assertEqual(len(set(selected)), len(profiles))
         self.assertEqual(self._launch_random(), "high")
 
+    def test_exhausted_quota_is_last_resort_behind_unknown_profiles(self):
+        """Known quota > 0 ranks first, unknown ranks second, and exhausted (0.0) ranks last."""
+        exhausted, unknown, positive = self._create("codex", "exhausted", "unknown", "positive")
+        self._write_snapshot([
+            {
+                "name": exhausted.name,
+                "seq": exhausted.seq,
+                "engine": "codex",
+                "ok": True,
+                "error": None,
+                "stale": False,
+                "quality": "observed",
+                "observed_at": self.now.isoformat(),
+                "summary": {
+                    "codex": {
+                        "available": 0.0,
+                        "weekly": 0.0,
+                        "five_hour": 1.0,
+                        "reset_at": (self.now + timedelta(days=2)).isoformat(),
+                        "weekly_reset_at": (self.now + timedelta(days=2)).isoformat(),
+                        "five_hour_reset_at": (self.now + timedelta(hours=3)).isoformat(),
+                    }
+                },
+            },
+            {
+                "name": positive.name,
+                "seq": positive.seq,
+                "engine": "codex",
+                "ok": True,
+                "error": None,
+                "stale": False,
+                "quality": "observed",
+                "observed_at": self.now.isoformat(),
+                "summary": {
+                    "codex": {
+                        "available": 0.4,
+                        "weekly": 0.4,
+                        "five_hour": 1.0,
+                        "reset_at": (self.now + timedelta(days=2)).isoformat(),
+                        "weekly_reset_at": (self.now + timedelta(days=2)).isoformat(),
+                        "five_hour_reset_at": (self.now + timedelta(hours=3)).isoformat(),
+                    }
+                },
+            },
+        ])
+
+        selected = [self._launch_random() for _ in range(3)]
+        self.assertEqual(selected, ["positive", "unknown", "exhausted"])
+
+        with profile_rotation.Rotation(self.store, "codex") as rotation:
+            excluded_pick = rotation.select(
+                [exhausted, unknown, positive], exclude={"positive", "unknown"}
+            )
+            self.assertEqual(excluded_pick.name, "exhausted")
+
     def test_new_eligible_profile_joins_current_cycle_before_any_repeat(self):
         self._create("codex", "first", "second")
 

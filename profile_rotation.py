@@ -137,13 +137,24 @@ def state_file_issue(store: Store, path: Path) -> Optional[str]:
 
 
 def _quota_order(availability: object) -> tuple:
+    """Three-tier quota ranking tuple ensuring exhausted profiles rank last.
+
+    Tier 0: known remaining quota > 0, ordered by descending availability (-availability).
+    Tier 1: unknown quota (no snapshot reading or expired/untrustworthy observation).
+    Tier 2: known exhausted quota (exactly 0.0), used only as a last resort.
+    An exhausted profile never ranks ahead of an unknown candidate.
+    """
     known = (
         isinstance(availability, (int, float))
         and not isinstance(availability, bool)
         and 0 <= availability <= 1
         and math.isfinite(availability)
     )
-    return (not known, -availability if known else 0)
+    if not known:
+        return (1, 0)
+    if availability == 0.0:
+        return (2, 0)
+    return (0, -availability)
 
 
 class NoEligibleProfileError(StoreError):
