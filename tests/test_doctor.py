@@ -68,20 +68,20 @@ class TestDoctor(BaseCase):
             exit_code = doctor.run_checks(self.store)
         report = output.getvalue()
         self.assertEqual(exit_code, 0)
-        self.assertIn("result: healthy", report)
+        self.assertIn(i18n.t("cmd.doctor.result_ok"), report)
         self.assertNotIn("\n[XX]", report)
         ctx = self._ctx()
         status, msg = doctor._check_store(self.store, ctx)
         self.assertEqual(status, doctor.OK)
-        self.assertIn("store writable", msg)
+        self.assertIn(i18n.t("doctor.store.ok", path=self.store.root), msg)
         status, msg = doctor._check_persistent_state(self.store, ctx)
         self.assertEqual(status, doctor.OK)
-        self.assertIn("valid", msg)
+        self.assertIn(i18n.t("doctor.persistent.valid"), msg)
         status, msg = doctor._check_profiles(self.store, ctx)
         self.assertEqual(status, doctor.OK)
         status, msg = doctor._check_locks(self.store, ctx)
         self.assertEqual(status, doctor.OK)
-        self.assertIn("no live sessions", msg)
+        self.assertIn(i18n.t("doctor.locks.none"), msg)
         status, msg = doctor._check_schema_canary(self.store, ctx)
         self.assertEqual(status, doctor.OK)
 
@@ -125,10 +125,11 @@ class TestDoctor(BaseCase):
             exit_code = doctor.run_checks(self.store)
         report = output.getvalue()
         self.assertEqual(exit_code, 1)
-        self.assertIn("[XX] agy binary not found", report)
+        expected_binary_fail = i18n.t("doctor.binary.fail", env_var="AGYDRA_AGY_BIN")
+        self.assertIn(f"[XX] {expected_binary_fail}", report)
         status, message = doctor._check_binary(self.store, self._ctx())
         self.assertEqual(status, doctor.FAIL)
-        self.assertIn("agy binary not found", message)
+        self.assertIn(expected_binary_fail, message)
 
     def test_corrupt_metadata_does_not_break_run(self):
         self.store.create("work")
@@ -284,7 +285,7 @@ class TestDoctor(BaseCase):
             (status, message),
             (
                 doctor.OK,
-                "install: pip-managed package (pip/pipx; no Agydra shim expected)",
+                i18n.t("doctor.install.pip_managed"),
             ),
         )
         check_state.assert_called_once_with(fake_root)
@@ -314,15 +315,11 @@ class TestDoctor(BaseCase):
 
             self.assertEqual(status, expected_status)
             drift.assert_called_once()
+            expected_stale = i18n.t("doctor.install.editable_stale", modules="i18n")
             if unimportable:
-                # The message has to name the missing modules AND the fix:
-                # this is the only place the failure is visible before the
-                # console script dies with a bare ModuleNotFoundError.
-                self.assertIn("editable install is stale", message)
-                self.assertIn("i18n", message)
-                self.assertIn("agydra setup", message)
+                self.assertIn(expected_stale, message)
             else:
-                self.assertNotIn("editable install is stale", message)
+                self.assertNotIn(expected_stale, message)
 
     def test_keychain_check_flags_identity_mismatch(self):
         self.store.create("alpha")
@@ -412,8 +409,8 @@ class TestDoctor(BaseCase):
         finally:
             holder.release()
         self.assertEqual(status, doctor.WARN)
-        self.assertIn("swap lock is held", message)
-        self.assertIn("lsof", message)
+        hint = f"identify the holder with: lsof {lock_path}"
+        self.assertIn(i18n.t("doctor.keychain.swap_held", hint=hint), message)
 
     def test_keychain_check_warns_when_swap_lock_probe_raises(self):
         lock_path = keychain.swap_lock_path(self.store)
@@ -425,7 +422,8 @@ class TestDoctor(BaseCase):
                 ):
             status, message = doctor._check_keychain(self.store, self._ctx())
         self.assertEqual(status, doctor.WARN)
-        self.assertIn("not inspectable", message)
+        hint = f"identify the holder with: lsof {lock_path}"
+        self.assertIn(i18n.t("doctor.keychain.swap_held", hint=hint), message)
 
     def test_keychain_check_reports_bridge_disabled_via_env(self):
         """When AGYDRA_NO_KEYCHAIN is active, doctor must report that the bridge
@@ -434,8 +432,8 @@ class TestDoctor(BaseCase):
         with mock.patch.dict(os.environ, {"AGYDRA_NO_KEYCHAIN": "1"}):
             status, message = doctor._check_keychain(self.store, self._ctx())
         self.assertEqual(status, doctor.WARN)
-        self.assertIn("bridge disabled via AGYDRA_NO_KEYCHAIN", message)
-        self.assertNotIn("`security` not found", message)
+        self.assertIn(i18n.t("doctor.keychain.disabled_env"), message)
+        self.assertNotIn(i18n.t("doctor.keychain.missing_security"), message)
 
     def test_keychain_check_warns_on_setup_skipped_marker(self):
         """When .setup-skipped marker exists, doctor must surface an explanatory
@@ -446,8 +444,8 @@ class TestDoctor(BaseCase):
         with mock.patch.object(keychain, "supported", return_value=True):
             status, message = doctor._check_keychain(self.store, self._ctx())
         self.assertEqual(status, doctor.WARN)
-        self.assertIn(".setup-skipped", message)
-        self.assertIn("delete", message.lower())
+        skip_marker_name = getattr(keychain, "_SKIP_MARKER_NAME", ".setup-skipped")
+        self.assertIn(i18n.t("doctor.keychain.skip_marker", marker=skip_marker_name, path=marker), message)
 
     def test_apply_fixes_purges_orphan_keychain_slots_with_fresh_names(self):
         """Regression: ``_apply_fixes``'s keychain-orphan purge must re-derive
@@ -705,7 +703,7 @@ class TestIsolationRecovery(BaseCase):
         migrate.assert_not_called()
         self.assertTrue(source_token.is_file())
         self.assertFalse((data_dir / "antigravity-cli" / "token.json").exists())
-        self.assertIn("profile lock is held", output.getvalue())
+        self.assertIn(i18n.t("doctor.fix.reason.active_session"), output.getvalue())
 
     def test_fix_skips_overlay_recovery_when_a_leased_session_is_live(self):
         """A session registered in the lease registry blocks the overlay
@@ -729,7 +727,7 @@ class TestIsolationRecovery(BaseCase):
         migrate.assert_not_called()
         self.assertTrue(source_token.is_file())
         self.assertFalse((data_dir / "antigravity-cli" / "token.json").exists())
-        self.assertIn("profile lock is held", output.getvalue())
+        self.assertIn(i18n.t("doctor.fix.reason.active_session"), output.getvalue())
         self.assertEqual(locks.lock_path(self.store, "alpha").read_bytes(), registry)
 
     def test_fix_skips_overlay_recovery_when_profile_owner_changed(self):
@@ -762,7 +760,7 @@ class TestIsolationRecovery(BaseCase):
         self.assertEqual(changed, ["alpha"])
         self.assertTrue(source_token.is_file())
         self.assertFalse((data_dir / "antigravity-cli" / "token.json").exists())
-        self.assertIn("profile or overlay owner changed", output.getvalue())
+        self.assertIn(i18n.t("doctor.fix.reason.owner_changed"), output.getvalue())
 
     def test_fix_skips_overlay_recovery_when_overlay_directory_is_replaced(self):
         import locks
@@ -805,7 +803,7 @@ class TestIsolationRecovery(BaseCase):
             ),
             "foreign overlay",
         )
-        self.assertIn("profile or overlay owner changed", output.getvalue())
+        self.assertIn(i18n.t("doctor.fix.reason.changed_during_lock"), output.getvalue())
 
     def test_fix_clears_dangling_default_profile(self):
         """If the default points at a profile that no longer exists, --fix
@@ -1148,11 +1146,11 @@ class TestOrphanScanCaching(BaseCase):
         status, output = doctor._check_profiles(self.store, ctx)
         self.assertEqual(status, doctor.WARN)
         self.assertNotIn("MISSING (dangling)", output)
-        self.assertNotIn("does not exist", output)
-        self.assertIn("unreadable profile metadata: work", output)
+        self.assertNotIn(i18n.t("doctor.profiles.default_missing", name="work"), output)
+        self.assertIn(i18n.t("doctor.profiles.unreadable", names="work"), output)
 
         preview = doctor._preview_fixables(self.store, ctx)
-        self.assertNotIn("clear dangling default profile 'work'", preview)
+        self.assertNotIn(i18n.t("doctor.fix.preview_default", name="work"), preview)
 
         doctor._apply_fixes(self.store, ctx)
         self.assertEqual(self.store.default_name(), "work")
@@ -1172,18 +1170,18 @@ class TestDoctorLockRegistryCorrupt(BaseCase):
         ctx = doctor._build_ctx(self.store)
         status, message = doctor._check_locks(self.store, ctx)
         self.assertEqual(status, doctor.WARN)
-        self.assertIn(f"unreadable lease registry {lock_file}", message)
-        self.assertNotIn("live sessions: work", message)
+        self.assertIn(i18n.t("doctor.locks.unreadable", path=lock_file), message)
+        self.assertNotIn(i18n.t("doctor.locks.live", names="work"), message)
 
         preview = doctor._preview_fixables(self.store, ctx)
-        self.assertIn(f"reset unreadable lease registry {lock_file}", preview)
+        self.assertIn(i18n.t("doctor.fix.preview_reset_lease", path=lock_file), preview)
 
         doctor._apply_fixes(self.store, ctx)
         self.assertEqual(locks.lease_holders(self.store, "work"), [])
 
         status_after, message_after = doctor._check_locks(self.store, ctx)
         self.assertEqual(status_after, doctor.OK)
-        self.assertIn("no live sessions", message_after)
+        self.assertIn(i18n.t("doctor.locks.none"), message_after)
 
     def test_unreadable_lease_registry_busy_lock_not_reset_by_fix(self):
         import locks
@@ -1196,7 +1194,7 @@ class TestDoctorLockRegistryCorrupt(BaseCase):
         self.assertIsNotNone(handle)
         try:
             preview = doctor._preview_fixables(self.store, ctx)
-            self.assertNotIn(f"reset unreadable lease registry {lock_file}", preview)
+            self.assertNotIn(i18n.t("doctor.fix.preview_reset_lease", path=lock_file), preview)
 
             doctor._apply_fixes(self.store, ctx)
         finally:

@@ -201,6 +201,35 @@ HOST_ENGINE_VARIABLES = (
     "GROK_LEADER_SOCKET",
 )
 
+AGYDRA_TEST_LANG_VAR = "AGYDRA_TEST_LANG"
+
+
+def apply_test_language_override(env: dict[str, str] | None = None) -> str:
+    """Apply the test language override to the active i18n catalog and environment.
+
+    When ``AGYDRA_TEST_LANG`` is set in the environment (for example,
+    ``AGYDRA_TEST_LANG=es``), this helper activates the corresponding language
+    catalog in :mod:`i18n` and updates ``os.environ['AGYDRA_LANG']`` (and the
+    given environment dictionary, if provided) so both in-process assertions
+    and CLI subprocesses execute under that language.
+    When unset or invalid, it defaults to English (``en``).
+
+    Returns the normalized language code that was activated.
+    """
+    import i18n
+
+    target_env = os.environ if env is None else env
+    raw = target_env.get(AGYDRA_TEST_LANG_VAR) or os.environ.get(AGYDRA_TEST_LANG_VAR)
+    normalized = i18n._normalize(raw) if raw is not None else None
+    active = normalized or "en"
+    i18n._set_active(active)
+    if normalized:
+        target_env["AGYDRA_LANG"] = active
+    return active
+
+
+apply_test_language_override()
+
 
 def cli_environment(extra: dict = None) -> dict:
     """Environment for ``python -m agydra`` children, independent of the cwd.
@@ -737,14 +766,13 @@ class BaseCase(unittest.TestCase):
 
         self.agy_bin = write_fake_agy(self.bin_dir / "agy")
         os.environ["AGYDRA_AGY_BIN"] = str(self.agy_bin)
-        import i18n
-        i18n._set_active("en")
+        apply_test_language_override()
 
     def tearDown(self) -> None:
-        import i18n
-        i18n._set_active("en")
+        apply_test_language_override()
         os.environ.clear()
         os.environ.update(self._old_env)
+        apply_test_language_override()
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _run_cli(self, *args, cwd=None):

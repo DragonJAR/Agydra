@@ -2,6 +2,7 @@
 import errno
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import i18n
 import store as store_mod
 from store import Config, Store, StoreError, backup_owner, read_json_object
 
@@ -227,7 +229,17 @@ class TestStore(BaseCase):
         root_before = snapshot_tree(store.root)
 
         self.assertEqual(store.scan_readonly(), ([], ["alpha"]))
-        with self.assertRaisesRegex(StoreError, "symlink or junction"):
+        expected = re.escape(store_mod._store_text(
+            "store.path.symlink_refused",
+            subject=store_mod.module_text(
+                "store.path.profile_subject",
+                "profile {name!r} {label}",
+                name="alpha",
+                label=store_mod._store_label_text("directory"),
+            ),
+            path=profile_link,
+        ))
+        with self.assertRaisesRegex(StoreError, expected):
             store.get_readonly("alpha")
         self.assertEqual(snapshot_tree(external), before)
         self.assertEqual(snapshot_tree(store.root), root_before)
@@ -242,7 +254,7 @@ class TestStore(BaseCase):
         )
         for operation in operations:
             with self.subTest(operation=operation), self.assertRaisesRegex(
-                StoreError, "symlink or junction"
+                StoreError, expected
             ):
                 operation()
 
@@ -337,9 +349,19 @@ class TestStore(BaseCase):
             lambda: store.profile_data_dir("alpha"),
             lambda: store.profile_data_dir("alpha", engine="agy"),
         )
+        expected = re.escape(store_mod._store_text(
+            "store.path.symlink_refused",
+            subject=store_mod.module_text(
+                "store.path.profile_subject",
+                "profile {name!r} {label}",
+                name="alpha",
+                label=store_mod._store_label_text("data"),
+            ),
+            path=data_dir,
+        ))
         for operation in operations:
             with self.subTest(operation=operation), self.assertRaisesRegex(
-                StoreError, "data .* symlink or junction"
+                StoreError, expected
             ):
                 operation()
 
@@ -365,9 +387,19 @@ class TestStore(BaseCase):
             lambda: store.rename("alpha", "renamed"),
             lambda: store.delete("alpha", backup=False),
         )
+        expected = re.escape(store_mod._store_text(
+            "store.path.symlink_refused",
+            subject=store_mod.module_text(
+                "store.path.profile_subject",
+                "profile {name!r} {label}",
+                name="alpha",
+                label=store_mod._store_label_text("data"),
+            ),
+            path=data_dir,
+        ))
         for operation in operations:
             with self.subTest(operation=operation), self.assertRaisesRegex(
-                StoreError, "data .* symlink or junction"
+                StoreError, expected
             ):
                 operation()
 
@@ -392,11 +424,21 @@ class TestStore(BaseCase):
         root_before = snapshot_tree(store.root)
 
         self.assertEqual(store.scan_readonly(), ([], ["alpha"]))
-        with self.assertRaisesRegex(StoreError, "metadata .* symlink or junction"):
+        expected = re.escape(store_mod._store_text(
+            "store.path.symlink_refused",
+            subject=store_mod.module_text(
+                "store.path.profile_subject",
+                "profile {name!r} {label}",
+                name="alpha",
+                label=store_mod._store_label_text("metadata"),
+            ),
+            path=metadata_link,
+        ))
+        with self.assertRaisesRegex(StoreError, expected):
             store.get_readonly("alpha")
         self.assertEqual(external_metadata.read_bytes(), before)
         self.assertEqual(snapshot_tree(store.root), root_before)
-        with self.assertRaisesRegex(StoreError, "metadata .* symlink or junction"):
+        with self.assertRaisesRegex(StoreError, expected):
             store.delete("alpha", backup=False)
         self.assertEqual(external_metadata.read_bytes(), before)
         self.assertTrue(metadata_link.is_symlink())
@@ -411,12 +453,13 @@ class TestStore(BaseCase):
         )
 
         self.assertEqual(store.scan_readonly(), ([], ["alpha"]))
+        expected = re.escape(i18n.t("store.profile.metadata_unreadable", name="alpha"))
         for read in (lambda: store.get("alpha"), lambda: store.get_readonly("alpha")):
             with self.subTest(read=read), self.assertRaisesRegex(
-                StoreError, "unreadable metadata"
+                StoreError, expected
             ):
                 read()
-        with self.assertRaisesRegex(StoreError, "unreadable metadata"):
+        with self.assertRaisesRegex(StoreError, expected):
             store.profile_data_dir("alpha")
         self.assertFalse(store.profile_dir("beta").exists())
         self.assertEqual(
@@ -446,7 +489,9 @@ class TestStore(BaseCase):
                 self.assertFalse(store.root.exists())
 
         store = Store(root=self._tmp / "empty-get")
-        with self.assertRaisesRegex(StoreError, "does not exist"):
+        with self.assertRaisesRegex(
+            StoreError, re.escape(i18n.t("store.profile.missing", name="ghost"))
+        ):
             store.get("ghost")
         self.assertFalse(store.root.exists())
 
@@ -603,7 +648,9 @@ class TestStore(BaseCase):
         unreadable_dir.mkdir()
         (unreadable_dir / "profile.json").write_text("{invalid", encoding="utf-8")
 
-        with self.assertRaisesRegex(StoreError, "cannot initialize profile sequence state"):
+        with self.assertRaisesRegex(
+            StoreError, re.escape(i18n.t("store.sequence.initialize_unreadable", names="unreadable"))
+        ):
             store.create("new")
 
         self.assertFalse(store.sequence_state_path.exists())
@@ -632,7 +679,9 @@ class TestStore(BaseCase):
             profile_dir.mkdir()
             (profile_dir / "profile.json").write_text("{invalid", encoding="utf-8")
 
-        with self.assertRaisesRegex(StoreError, "cannot initialize profile sequence state"):
+        with self.assertRaisesRegex(
+            StoreError, re.escape(i18n.t("store.sequence.initialize_unreadable", names="first-broken, second-broken"))
+        ):
             store.delete("first-broken", backup=False)
 
         self.assertFalse(store.sequence_state_path.exists())
@@ -712,7 +761,9 @@ class TestStore(BaseCase):
         )
         self.assertTrue(store.rename_journal_path.is_file())
 
-        with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
+        with self.assertRaisesRegex(
+            StoreError, re.escape(i18n.t("store.rename.interrupted"))
+        ):
             store.list()
         self.assertTrue(store.rename_journal_path.is_file())
 
@@ -732,9 +783,19 @@ class TestStore(BaseCase):
         store.create("locked")
         handle = locks.try_lock(store, "locked")
         try:
-            with self.assertRaisesRegex(StoreError, "live session"):
+            rename_expected = re.escape(i18n.t(
+                "store.profile_has_a_live_session_end_it_before",
+                name="locked",
+                action=store_mod._store_action_text("renaming"),
+            ))
+            with self.assertRaisesRegex(StoreError, rename_expected):
                 store.rename("locked", "renamed")
-            with self.assertRaisesRegex(StoreError, "live session"):
+            delete_expected = re.escape(i18n.t(
+                "store.profile_has_a_live_session_end_it_before",
+                name="locked",
+                action=store_mod._store_action_text("deleting"),
+            ))
+            with self.assertRaisesRegex(StoreError, delete_expected):
                 store.delete("locked")
         finally:
             handle.release()
@@ -749,7 +810,12 @@ class TestStore(BaseCase):
         store.create("old")
         destination_lock = locks.try_lock(store, "new")
         try:
-            with self.assertRaisesRegex(StoreError, "live session"):
+            expected = re.escape(i18n.t(
+                "store.profile_has_a_live_session_end_it_before",
+                name="new",
+                action=store_mod._store_action_text("renaming"),
+            ))
+            with self.assertRaisesRegex(StoreError, expected):
                 store.rename("old", "new")
         finally:
             destination_lock.release()
@@ -758,7 +824,12 @@ class TestStore(BaseCase):
 
         create_lock = locks.try_lock(store, "reserved")
         try:
-            with self.assertRaisesRegex(StoreError, "live session"):
+            expected = re.escape(i18n.t(
+                "store.profile_has_a_live_session_end_it_before",
+                name="reserved",
+                action=store_mod._store_action_text("creating"),
+            ))
+            with self.assertRaisesRegex(StoreError, expected):
                 store.create("reserved")
         finally:
             create_lock.release()
@@ -795,7 +866,15 @@ class TestStore(BaseCase):
             thread.start()
             try:
                 self.assertTrue(first_in_list.wait(60))
-                with self.assertRaisesRegex(StoreError, "sequence allocation is busy"):
+                expected = re.escape(store_mod._store_text(
+                    "store.sequence.lock_busy",
+                    message=store_mod.module_text(
+                        "store.sequence.allocation_busy",
+                        "profile sequence allocation is busy; sequence lock is busy",
+                    ),
+                    action=store_mod._store_action_text("creating"),
+                ))
+                with self.assertRaisesRegex(StoreError, expected):
                     store.create("second")
                 self.assertFalse(store.profile_dir("second").exists())
             finally:
@@ -841,7 +920,12 @@ class TestStore(BaseCase):
             thread.start()
             try:
                 self.assertTrue(rename_reached_metadata.wait(5))
-                with self.assertRaisesRegex(StoreError, "live session"):
+                expected = re.escape(i18n.t(
+                    "store.profile_has_a_live_session_end_it_before",
+                    name="alpha",
+                    action=store_mod._store_action_text("recovering"),
+                ))
+                with self.assertRaisesRegex(StoreError, expected):
                     store.create("concurrent")
                 self.assertFalse(store.profile_dir("concurrent").exists())
             finally:
@@ -898,7 +982,8 @@ class TestStore(BaseCase):
         with unittest.mock.patch.object(
             store, "_prepare_delete_backup", side_effect=prepare_then_change_identity
         ):
-            with self.assertRaisesRegex(StoreError, "identity changed"):
+            expected = re.escape(i18n.t("store.profile.identity_changed", name="victim"))
+            with self.assertRaisesRegex(StoreError, expected):
                 store.delete("victim")
         self.assertEqual(payload.read_text(encoding="utf-8"), "keep")
 
@@ -906,7 +991,12 @@ class TestStore(BaseCase):
         store = Store()
         store.create("stubborn")
         with unittest.mock.patch.object(store_mod, "rmtree"):
-            with self.assertRaisesRegex(StoreError, "could not be fully removed"):
+            expected = re.escape(i18n.t(
+                "store.profile.delete_failed",
+                name="stubborn",
+                path=store.profile_dir("stubborn"),
+            ))
+            with self.assertRaisesRegex(StoreError, expected):
                 store.delete("stubborn", backup=False)
         self.assertTrue(store.profile_dir("stubborn").is_dir())
 
@@ -921,7 +1011,10 @@ class TestStore(BaseCase):
             store.delete("first", backup=False)
         self.assertFalse(store.profile_dir("first").exists())
         warning.assert_called_once()
-        self.assertIn("could not update default profile", warning.call_args[0][0])
+        self.assertIn(
+            i18n.t("store.profile.default_update_failed", name="first", error="disk full"),
+            warning.call_args[0][0],
+        )
 
     def test_delete_no_backup(self):
         store = Store()
@@ -1008,9 +1101,14 @@ class TestStore(BaseCase):
         with unittest.mock.patch(
             "store._atomic_write_json", side_effect=OSError("disk full")
         ):
-            with self.assertRaisesRegex(StoreError, "cannot persist profile sequence"):
+            expected = re.escape(store_mod._store_text(
+                "store.sequence.persist_failed",
+                path=store.sequence_state_path,
+                error="disk full",
+            ))
+            with self.assertRaisesRegex(StoreError, expected):
                 store.create("new")
-            with self.assertRaisesRegex(StoreError, "cannot persist profile sequence"):
+            with self.assertRaisesRegex(StoreError, expected):
                 store.delete("existing", backup=False)
 
         self.assertFalse(store.profile_dir("new").exists())
@@ -1219,9 +1317,11 @@ class TestStore(BaseCase):
 
     def test_resolve_ref_rejects_non_ascii_digits_and_oversized_numbers(self):
         profile = store_mod.Profile(name="alpha", seq=1)
-        with self.assertRaisesRegex(StoreError, "unknown profile"):
+        expected_unknown = re.escape(i18n.t("store.profile.unknown_ref", ref="²", names="alpha", hint=""))
+        with self.assertRaisesRegex(StoreError, expected_unknown):
             Store._resolve_ref_in([profile], [], "²")
-        with self.assertRaisesRegex(StoreError, "out of range"):
+        expected_range = re.escape(i18n.t("store.profile.number_out_of_range", ref="9" * 5000, count=1))
+        with self.assertRaisesRegex(StoreError, expected_range):
             Store._resolve_ref_in([profile], [], "9" * 5000)
 
     def test_read_json_object_normalizes_recursion_failures(self):
@@ -1231,7 +1331,8 @@ class TestStore(BaseCase):
             "store.json.loads", side_effect=RecursionError("deep input")
         ):
             self.assertIsNone(read_json_object(path, tolerant=True))
-            with self.assertRaisesRegex(ValueError, "nesting exceeds"):
+            expected = re.escape(i18n.t("store.json_nesting_exceeds_the_supported_depth", name=path.name))
+            with self.assertRaisesRegex(ValueError, expected):
                 read_json_object(path)
 
     def test_readonly_removal_retry_preserves_mode_and_reports_failure(self):
@@ -1350,10 +1451,15 @@ class TestStore(BaseCase):
             store_mod._raise_rmtree_failure(
                 path, PermissionError("still busy"), restore_errors
             )
-        message = str(ctx.exception)
-        self.assertIn("still busy", message)
-        self.assertIn("chmod denied", message)
-        self.assertIn("could not restore original permissions", message)
+        self.assertEqual(
+            str(ctx.exception),
+            i18n.t(
+                "store.could_not_remove_could_not_restore_original_permissions",
+                path=path,
+                cleanup_error="still busy",
+                details=f"{path / 'child'}: chmod denied",
+            ),
+        )
 
     @posix_only
     def test_rmtree_restores_mode_of_surviving_readonly_directory(self):
@@ -1441,7 +1547,7 @@ class TestStore(BaseCase):
             meta_path.write_text(json.dumps(metadata), encoding="utf-8")
             profile_bytes[name] = meta_path.read_bytes()
 
-        expected = "duplicate positive profile sequence 1 is shared by 'alpha', 'beta'"
+        expected = re.escape(i18n.t("store.profile.duplicate_sequence", sequence=1, names="'alpha', 'beta'"))
         operations = (
             store.scan,
             store.list,
@@ -1706,8 +1812,13 @@ class TestStore(BaseCase):
         self.assertIn("alpha", [p.name for p in store.list()])
         self.assertTrue(store.profile_meta_path("alpha").is_file())
         self.assertTrue(store.profile_data_dir("alpha").is_dir())
+        expected_warn = i18n.t(
+            "store.profile.default_create_corrupt",
+            name="alpha",
+            path=fresh / "agydra.json",
+        )
         self.assertTrue(
-            any("could not mark" in w and "default profile" in w for w in warnings),
+            any(expected_warn in w for w in warnings),
             f"Expected warning that profile could not be marked as default, got: {warnings}",
         )
 
@@ -1729,12 +1840,13 @@ class TestStore(BaseCase):
         saved = store.get("alpha")
         self.assertEqual((saved.name, saved.seq), (profile.name, profile.seq))
         self.assertIsNone(store.default_name())
+        expected_warn = i18n.t(
+            "store.profile.default_create_failed",
+            name="alpha",
+            error="disk full",
+        )
         self.assertTrue(
-            any(
-                "could not mark 'alpha' as default profile" in warning
-                and "disk full" in warning
-                for warning in warnings
-            ),
+            any(expected_warn in warning for warning in warnings),
             f"Expected warning that default profile was not saved, got: {warnings}",
         )
 
@@ -1886,7 +1998,12 @@ store.create("live")
             stage_path = Path(output[0].strip())
             self.assertTrue(stage_path.is_dir())
             self.assertFalse(store.profile_dir("live").exists())
-            with self.assertRaisesRegex(StoreError, "live session"):
+            expected = re.escape(i18n.t(
+                "store.profile_has_a_live_session_end_it_before",
+                name="live",
+                action=store_mod._store_action_text("creating"),
+            ))
+            with self.assertRaisesRegex(StoreError, expected):
                 store.create("live")
             self.assertTrue(stage_path.is_dir())
         finally:
@@ -1951,7 +2068,9 @@ store.rename("old", "new")
                 self.assertEqual(result.returncode, exit_code, result.stderr)
 
                 reopened = Store(root=root)
-                with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
+                with self.assertRaisesRegex(
+                    StoreError, re.escape(i18n.t("store.rename.interrupted"))
+                ):
                     reopened.list()
                 self.assertTrue(reopened.rename_journal_path.is_file())
                 reopened.set_default(expected_name)
@@ -1989,10 +2108,13 @@ store.rename("old", "new")
         }
         journal_before = store.rename_journal_path.read_bytes()
 
-        with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
+        with self.assertRaisesRegex(
+            StoreError, re.escape(i18n.t("store.rename.interrupted"))
+        ):
             store.list()
 
-        with self.assertRaisesRegex(StoreError, "duplicate positive profile sequence 1"):
+        expected_dup = re.escape(i18n.t("store.profile.duplicate_sequence", sequence=1, names="'new', 'peer'"))
+        with self.assertRaisesRegex(StoreError, expected_dup):
             store.set_default("new")
 
         self.assertTrue(store.rename_journal_path.is_file())
@@ -2024,7 +2146,9 @@ store.rename("old", "new")
             self.assertEqual(unreadable, [])
             self.assertTrue((overlay / "marker").is_file())
 
-            with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
+            with self.assertRaisesRegex(
+                StoreError, re.escape(i18n.t("store.rename.interrupted"))
+            ):
                 store.list()
             self.assertTrue(store.rename_journal_path.is_file())
             self.assertTrue(store.profile_dir("new").is_dir())
@@ -2076,7 +2200,15 @@ Store(root=root).rename("old", "new")
         try:
             self.assertTrue(ready.wait(5), "renamer did not reach metadata boundary")
             self.assertTrue(store.rename_journal_path.is_file())
-            with self.assertRaisesRegex(StoreError, "retry reading profiles"):
+            expected_retry = re.escape(store_mod._store_text(
+                "store.sequence.lock_busy",
+                message=store_mod.module_text(
+                    "store.sequence.busy_detail",
+                    "profile sequence lock is busy",
+                ),
+                action=store_mod._store_action_text("reading profiles"),
+            ))
+            with self.assertRaisesRegex(StoreError, expected_retry):
                 store.list()
             self.assertTrue(store.rename_journal_path.is_file())
             self.assertTrue(store.profile_meta_path("new").is_file())
@@ -2106,12 +2238,16 @@ Store(root=root).rename("old", "new")
         before = snapshot_tree(store.root)
         with mock.patch("locks.try_lock") as lock, mock.patch("locks.try_mutation_lock") as mutation_lock, mock.patch("locks.try_sequence_lock") as seq_lock:
             self.assertTrue(store.has_pending_rename())
+            expected_unreadable = re.escape(i18n.t(
+                "store.rename.readonly_unreadable",
+                path=store.rename_journal_path,
+            ))
             for read in (
                 lambda: store.get_readonly("old"),
                 store.scan_readonly,
                 lambda: store.resolve_ref_readonly("old"),
             ):
-                with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
+                with self.assertRaisesRegex(StoreError, expected_unreadable):
                     read()
         lock.assert_not_called()
         mutation_lock.assert_not_called()
@@ -2134,7 +2270,12 @@ Store(root=root).rename("old", "new")
 
         with mock.patch.object(Path, "lstat", deny):
             self.assertTrue(store.has_pending_rename())
-            with self.assertRaisesRegex(StoreError, "cannot inspect rename journal"):
+            expected_inspect = re.escape(i18n.t(
+                "store.rename.readonly_inspection_failed",
+                path=journal,
+                error="denied",
+            ))
+            with self.assertRaisesRegex(StoreError, expected_inspect):
                 store.get_readonly("old")
             import usage
 
@@ -2156,7 +2297,12 @@ Store(root=root).rename("old", "new")
         store.create("old")
         store.rename_journal_path.write_text("{invalid", encoding="utf-8")
 
-        with self.assertRaisesRegex(StoreError, "rename journal"):
+        pattern = re.escape(i18n.t(
+            "store.rename.journal_unreadable",
+            path=store.rename_journal_path,
+            error="___ERR___",
+        )).replace("___ERR___", ".*")
+        with self.assertRaisesRegex(StoreError, pattern):
             store.list()
 
         self.assertTrue(store.profile_dir("old").is_dir())
@@ -2192,7 +2338,9 @@ Store(root=root).rename("old", "new")
         with unittest.mock.patch.object(
             locks, "try_sequence_lock", side_effect=crash_like_rename_before_sequence_acquire
         ):
-            with self.assertRaisesRegex(StoreError, "rename recovery is pending"):
+            with self.assertRaisesRegex(
+                StoreError, re.escape(i18n.t("store.rename.interrupted"))
+            ):
                 store.get("new")
 
         self.assertTrue(injected)
@@ -2219,7 +2367,10 @@ Store(root=root).rename("old", "new")
         store.profile_meta_path("work").write_text("[1, 2]", encoding="utf-8")
         with self.assertRaises(StoreError) as ctx:
             store.get("work")
-        self.assertIn("remove it with: agydra delete work", str(ctx.exception))
+        self.assertEqual(
+            str(ctx.exception),
+            i18n.t("store.profile.metadata_unreadable", name="work"),
+        )
         self.assertNotIn("recreate the profile", str(ctx.exception))
 
     def test_read_json_object_strict_and_tolerant_contracts(self):
@@ -2293,7 +2444,7 @@ Store(root=root).rename("old", "new")
 
         with self.assertRaises(StoreError) as ctx:
             store.rename("alpha", "beta")
-        self.assertIn("already exists", str(ctx.exception))
+        self.assertEqual(str(ctx.exception), i18n.t("store.rename.target_exists", path=target_dir))
 
     def test_rename_unexpected_oserror_reraised(self):
         """Unexpected OSErrors (e.g. EACCES) during directory rename must be reraised."""
@@ -2345,7 +2496,7 @@ Store(root=root).rename("old", "new")
         store.create("work")
         with self.assertRaises(StoreError) as ctx:
             store.rename("work", "work")
-        self.assertEqual(str(ctx.exception), "cannot rename profile 'work' to itself")
+        self.assertEqual(str(ctx.exception), i18n.t("store.rename.self", old="work"))
 
     def test_resolve_ref_unreadable_token_with_hash(self):
         """#broken must report unreadable metadata, not unknown profile."""
@@ -2354,7 +2505,7 @@ Store(root=root).rename("old", "new")
         broken_dir.mkdir(parents=True)
         with self.assertRaises(StoreError) as ctx:
             store.resolve_ref("#broken")
-        self.assertIn("profile 'broken' has unreadable metadata", str(ctx.exception))
+        self.assertEqual(str(ctx.exception), i18n.t("store.profile.metadata_unreadable", name="broken"))
         self.assertIn("agydra delete broken", str(ctx.exception))
 
     def test_resolve_ref_suggests_create_only_for_valid_names(self):
@@ -2363,12 +2514,12 @@ Store(root=root).rename("old", "new")
         store = Store()
         with self.assertRaises(StoreError) as ctx:
             store.resolve_ref("validname")
-        self.assertIn("— create it with: agydra create validname", str(ctx.exception))
+        self.assertIn(i18n.t("store.profile.create_hint", ref="validname"), str(ctx.exception))
 
         for invalid in ("#broken", "INVALID!", "9", "#9", "aux", "doctor"):
             with self.assertRaises(StoreError) as ctx:
                 store.resolve_ref(invalid)
-            self.assertNotIn("create it with", str(ctx.exception))
+            self.assertNotIn(i18n.t("store.profile.create_hint", ref=invalid), str(ctx.exception))
 
     def test_prune_backups_identical_mtime(self):
         """Ensure _prune_backups does not crash on Python < 3.12 when backups
@@ -2422,7 +2573,12 @@ class TestLeasedSessionBlocksMutations(BaseCase):
     def test_flock_is_free_but_delete_is_refused_with_data_untouched(self):
         self.assertFalse(self.locks._flock_probe_locked(self.store, "work"))
         before = self._tree()
-        with self.assertRaisesRegex(StoreError, "live session"):
+        expected = re.escape(i18n.t(
+            "store.profile_has_a_live_session_end_it_before",
+            name="work",
+            action=store_mod._store_action_text("deleting"),
+        ))
+        with self.assertRaisesRegex(StoreError, expected):
             self.store.delete("work")
         self.assertEqual(self._tree(), before)
         self.assertEqual(self.locks.lock_path(self.store, "work").read_bytes(), self.registry)
@@ -2430,11 +2586,16 @@ class TestLeasedSessionBlocksMutations(BaseCase):
 
     def test_rename_is_refused_for_either_endpoint(self):
         before = self._tree()
-        with self.assertRaisesRegex(StoreError, "live session"):
+        expected = re.escape(i18n.t(
+            "store.profile_has_a_live_session_end_it_before",
+            name="work",
+            action=store_mod._store_action_text("renaming"),
+        ))
+        with self.assertRaisesRegex(StoreError, expected):
             self.store.rename("work", "other")
         self.assertEqual(self._tree(), before)
         self.store.create("spare")
-        with self.assertRaisesRegex(StoreError, "live session"):
+        with self.assertRaisesRegex(StoreError, expected):
             self.store.rename("spare", "work")
         self.assertTrue(self.marker.is_file())
 
@@ -2464,7 +2625,7 @@ class TestProfileSequenceIdentity(BaseCase):
         agy = _write_profile_metadata(store, "alpha", seq=4, engine="agy")
         codex = _write_profile_metadata(store, "beta", seq=4, engine="codex")
         before = (agy.read_bytes(), codex.read_bytes())
-        expected = "duplicate positive profile sequence 4 is shared by 'alpha', 'beta'"
+        expected = re.escape(i18n.t("store.profile.duplicate_sequence", sequence=4, names="'alpha', 'beta'"))
         for operation in (
             store.scan,
             store.list,
@@ -2483,7 +2644,8 @@ class TestProfileSequenceIdentity(BaseCase):
         store = Store()
         _write_profile_metadata(store, "alpha", seq=2, engine="codex")
         store.profile_dir("beta").mkdir(parents=True)
-        with self.assertRaisesRegex(StoreError, "duplicate positive profile sequence 2"):
+        expected = re.escape(i18n.t("store.profile.duplicate_sequence", sequence=2, names="'alpha', 'beta'"))
+        with self.assertRaisesRegex(StoreError, expected):
             store.save(store_mod.Profile(name="beta", seq=2, engine="grok"))
         self.assertFalse(store.profile_meta_path("beta").exists())
 
@@ -2519,7 +2681,8 @@ class TestProfileSequenceIdentity(BaseCase):
         profile = store_mod.Profile(name="spelled", seq=1, engine="claude")
         profile.engine = "Claude"
         profile.seq = 0
-        with self.assertRaisesRegex(StoreError, "invalid profile sequence"):
+        expected = re.escape(i18n.t("store.profile.sequence_engine_invalid", sequence=0, engine="Claude"))
+        with self.assertRaisesRegex(StoreError, expected):
             store.save(profile)
 
 
@@ -2573,7 +2736,8 @@ class TestRoutineSaveSkipsTheWholeStoreScan(BaseCase):
         with unittest.mock.patch.object(
             self.store, "_scan", side_effect=lambda: scans.append(1) or original()
         ):
-            with self.assertRaisesRegex(StoreError, "duplicate positive profile sequence"):
+            expected = re.escape(i18n.t("store.profile.duplicate_sequence", sequence=2, names="'alpha', 'beta'"))
+            with self.assertRaisesRegex(StoreError, expected):
                 self.store.save(profile)
         self.assertEqual(len(scans), 1)
         self.assertNotEqual(
@@ -2614,7 +2778,8 @@ class TestRoutineSaveSkipsTheWholeStoreScan(BaseCase):
         before = beta_path.read_bytes()
         alpha.touch()
         self.store.save(alpha)
-        with self.assertRaisesRegex(StoreError, "duplicate positive profile sequence"):
+        expected = re.escape(i18n.t("store.profile.duplicate_sequence", sequence=1, names="'alpha', 'beta'"))
+        with self.assertRaisesRegex(StoreError, expected):
             self.store.list()
         self.assertEqual(beta_path.read_bytes(), before)
 

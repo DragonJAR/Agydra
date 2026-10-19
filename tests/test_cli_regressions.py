@@ -22,10 +22,12 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from store import Store, StoreError, read_json_object
 import shutil as shutil_mod
 
+import i18n
 import ui
 from ui import strip_ansi
 
@@ -51,6 +53,8 @@ class TestListColumnsAlignWithColor(BaseCase):
         os.environ["FORCE_COLOR"] = "1"
 
     def test_row_columns_align_with_header_under_color(self):
+        import cli
+
         self.store.create("work")
         data_dir = self.store.profile_data_dir("work") / "antigravity-cli"
         data_dir.mkdir(parents=True)
@@ -59,12 +63,14 @@ class TestListColumnsAlignWithColor(BaseCase):
         )
         lines = self.capture_list()
         plain_header, plain_row = strip_ansi(lines[0]), strip_ansi(lines[1])
-        auth_at = plain_header.index("AUTH")
-        default_at = plain_header.index("DEFAULT")
-        busy_at = plain_header.index("BUSY")
-        last_at = plain_header.index("LAST USED")
+        headers = cli._table_headers()
+        auth_at = plain_header.index(headers["auth"])
+        default_at = plain_header.index(headers["default"])
+        busy_at = plain_header.index(headers["busy"])
+        last_at = plain_header.index(headers["last_used"])
+        auth_label = i18n.t("cmd.list.state_authenticated")
         self.assertEqual(
-            plain_row.index("authenticated"), auth_at,
+            plain_row.index(auth_label), auth_at,
             "AUTH column misaligned under color",
         )
         self.assertEqual(plain_row[default_at], "*")
@@ -100,15 +106,19 @@ class TestListHeaderNeverFusesColumns(BaseCase):
         self.store.create("work")
         lines = self.capture_list()
         header = lines[0]
-        self.assertIn(f"{cli._PROFILE_LABEL}  EMAIL", header)
+        headers = cli._table_headers()
+        self.assertIn(f"{cli._PROFILE_LABEL}  {headers['email']}", header)
 
     def test_long_profile_name_still_aligned(self):
+        import cli
+
         self.store.create("a" * 30)
         lines = self.capture_list()
         header = lines[0]
         row = lines[1]
-        self.assertEqual(header.index("EMAIL"), row.index("-"))
-        self.assertLess(header.index("EMAIL"), header.index("AUTH"))
+        headers = cli._table_headers()
+        self.assertEqual(header.index(headers["email"]), row.index("-"))
+        self.assertLess(header.index(headers["email"]), header.index(headers["auth"]))
 
     def capture_list(self):
         import cli
@@ -242,9 +252,9 @@ class TestDeletePurgesUnderProfileLock(BaseCase):
 
         self.assertEqual(result, 1)
         self.assertFalse(self.store.exists("kc"))
-        self.assertIn("backup saved:", stdout.getvalue())
-        self.assertIn("deleted profile: kc", stdout.getvalue())
-        self.assertIn("was deleted, but keychain purge failed", stderr.getvalue())
+        self.assertIn(i18n.t("cmd.delete.backup_saved", path="").split(":")[0], stdout.getvalue())
+        self.assertIn(i18n.t("cmd.delete.ok", name="kc"), stdout.getvalue())
+        self.assertIn(i18n.t("cmd.delete.purge_failed", name="kc", error="keychain offline"), stderr.getvalue())
         self.assertTrue(list(self.store.backups_dir.glob("kc-*.zip")))
 
 
@@ -270,8 +280,10 @@ class TestImportGuards(BaseCase):
 
         with self.assertRaises(StoreError) as ctx:
             cli.cmd_import(self.store, Args())
-        self.assertIn("already has data", str(ctx.exception))
-        self.assertIn("agydra delete populated", str(ctx.exception))
+        self.assertEqual(
+            str(ctx.exception),
+            i18n.t("import.profile_has_data", name="populated", path=data),
+        )
         parent = data.parent
         self.assertFalse(
             [p for p in parent.iterdir() if p.name.startswith(".import-")],
@@ -643,10 +655,8 @@ class TestLateFlagWarningNoDuplicates(BaseCase):
         self.store.create("alpha")
 
     def test_repeated_flag_swallowing_value_flag_warns_exactly_once(self):
-        # -p alpha consumes profile; -p beta repeats and is itself the
-        # first forwarded flag the note must name; -b /opt/fake follows it
         result = self._run_cli("-p", "alpha", "-p", "beta", "-b", "/opt/fake")
-        needle = "'-p beta' was passed to agy, not agydra"
+        needle = i18n.t("cli.note_late_flags", spelling="-p beta")
         self.assertIn(needle, result.stderr)
         self.assertEqual(
             result.stderr.count(needle), 1,
@@ -654,10 +664,8 @@ class TestLateFlagWarningNoDuplicates(BaseCase):
         )
 
     def test_repeated_flag_swallowing_boolean_flag_warns_exactly_once(self):
-        # -p alpha consumes profile; -p beta repeats, swallowing -n
-        # (This was the original bug that launched without dry-run)
         result = self._run_cli("-p", "alpha", "-p", "beta", "-n")
-        needle = "'-p beta' was passed to agy, not agydra"
+        needle = i18n.t("cli.note_late_flags", spelling="-p beta")
         self.assertIn(needle, result.stderr)
         self.assertEqual(
             result.stderr.count(needle), 1,
@@ -665,9 +673,8 @@ class TestLateFlagWarningNoDuplicates(BaseCase):
         )
 
     def test_late_flag_after_non_flag_still_warns_exactly_once(self):
-        # General case: -p after a non-flag token
         result = self._run_cli("chat", "-p", "alpha", "-n")
-        needle = "'-p alpha' was passed to agy, not agydra"
+        needle = i18n.t("cli.note_late_flags", spelling="-p alpha")
         self.assertIn(needle, result.stderr)
         self.assertEqual(
             result.stderr.count(needle), 1,
@@ -709,7 +716,7 @@ class TestLateFlagsDashDashOrder(BaseCase):
 
     def test_flag_before_dash_dash_warns(self):
         out = self._warn(["chat", "-b", "/opt/fake", "--", "prompt"])
-        self.assertIn("'-b /opt/fake' was passed to agy, not agydra", out)
+        self.assertIn(i18n.t("cli.note_late_flags", spelling="-b /opt/fake"), out)
 
     def test_flag_after_dash_dash_is_ignored(self):
         out = self._warn(["chat", "--", "-p", "work"])
@@ -763,7 +770,10 @@ class TestStatusDryRunIsReadOnly(BaseCase):
             code = cli.cmd_status(self.store, args)
 
         self.assertEqual(code, 1)
-        self.assertIn("recovery is pending", strip_ansi(err.getvalue()))
+        self.assertIn(
+            i18n.t("store.rename.readonly_unreadable", path=journal),
+            strip_ansi(err.getvalue()),
+        )
         self.assertEqual(journal.read_bytes(), journal_bytes)
 
     def test_status_dry_run_plans_with_the_read_only_flag(self):
@@ -794,15 +804,24 @@ class TestAssertFreeActionContext(BaseCase):
         try:
             with self.assertRaises(StoreError) as ctx:
                 cli._assert_free(self.store, "busy-prof", "logging in")
-            self.assertIn("before logging in", str(ctx.exception))
+            self.assertIn(
+                i18n.t("cli.profile_busy", name="busy-prof", session="", action="logging in").split(";")[-1].strip(),
+                str(ctx.exception),
+            )
 
             with self.assertRaises(StoreError) as ctx:
                 cli._assert_free(self.store, "busy-prof", "sharing config")
-            self.assertIn("before sharing config", str(ctx.exception))
+            self.assertIn(
+                i18n.t("cli.profile_busy", name="busy-prof", session="", action="sharing config").split(";")[-1].strip(),
+                str(ctx.exception),
+            )
 
             with self.assertRaises(StoreError) as ctx:
                 cli._assert_free(self.store, "busy-prof", "deleting the profile")
-            self.assertIn("before deleting the profile", str(ctx.exception))
+            self.assertIn(
+                i18n.t("cli.profile_busy", name="busy-prof", session="", action="deleting the profile").split(";")[-1].strip(),
+                str(ctx.exception),
+            )
         finally:
             handle.release()
 
@@ -822,9 +841,9 @@ class TestDeleteTOCTOUGuard(BaseCase):
         try:
             with self.assertRaises(StoreError) as ctx:
                 cli._finish_delete(self.store, "victim", no_backup=True)
-            self.assertIn("holder state could not be verified", str(ctx.exception))
+            self.assertIn(i18n.t("cli.session_unverified"), str(ctx.exception))
             self.assertNotIn("kill", str(ctx.exception))
-            self.assertIn("before deleting the profile", str(ctx.exception))
+            self.assertIn(i18n.t("cli.action_delete"), str(ctx.exception))
         finally:
             handle.release()
 
@@ -839,7 +858,7 @@ class TestDeleteTOCTOUGuard(BaseCase):
             message = str(ctx.exception)
             self.assertNotIn("kill", message)
             self.assertNotIn("12345", message)
-            self.assertIn("could not be verified", message)
+            self.assertIn(i18n.t("cli.session_unverified"), message)
         finally:
             handle.release()
 
@@ -949,6 +968,7 @@ class TestShareConfigDeduplication(BaseCase):
 
         outputs = []
         old_seed = os.environ.get("PYTHONHASHSEED")
+        prefix = i18n.t("cmd.share_config.entry_copied", entry="").rstrip()
         try:
             for seed in ("1", "2"):
                 os.environ["PYTHONHASHSEED"] = seed
@@ -957,7 +977,7 @@ class TestShareConfigDeduplication(BaseCase):
                 outputs.append(
                     [
                         line for line in result.stdout.splitlines()
-                        if line.startswith("copied:")
+                        if line.startswith(prefix)
                     ]
                 )
         finally:
@@ -967,9 +987,9 @@ class TestShareConfigDeduplication(BaseCase):
                 os.environ["PYTHONHASHSEED"] = old_seed
 
         expected = [
-            "copied: target/settings.json",
-            "copied: target/mcp.json",
-            "copied: target/config.toml",
+            i18n.t("cmd.share_config.entry_copied", entry="target/settings.json"),
+            i18n.t("cmd.share_config.entry_copied", entry="target/mcp.json"),
+            i18n.t("cmd.share_config.entry_copied", entry="target/config.toml"),
         ]
         self.assertEqual(outputs, [expected, expected])
 
@@ -985,7 +1005,7 @@ class TestCliCreateWithDanglingDefault(BaseCase):
     def test_create_succeeds_when_default_profile_is_missing(self):
         result = self._run_cli("create", "fresh")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("created profile: fresh", result.stdout)
+        self.assertIn(i18n.t("cmd.create.ok", name="fresh"), result.stdout)
         self.assertTrue(self.store.exists("fresh"))
 
 
@@ -1348,18 +1368,22 @@ os._exit(0)
                     )
 
                 with keychain_patches[0], keychain_patches[1]:
-                    with self.assertRaisesRegex(StoreError, "journal retained"):
+                    with self.assertRaises(StoreError) as cm:
                         cli.cmd_rename(store, Args())
+                    retained_prefix = i18n.t("store.rename.action_callback_failed", error="").split("(")[0].strip()
+                    self.assertIn(retained_prefix, str(cm.exception))
                     self.assertTrue(store.rename_journal_path.is_file())
                     self.assertTrue(old_slot.is_file())
                     self.assertEqual(old_slot.read_bytes(), b"source-credential")
                     self.assertEqual(new_slot.read_bytes(), b"stale-target-credential")
 
-                    with self.assertRaisesRegex(
-                        StoreError,
-                        "rename recovery is pending|profile rename was interrupted",
-                    ):
+                    pending_prefix = i18n.t("store.rename.pending").split(";")[0].strip()
+                    interrupted_prefix = i18n.t("store.rename.interrupted").split(";")[0].strip()
+                    with self.assertRaises(StoreError) as cm:
                         store.list()
+                    self.assertTrue(
+                        pending_prefix in str(cm.exception) or interrupted_prefix in str(cm.exception)
+                    )
                     self.assertTrue(store.rename_journal_path.is_file())
 
                 with mock.patch.object(keychain, "supported", return_value=True), \
@@ -1409,8 +1433,7 @@ class TestHelpFormattingRegression(BaseCase):
         result = self._run_cli("doctor", "--help")
         self.assertEqual(result.returncode, 0, result.stderr)
         flat = " ".join(result.stdout.split())
-        self.assertIn("(overlays and keychain files)", flat)
-        self.assertIn("backup ZIPs are never scanned or deleted", flat)
+        self.assertIn(i18n.t("arg.doctor.fix"), flat)
         self.assertNotIn("backups)", flat)
         self.assertNotIn("overlays/locks/keychain", flat)
 
@@ -1471,8 +1494,14 @@ class TestImportRuntimeExclusion(BaseCase):
             with self.assertRaises(StoreError) as ctx:
                 cli.cmd_import(self.store, Args())
         message = str(ctx.exception)
-        self.assertIn("import failed", message)
-        self.assertIn("2 entries", message)
+        prefix = i18n.t(
+            "cli.import_failed",
+            count=2,
+            unit=i18n.t("cli.import_entries"),
+            source="SRC",
+            detail="",
+        ).split("SRC")[0].strip()
+        self.assertIn(prefix, message)
         self.assertIn("/src/a", message)
         self.assertNotIn("/src/b", message)
         parent = self.store.profile_data_dir("cx2", engine="codex").parent
@@ -1490,7 +1519,15 @@ class TestSummarizeImportFailure(BaseCase):
         for error in (shutil_mod.Error(), shutil_mod.Error("plain reason"), shutil_mod.Error([])):
             with self.subTest(args=error.args):
                 message = cli._summarize_import_failure(error, source)
-                self.assertIn(f"0 entries could not be copied from {source}", message)
+                unit = i18n.t("cli.import_entries")
+                prefix = i18n.t(
+                    "cli.import_failed",
+                    count=0,
+                    unit=unit,
+                    source=source,
+                    detail="",
+                ).split(";")[0].strip()
+                self.assertIn(prefix, message)
 
 
 
@@ -1557,9 +1594,8 @@ class TestLeaseAwareProfileLocks(BaseCase):
         status, out, err = self._run(["import", "work", "--source", str(self.source)])
 
         self.assertEqual(status, 1, err)
-        self.assertIn("live session", err)
-        self.assertIn(f"PID {self.holder.pid}", err)
-        self.assertNotIn("imported generic data", out)
+        self.assertIn(i18n.t("cli.session_verified", pid=self.holder.pid, kill_pid=self.holder.pid), err)
+        self.assertNotIn(i18n.t("cmd.import.ok", name="work", path=data_dir).split(":")[0], out)
         self.assertEqual(list(data_dir.iterdir()), [])
         self._assert_lease_intact("work", lease, before)
 
@@ -1580,7 +1616,7 @@ class TestLeaseAwareProfileLocks(BaseCase):
         status, out, err = self._run(["share-config", "work", "other"])
 
         self.assertEqual(status, 1, err)
-        self.assertIn("live session", err)
+        self.assertIn(i18n.t("cli.session_verified", pid=self.holder.pid, kill_pid=self.holder.pid), err)
         self.assertFalse((self.store.profile_data_dir("other") / "settings.json").exists())
         self._assert_lease_intact("other", lease, before)
 
@@ -1592,7 +1628,7 @@ class TestLeaseAwareProfileLocks(BaseCase):
         status, out, err = self._run(["share-config", "work", "other"])
 
         self.assertEqual(status, 1, err)
-        self.assertIn("live session", err)
+        self.assertIn(i18n.t("cli.session_verified", pid=self.holder.pid, kill_pid=self.holder.pid), err)
         self._assert_lease_intact("work", source_lease, source_before)
         self._assert_lease_intact("other", target_lease, target_before)
 
@@ -1613,7 +1649,7 @@ class TestLeaseAwareProfileLocks(BaseCase):
         status, out, err = self._run(["create", "fresh"])
 
         self.assertEqual(status, 0, err)
-        self.assertIn("created profile: fresh", out)
+        self.assertIn(i18n.t("cmd.create.ok", name="fresh"), out)
         self.assertTrue((self.store.profile_data_dir("fresh") / "settings.json").exists())
         self._assert_lease_intact("work", lease, before)
 
@@ -1625,7 +1661,7 @@ class TestLeaseAwareProfileLocks(BaseCase):
         ), contextlib.redirect_stderr(io.StringIO()) as err:
             rc = cli.cmd_create(self.store, argparse.Namespace(name="fresh", engine="agy", description=""))
         self.assertEqual(rc, 0)
-        self.assertIn("settings not copied from default profile 'work'", err.getvalue())
+        self.assertIn(i18n.t("cmd.create.settings_not_copied", default_name="work", exc="disk full"), err.getvalue())
 
     def test_create_does_not_mask_a_non_busy_store_error_from_the_copy(self):
         import cli
@@ -1635,7 +1671,7 @@ class TestLeaseAwareProfileLocks(BaseCase):
         ), contextlib.redirect_stderr(io.StringIO()) as err:
             rc = cli.cmd_create(self.store, argparse.Namespace(name="fresh", engine="agy", description=""))
         self.assertEqual(rc, 0)
-        self.assertIn("settings not copied from default profile 'work'", err.getvalue())
+        self.assertIn(i18n.t("cmd.create.settings_not_copied", default_name="work", exc="cannot safely share config"), err.getvalue())
 
     def test_an_unreadable_lease_registry_is_reported_as_unverified_and_still_refuses(self):
         import cli
@@ -1649,8 +1685,8 @@ class TestLeaseAwareProfileLocks(BaseCase):
             cli._assert_free(self.store, "work", "importing into it")
 
         message = str(ctx.exception)
-        self.assertIn("could not be verified", message)
-        self.assertNotIn("a live session", message)
+        self.assertIn(i18n.t("cli.session_unverified"), message)
+        self.assertNotIn(i18n.t("cli.session_single"), message)
         self.assertEqual(path.read_bytes(), before)
 
     def test_assert_free_names_a_pid_only_for_verified_holders(self):
@@ -1661,9 +1697,9 @@ class TestLeaseAwareProfileLocks(BaseCase):
             return SimpleNamespace(pid=pid, start=start)
 
         cases = (
-            ([holder(11, "t1"), holder(22, "t2")], ["2 live sessions", "first PID 11", "kill 11"], []),
-            ([holder(11, None), holder(22, None)], ["2 live sessions", "unverified"], ["kill", "PID"]),
-            ([holder(11, None)], ["a live session", "unverified"], ["kill", "PID"]),
+            ([holder(11, "t1"), holder(22, "t2")], [i18n.t("cli.sessions_verified", count=2, pid=11, kill_pid=11)], []),
+            ([holder(11, None), holder(22, None)], [i18n.t("cli.session_identity_unverified", session=i18n.t("cli.sessions_plural", count=2))], ["kill", "PID"]),
+            ([holder(11, None)], [i18n.t("cli.session_identity_unverified", session=i18n.t("cli.session_single"))], ["kill", "PID"]),
         )
         for holders, expected, forbidden in cases:
             with self.subTest(holders=[(h.pid, h.start) for h in holders]):
@@ -1684,10 +1720,17 @@ class TestLeaseAwareProfileLocks(BaseCase):
         with mock.patch.object(
             cli.locks, "try_mutation_lock", side_effect=cli.locks.LockError("registry unreadable")
         ):
-            with self.assertRaisesRegex(StoreError, "cannot safely proceed") as ctx:
+            with self.assertRaises(StoreError) as ctx:
                 cli._acquire_profile_lock(self.store, "work", "importing into it")
         self.assertNotIsInstance(ctx.exception, cli.ProfileBusyError)
         self.assertIn("registry unreadable", str(ctx.exception))
+        expected = i18n.t(
+            "store.error.cannot_safely_proceed",
+            action="importing into it",
+            subject=i18n.t("cli.profile_subject", name="work"),
+            cause="registry unreadable",
+        )
+        self.assertEqual(str(ctx.exception), expected)
 
     def test_profile_lock_helper_uses_the_lease_aware_mutation_lock(self):
         import cli
@@ -1776,7 +1819,7 @@ class TestP5CliRegressions(BaseCase):
         with contextlib.redirect_stderr(buf):
             rc = cli._report_error(EOFError("EOF when reading a line"))
         self.assertEqual(rc, 1)
-        self.assertIn("no input available to confirm; re-run with --force", buf.getvalue())
+        self.assertIn(i18n.t("error.no_input_available"), buf.getvalue())
 
     def test_confirm_accepts_spanish_affirmative_answers(self):
         import cli
@@ -1951,7 +1994,6 @@ class TestF5MutualExclusionHint(BaseCase):
             rc = cli.main(["-p", "cc", "-r"])
         self.assertEqual(rc, 2)
         err = err_buf.getvalue()
-        self.assertIn("-p/--profile and -r/--random are mutually exclusive", err)
-        self.assertIn("to pass -r to the engine, put it after --: agydra -p cc -- -r", err)
+        self.assertIn(i18n.t("cli.error_profile_and_random_exclusive", profile="cc"), err)
         self.assertNotIn("{", err)
 

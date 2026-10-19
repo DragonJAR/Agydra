@@ -10,10 +10,14 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import cli
+import i18n
 import locks
 import platforms
 import runner
-from conftest import BaseCase, write_fake_binary
+try:
+    from conftest import BaseCase, write_fake_binary
+except ModuleNotFoundError:
+    from tests.conftest import BaseCase, write_fake_binary
 from store import Store, StoreError
 
 
@@ -148,17 +152,18 @@ class TestUsageNetworkErrors(BaseCase):
         data_dir = self.store.profile_data_dir("cx", engine="codex")
         res = usage.query_codex_usage(data_dir, "cx", email="c@test.com", plan=None)
         self.assertFalse(res.ok)
-        self.assertEqual(res.error, "usage unavailable (HTTP 500)")
+        self.assertEqual(res.error, i18n.t("usage.http_unavailable", code=500))
         self.assertIsNone(res.plan)
 
     @mock.patch("usage.fetch_codex_usage_payload")
     def test_codex_usage_offline_exception_returns_ok_false_and_no_fake_plan(self, mock_fetch):
         import usage
-        mock_fetch.side_effect = OSError("network unreachable")
+        err = OSError("network unreachable")
+        mock_fetch.side_effect = err
         data_dir = self.store.profile_data_dir("cx", engine="codex")
         res = usage.query_codex_usage(data_dir, "cx", email="c@test.com", plan=None)
         self.assertFalse(res.ok)
-        self.assertEqual(res.error, "offline (network unreachable)")
+        self.assertEqual(res.error, i18n.t("usage.offline", error=err))
         self.assertIsNone(res.plan)
 
     @mock.patch("usage._usage_auth_snapshot", return_value=({"auth_type": "oauth", "key": "k"}, None, "g@test.com"))
@@ -179,7 +184,7 @@ class TestUsageNetworkErrors(BaseCase):
         (data_dir / "auth.json").write_text(json.dumps({"auth": auth_data}), encoding="utf-8")
         res = usage.query_grok_usage(data_dir, "gx", email="g@test.com", plan=None, store=self.store)
         self.assertFalse(res.ok)
-        self.assertEqual(res.error, "usage unavailable (HTTP 503)")
+        self.assertEqual(res.error, i18n.t("usage.http_unavailable", code=503))
         self.assertIsNone(res.plan)
 
     @mock.patch("usage.query_profile_usage")
@@ -226,7 +231,7 @@ class TestGrokUsage401Locking(BaseCase):
         try:
             res = usage.query_grok_usage(self.data_dir, "gx", store=self.store)
             self.assertFalse(res.ok)
-            self.assertEqual(res.error, "session expired (401)")
+            self.assertEqual(res.error, i18n.t("usage.session_expired"))
             self.assertFalse(mock_refresh.called)
         finally:
             handle.release()

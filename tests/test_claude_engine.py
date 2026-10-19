@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import account
 import doctor
 import engines
+import i18n
 import isolation
 import locks
 import models
@@ -26,14 +27,24 @@ import runner
 import store as store_mod
 from store import Store, StoreError
 
-from conftest import (
-    BaseCase,
-    LiveHolders,
-    make_dir_link,
-    posix_only,
-    snapshot_tree,
-    write_fake_binary,
-)
+try:
+    from conftest import (
+        BaseCase,
+        LiveHolders,
+        make_dir_link,
+        posix_only,
+        snapshot_tree,
+        write_fake_binary,
+    )
+except ModuleNotFoundError:
+    from tests.conftest import (
+        BaseCase,
+        LiveHolders,
+        make_dir_link,
+        posix_only,
+        snapshot_tree,
+        write_fake_binary,
+    )
 
 REAL_CLAUDE = shutil.which("claude")
 
@@ -712,7 +723,8 @@ class TestDeleteAndBackup(ClaudeBase):
     def test_down_supervisor_with_listed_workers_blocks(self):
         self.make_profile("alpha")
         self.seed_background(roster={"version": 1, "workers": {"abc": {"pid": 1}}})
-        self.assertIn("workers", self.assert_delete_refused_untouched())
+        expected_prefix = i18n.t("store.claude.workers_running", name="alpha", stop_hint="").split(";")[0]
+        self.assertIn(expected_prefix, self.assert_delete_refused_untouched())
 
     def test_unreadable_roster_blocks(self):
         self.make_profile("alpha")
@@ -752,7 +764,8 @@ class TestDeleteAndBackup(ClaudeBase):
         (cfg / ".credentials.json").write_text("secret", encoding="utf-8")
         with self.assertRaises(StoreError) as ctx:
             self.store.delete("alpha")
-        self.assertIn("damaged", str(ctx.exception))
+        expected = i18n.t("store.claude.metadata_damaged", name="alpha", error="profile seq must be positive, got 0")
+        self.assertEqual(str(ctx.exception), expected)
         self.assertTrue((cfg / ".credentials.json").exists())
         self.assertTrue(self.store.profile_dir("alpha").exists())
 
@@ -869,7 +882,8 @@ class TestDeleteAndBackup(ClaudeBase):
         ):
             with self.assertRaises(StoreError) as ctx:
                 self.store.delete("alpha")
-        self.assertIn("nothing was deleted", str(ctx.exception))
+        expected = i18n.t("store.claude.invalidate_cache_failed", name="alpha", error="locked")
+        self.assertEqual(str(ctx.exception), expected)
         self.assertTrue((cfg / ".claude.json").exists())
         self.assertTrue(self.store.profile_meta_path("alpha").exists())
 
@@ -1014,7 +1028,8 @@ class TestDoctor(ClaudeBase):
         results = self.checks()
         status, message = next(v for k, v in results.items() if "binary" in k.lower())
         self.assertEqual(status, doctor.OK)
-        self.assertIn("claude binary", message)
+        expected_prefix = i18n.t("doctor.binary.claude_ok", path="").split(":")[0]
+        self.assertIn(expected_prefix, message)
 
     def test_missing_binary_fails_explicitly(self):
         self.make_profile("work")
@@ -1112,8 +1127,8 @@ class TestReadonlyStoreApi(ClaudeBase):
                 call()
             msg = str(ctx.exception)
             self.assertTrue(
-                "rename recovery is pending" in msg
-                or "profile rename was interrupted" in msg
+                i18n.t("store.rename.pending") in msg
+                or i18n.t("store.rename.interrupted") in msg
             )
         self.assertEqual(self.store.rename_journal_path.read_text(encoding="utf-8"), journal)
         self.assertTrue(self.store.profile_dir("alpha").exists())

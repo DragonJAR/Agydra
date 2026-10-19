@@ -129,7 +129,16 @@ class TestDeleteSequenceLockScope(BaseCase):
                 self.assertTrue(entered_backup.wait(10))
                 created = store.create("parallel")
                 self.assertEqual(created.seq, 2)
-                with self.assertRaisesRegex(StoreError, "live session"):
+                with self.assertRaisesRegex(
+                    StoreError,
+                    re.escape(
+                        i18n.t(
+                            "store.profile_has_a_live_session_end_it_before",
+                            name="victim",
+                            action=i18n.t("store.action.deleting"),
+                        )
+                    ),
+                ):
                     store.delete("victim", backup=False)
             finally:
                 continue_backup.set()

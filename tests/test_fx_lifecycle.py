@@ -11,6 +11,8 @@ from models import Profile
 import cli
 import locks
 import doctor
+import i18n
+import re
 
 
 class TestFxLifecycle(BaseCase):
@@ -74,7 +76,7 @@ class TestFxLifecycle(BaseCase):
         with mock.patch("cli._note") as mock_note:
             code = cli.cmd_export(self.store, args)
             self.assertEqual(code, 0)
-            mock_note.assert_called_with("exporting live profile 'work'; the archive is a best-effort snapshot")
+            mock_note.assert_called_with(i18n.t("cmd.export.live_note", name="work"))
 
     def test_c2_shared_config_files_and_import_overwrites_them(self):
         self.assertEqual(cli.SHARED_CONFIG_FILES, ("settings.json", "mcp.json", "config.toml"))
@@ -101,7 +103,7 @@ class TestFxLifecycle(BaseCase):
         dirty_args = mock.Mock(ref="dirty", source=str(source_dir))
         with self.assertRaises(StoreError) as ctx:
             cli.cmd_import(self.store, dirty_args)
-        self.assertIn("already has data", str(ctx.exception))
+        self.assertIn(i18n.t("import.profile_has_data", name="dirty", path=dirty_dir), str(ctx.exception))
 
     def test_c3_cmd_create_settings_copy_catches_store_error_and_os_error(self):
         self.store.create("default-prof")
@@ -249,7 +251,7 @@ class TestFxLifecycle(BaseCase):
 
         status, message = doctor._check_profiles(self.store, ctx)
         self.assertEqual(status, doctor.FAIL)
-        self.assertIn("duplicate positive profile sequence", message)
+        self.assertIn(str(self.store._duplicate_profile_sequence_error(p1.seq, ["first-c", "second-c"])), message)
         self.assertIn(str(self.store.profile_meta_path("first-c")), message)
         self.assertIn(str(self.store.profile_meta_path("second-c")), message)
 
@@ -275,13 +277,13 @@ class TestFxLifecycle(BaseCase):
                 with self.assertRaises(StoreError) as cm:
                     self.store.get_readonly(target)
                 err_msg = str(cm.exception)
-                self.assertIn("next launch or profile-changing command", err_msg)
+                self.assertIn(i18n.t("store.rename.interrupted"), err_msg)
                 self.assertNotIn("run any agydra command that writes", err_msg)
 
             with self.assertRaises(StoreError) as cm:
                 self.store.scan_readonly()
             err_msg = str(cm.exception)
-            self.assertIn("next launch or profile-changing command", err_msg)
+            self.assertIn(i18n.t("store.rename.interrupted"), err_msg)
             self.assertNotIn("run any agydra command that writes", err_msg)
 
             self.assertEqual(self.store.resolve_ref_readonly("other"), "other")
@@ -325,8 +327,7 @@ class TestUsageFinishesPendingRename(BaseCase):
         status, out, err = self._usage(argv)
         report = out + err
         self.assertEqual(status, 1, report)
-        self.assertIn("profile rename recovery is pending", report)
-        self.assertIn("next launch or profile-changing command", report)
+        self.assertIn(i18n.t("store.rename.interrupted"), report)
         self.assertEqual(self.store.rename_journal_path.read_bytes(), journal_before)
 
         with mock.patch.object(cli, "Store", return_value=self.store):
@@ -335,7 +336,7 @@ class TestUsageFinishesPendingRename(BaseCase):
         self.assertEqual(status, 0)
         self.assertFalse(self.store.rename_journal_path.exists())
         status, out, err = self._usage(argv)
-        self.assertNotIn("next launch or profile-changing command", out + err)
+        self.assertNotIn(i18n.t("store.rename.interrupted"), out + err)
 
     def test_usage_table_reports_retry_then_next_command_heals(self):
         self._assert_read_reports_retry_and_next_command_heals(["usage"])
@@ -419,7 +420,7 @@ class TestPendingRenameCommandRecovery(BaseCase):
 
             self.assertEqual(result, 1)
             self.assertIn(
-                "next launch or profile-changing command", out.getvalue() + err.getvalue()
+                i18n.t("store.rename.interrupted"), out.getvalue() + err.getvalue()
             )
             self.assertEqual(self.store.rename_journal_path.read_bytes(), journal_before)
         self.assertTrue(self.store.rename_journal_path.exists())
@@ -458,8 +459,7 @@ class TestUnsafeRenameLaunchRecovery(BaseCase):
         )
 
         self.assertEqual(result, 1, output)
-        self.assertIn("launch was not started", output)
-        self.assertIn("ordinary mutating command", output)
+        self.assertIn(i18n.t("store.rename.launch_unreadable", path=self.store.rename_journal_path), output)
         plan.assert_not_called()
         run.assert_not_called()
         self.assertEqual(self.store.rename_journal_path.read_bytes(), raw)
@@ -492,7 +492,7 @@ class TestUnsafeRenameLaunchRecovery(BaseCase):
                     )
 
                     self.assertEqual(result, 1, output)
-                    self.assertIn("conflicting profile state", output)
+                    self.assertIn(i18n.t("store.rename.conflict", old="old", new="new"), output)
                     plan.assert_not_called()
                     run.assert_not_called()
                     self.assertEqual(
@@ -535,7 +535,7 @@ class TestUnsafeRenameLaunchRecovery(BaseCase):
                     self.store.profile_dir("new").is_dir(), directories_present
                 )
                 with self.assertRaisesRegex(
-                    StoreError, "profile rename recovery is pending"
+                    StoreError, re.escape(i18n.t("store.rename.interrupted"))
                 ):
                     self.store.scan()
                 self.assertFalse(
@@ -596,7 +596,7 @@ class TestUnsafeRenameLaunchRecovery(BaseCase):
         self.assertFalse(worker.is_alive())
         outcome = outcomes.get_nowait()
         self.assertIsInstance(outcome, StoreError)
-        self.assertIn("rename", str(outcome))
+        self.assertIn(i18n.t("store.rename.interrupted"), str(outcome))
 
     def test_conflicting_launch_scope_resets_after_exception(self):
         with self.assertRaisesRegex(RuntimeError, "scope failure"):

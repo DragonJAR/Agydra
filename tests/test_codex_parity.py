@@ -13,10 +13,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import account
 import cli
+import i18n
 import runner
 import usage
 from unittest import mock
-from conftest import BaseCase, _make_jwt, write_fake_binary
+try:
+    from conftest import BaseCase, _make_jwt, write_fake_binary
+except ModuleNotFoundError:
+    from tests.conftest import BaseCase, _make_jwt, write_fake_binary
 from store import Store
 
 
@@ -112,7 +116,7 @@ class TestCodexParity(BaseCase):
         d_key = self._tmp / "d_key"
         d_key.mkdir()
         (d_key / "auth.json").write_text(json.dumps({"OPENAI_API_KEY": "sk-12345"}), encoding="utf-8")
-        self.assertEqual(account.detect_codex_plan(d_key), "OpenAI API Key")
+        self.assertEqual(account.detect_codex_plan(d_key), i18n.t("usage.openai_api_key"))
 
     def test_codex_lifecycle_crud_parity(self):
         profile = self.store.create("mycodex", engine="codex")

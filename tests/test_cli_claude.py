@@ -6,6 +6,7 @@ import base64
 import io
 import json
 import os
+import re
 import sys
 import subprocess
 import shlex
@@ -22,6 +23,7 @@ except ImportError:
     from tests.conftest import BaseCase, child_launch_double, make_dir_link, snapshot_tree
 import account
 import cli
+import i18n
 import locks
 import usage
 import usage_snapshot
@@ -133,7 +135,7 @@ class TestClaudeCli(BaseCase):
                 self.assertEqual(command(self.store, args), 0)
                 self.assertEqual(probe.call_count, 1)
                 self.assertIn("cc@example.test", out.getvalue())
-                self.assertIn("authenticated", out.getvalue())
+                self.assertIn(i18n.t("auth.authenticated"), out.getvalue())
 
     def test_import_and_share_reject_claude_without_copying(self):
         self.store.create("cc", engine="claude")
@@ -167,17 +169,17 @@ class TestClaudeCli(BaseCase):
             self.assertEqual(cli.cmd_usage(self.store, SimpleNamespace(ref="cc")), 0)
         table = compact.getvalue()
         self.assertIn("ANTHROPIC CLAUDE CODE", table)
-        header = next(line for line in table.splitlines() if "PROFILE" in line and "STATE" in line)
-        for column in ("#", "PROFILE", "ACCOUNT", "AVAILABLE", "WK · 5H", "↻", "STATE"):
+        header = next(line for line in table.splitlines() if i18n.t("usage.header_profile") in line and i18n.t("usage.header_state") in line)
+        for column in ("#", i18n.t("usage.header_profile"), i18n.t("usage.header_account"), i18n.t("usage.header_available"), i18n.t("usage.header_windows"), "↻", i18n.t("usage.header_state")):
             self.assertIn(column, header)
         row = next(line for line in table.splitlines() if " cc " in line)
-        self.assertIn("snapshot", row)
+        self.assertIn(i18n.t("usage.state_snapshot"), row)
         for prose in cli._claude_usage_lines(result, 10)[:2]:
             self.assertNotIn(prose, table)
             self.assertIn(prose, detail.getvalue())
-        self.assertIn("identity unverified", detail.getvalue())
+        self.assertIn(i18n.t("usage.snapshot_notice"), detail.getvalue())
         self.assertNotIn("source:", table)
-        self.assertNotIn("USE NOW", table)
+        self.assertNotIn(i18n.t("usage.use_now"), table)
         self.assertNotIn("CLAUDE + GPT", table)
 
     def test_live_rows_fill_the_shared_columns_and_feed_the_use_now_line(self):
@@ -196,9 +198,12 @@ class TestClaudeCli(BaseCase):
         claudio = next(line for line in lines if " claudio " in line)
         claudia = next(line for line in lines if " claudia " in line)
         viejo = next(line for line in lines if " viejo " in line)
-        self.assertRegex(claudio, r"24\s+24 ·\s+49\s+\d+[dhm]( \d+[hm])?\s+live")
-        self.assertRegex(claudia, r"86\s+86 · 100\s+\d+[dhm]( \d+[hm])?\s+live")
-        self.assertRegex(viejo, r"unavailable\s+stale")
+        state_live = re.escape(i18n.t("usage.state_live"))
+        self.assertRegex(claudio, rf"24\s+24 ·\s+49\s+\d+[dhm]( \d+[hm])?\s+{state_live}")
+        self.assertRegex(claudia, rf"86\s+86 · 100\s+\d+[dhm]( \d+[hm])?\s+{state_live}")
+        unavail = re.escape(i18n.t("usage.unavailable"))
+        state_stale = re.escape(i18n.t("usage.state_stale"))
+        self.assertRegex(viejo, rf"{unavail}\s+{state_stale}")
         self.assertNotIn("timed out", out.getvalue())
         self.assertIn("Claude Code → claudia 86%", out.getvalue())
         self.assertNotIn("claudio 24%", out.getvalue())
@@ -217,9 +222,11 @@ class TestClaudeCli(BaseCase):
         lines = out.getvalue().splitlines()
         for name, state in (("parcial", "unknown"), ("ambigua", "ambiguous")):
             row = next(line for line in lines if f" {name} " in line)
-            self.assertRegex(row, rf"unavailable\s+{state}")
+            unavail = re.escape(i18n.t("usage.unavailable"))
+            state_label = re.escape(i18n.t(f"usage.state_{state}"))
+            self.assertRegex(row, rf"{unavail}\s+{state_label}")
             self.assertNotIn("█", row)
-        self.assertNotIn("USE NOW", out.getvalue())
+        self.assertNotIn(i18n.t("usage.use_now"), out.getvalue())
 
     def test_account_column_is_filled_once_for_claude_profiles_only(self):
         self.store.create("cc", engine="claude")
@@ -248,20 +255,21 @@ class TestClaudeCli(BaseCase):
     def test_expired_partial_snapshot_does_not_infer_full_quota(self):
         result = self._snapshot(reset=datetime.now(timezone.utc) - timedelta(seconds=1))
         rendered = "\n".join(cli._claude_usage_lines(result, 10))
-        self.assertIn("Five hour: unknown", rendered)
+        expected_window = f"Five hour: {i18n.t('usage.snapshot_unknown')}"
+        self.assertIn(expected_window, rendered)
         self.assertNotIn("100", rendered)
         self.assertNotIn("75", rendered)
         self.assertNotIn("Weekly", rendered)
         for quality in ("stale", "unknown", "ambiguous", "corrupt"):
             result.quality = quality
-            self.assertIn("Five hour: unknown", "\n".join(cli._claude_usage_lines(result, 10)))
+            self.assertIn(expected_window, "\n".join(cli._claude_usage_lines(result, 10)))
 
     def test_partial_snapshot_shows_fresh_window_without_total_availability(self):
         result = self._snapshot(quality="unknown")
         rendered = "\n".join(cli._claude_usage_lines(result, 10))
         self.assertIn("75", rendered)
         self.assertNotIn("Weekly", rendered)
-        self.assertNotIn("Five hour: unknown", rendered)
+        self.assertNotIn(f"Five hour: {i18n.t('usage.snapshot_unknown')}", rendered)
         for quality in ("stale", "ambiguous", "corrupt"):
             result.quality = quality
             self.assertNotIn("75", "\n".join(cli._claude_usage_lines(result, 10)))
@@ -289,7 +297,7 @@ class TestClaudeCli(BaseCase):
         ])])
         with patch.object(usage, "gather_usage_report", return_value=[agy, self._snapshot()]), contextlib.redirect_stdout(io.StringIO()) as out:
             cli.cmd_usage(self.store, SimpleNamespace(ref=None))
-        recommendation = next(line for line in out.getvalue().splitlines() if "USE NOW" in line)
+        recommendation = next(line for line in out.getvalue().splitlines() if i18n.t("usage.use_now") in line)
         self.assertIn("Claude/GPT → work 40%", recommendation)
         self.assertNotIn("cc", recommendation)
 
@@ -423,7 +431,7 @@ class TestClaudeCaptureEnable(BaseCase):
         if command.startswith("powershell.exe -NoProfile -NonInteractive -EncodedCommand "):
             command = base64.b64decode(command.split()[-1]).decode("utf-16-le")
         self.assertIn("claude_usage", command)
-        self.assertIn("capture enabled", out)
+        self.assertEqual(out.strip(), i18n.t("claude.capture_enabled", path=str(self._settings_path()), name="cc"))
 
     def test_apply_merges_preserving_existing_keys(self):
         self.store.create("cc", engine="claude")
@@ -442,7 +450,7 @@ class TestClaudeCaptureEnable(BaseCase):
         self._run_apply()
         rc, out = self._run_apply()
         self.assertEqual(rc, 0)
-        self.assertIn("already enabled", out)
+        self.assertEqual(out.strip(), i18n.t("claude.capture_already_enabled", name="cc"))
 
     def test_apply_refuses_to_overwrite_foreign_statusline(self):
         self.store.create("cc", engine="claude")
@@ -454,7 +462,7 @@ class TestClaudeCaptureEnable(BaseCase):
         )
         with self.assertRaises(StoreError) as ctx:
             self._run_apply()
-        self.assertIn("already defines a statusLine", str(ctx.exception))
+        self.assertEqual(str(ctx.exception), i18n.t("cli.capture_existing_statusline", path=path))
         settings = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(settings["statusLine"]["command"], "my-own")
 
@@ -465,7 +473,7 @@ class TestClaudeCaptureEnable(BaseCase):
         path.write_text("not json", encoding="utf-8")
         with self.assertRaises(StoreError) as ctx:
             self._run_apply()
-        self.assertIn("not valid JSON", str(ctx.exception))
+        self.assertEqual(str(ctx.exception), i18n.t("cli.capture_invalid_json", path=path, error="JSONDecodeError"))
         self.assertEqual(path.read_text(encoding="utf-8"), "not json")
 
     def test_apply_requires_claude_profile(self):
@@ -567,7 +575,8 @@ class TestClaudeCaptureEnable(BaseCase):
         with patch.object(self.store, "get_readonly", side_effect=change_identity_on_final_read), patch.object(
             cli, "atomic_write_text"
         ) as write:
-            with self.assertRaisesRegex(StoreError, "identity changed"):
+            with self.assertRaises(StoreError) as ctx:
                 self._run_apply()
+            self.assertEqual(str(ctx.exception), i18n.t("cli.capture_identity_changed", name="cc"))
 
         write.assert_not_called()

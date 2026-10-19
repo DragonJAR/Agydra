@@ -12,17 +12,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cli
+import i18n
 import locks
 import models
 import platforms
 import resolver
 import runner
-from conftest import (
-    BaseCase,
-    LiveHolders as _LiveHolders,
-    authenticate_agy_profile as _authenticate,
-    child_launch_double,
-)
+try:
+    from conftest import (
+        BaseCase,
+        LiveHolders as _LiveHolders,
+        authenticate_agy_profile as _authenticate,
+        child_launch_double,
+    )
+except ModuleNotFoundError:
+    from tests.conftest import (
+        BaseCase,
+        LiveHolders as _LiveHolders,
+        authenticate_agy_profile as _authenticate,
+        child_launch_double,
+    )
 from store import Store, StoreError
 
 
@@ -68,9 +77,11 @@ class TestAcquireLeaseLimit(BaseCase):
             locks.release_lease(self.store, "work")
 
     def test_limit_error_is_a_lock_error_and_names_the_limit(self):
+        expected = i18n.t("locks.profile_already_has_live_session_s_limit_of", name="work", count=2, limit=2)
         with _LiveHolders(self.store, "work", 2):
-            with self.assertRaisesRegex(locks.LockError, "2 live session"):
+            with self.assertRaises(locks.LockError) as caught:
                 locks.acquire_lease(self.store, "work", max_holders=2)
+            self.assertEqual(str(caught.exception), expected)
 
 
 class TestResolverLimit(BaseCase):
@@ -129,10 +140,12 @@ class TestRunnerLimit(BaseCase):
 
     def test_explicit_profile_at_the_limit_is_refused_without_spawning(self):
         plan = runner.build_plan(self.store, ["chat"], flag_ref="alpha")
+        expected = i18n.t("locks.profile_already_has_live_session_s_limit_of", name="alpha", count=2, limit=2)
         with _LiveHolders(self.store, "alpha", 2):
             before = locks.lease_holders(self.store, "alpha")
-            with self.assertRaisesRegex(StoreError, "limit of 2"):
+            with self.assertRaises(StoreError) as caught:
                 self._run(plan)
+            self.assertIn(expected, str(caught.exception))
             self.assertEqual(locks.lease_holders(self.store, "alpha"), before)
         self.assertEqual(self.spawned, [])
 
@@ -255,7 +268,7 @@ class TestDefaultIsUnlimited(BaseCase):
         out = io.StringIO()
         with _LiveHolders(self.store, "alpha", 4), contextlib.redirect_stdout(out):
             self.assertEqual(cli.main(["status", "alpha"]), 0)
-        self.assertIn("sessions  : 4\n", out.getvalue())
+        self.assertIn(i18n.t("cmd.status.sessions", count="4") + "\n", out.getvalue())
 
 
 class TestStatusShowsTheLimit(BaseCase):
@@ -269,7 +282,7 @@ class TestStatusShowsTheLimit(BaseCase):
         out = io.StringIO()
         with _LiveHolders(store, "work", 1), contextlib.redirect_stdout(out):
             self.assertEqual(cli.main(["status", "work"]), 0)
-        self.assertIn("sessions  : 1/3", out.getvalue())
+        self.assertIn(i18n.t("cmd.status.sessions", count="1/3"), out.getvalue())
 
 
 if __name__ == "__main__":

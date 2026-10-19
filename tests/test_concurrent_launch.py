@@ -15,19 +15,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import account
+import i18n
 import keychain
 import locks
 import platforms
 import profile_rotation
 import runner
-from conftest import (
-    BaseCase,
-    LiveHolders,
-    authenticate_agy_profile as _authenticate,
-    child_launch_double,
-    held_cli_session,
-    simulated_macos_keychain,
-)
+try:
+    from conftest import (
+        BaseCase,
+        LiveHolders,
+        authenticate_agy_profile as _authenticate,
+        child_launch_double,
+        held_cli_session,
+        simulated_macos_keychain,
+    )
+except ModuleNotFoundError:
+    from tests.conftest import (
+        BaseCase,
+        LiveHolders,
+        authenticate_agy_profile as _authenticate,
+        child_launch_double,
+        held_cli_session,
+        simulated_macos_keychain,
+    )
 from store import Store, StoreError
 
 
@@ -94,8 +105,10 @@ class TestStoreReadPatience(BaseCase):
         holder = locks.try_sequence_lock(self.store)
         try:
             with mock.patch.object(type(self.store), "READ_LOCK_PATIENCE_S", 0.2):
-                with self.assertRaisesRegex(StoreError, "sequence lock is busy"):
+                expected = i18n.t("store.sequence.busy_detail")
+                with self.assertRaises(StoreError) as caught:
                     self.store.list()
+                self.assertIn(expected, str(caught.exception))
         finally:
             holder.release()
 
@@ -103,8 +116,14 @@ class TestStoreReadPatience(BaseCase):
         locks.acquire_lease(self.store, "alpha")
         try:
             started = time.monotonic()
-            with self.assertRaisesRegex(StoreError, "live session"):
+            expected = i18n.t(
+                "store.profile_has_a_live_session_end_it_before",
+                name="alpha",
+                action=i18n.t("store.action.deleting"),
+            )
+            with self.assertRaises(StoreError) as caught:
                 self.store.delete("alpha")
+            self.assertIn(expected, str(caught.exception))
             self.assertLess(time.monotonic() - started, 0.5)
         finally:
             locks.release_lease(self.store, "alpha")
@@ -145,8 +164,10 @@ class TestRotationLockPatience(BaseCase):
                 profile_rotation, "LOCK_PATIENCE_S", 0.15
             ):
                 started = time.monotonic()
-                with self.assertRaisesRegex(StoreError, "grok profile rotation is busy"):
+                expected = i18n.t("profile_rotation.profile_rotation_is_busy_retry_in_a_moment", scope="grok")
+                with self.assertRaises(StoreError) as caught:
                     rotation.__enter__()
+                self.assertIn(expected, str(caught.exception))
                 self.assertGreaterEqual(time.monotonic() - started, 0.1)
                 self.assertLess(time.monotonic() - started, 2.0)
             self.assertEqual(rotation.handles, [])
@@ -198,8 +219,10 @@ class TestRotationLockPatience(BaseCase):
                     mock.patch.object(profile_rotation.time, "monotonic", side_effect=lambda: elapsed), \
                     mock.patch.object(profile_rotation.time, "sleep", side_effect=advance), \
                     mock.patch.object(locks, "try_lock_path", side_effect=acquire):
-                with self.assertRaisesRegex(StoreError, "claude profile rotation is busy"):
+                expected = i18n.t("profile_rotation.profile_rotation_is_busy_retry_in_a_moment", scope="claude")
+                with self.assertRaises(StoreError) as caught:
                     rotation.__enter__()
+                self.assertIn(expected, str(caught.exception))
             self.assertAlmostEqual(elapsed, 0.3)
             self.assertEqual(rotation.handles, [])
         finally:

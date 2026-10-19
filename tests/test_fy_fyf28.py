@@ -172,6 +172,74 @@ class TestFYF28(BaseCase):
             with self.assertRaises(OSError):
                 os.fstat(fd)
 
+    def test_payload_failure_unlinks_temp_after_chmod_failure(self):
+        target = self._tmp / "target"
+        attempted = []
+        original_unlink = store._unlink_with_retry
+
+        def record_unlink(path):
+            attempted.append(Path(path))
+            return original_unlink(path)
+
+        with mock.patch.object(store.os, "chmod", side_effect=PermissionError("chmod failed")), \
+                mock.patch.object(store, "_unlink_with_retry", side_effect=record_unlink):
+            with self.assertRaisesRegex(RuntimeError, "payload failed"):
+                store._atomic_replace(
+                    target,
+                    lambda fh, tmp: (_ for _ in ()).throw(RuntimeError("payload failed")),
+                )
+
+        self.assertEqual(len(attempted), 1)
+        self.assertFalse(attempted[0].exists())
+
+    def test_persistent_temp_cleanup_failure_does_not_mask_payload_error(self):
+        target = self._tmp / "target"
+        attempted = []
+
+        def failed_unlink(path):
+            attempted.append(Path(path))
+            Path(path).unlink()
+            raise PermissionError("cleanup failed")
+
+        with mock.patch.object(store.os, "chmod", side_effect=PermissionError("chmod failed")), \
+                mock.patch.object(store, "_unlink_with_retry", side_effect=failed_unlink):
+            with self.assertRaisesRegex(RuntimeError, "payload failed") as caught:
+                store._atomic_replace(
+                    target,
+                    lambda fh, tmp: (_ for _ in ()).throw(RuntimeError("payload failed")),
+                )
+
+        self.assertEqual(len(attempted), 1)
+        self.assertIsInstance(caught.exception.__cause__, PermissionError)
+        self.assertEqual(str(caught.exception.__cause__), "cleanup failed")
+
+    def test_fdopen_error_remains_primary_after_both_raw_close_attempts_fail(self):
+        target = self._tmp / "target"
+        raw_fds = []
+        close_attempts = []
+        real_mkstemp, real_close = store.tempfile.mkstemp, os.close
+
+        def capture_fd(*args, **kwargs):
+            result = real_mkstemp(*args, **kwargs)
+            raw_fds.append(result[0])
+            return result
+
+        def close_then_fail(fd):
+            close_attempts.append(fd)
+            if len(close_attempts) == 2:
+                real_close(fd)
+            raise OSError("close cleanup")
+
+        with mock.patch.object(store.tempfile, "mkstemp", side_effect=capture_fd), \
+                mock.patch.object(store.os, "fdopen", side_effect=OSError("fdopen original")), \
+                mock.patch.object(store.os, "close", side_effect=close_then_fail):
+            with self.assertRaisesRegex(OSError, "fdopen original"):
+                store._atomic_replace(target, lambda fh, tmp: None)
+
+        self.assertEqual(len(close_attempts), 2)
+        self.assertEqual(len(raw_fds), 1)
+        self.assertEqual(list(self._tmp.glob("target.*.tmp")), [])
+
     def test_timeout_unblocks_large_feeder(self):
         workers = []
         real_thread = threading.Thread

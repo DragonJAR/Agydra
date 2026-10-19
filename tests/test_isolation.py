@@ -8,6 +8,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import account
+import i18n
 import isolation
 import platforms
 from store import Store
@@ -162,6 +163,34 @@ class TestMigrateRealDir(BaseCase):
         self.assertTrue(isolation._is_link(link))
         self.assertEqual(link.resolve(), self.data_dir.resolve())
 
+    def test_migrate_keeps_source_when_new_destination_snapshot_is_foreign(self):
+        real_dir = self.fake_home / "real-dir"
+        real_dir.mkdir()
+        source = real_dir / "payload"
+        source.write_bytes(b"source payload")
+        target = self.data_dir / "payload"
+        original_snapshot = isolation.store.regular_file_snapshot
+        injected = []
+
+        def replace_before_snapshot(path):
+            path = Path(path)
+            if path == target and not injected:
+                path.write_bytes(b"foreign payload")
+                injected.append(True)
+            return original_snapshot(path)
+
+        with mock.patch.object(
+            isolation.store,
+            "regular_file_snapshot",
+            side_effect=replace_before_snapshot,
+        ):
+            with self.assertRaises(isolation.IsolationError):
+                isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
+
+        self.assertEqual(source.read_bytes(), b"source payload")
+        self.assertEqual(target.read_bytes(), b"foreign payload")
+        self.assertTrue(real_dir.exists())
+
     def test_migrate_refuses_missing_data_dir(self):
         """The guard exists to prevent destroying real data: if the target
         data dir is missing, migrating would invent state — refuse instead."""
@@ -287,7 +316,16 @@ class TestMigrateRealDir(BaseCase):
 
         with self.assertRaises(isolation.IsolationError) as cm:
             isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
-        self.assertIn("type mismatch", str(cm.exception))
+        self.assertEqual(
+            str(cm.exception),
+            i18n.t(
+                "isolation.cannot_migrate_a_already_exists_at_type_mismatch_with",
+                entry=real_dir / "clash",
+                target=target_file,
+                source_type=i18n.t("isolation.entry_type.directory"),
+                target_type=i18n.t("isolation.entry_type.file"),
+            ),
+        )
         self.assertTrue(target_file.is_file(), "target file must remain intact")
         self.assertEqual(target_file.read_text(encoding="utf-8"), "existing file")
 
@@ -305,7 +343,14 @@ class TestMigrateRealDir(BaseCase):
         with self.assertRaises(isolation.IsolationError) as cm:
             isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
 
-        self.assertIn("file-to-file collision", str(cm.exception))
+        self.assertEqual(
+            str(cm.exception),
+            i18n.t(
+                "isolation.cannot_migrate_a_file_with_different_contents_already_exists",
+                entry=collision_source,
+                target=collision_target,
+            ),
+        )
         self.assertEqual(collision_source.read_text(encoding="utf-8"), "overlay credentials")
         self.assertEqual(collision_target.read_text(encoding="utf-8"), "profile credentials")
         self.assertEqual(safe_source.read_text(encoding="utf-8"), "independent source")
@@ -327,7 +372,14 @@ class TestMigrateRealDir(BaseCase):
         with self.assertRaises(isolation.IsolationError) as cm:
             isolation.migrate_real_dir_to_store(real_dir, self.data_dir)
 
-        self.assertIn("file-to-file collision", str(cm.exception))
+        self.assertEqual(
+            str(cm.exception),
+            i18n.t(
+                "isolation.cannot_migrate_a_file_with_different_contents_already_exists",
+                entry=collision_source,
+                target=collision_target,
+            ),
+        )
         self.assertEqual(collision_source.read_text(encoding="utf-8"), "overlay credentials")
         self.assertEqual(collision_target.read_text(encoding="utf-8"), "profile credentials")
         self.assertEqual(safe_source.read_text(encoding="utf-8"), "independent source")
@@ -634,7 +686,13 @@ class TestIsolationAncestorMirroring(BaseCase):
             isolation.build_overlay("alpha", data_dir, store_root)
         msg = str(cm.exception)
         self.assertNotIn("doctor --fix", msg)
-        self.assertIn("remove it manually", msg)
+        self.assertEqual(
+            msg,
+            i18n.t(
+                "isolation.overlay_entry_is_a_real_file_not_the_expected",
+                link=overlay / "Library",
+            ),
+        )
 
     def test_real_gemini_entry_remedies_order(self):
         """Data-preserving doctor --fix must be listed before destructive remedies."""
@@ -647,12 +705,13 @@ class TestIsolationAncestorMirroring(BaseCase):
 
         with self.assertRaises(isolation.IsolationError) as cm:
             isolation.build_overlay("alpha", data_dir, store_root)
-        msg = str(cm.exception)
-        fix_idx = msg.find("doctor --fix")
-        destructive_idx = msg.find("destructive")
-        self.assertNotEqual(fix_idx, -1, "expected doctor --fix in error message")
-        self.assertNotEqual(destructive_idx, -1, "expected destructive note in error message")
-        self.assertLess(fix_idx, destructive_idx, "doctor --fix must come before destructive remedies")
+        self.assertEqual(
+            str(cm.exception),
+            i18n.t(
+                "isolation.overlay_entry_is_a_real_directory_file_not_the",
+                data_link=overlay / platforms.AGY_DATA_DIR_NAME,
+            ),
+        )
 
     def test_unlink_failure_at_ancestor_link_raises_isolation_error(self):
         store_root = self.fake_home / "Library" / "Application Support" / "agydra"
@@ -792,7 +851,15 @@ class TestMigrateCleanupFailure(BaseCase):
         with mock.patch.object(isolation.store, "rmtree"):
             with self.assertRaises(isolation.IsolationError) as cm:
                 isolation.migrate_real_dir_to_store(self.real_dir, self.data_dir)
-        self.assertIn("source cleanup failed", str(cm.exception))
+        self.assertEqual(
+            str(cm.exception),
+            i18n.t(
+                "isolation.all_overlay_data_was_copied_into_but_source_cleanup",
+                data_dir=self.data_dir,
+                real_dir=self.real_dir,
+                removal_error="",
+            ),
+        )
         self.assertTrue(self.real_dir.exists())
         self.assertEqual(
             (self.data_dir / "nested" / "token.json").read_text(encoding="utf-8"), "secret"
@@ -1083,7 +1150,14 @@ class TestCentralLinkProbe(BaseCase):
         with mock.patch.object(isolation.platforms, "is_link", side_effect=probe):
             with self.assertRaises(isolation.IsolationError) as cm:
                 isolation.validate_overlay_roots("alpha", self.data_dir, self.store.root)
-        self.assertIn("cannot inspect", str(cm.exception))
+        self.assertEqual(
+            str(cm.exception),
+            i18n.t(
+                "isolation.cannot_inspect_refusing_to_continue",
+                path=self.store.overlays_dir,
+                exc=PermissionError("denied"),
+            ),
+        )
 
     def test_claude_config_guard_rejects_junction_and_inspection_errors(self):
         config = self.store.claude_config_root / "1"

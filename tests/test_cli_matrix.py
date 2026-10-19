@@ -6,12 +6,12 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import i18n
 from conftest import BaseCase
 from store import Store
 
-# ``resolver.resolve`` labels a read-only random pick with this reason. The
-# prefix is the stable part; the trailing caveat text is free to change.
 RANDOM_MARKER = "read-only random plan candidate (-r"
 
 
@@ -37,10 +37,27 @@ class TestCliParameterMatrix(BaseCase):
             (["--profile=alpha", "-n"], 0, "profile : alpha"),
             (["-p", "1", "-n"], 0, "profile : alpha"),
             (["-p", "#2", "-n"], 0, "profile : beta"),
-            (["-p", "nonexistent", "-n"], 1, "unknown profile"),
-            (["-p", "99", "-n"], 1, "out of range"),
-            (["-p", "", "-n"], 1, "unknown profile"),
-            (["--profile=", "-n"], 1, "unknown profile"),
+            (
+                ["-p", "nonexistent", "-n"],
+                1,
+                i18n.t(
+                    "store.profile.unknown_ref",
+                    ref="nonexistent",
+                    names="alpha, beta, gamma",
+                    hint=i18n.t("store.profile.create_hint", ref="nonexistent"),
+                ),
+            ),
+            (["-p", "99", "-n"], 1, i18n.t("store.profile.number_out_of_range", ref="99", count=3)),
+            (
+                ["-p", "", "-n"],
+                1,
+                i18n.t("store.profile.unknown_ref", ref="", names="alpha, beta, gamma", hint=""),
+            ),
+            (
+                ["--profile=", "-n"],
+                1,
+                i18n.t("store.profile.unknown_ref", ref="", names="alpha, beta, gamma", hint=""),
+            ),
         ]
         for args, expected_rc, needle in cases:
             with self.subTest(args=args):
@@ -94,7 +111,8 @@ class TestCliParameterMatrix(BaseCase):
             with self.subTest(args=args):
                 res = self._run_cli(*args)
                 self.assertEqual(res.returncode, 2, res.stderr)
-                self.assertIn("mutually exclusive", res.stderr)
+                profile = "beta" if any("beta" in a for a in args) else "alpha"
+                self.assertIn(i18n.t("cli.error_profile_and_random_exclusive", profile=profile), res.stderr)
 
     def test_short_flag_bundles_and_combinations(self):
         cases = [
@@ -161,7 +179,7 @@ class TestCliParameterMatrix(BaseCase):
 
         res_late = self._run_cli("chat", "-p", "alpha", "-n")
         self.assertEqual(res_late.returncode, 0, res_late.stderr)
-        self.assertIn("must come first", res_late.stderr)
+        self.assertIn(i18n.t("cli.note_late_flags", spelling="-p alpha"), res_late.stderr)
 
     def test_subcommand_aliases_and_operations(self):
         for cmd in ("list", "ls", "l"):
@@ -172,7 +190,7 @@ class TestCliParameterMatrix(BaseCase):
 
         res_c = self._run_cli("c", "delta", "-d", "fourth profile")
         self.assertEqual(res_c.returncode, 0, res_c.stderr)
-        self.assertIn("created profile: delta", res_c.stdout)
+        self.assertIn(i18n.t("cmd.create.ok", name="delta"), res_c.stdout)
 
         res_login_dry = self._run_cli("login", "delta", "-n")
         self.assertEqual(res_login_dry.returncode, 0, res_login_dry.stderr)
@@ -188,7 +206,7 @@ class TestCliParameterMatrix(BaseCase):
 
         res_d_set = self._run_cli("d", "beta")
         self.assertEqual(res_d_set.returncode, 0, res_d_set.stderr)
-        self.assertIn("default profile: beta", res_d_set.stdout)
+        self.assertIn(i18n.t("cmd.default.set_ok", name="beta"), res_d_set.stdout)
 
         for cmd in ("status", "st"):
             with self.subTest(cmd=cmd):
@@ -199,21 +217,21 @@ class TestCliParameterMatrix(BaseCase):
         (self.store.profile_data_dir("alpha") / "settings.json").write_text("{}", encoding="utf-8")
         res_share = self._run_cli("share", "alpha", "beta")
         self.assertEqual(res_share.returncode, 0, res_share.stderr)
-        self.assertIn("copied", res_share.stdout)
+        self.assertIn(i18n.t("cmd.share_config.entry_copied", entry="beta/settings.json"), res_share.stdout)
 
         res_mv = self._run_cli("mv", "delta", "epsilon")
         self.assertEqual(res_mv.returncode, 0, res_mv.stderr)
-        self.assertIn("renamed 'delta' -> 'epsilon'", res_mv.stdout)
+        self.assertIn(i18n.t("cmd.rename.ok", old="delta", new="epsilon"), res_mv.stdout)
 
         res_rm = self._run_cli("rm", "epsilon", "-f", "--no-backup")
         self.assertEqual(res_rm.returncode, 0, res_rm.stderr)
-        self.assertIn("deleted profile: epsilon", res_rm.stdout)
+        self.assertIn(i18n.t("cmd.delete.ok", name="epsilon"), res_rm.stdout)
 
         for cmd in ("doctor", "doc"):
             with self.subTest(cmd=cmd):
                 res = self._run_cli(cmd)
                 self.assertEqual(res.returncode, 0, res.stderr)
-                self.assertIn("result: healthy", res.stdout)
+                self.assertIn(i18n.t("cmd.doctor.result_ok"), res.stdout)
 
         for cmd in ("setup", "install"):
             with self.subTest(cmd=cmd):
@@ -224,7 +242,8 @@ class TestCliParameterMatrix(BaseCase):
             with self.subTest(cmd=cmd):
                 res = self._run_cli(cmd)
                 self.assertEqual(res.returncode, 0, res.stderr)
-                self.assertIn("usage: agydra", res.stdout)
+                expected_usage = "uso: agydra" if i18n._get_active() == "es" else "usage: agydra"
+                self.assertIn(expected_usage, res.stdout)
 
         import agydra
 

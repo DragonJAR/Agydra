@@ -8,8 +8,10 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import account
+import i18n
 import locks
 import platforms
 from store import Store
@@ -101,7 +103,7 @@ class TestCliHelperIndependence(BaseCase):
         os.environ.pop("PYTHONPATH", None)
         result = run_cli("ls", cwd=outside)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("no profiles", result.stdout)
+        self.assertIn(i18n.t("cmd.list.no_profiles"), result.stdout)
 
     def test_cli_never_goes_through_bootstrap_or_the_repo_venv(self):
         import shutil
@@ -117,7 +119,7 @@ class TestCliHelperIndependence(BaseCase):
             "ls", cwd=outside, extra_env={"PYTHONPATH": str(installation)}
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("no profiles", result.stdout)
+        self.assertIn(i18n.t("cmd.list.no_profiles"), result.stdout)
         self.assertNotIn("running setup", result.stdout)
         self.assertFalse((installation / ".venv").exists())
         self.assertFalse((self.fake_home / ".local" / "bin" / "agydra").exists())
@@ -133,7 +135,7 @@ class TestCliHelperIndependence(BaseCase):
         )
         out, err = process.communicate(timeout=60)
         self.assertEqual(process.returncode, 0, err)
-        self.assertIn("no profiles", out)
+        self.assertIn(i18n.t("cmd.list.no_profiles"), out)
 
 
 class TestFixtureEnvironment(BaseCase):
@@ -358,7 +360,7 @@ class TestRandomProfileSelection(BaseCase):
     def test_r_and_p_are_mutually_exclusive(self):
         result = self._run_cli("-r", "-p", "work")
         self.assertEqual(result.returncode, 2)
-        self.assertIn("mutually exclusive", result.stderr)
+        self.assertIn(i18n.t("cli.error_profile_and_random_exclusive", profile="work"), result.stderr)
 
     def test_r_skips_authenticated_only(self):
         (
@@ -415,7 +417,7 @@ class TestBusyGuards(BaseCase):
         try:
             result = self._run_cli("delete", "work", "-f")
             self.assertEqual(result.returncode, 1)
-            self.assertIn("holder state could not be verified", result.stderr)
+            self.assertIn(i18n.t("cli.session_unverified"), result.stderr)
         finally:
             handle.release()
 
@@ -430,7 +432,7 @@ class TestBusyGuards(BaseCase):
         try:
             result = self._run_cli("delete", "work", "-f")
             self.assertEqual(result.returncode, 1)
-            self.assertIn("holder state could not be verified", result.stderr)
+            self.assertIn(i18n.t("cli.session_unverified"), result.stderr)
             self.assertNotIn("kill", result.stderr)
             self.assertNotIn(f"PID {os.getpid()}", result.stderr)
         finally:
@@ -448,7 +450,7 @@ class TestBusyGuards(BaseCase):
             os.fsync(handle._fd)
             result = self._run_cli("delete", "work", "-f")
             self.assertEqual(result.returncode, 1)
-            self.assertIn("holder state could not be verified", result.stderr)
+            self.assertIn(i18n.t("cli.session_unverified"), result.stderr)
             self.assertNotIn("PID", result.stderr)
         finally:
             handle.release()
@@ -476,7 +478,7 @@ class TestBusyGuards(BaseCase):
         try:
             result = self._run_cli("rename", "work", "new")
             self.assertEqual(result.returncode, 1)
-            self.assertIn("holder state could not be verified", result.stderr)
+            self.assertIn(i18n.t("cli.session_unverified"), result.stderr)
         finally:
             handle.release()
 
@@ -485,8 +487,8 @@ class TestBusyGuards(BaseCase):
         try:
             result = self._run_cli("list")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("BUSY", result.stdout)
-            self.assertIn("yes", result.stdout)
+            self.assertIn(i18n.t("cmd.list.header_busy"), result.stdout)
+            self.assertIn(i18n.t("cmd.list.busy_yes"), result.stdout)
         finally:
             handle.release()
 
@@ -512,7 +514,7 @@ class TestDeleteRecoversCorruptProfile(BaseCase):
         try:
             result = self._run_cli("delete", "broken", "-f")
             self.assertEqual(result.returncode, 1)
-            self.assertIn("holder state could not be verified", result.stderr)
+            self.assertIn(i18n.t("cli.session_unverified"), result.stderr)
             self.assertTrue(self.store.profile_dir("broken").exists())
         finally:
             handle.release()
@@ -537,10 +539,10 @@ class TestImportFlow(BaseCase):
         self.store.create("work")
 
     def test_path_as_ref_gets_corrective_error(self):
-        result = self._run_cli("import", str(self.fake_home / ".gemini"))
+        target_path = str(self.fake_home / ".gemini")
+        result = self._run_cli("import", target_path)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("TARGET profile name, not a path", result.stderr)
-        self.assertIn("agydra import <profile-name>", result.stderr)
+        self.assertIn(i18n.t("cmd.import.takes_profile_not_path", ref=target_path), result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
     def test_import_copies_generic_into_profile(self):
@@ -566,16 +568,20 @@ class TestImportFlow(BaseCase):
         )
 
     def test_import_missing_source_reports_path(self):
+        missing_source = str(self._tmp / "nope")
         result = self._run_cli(
-            "import", "work", "--source", str(self._tmp / "nope")
+            "import", "work", "--source", missing_source
         )
         self.assertEqual(result.returncode, 1)
-        self.assertIn("source directory not found", result.stderr)
+        self.assertIn(i18n.t("cli.import_source_missing", path=missing_source), result.stderr)
 
     def test_import_requires_existing_profile(self):
         result = self._run_cli("import", "ghost")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("unknown profile", result.stderr)
+        self.assertIn(
+            i18n.t("store.profile.unknown_ref", ref="ghost", names="work", hint=i18n.t("store.profile.create_hint", ref="ghost")),
+            result.stderr,
+        )
 
 
 class TestAliasesAndFlagTable(BaseCase):
@@ -635,8 +641,14 @@ class TestAliasesAndFlagTable(BaseCase):
         with redirect_stdout(buf):
             self.assertEqual(main(["help"]), 0)
         out = buf.getvalue()
-        for token in ("management:", "examples:", "create", "login",
-                      "import main", "agydra -p"):
+        for token in (
+            i18n.t("help.management_header"),
+            i18n.t("help.examples_header"),
+            "create",
+            "login",
+            "import main",
+            "agydra -p",
+        ):
             self.assertIn(token, out)
 
     def test_help_is_plain_in_captured_pipes(self):
@@ -685,7 +697,7 @@ class TestAliasesAndFlagTable(BaseCase):
         self.assertIn("\x1b[", out)
         from ui import strip_ansi
         self.assertEqual(strip_ansi(out).split(), plain.split())
-        self.assertIn("management:", strip_ansi(out))
+        self.assertIn(i18n.t("help.management_header"), strip_ansi(out))
 
     def test_no_color_wins_over_force_color(self):
         import os
@@ -758,7 +770,7 @@ class TestAliasesAndFlagTable(BaseCase):
     def test_alias_subcommand_runs(self):
         result = self._run_cli("ls")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("no profiles", result.stdout)
+        self.assertIn(i18n.t("cmd.list.no_profiles"), result.stdout)
 
 
 class TestLauncherFlagExtraction(unittest.TestCase):
@@ -831,25 +843,25 @@ class TestLateProfileFlagWarning(unittest.TestCase):
 
     def test_separate_p_warns(self):
         out = self._capture(["chat", "-p", "work"])
-        self.assertIn("must come first", out)
+        self.assertIn(i18n.t("cli.note_late_flags", spelling="-p work"), out)
         self.assertIn("-p work", out)
 
     def test_separate_profile_warns(self):
         out = self._capture(["chat", "--profile", "work"])
-        self.assertIn("must come first", out)
+        self.assertIn(i18n.t("cli.note_late_flags", spelling="--profile work"), out)
 
     def test_attached_p_dash_pwork_warns(self):
         out = self._capture(["chat", "-pwork"])
-        self.assertIn("must come first", out)
+        self.assertIn(i18n.t("cli.note_late_flags", spelling="-pwork"), out)
         self.assertIn("-pwork", out)
 
     def test_profile_equals_warns(self):
         out = self._capture(["chat", "--profile=work"])
-        self.assertIn("must come first", out)
+        self.assertIn(i18n.t("cli.note_late_flags", spelling="--profile=work"), out)
 
     def test_late_binary_warns(self):
         out = self._capture(["chat", "-b", "/opt/agy"])
-        self.assertIn("must come first", out)
+        self.assertIn(i18n.t("cli.note_late_flags", spelling="-b /opt/agy"), out)
         self.assertIn("-b /opt/agy", out)
 
     def test_double_dash_terminates_scan(self):

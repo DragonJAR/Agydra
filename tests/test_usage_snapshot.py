@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cli
+import i18n
 import usage
 import usage_snapshot
 from conftest import BaseCase
@@ -237,7 +238,7 @@ class SnapshotDocumentTests(unittest.TestCase):
         self.assertTrue(document["profiles"][0]["ok"])
         self.assertEqual(document["profiles"][0]["name"], "a")
         self.assertFalse(document["profiles"][1]["ok"])
-        self.assertEqual(document["profiles"][1]["error"], "no result for this profile")
+        self.assertEqual(document["profiles"][1]["error"], i18n.t("usage.snapshot_missing_result"))
 
     def test_document_is_strict_json_serializable(self):
         document = usage_snapshot.build_snapshot(
@@ -577,14 +578,14 @@ class SnapshotStoreIntegrationTests(BaseCase):
         ctx = doctor._DoctorContext(scan=self.store.scan(), names=self.store.names())
         status, msg = doctor._check_store(self.store, ctx)
         self.assertEqual(status, doctor.OK)
-        self.assertIn("store writable", msg)
+        self.assertEqual(msg, i18n.t("doctor.store.ok", path=self.store.root))
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = doctor.run_checks(self.store)
         report = buf.getvalue()
         self.assertEqual(code, 0)
-        self.assertIn("store writable", report)
+        self.assertIn(i18n.t("doctor.store.ok", path=self.store.root), report)
         self.assertTrue(snapshot_path.exists())
         payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
         profile_names = [p.get("name") for p in payload.get("profiles", [])]

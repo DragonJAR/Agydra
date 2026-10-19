@@ -61,7 +61,7 @@ class TestFYCBugFixes(BaseCase):
         with mock.patch("sys.stderr", new_callable=io.StringIO) as mock_stderr:
             ret = cli._report_error(err)
             self.assertEqual(ret, 130)
-            self.assertIn("cancelled", mock_stderr.getvalue())
+            self.assertIn(i18n.t("confirm.cancelled"), mock_stderr.getvalue())
 
     def test_b5_subcommand_catches_keyboard_interrupt_in_main(self):
         self.store.create("ctrlc_prof", engine="agy")
@@ -69,7 +69,7 @@ class TestFYCBugFixes(BaseCase):
             with mock.patch("sys.stderr", new_callable=io.StringIO) as mock_stderr:
                 ret = cli.main(["list"])
                 self.assertEqual(ret, 130)
-                self.assertIn("cancelled", mock_stderr.getvalue())
+                self.assertIn(i18n.t("confirm.cancelled"), mock_stderr.getvalue())
 
     def test_b4_grok_401_on_busy_profile_reports_authenticated_state(self):
         self.store.create("busy_grok", engine="grok")
@@ -87,7 +87,7 @@ class TestFYCBugFixes(BaseCase):
             with mock.patch("locks.try_mutation_lock", return_value=None):
                 res = usage.query_profile_usage(self.store, "busy_grok")
                 self.assertFalse(res.ok)
-                self.assertEqual(res.error, "session expired (401)")
+                self.assertEqual(res.error, i18n.t("usage.session_expired"))
                 self.assertEqual(res.authentication_state, "authenticated")
 
     def test_b4_grok_try_mutation_lock_error_handled_gracefully(self):
@@ -106,7 +106,7 @@ class TestFYCBugFixes(BaseCase):
             with mock.patch("locks.try_mutation_lock", side_effect=locks.LockError("permission denied")):
                 res = usage.query_profile_usage(self.store, "err_grok")
                 self.assertFalse(res.ok)
-                self.assertEqual(res.error, "session expired (401)")
+                self.assertEqual(res.error, i18n.t("usage.session_expired"))
                 self.assertEqual(res.authentication_state, "authenticated")
 
     def test_b9_status_uses_shared_auth_and_email_and_localizes_in_spanish(self):
@@ -210,7 +210,7 @@ class TestFYCBugFixes(BaseCase):
                     )
                     self.assertIsNone(token)
                     self.assertIsNotNone(res)
-                    self.assertEqual(res.error, "failed to persist refreshed tokens")
+                    self.assertEqual(res.error, i18n.t("usage.refresh_persist_failed"))
 
     def test_b9_claude_status_single_probe_when_no_email(self):
         self.store.create("claude_no_email", engine="claude")
@@ -272,7 +272,7 @@ class TestFYCBugFixes(BaseCase):
             self.assertEqual(ret, 1)
             mock_error.assert_called_once()
             err_msg = mock_error.call_args[0][0]
-            self.assertIn("import takes the TARGET profile name, not a path", err_msg)
+            self.assertIn(i18n.t("cmd.import.takes_profile_not_path", ref="backup/data"), err_msg)
             self.assertNotIn("The generic agy data dir is auto-detected", err_msg)
 
     def test_h1_3_help_subcommand_dispatches_to_subcommand_help(self):
@@ -335,7 +335,7 @@ class TestFYCBugFixes(BaseCase):
         )
         res = usage.query_profile_usage(self.store, "gk_refr")
         self.assertFalse(res.ok)
-        self.assertEqual(res.error, "missing access token")
+        self.assertEqual(res.error, i18n.t("usage.missing_access_token"))
         self.assertEqual(res.authentication_state, "authenticated")
 
     def test_h3_3_unrelated_profile_usage_succeeds_with_pending_rename(self):
@@ -351,10 +351,10 @@ class TestFYCBugFixes(BaseCase):
             json.dump(journal, handle)
 
         res_gamma = usage.query_profile_usage(self.store, "gamma")
-        self.assertNotEqual(res_gamma.error, "profile rename recovery pending")
+        self.assertNotEqual(res_gamma.error, i18n.t("usage.rename_pending"))
 
         res_alpha = usage.query_profile_usage(self.store, "alpha")
-        self.assertEqual(res_alpha.error, "profile rename recovery pending")
+        self.assertEqual(res_alpha.error, i18n.t("usage.rename_pending"))
 
     def test_h3_4_import_copy_failure_preserves_existing_data(self):
         import shutil
@@ -390,12 +390,12 @@ class TestFYCBugFixes(BaseCase):
         with mock.patch("locks.try_mutation_lock", side_effect=locks.LockError("busy fd")):
             with self.assertRaises(StoreError) as ctx:
                 cli._acquire_profile_lock(self.store, "p1", "exporting")
-            self.assertIn("cannot safely proceed with exporting profile 'p1': busy fd", str(ctx.exception))
+            self.assertIn(store.cannot_safely_proceed_message("exporting", i18n.t("cli.profile_subject", name="p1"), locks.LockError("busy fd")), str(ctx.exception))
 
         with mock.patch("locks.try_read_lock", side_effect=locks.LockError("read busy")):
             with self.assertRaises(StoreError) as ctx:
                 cli._acquire_profile_read_lock(self.store, "p1", "reading")
-            self.assertIn("cannot safely proceed with reading profile 'p1': read busy", str(ctx.exception))
+            self.assertIn(store.cannot_safely_proceed_message("reading", i18n.t("cli.profile_subject", name="p1"), locks.LockError("read busy")), str(ctx.exception))
 
     def test_bootstrap_check_state_docstring_mentions_dead(self):
         self.assertIn("dead", bootstrap.check_state.__doc__ or "")
@@ -412,35 +412,38 @@ class TestFYCBugFixes(BaseCase):
         buf_err = io.StringIO()
         with mock.patch("sys.stderr", buf_err):
             self.assertEqual(cli.main(["help", "nonexistent_subcommand"]), 2)
-        self.assertIn("unknown command 'nonexistent_subcommand'", buf_err.getvalue())
+        self.assertIn(i18n.t("cli.error_unknown_command", cmd="nonexistent_subcommand"), buf_err.getvalue())
 
     def test_h8_catalog_keys_and_help_text(self):
-        i18n._set_active("en")
-        self.assertIn("existing profile", i18n.t("cmd.import.help"))
-        self.assertIn("grok", i18n.t("cmd.import.help"))
-        self.assertIn("portable profile archive", i18n.t("cmd.export.help"))
-        self.assertIn("Aggregate quota usage", i18n.t("cmd.usage.help"))
-        self.assertEqual(i18n.t("cmd.language.help"), i18n.t("cmd.lang.help"))
-        self.assertTrue(i18n.t("launcher.profile_help"))
-        self.assertTrue(i18n.t("launcher.engine_help"))
-        self.assertTrue(i18n.t("launcher.dry_run_help"))
-        self.assertTrue(i18n.t("launcher.binary_help"))
-        self.assertTrue(i18n.t("launcher.force_help"))
-        self.assertIn("unknown command", i18n.t("cli.error_unknown_command", cmd="foo"))
+        prev_lang = i18n._get_active()
+        try:
+            i18n._set_active("en")
+            self.assertIn("existing profile", i18n.t("cmd.import.help"))
+            self.assertIn("grok", i18n.t("cmd.import.help"))
+            self.assertIn("portable profile archive", i18n.t("cmd.export.help"))
+            self.assertIn("Aggregate quota usage", i18n.t("cmd.usage.help"))
+            self.assertEqual(i18n.t("cmd.language.help"), i18n.t("cmd.lang.help"))
+            self.assertTrue(i18n.t("launcher.profile_help"))
+            self.assertTrue(i18n.t("launcher.engine_help"))
+            self.assertTrue(i18n.t("launcher.dry_run_help"))
+            self.assertTrue(i18n.t("launcher.binary_help"))
+            self.assertTrue(i18n.t("launcher.force_help"))
+            self.assertIn("unknown command", i18n.t("cli.error_unknown_command", cmd="foo"))
 
-        i18n._set_active("es")
-        self.assertIn("existente", i18n.t("cmd.import.help"))
-        self.assertIn("grok", i18n.t("cmd.import.help"))
-        self.assertIn("portátil", i18n.t("cmd.export.help"))
-        self.assertIn("Consolidar", i18n.t("cmd.usage.help"))
-        self.assertEqual(i18n.t("cmd.language.help"), i18n.t("cmd.lang.help"))
-        self.assertTrue(i18n.t("launcher.profile_help"))
-        self.assertTrue(i18n.t("launcher.engine_help"))
-        self.assertTrue(i18n.t("launcher.dry_run_help"))
-        self.assertTrue(i18n.t("launcher.binary_help"))
-        self.assertTrue(i18n.t("launcher.force_help"))
-        self.assertIn("desconocido", i18n.t("cli.error_unknown_command", cmd="foo"))
-        i18n._set_active("en")
+            i18n._set_active("es")
+            self.assertIn("existente", i18n.t("cmd.import.help"))
+            self.assertIn("grok", i18n.t("cmd.import.help"))
+            self.assertIn("portátil", i18n.t("cmd.export.help"))
+            self.assertIn("Consolidar", i18n.t("cmd.usage.help"))
+            self.assertEqual(i18n.t("cmd.language.help"), i18n.t("cmd.lang.help"))
+            self.assertTrue(i18n.t("launcher.profile_help"))
+            self.assertTrue(i18n.t("launcher.engine_help"))
+            self.assertTrue(i18n.t("launcher.dry_run_help"))
+            self.assertTrue(i18n.t("launcher.binary_help"))
+            self.assertTrue(i18n.t("launcher.force_help"))
+            self.assertIn("desconocido", i18n.t("cli.error_unknown_command", cmd="foo"))
+        finally:
+            i18n._set_active(prev_lang)
 
     def test_perf_process_start_token_caches_own_pid(self):
         platforms._OWN_PROCESS_START_TOKEN = None

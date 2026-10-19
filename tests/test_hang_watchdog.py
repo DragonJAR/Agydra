@@ -23,6 +23,7 @@ import sys
 import time
 import unittest
 
+sys.path.insert(0, {repo_root!r})
 sys.path.insert(0, {tests_dir!r})
 import conftest
 
@@ -42,9 +43,13 @@ class HangProbe(unittest.TestCase):
 
 def write_hang_probe(tmp_dir: str) -> None:
     """Write the child probe module that imports the real conftest watchdog wiring."""
+    repo_root = str(Path(__file__).resolve().parent.parent)
     tests_dir = str(Path(__file__).resolve().parent)
     probe = Path(tmp_dir) / "hang_probe.py"
-    probe.write_text(HANG_PROBE_MODULE.format(tests_dir=tests_dir), encoding="utf-8")
+    probe.write_text(
+        HANG_PROBE_MODULE.format(repo_root=repo_root, tests_dir=tests_dir),
+        encoding="utf-8",
+    )
 
 
 def run_probe_child(tmp_dir: str, test_name: str, env_overrides: dict) -> subprocess.CompletedProcess:

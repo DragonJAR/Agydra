@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cli
+import engines
 import i18n
 import platforms
 import resolver
@@ -248,17 +249,17 @@ class TestCodexRunner(BaseCase):
 
     def test_doctor_check_binary_only_codex_profiles_no_agy(self):
         import doctor
-        # Clear agy profiles, keep only codex
         codex_store = Store(self._tmp / "codex-only-store")
         codex_store.create("cx-only", engine="codex")
         (codex_store.profile_data_dir("cx-only") / "auth.json").write_text("{}", encoding="utf-8")
         ctx = doctor._build_ctx(codex_store)
 
-        # Even with agy binary missing, check_binary must pass since no agy profiles exist
         with mock.patch.dict(os.environ, {"AGYDRA_AGY_BIN": "/nonexistent/agy"}):
             status, msg = doctor._check_binary(codex_store, ctx)
             self.assertEqual(status, doctor.OK)
-            self.assertIn(i18n.t("doctor.binary.codex_ok", path=""), msg)
+            binary = engines.get_engine("codex").resolve_configured_binary(codex_store.load_config())
+            self.assertIsNotNone(binary)
+            self.assertIn(i18n.t("doctor.binary.codex_ok", path=binary), msg)
             self.assertNotIn(
                 i18n.t("doctor.binary.fail", env_var="AGYDRA_AGY_BIN"), msg
             )

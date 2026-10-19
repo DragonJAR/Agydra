@@ -11,7 +11,10 @@ import i18n
 import store
 import usage
 import usage_snapshot
-from conftest import BaseCase
+try:
+    from conftest import BaseCase
+except ModuleNotFoundError:
+    from tests.conftest import BaseCase
 
 
 class TestBatch2AFyc(BaseCase):
@@ -169,7 +172,7 @@ class TestBatch2AFyc(BaseCase):
         self.assertEqual(read.call_count, 1)
         self.assertEqual(result.plan, "SuperGrok")
         self.assertEqual(result.email, "g@example.com")
-        self.assertEqual(result.error, "session expired (401)")
+        self.assertEqual(result.error, i18n.t("usage.session_expired"))
 
     def test_oauth_queries_reuse_one_payload_for_metadata_and_request(self):
         fixtures = [("codex", {"tokens": {"access_token": "fake-codex"}}, "fetch_codex_usage_payload"),

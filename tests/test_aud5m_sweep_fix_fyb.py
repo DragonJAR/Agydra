@@ -11,7 +11,6 @@ from unittest import mock
 
 import account
 import keychain
-import locks
 import platforms
 import runner
 from store import Store, StoreError
@@ -283,3 +282,76 @@ assert swapped
             with mock.patch.object(platforms, "run_with_group_kill", return_value=proc):
                 result = account.inspect_claude_auth(Path("synthetic-claude"), cfg, {})
             self.assertEqual(result.authenticated, value == str(cfg))
+
+    def test_keychain_directory_symlink_refuses_external_lease_and_writes(self):
+        import orphans
+        outside = self._tmp / "outside_keychain"
+        outside.mkdir()
+        (outside / "slot-lease.json").write_text('{"owner": "alpha", "had_shared": null}', encoding="utf-8")
+        (outside / "alpha.secret").write_bytes(b"victim-secret")
+        (outside / "ghost.secret").write_bytes(b"ghost-secret")
+        keychain_link = self.store_root / "keychain"
+        keychain_link.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaises((keychain.CorruptSlotLeaseError, keychain.KeychainError)):
+            keychain._load_slot_lease(self.s)
+
+        with self.assertRaises(keychain.KeychainError):
+            keychain.save_profile_slot(self.s, "new_profile", b"new-secret")
+        self.assertFalse((outside / "new_profile.secret").exists())
+
+        with self.assertRaises(keychain.KeychainError):
+            keychain._save_slot_lease(self.s, "alpha", None)
+
+        with self.assertRaises(keychain.KeychainError):
+            keychain.swap_lock_path(self.s)
+
+        keychain.purge_profile_slot(self.s, "alpha")
+        self.assertTrue((outside / "alpha.secret").exists())
+
+        quarantined = keychain._quarantine_profile_slot(self.s, "alpha")
+        self.assertIsNone(quarantined)
+        self.assertTrue((outside / "alpha.secret").exists())
+
+        orphans.remove_orphans(self.s, orphans.OrphanScan(keychain_secrets=["ghost"]))
+        self.assertTrue((outside / "ghost.secret").exists())
+
+        self.s.create("alpha")
+        with self.assertRaises(StoreError):
+            self.s._write_backup("alpha")
+
+    def test_rename_preserves_substituted_source_and_retains_journal_after_validation(self):
+        self.s.create("alpha")
+        old = self.secret(b"original-secret")
+        os.chmod(old, 0o600)
+
+        orig_require = account.require_private_credential_unchanged
+        calls = []
+
+        def tamper_after_second_require(path, before):
+            calls.append(path)
+            orig_require(path, before)
+            if len(calls) == 2:
+                replacement = old.with_name("replacement")
+                replacement.write_bytes(b"substituted-secret")
+                os.chmod(replacement, 0o600)
+                os.replace(replacement, old)
+
+        action = "sweep-keychain-retire"
+        handler = lambda s, old_name, new_name, data: keychain.recover_rename_profile_slot(s, old_name, new_name, data)
+        with mock.patch.dict(Store._rename_recovery_handlers, {action: handler}):
+            with mock.patch.object(account, "require_private_credential_unchanged", side_effect=tamper_after_second_require):
+                with self.assertRaises((StoreError, keychain.KeychainError)):
+                    self.s.rename(
+                        "alpha",
+                        "beta",
+                        after_rename=lambda profile: keychain.rename_profile_slot(
+                            self.s, "alpha", "beta", source_present=True, strict=True
+                        ),
+                        recovery_action=action,
+                        recovery_data_provider=lambda: {"source_present": True},
+                    )
+
+        self.assertTrue(self.s.rename_journal_path.exists())
+        self.assertTrue(old.exists())
+        self.assertEqual(old.read_bytes(), b"substituted-secret")

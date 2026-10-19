@@ -744,7 +744,7 @@ class TestEmptyRotationScope(BaseCase):
         with profile_rotation.Rotation(store, "agy") as rotation:
             with self.assertRaisesRegex(
                 StoreError,
-                "no eligible agy profile for rotation",
+                re.escape(i18n.t("profile_rotation.no_eligible_profile_for_rotation", scope="agy")),
             ):
                 rotation.select([])
 

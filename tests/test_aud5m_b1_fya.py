@@ -1,6 +1,7 @@
 """Batch 1 audit fixes: immutable sequences and non-destructive creation."""
 from unittest import mock
 
+import i18n
 import keychain
 import locks
 import store as store_module
@@ -28,7 +29,7 @@ class TestAuditBatchOneStore(BaseCase):
         with self.assertRaises(StoreError) as caught:
             self.store.create("gamma")
         self.assertIn(str(counter), str(caught.exception))
-        self.assertIn("surviving max seq=1", str(caught.exception))
+        self.assertIn(i18n.t("store.sequence.maximum", maximum=1), str(caught.exception))
         self.assertEqual(previous, 2)
         self.assertEqual(counter.read_bytes(), b"{")
         self.assertFalse(self.store.profile_dir("gamma").exists())
@@ -50,7 +51,7 @@ class TestAuditBatchOneStore(BaseCase):
         with self.assertRaises(StoreError) as caught:
             self.store.delete("damaged")
         self.assertIn(str(counter), str(caught.exception))
-        self.assertIn("surviving max seq=1", str(caught.exception))
+        self.assertIn(i18n.t("store.sequence.maximum", maximum=1), str(caught.exception))
         self.assertEqual(counter.read_bytes(), b"{")
         self.assertEqual(self.store.profile_meta_path("damaged").read_bytes(), b"{")
         self.assertFalse(self.store.backups_dir.exists())

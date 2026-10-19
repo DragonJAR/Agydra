@@ -196,7 +196,7 @@ class TestQueryProfileUsageFailureModes(_UsageBase):
         os.environ["FAKE_AGY_USAGE_RESPONSE_FILE"] = str(path)
         result = usage.query_profile_usage(self.store, "alpha")
         self.assertFalse(result.ok)
-        self.assertIn("non-JSON", result.error)
+        self.assertIn(i18n.t("usage.non_json"), result.error)
 
     def test_nonzero_exit_degrades(self):
         os.environ["FAKE_AGY_USAGE_EXIT"] = "3"
@@ -216,13 +216,14 @@ class TestQueryProfileUsageFailureModes(_UsageBase):
             result = usage.query_profile_usage(self.store, "beta")
         mock_run.assert_not_called()
         self.assertFalse(result.ok)
-        self.assertEqual(result.error, "not authenticated")
+        self.assertEqual(result.error, i18n.t("usage.not_authenticated"))
 
     def test_subprocess_decode_error_degrades(self):
-        with mock.patch("platforms.run_with_group_kill", side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")):
+        exc = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
+        with mock.patch("platforms.run_with_group_kill", side_effect=exc):
             result = usage.query_profile_usage(self.store, "alpha")
         self.assertFalse(result.ok)
-        self.assertIn("could not run agy", result.error)
+        self.assertEqual(result.error, i18n.t("usage.agy_run_failed", error=exc))
 
     def test_pathological_json_nesting_degrades_without_raising(self):
         """Over-nested JSON makes ``json.loads`` raise ``RecursionError``,
@@ -236,7 +237,7 @@ class TestQueryProfileUsageFailureModes(_UsageBase):
         os.environ["FAKE_AGY_USAGE_RESPONSE_FILE"] = str(path)
         result = usage.query_profile_usage(self.store, "alpha")
         self.assertFalse(result.ok)
-        self.assertEqual(result.error, "non-JSON response")
+        self.assertEqual(result.error, i18n.t("usage.non_json"))
 
 
 class TestQueryProfileUsageCredentialUnavailable(_UsageBase):
@@ -283,7 +284,7 @@ class TestGatherUsageReportSurvivesPerProfileFailures(_UsageBase):
         res = usage.query_profile_usage(self.store, "cx")
         self.assertFalse(res.ok)
         self.assertEqual(res.engine, "codex")
-        self.assertEqual(res.error, "not authenticated")
+        self.assertEqual(res.error, i18n.t("usage.not_authenticated"))
 
         data_dir = self.store.profile_data_dir("cx", engine="codex")
         auth_file = data_dir / "auth.json"
@@ -294,7 +295,7 @@ class TestGatherUsageReportSurvivesPerProfileFailures(_UsageBase):
         res_auth = usage.query_profile_usage(self.store, "cx")
         self.assertTrue(res_auth.ok)
         self.assertEqual(res_auth.engine, "codex")
-        self.assertEqual(res_auth.plan, "OpenAI API Key")
+        self.assertEqual(res_auth.plan, i18n.t("usage.openai_api_key"))
 
 
     def test_unexpected_exception_from_query_does_not_abort_the_report(self):
@@ -338,7 +339,7 @@ class TestQueryProfileUsageTimeoutKillsProcessGroup(_UsageBase):
 
         result = usage.query_profile_usage(self.store, "alpha", timeout=2.0)
         self.assertFalse(result.ok)
-        self.assertIn("timed out", result.error)
+        self.assertIn(i18n.t("usage.timed_out"), result.error)
 
         deadline = _time.monotonic() + 5.0
         while not heartbeat_log.exists() and _time.monotonic() < deadline:
@@ -463,7 +464,7 @@ class TestUsageRenderingHelpers(unittest.TestCase):
         self.assertEqual(
             usage.format_countdown(now + timedelta(minutes=12), now=now), "12m"
         )
-        self.assertEqual(usage.format_countdown(now - timedelta(minutes=1), now=now), "now")
+        self.assertEqual(usage.format_countdown(now - timedelta(minutes=1), now=now), i18n.t("usage.now"))
 
 
     def test_format_mini_bar_renders_exact_proportions(self):
@@ -617,7 +618,8 @@ class TestCodexUsage(BaseCase):
     def test_query_codex_usage_offline_fallback(self, mock_fetch):
         import urllib.error
 
-        mock_fetch.side_effect = urllib.error.URLError("No route to host")
+        err = urllib.error.URLError("No route to host")
+        mock_fetch.side_effect = err
         auth_data = {
             "tokens": {
                 "access_token": "acc_tok",
@@ -632,7 +634,7 @@ class TestCodexUsage(BaseCase):
         self.assertFalse(res.ok)
         self.assertEqual(res.email, "offline@example.com")
         self.assertEqual(res.groups, [])
-        self.assertIn("offline", res.error)
+        self.assertEqual(res.error, i18n.t("usage.offline", error=err))
         self.assertIsNone(res.plan)
 
     @mock.patch("usage.fetch_codex_usage_payload")
@@ -653,7 +655,7 @@ class TestCodexUsage(BaseCase):
         res = usage.query_codex_usage(data_dir, "cx_http_unavailable")
 
         self.assertFalse(res.ok, res.error)
-        self.assertEqual(res.error, "usage unavailable (HTTP 503)")
+        self.assertEqual(res.error, i18n.t("usage.http_unavailable", code=503))
         self.assertEqual(res.email, "unavailable@example.com")
         self.assertEqual(res.groups, [])
         self.assertIsNone(res.plan)
@@ -668,7 +670,7 @@ class TestCodexUsage(BaseCase):
         res = usage.query_codex_usage(data_dir, "cx_refresh_only")
 
         self.assertFalse(res.ok)
-        self.assertEqual(res.error, "missing access token")
+        self.assertEqual(res.error, i18n.t("usage.missing_access_token"))
         self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8")), auth_data)
 
     @mock.patch("usage.fetch_codex_usage_payload")
@@ -696,7 +698,7 @@ class TestCodexUsage(BaseCase):
 
         res = usage.query_codex_usage(data_dir, "cx_ref")
         self.assertFalse(res.ok)
-        self.assertEqual(res.error, "session expired (401)")
+        self.assertEqual(res.error, i18n.t("usage.session_expired"))
         self.assertEqual(mock_fetch.call_count, 1)
         self.assertEqual(closed, [True])
         saved_auth = json.loads((data_dir / "auth.json").read_text(encoding="utf-8"))
@@ -876,13 +878,13 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
             http_result = usage.query_grok_usage(data_dir, "grok_unavailable")
 
         for result, error in (
-            (transport_result, "offline"),
-            (http_result, "usage unavailable (HTTP 503)"),
+            (transport_result, i18n.t("usage.offline", error=urllib.error.URLError("connection refused"))),
+            (http_result, i18n.t("usage.http_unavailable", code=503)),
         ):
             self.assertFalse(result.ok, result.error)
             self.assertEqual(result.email, "grok@example.com")
             self.assertEqual(result.groups, [])
-            self.assertIn(error, result.error)
+            self.assertEqual(result.error, error)
             self.assertEqual(result.plan, "Grok (xAI)")
         mock_settings.assert_not_called()
         mock_refresh.assert_not_called()
@@ -902,7 +904,7 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
         res = usage.query_codex_usage(data_dir, "cx_empty_response")
 
         self.assertFalse(res.ok)
-        self.assertEqual(res.error, "no usage data in response")
+        self.assertEqual(res.error, i18n.t("usage.no_data"))
 
     @mock.patch("usage.fetch_grok_settings_payload", return_value=None)
     @mock.patch("usage.fetch_grok_billing_payload", return_value={"config": {}})
@@ -917,7 +919,7 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
         res = usage.query_grok_usage(data_dir, "grok_empty_response")
 
         self.assertFalse(res.ok)
-        self.assertEqual(res.error, "no usage data in response")
+        self.assertEqual(res.error, i18n.t("usage.no_data"))
 
     def _grok_empty_with_tier(self, tier, billing):
         data_dir = self._tmp / f"grok_tier_{abs(hash((tier, str(billing))))}"
@@ -936,7 +938,7 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
                 with self.subTest(tier=tier, billing=billing):
                     res = self._grok_empty_with_tier(tier, billing)
                     self.assertTrue(res.ok)
-                    self.assertEqual(res.error, usage.PLAN_WITHOUT_QUOTA)
+                    self.assertEqual(res.error, i18n.t("usage.plan_without_quota"))
                     self.assertEqual(res.plan, tier)
                     self.assertEqual(res.groups, [])
 
@@ -945,7 +947,7 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
             with self.subTest(tier=tier):
                 res = self._grok_empty_with_tier(tier, {"config": {}})
                 self.assertFalse(res.ok)
-                self.assertEqual(res.error, "no usage data in response")
+                self.assertEqual(res.error, i18n.t("usage.no_data"))
 
     def test_query_grok_usage_success_with_existing_access_token_is_read_only(self):
         data_dir = self._tmp / "grok_success_response"
@@ -1206,7 +1208,7 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
 
         res = usage.query_grok_usage(data_dir, "grok_pro")
         self.assertFalse(res.ok)
-        self.assertEqual(res.error, "missing access token")
+        self.assertEqual(res.error, i18n.t("usage.missing_access_token"))
         mock_refresh.assert_not_called()
         mock_billing.assert_not_called()
         mock_settings.assert_not_called()
@@ -1285,8 +1287,7 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
         res = usage.query_grok_usage(data_dir, "grok_dead")
 
         self.assertFalse(res.ok)
-        self.assertIn("session expired (401)", res.error)
-        self.assertIn("agydra login grok_dead", res.error)
+        self.assertEqual(res.error, i18n.t("usage.relogin_required", name="grok_dead"))
         mock_refresh.assert_called_once()
         self.assertEqual(
             json.loads((data_dir / "auth.json").read_text(encoding="utf-8")),
@@ -1307,7 +1308,7 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
         res = usage.query_grok_usage(data_dir, "grok_nr")
 
         self.assertFalse(res.ok)
-        self.assertIn("agydra login grok_nr", res.error)
+        self.assertEqual(res.error, i18n.t("usage.relogin_required", name="grok_nr"))
         mock_refresh.assert_not_called()
 
     def _grok_dir_with_refresh_token(self, label):
@@ -1338,7 +1339,7 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
         res = usage.query_grok_usage(data_dir, "grok_s401")
 
         self.assertFalse(res.ok)
-        self.assertIn("re-login required: agydra login grok_s401", res.error)
+        self.assertEqual(res.error, i18n.t("usage.relogin_required", name="grok_s401"))
         self.assertEqual(mock_billing.call_count, 2)
         mock_refresh.assert_called_once()
 
@@ -1355,7 +1356,7 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
         res = usage.query_grok_usage(data_dir, "grok_blank")
 
         self.assertFalse(res.ok)
-        self.assertIn("re-login required: agydra login grok_blank", res.error)
+        self.assertEqual(res.error, i18n.t("usage.relogin_required", name="grok_blank"))
         self.assertEqual(mock_billing.call_count, 1)
         mock_refresh.assert_called_once()
 
@@ -1374,7 +1375,7 @@ class TestCodexAndGrokEnhancedUsage(BaseCase):
             res = usage.query_grok_usage(data_dir, "grok_pf")
 
         self.assertFalse(res.ok)
-        self.assertEqual(res.error, "failed to persist refreshed tokens")
+        self.assertEqual(res.error, i18n.t("usage.refresh_persist_failed"))
 
 
 class TestRecordUsageSnapshotPreservesCachedReading(BaseCase):
@@ -1555,7 +1556,7 @@ class TestRecordUsageSnapshotPreservesCachedReading(BaseCase):
         self.assertEqual(code, 0)
         compact_text = out_compact.getvalue()
         self.assertIn("offline (Network down)", compact_text)
-        self.assertIn("cached 10m ago", compact_text)
+        self.assertIn(i18n.t("usage.cached_age", age="10m"), compact_text)
 
         out_detail = io.StringIO()
         err_detail = io.StringIO()
@@ -1569,9 +1570,12 @@ class TestRecordUsageSnapshotPreservesCachedReading(BaseCase):
         self.assertEqual(code, 1)
         detail_all = out_detail.getvalue() + err_detail.getvalue()
         self.assertIn("offline (Network down)", detail_all)
-        self.assertIn("10m ago", detail_all)
+        self.assertIn(i18n.t("usage.cached_age", age="10m"), detail_all)
         self.assertIn("Codex", out_detail.getvalue())
-        self.assertIn("status    : authenticated", out_detail.getvalue())
+        self.assertIn(
+            i18n.t("usage.status_label", state=i18n.t("auth.authenticated")),
+            out_detail.getvalue(),
+        )
 
 
 if __name__ == "__main__":

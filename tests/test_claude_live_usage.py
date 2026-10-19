@@ -13,10 +13,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import account
 import claude_usage
 import cli
+import i18n
 import platforms
 import usage
 
-from conftest import BaseCase, posix_only, write_fake_binary
+try:
+    from conftest import BaseCase, posix_only, write_fake_binary
+except ModuleNotFoundError:
+    from tests.conftest import BaseCase, posix_only, write_fake_binary
 
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 
@@ -331,7 +335,8 @@ class TestLivePipeline(LiveBase):
         self.assertEqual(result.observed_at, later)
 
     def test_failure_reasons_surface_only_when_nothing_is_known_and_never_poison(self):
-        for reason, text in claude_usage.LIVE_REASON_TEXT.items():
+        for reason, default_text in claude_usage.LIVE_REASON_TEXT.items():
+            text = i18n.t(f"claude.live_reason.{reason}", default=default_text)
             with self.subTest(reason=reason):
                 result = self.live(runner=self.runner(reason=reason))
                 self.assertTrue(result.ok)
@@ -343,7 +348,13 @@ class TestLivePipeline(LiveBase):
     def test_unusable_reading_is_rejected_before_it_is_cached(self):
         bad = {"rate_limits": {"five_hour": {"used_percentage": 140.0, "resets_at": None}}}
         result = self.live(runner=self.runner(bad))
-        self.assertEqual(result.error, claude_usage.LIVE_REASON_TEXT["live_no_usage"])
+        self.assertEqual(
+            result.error,
+            i18n.t(
+                "claude.live_reason.live_no_usage",
+                default=claude_usage.LIVE_REASON_TEXT["live_no_usage"],
+            ),
+        )
         cache = self.store.usage_cache_dir(self.profile.seq)
         self.assertFalse(cache.exists() and any(cache.glob("*.json")))
 
@@ -422,16 +433,16 @@ class TestLiveWiring(LiveBase):
         live = self.live(runner=self.runner(live_limits()))
         text = "\n".join(cli._claude_usage_lines(live, 10))
         self.assertIn("claude_cli_usage", text)
-        self.assertIn("live (server-confirmed)", text)
+        self.assertIn(i18n.t("usage.snapshot_observed_live"), text)
         self.assertIn("claude /usage", text)
-        self.assertNotIn("identity unverified", text)
+        self.assertNotIn(i18n.t("usage.snapshot_notice"), text)
         snapshot = usage.UsageResult(
             "cc", True, engine="claude", source="claude_status_line", quality="unknown",
             identity_verified=False,
         )
         text = "\n".join(cli._claude_usage_lines(snapshot, 10))
-        self.assertIn("identity unverified", text)
-        self.assertNotIn("live (server-confirmed)", text)
+        self.assertIn(i18n.t("usage.snapshot_notice"), text)
+        self.assertNotIn(i18n.t("usage.snapshot_observed_live"), text)
 
 
 if __name__ == "__main__":

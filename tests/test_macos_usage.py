@@ -16,6 +16,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import i18n
 import keychain
 import locks
 import platforms
@@ -408,7 +409,7 @@ class TestUsageAuth004PendingRenameJournal(BaseCase):
 
         result = usage.query_profile_usage(self.store, "alpha")
         self.assertFalse(result.ok)
-        self.assertEqual(result.error, "profile rename recovery pending")
+        self.assertEqual(result.error, i18n.t("usage.rename_pending"))
         self.assertTrue(self.store.has_pending_rename())
         self.assertTrue(journal.exists())
 

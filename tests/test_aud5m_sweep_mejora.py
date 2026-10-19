@@ -1,6 +1,7 @@
 """Regressions for the MEJORA wave: shared HTTP budget, probe cleanup
 discipline, doctor warning consolidation and repair error frontiers."""
 
+import os
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -22,8 +23,10 @@ from store import PersistentStateDeclaration, Store
 class _FakeResponse:
     def __init__(self, payload):
         self._payload = payload
+        self.requested_sizes: list[int] = []
 
     def read(self, size=-1):
+        self.requested_sizes.append(size)
         if size is not None and size >= 0:
             return self._payload[:size]
         return self._payload
@@ -32,10 +35,12 @@ class _FakeResponse:
 class TestSharedHttpBudget(unittest.TestCase):
     def test_oversized_json_response_is_refused_without_parsing(self):
         payload = b"{" + b" " * (usage.MAX_USAGE_RESPONSE_BYTES + 10)
+        fake = _FakeResponse(payload)
         with self.assertRaises(usage.UsageResponseError) as raised:
             usage._read_json_object_response(
-                _FakeResponse(payload), "usage test source"
+                fake, "usage test source"
             )
+        self.assertEqual(fake.requested_sizes, [usage.MAX_USAGE_RESPONSE_BYTES + 1])
         self.assertIn(
             i18n.t("usage.response_too_large", source="usage test source"),
             str(raised.exception),
@@ -45,16 +50,20 @@ class TestSharedHttpBudget(unittest.TestCase):
         pad = usage.MAX_USAGE_RESPONSE_BYTES - len(b'{"pad": ""}')
         payload = b'{"pad": "' + b"x" * pad + b'"}'
         self.assertEqual(len(payload), usage.MAX_USAGE_RESPONSE_BYTES)
+        fake = _FakeResponse(payload)
         parsed = usage._read_json_object_response(
-            _FakeResponse(payload), "usage test source"
+            fake, "usage test source"
         )
+        self.assertEqual(fake.requested_sizes, [usage.MAX_USAGE_RESPONSE_BYTES + 1])
         self.assertEqual(parsed, {"pad": "x" * pad})
 
     def test_small_invalid_json_keeps_the_invalid_response_error(self):
+        fake = _FakeResponse(b"{invalid")
         with self.assertRaises(usage.UsageResponseError) as raised:
             usage._read_json_object_response(
-                _FakeResponse(b"{invalid"), "usage test source"
+                fake, "usage test source"
             )
+        self.assertEqual(fake.requested_sizes, [usage.MAX_USAGE_RESPONSE_BYTES + 1])
         self.assertIn(
             i18n.t("usage.response_invalid_json", source="usage test source"),
             str(raised.exception),
@@ -74,24 +83,114 @@ class TestStoreProbeCleanup(BaseCase):
         POSIX removes it, and both platforms still report the close error
         as the store-check failure.
         """
-        with mock.patch.object(
-            doctor.os, "close", side_effect=OSError("close denied")
-        ):
-            status, message = doctor._check_store(self.store, None)
-        self.assertEqual(status, doctor.FAIL)
-        self.assertIn(
-            i18n.t(
-                "doctor.store.fail",
-                path=self.store.root,
-                error=OSError("close denied"),
-            ),
-            message,
-        )
-        leftovers = list(self.store.root.glob(".write-probe.*"))
-        if sys.platform == "win32":
-            self.assertEqual(len(leftovers), 1)
-        else:
-            self.assertEqual(leftovers, [])
+        captured_fds = []
+        real_close = os.close
+
+        def fake_close(fd):
+            captured_fds.append(fd)
+            raise OSError("close denied")
+
+        try:
+            with mock.patch.object(
+                doctor.os, "close", side_effect=fake_close
+            ):
+                status, message = doctor._check_store(self.store, None)
+            self.assertEqual(status, doctor.FAIL)
+            self.assertIn(
+                i18n.t(
+                    "doctor.store.fail",
+                    path=self.store.root,
+                    error=OSError("close denied"),
+                ),
+                message,
+            )
+            leftovers = list(self.store.root.glob(".write-probe.*"))
+            if sys.platform == "win32":
+                self.assertEqual(len(leftovers), 1)
+            else:
+                self.assertEqual(leftovers, [])
+        finally:
+            for fd in captured_fds:
+                try:
+                    real_close(fd)
+                except OSError:
+                    pass
+
+    def test_store_probe_close_failure_retries_transient_unlink_failure(self):
+        captured_fds = []
+        real_close = os.close
+        attempts = []
+        real_unlink = Path.unlink
+
+        def fake_close(fd):
+            captured_fds.append(fd)
+            raise OSError("close denied")
+
+        def flaky_unlink(self_path, missing_ok=False):
+            if self_path.name.startswith(".write-probe."):
+                attempts.append(self_path.name)
+                if len(attempts) == 1:
+                    raise OSError("transient unlink contention")
+            return real_unlink(self_path, missing_ok=missing_ok)
+
+        try:
+            with mock.patch.object(doctor.os, "close", side_effect=fake_close), \
+                 mock.patch.object(Path, "unlink", flaky_unlink):
+                status, message = doctor._check_store(self.store, None)
+            self.assertEqual(status, doctor.FAIL)
+            self.assertIn(
+                i18n.t(
+                    "doctor.store.fail",
+                    path=self.store.root,
+                    error=OSError("close denied"),
+                ),
+                message,
+            )
+            self.assertEqual(len(attempts), 2)
+            leftovers = list(self.store.root.glob(".write-probe.*"))
+            if sys.platform == "win32":
+                self.assertEqual(len(leftovers), 1)
+            else:
+                self.assertEqual(leftovers, [])
+        finally:
+            for fd in captured_fds:
+                try:
+                    real_close(fd)
+                except OSError:
+                    pass
+
+    def test_store_probe_close_failure_absorbs_persistent_unlink_failure(self):
+        captured_fds = []
+        real_close = os.close
+
+        def fake_close(fd):
+            captured_fds.append(fd)
+            raise OSError("close denied")
+
+        def broken_unlink(self_path, missing_ok=False):
+            if self_path.name.startswith(".write-probe."):
+                raise OSError("persistent unlink contention")
+            return os.unlink(self_path)
+
+        try:
+            with mock.patch.object(doctor.os, "close", side_effect=fake_close), \
+                 mock.patch.object(Path, "unlink", broken_unlink):
+                status, message = doctor._check_store(self.store, None)
+            self.assertEqual(status, doctor.FAIL)
+            self.assertIn(
+                i18n.t(
+                    "doctor.store.fail",
+                    path=self.store.root,
+                    error=OSError("close denied"),
+                ),
+                message,
+            )
+        finally:
+            for fd in captured_fds:
+                try:
+                    real_close(fd)
+                except OSError:
+                    pass
 
     def test_probe_unlink_retries_once_through_a_transient_holder(self):
         original = Path.unlink
@@ -233,6 +332,55 @@ class TestUsageResetZoneFrontier(unittest.TestCase):
         reset = windows["rate_limits"]["five_hour"]["resets_at"]
         self.assertIsNotNone(reset)
         self.assertIsNotNone(usage.parse_iso_utc(reset))
+
+    def test_programming_errors_propagate_from_reset_parser(self):
+        with mock.patch("zoneinfo.ZoneInfo", side_effect=TypeError("programming error")):
+            with self.assertRaises(TypeError):
+                claude_usage.parse_usage_text(
+                    "Current session: 50% used · resets 5:30pm (America/New_York)",
+                    datetime(2026, 10, 18, tzinfo=timezone.utc),
+                )
+
+    def test_expected_degradation_classes_degrade_to_unknown_reset(self):
+        now = datetime(2026, 10, 18, tzinfo=timezone.utc)
+        text = "Current session: 50% used · resets 5:30pm (America/New_York)"
+        for exc in (
+            ValueError("invalid date"),
+            OverflowError("date out of range"),
+            OSError("system date failure"),
+            KeyError("unknown zone key"),
+        ):
+            with self.subTest(exc=exc.__class__.__name__):
+                with mock.patch("zoneinfo.ZoneInfo", side_effect=exc):
+                    windows = claude_usage.parse_usage_text(text, now)
+                    self.assertIsNone(
+                        windows["rate_limits"]["five_hour"]["resets_at"]
+                    )
+
+    def test_yearless_reset_past_within_24h_degrades_to_none(self):
+        now = datetime(2026, 10, 18, 17, 30, tzinfo=timezone.utc)
+        past_text = "Current session: 50% used · resets Oct 18 at 5:00pm (UTC)"
+        windows = claude_usage.parse_usage_text(past_text, now)
+        self.assertIsNone(
+            windows["rate_limits"]["five_hour"]["resets_at"]
+        )
+
+    def test_yearless_reset_exact_now_degrades_to_none(self):
+        now = datetime(2026, 10, 18, 17, 30, tzinfo=timezone.utc)
+        exact_text = "Current session: 50% used · resets Oct 18 at 5:30pm (UTC)"
+        windows = claude_usage.parse_usage_text(exact_text, now)
+        self.assertIsNone(
+            windows["rate_limits"]["five_hour"]["resets_at"]
+        )
+
+    def test_yearless_reset_future_resolves_timestamp(self):
+        now = datetime(2026, 10, 18, 17, 30, tzinfo=timezone.utc)
+        future_text = "Current session: 50% used · resets Oct 18 at 5:31pm (UTC)"
+        windows = claude_usage.parse_usage_text(future_text, now)
+        self.assertEqual(
+            windows["rate_limits"]["five_hour"]["resets_at"],
+            "2026-10-18T17:31:00+00:00",
+        )
 
 
 if __name__ == "__main__":

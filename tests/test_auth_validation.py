@@ -10,8 +10,11 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import conftest
 import account
+import i18n
 import store
 import usage
 
@@ -66,7 +69,7 @@ class TestAuthValidation(unittest.TestCase):
             result = usage.query_codex_usage(data_dir, "deep-jwt")
 
         self.assertFalse(result.ok)
-        self.assertEqual(result.error, "invalid usage response (offline)")
+        self.assertEqual(result.error, i18n.t("usage.invalid_response", error="offline"))
         fetch.assert_called_once()
 
     def test_deeply_nested_jwt_without_access_token_never_reaches_http(self):
@@ -79,7 +82,7 @@ class TestAuthValidation(unittest.TestCase):
             result = usage.query_codex_usage(data_dir, "deep-refresh-only")
 
         self.assertFalse(result.ok)
-        self.assertEqual(result.error, "missing access token")
+        self.assertEqual(result.error, i18n.t("usage.missing_access_token"))
         fetch.assert_not_called()
 
     def test_malformed_claude_sequence_cannot_resolve_another_config_path(self):
@@ -115,7 +118,7 @@ class TestAuthValidation(unittest.TestCase):
                     )
                     result = usage.query_codex_usage(data_dir, f"codex-{index}")
                     self.assertFalse(result.ok)
-                    self.assertEqual(result.error, "not authenticated")
+                    self.assertEqual(result.error, i18n.t("usage.not_authenticated"))
 
         fetch.assert_not_called()
 
@@ -156,7 +159,7 @@ class TestAuthValidation(unittest.TestCase):
         api_info = account.inspect_codex_auth(api_dir)
         self.assertEqual(api_info["auth_type"], "api_key")
         self.assertEqual(api_info["api_key"], "sk-project-example")
-        self.assertEqual(account.detect_codex_plan(api_dir), "OpenAI API Key")
+        self.assertEqual(account.detect_codex_plan(api_dir), i18n.t("usage.openai_api_key"))
         self.assertEqual(account.auth_state(api_dir, engine="codex"), "authenticated")
 
         with mock.patch.object(usage, "fetch_codex_usage_payload") as fetch:
@@ -164,7 +167,7 @@ class TestAuthValidation(unittest.TestCase):
             api_result = usage.query_codex_usage(api_dir, "api-key")
 
         self.assertFalse(refresh_result.ok)
-        self.assertEqual(refresh_result.error, "missing access token")
+        self.assertEqual(refresh_result.error, i18n.t("usage.missing_access_token"))
         self.assertTrue(api_result.ok)
         fetch.assert_not_called()
 
@@ -193,7 +196,7 @@ class TestAuthValidation(unittest.TestCase):
                     self.assertIsNone(account.detect_grok_email(data_dir))
                     result = usage.query_grok_usage(data_dir, f"grok-{index}")
                     self.assertFalse(result.ok)
-                    self.assertEqual(result.error, "not authenticated")
+                    self.assertEqual(result.error, i18n.t("usage.not_authenticated"))
 
         fetch.assert_not_called()
 
@@ -242,9 +245,9 @@ class TestAuthValidation(unittest.TestCase):
             api_result = usage.query_grok_usage(api_dir, "api-key")
 
         self.assertFalse(refresh_result.ok)
-        self.assertEqual(refresh_result.error, "missing access token")
+        self.assertEqual(refresh_result.error, i18n.t("usage.missing_access_token"))
         self.assertFalse(opaque_result.ok)
-        self.assertEqual(opaque_result.error, "invalid usage response (offline)")
+        self.assertEqual(opaque_result.error, i18n.t("usage.invalid_response", error="offline"))
         self.assertTrue(api_result.ok)
         fetch.assert_called_once()
         self.assertEqual(fetch.call_args.args[0], "opaque-not-a-verified-jwt")

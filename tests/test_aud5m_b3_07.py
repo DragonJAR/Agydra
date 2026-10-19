@@ -186,6 +186,13 @@ class TestAud5mB3F5BootstrapFallbackPrinter(unittest.TestCase):
 
 
 class TestAud5mB3F6NarrowExcepts(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self._env_patch = mock.patch.dict(os.environ, {}, clear=False)
+        self._env_patch.start()
+        os.environ.pop("AGYDRA_LANG", None)
+        self.addCleanup(self._env_patch.stop)
+
     def test_no_bare_except_exception_pass_in_audited_modules(self):
         repo_root = Path(__file__).resolve().parent.parent
         targets = [

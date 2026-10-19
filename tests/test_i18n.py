@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import i18n
-from conftest import BaseCase
+from conftest import BaseCase, run_cli
 from models import DEFAULT_SETTINGS
 from store import Store
 
@@ -107,6 +107,9 @@ class TestI18nModule(unittest.TestCase):
 
 
 class TestI18nCli(BaseCase):
+    def _run_cli(self, *args, cwd=None, extra_env=None):
+        return run_cli(*args, cwd=cwd or self._tmp, extra_env=extra_env)
+
     def test_global_flag_lang_persists(self):
         res = self._run_cli("--lang", "es")
         self.assertEqual(res.returncode, 0)
@@ -131,19 +134,19 @@ class TestI18nCli(BaseCase):
         self.assertIn("Idioma actual: es", res_query.stdout)
 
     def test_subcommand_aliases(self):
-        res = self._run_cli("lang", "en")
+        res = self._run_cli("lang", "en", extra_env={"AGYDRA_LANG": ""})
         self.assertEqual(res.returncode, 0)
-        res_idioma = self._run_cli("idioma")
+        res_idioma = self._run_cli("idioma", extra_env={"AGYDRA_LANG": ""})
         self.assertEqual(res_idioma.returncode, 0)
         self.assertIn("Current language: en", res_idioma.stdout)
 
     def test_language_query_supported_languages_localized(self):
-        self._run_cli("language", "es")
-        res_es = self._run_cli("language")
+        self._run_cli("language", "es", extra_env={"AGYDRA_LANG": ""})
+        res_es = self._run_cli("language", extra_env={"AGYDRA_LANG": ""})
         self.assertIn("soportados: en, es", res_es.stdout)
 
-        self._run_cli("language", "en")
-        res_en = self._run_cli("language")
+        self._run_cli("language", "en", extra_env={"AGYDRA_LANG": ""})
+        res_en = self._run_cli("language", extra_env={"AGYDRA_LANG": ""})
         self.assertIn("supported : en, es", res_en.stdout)
 
     def test_cmd_list_empty_profiles_localized(self):

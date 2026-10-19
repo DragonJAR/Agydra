@@ -7,9 +7,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from conftest import BaseCase, write_fake_binary
+try:
+    from conftest import BaseCase, write_fake_binary
+except ModuleNotFoundError:
+    from tests.conftest import BaseCase, write_fake_binary
 import cli
 import engines
+import i18n
 import isolation
 import keychain
 import platforms
@@ -134,7 +138,7 @@ class TestFYH7RegressionGuards(BaseCase):
         with contextlib.redirect_stderr(err), mock.patch.object(cli, "Store", return_value=store):
             rc = cli.main(["import", "backup/data"])
         self.assertEqual(rc, 1)
-        self.assertIn("import takes the TARGET profile name, not a path", err.getvalue())
+        self.assertIn(i18n.t("cmd.import.takes_profile_not_path", ref="backup/data"), err.getvalue())
 
     def test_grok_export_excludes_config_toml_secret(self):
         import contextlib

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from conftest import child_launch_double, _make_jwt, isolated_store_env, posix_only
 
+import i18n
 import keychain
 import models
 import resolver
@@ -112,7 +113,7 @@ class TestCreateAtomicReserve(unittest.TestCase):
             meta.unlink()
             with self.assertRaises(StoreError) as ctx:
                 store.create("alpha")
-            self.assertIn("already exists", str(ctx.exception))
+            self.assertEqual(str(ctx.exception), i18n.t("store.profile.already_exists", name="alpha"))
 
 
 class TestIsolatedStoreEnvironment(unittest.TestCase):

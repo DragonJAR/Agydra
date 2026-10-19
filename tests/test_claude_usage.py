@@ -22,9 +22,13 @@ import claude_usage
 import keychain
 import locks
 import platforms
+import i18n
 import store as store_module
 import usage
-from conftest import BaseCase, make_dir_link, snapshot_tree
+try:
+    from conftest import BaseCase, make_dir_link, snapshot_tree
+except ModuleNotFoundError:
+    from tests.conftest import BaseCase, make_dir_link, snapshot_tree
 from store import Store
 
 NOW = datetime(2026, 10, 1, 15, 0, tzinfo=timezone.utc)
@@ -354,7 +358,7 @@ class TestClaudeUsage(BaseCase):
         with mock.patch.object(self.store, "get", side_effect=AssertionError("recovery lookup")):
             result = usage.query_profile_usage(self.store, self.profile.name)
         self.assertEqual(result.quality, "unknown")
-        self.assertEqual(result.error, "profile rename recovery pending")
+        self.assertEqual(result.error, i18n.t("usage.rename_pending"))
         self.assertEqual(snapshot_tree(self.store.root, metadata=True), before)
 
     def test_unknown_engine_returns_explicit_error_without_agy_auth_probe(self):
@@ -367,7 +371,7 @@ class TestClaudeUsage(BaseCase):
             result = usage.query_profile_usage(self.store, "mystery")
         self.assertFalse(result.ok)
         self.assertEqual(result.engine, "mystery")
-        self.assertEqual(result.error, "unsupported usage engine: mystery")
+        self.assertEqual(result.error, i18n.t("usage.unsupported_engine", engine="mystery"))
 
     def test_reader_is_byte_for_byte_read_only_and_does_not_touch_engine_services(self):
         observed = datetime.now(timezone.utc)
@@ -619,7 +623,7 @@ class TestClaudeUsage(BaseCase):
         output = stdout.getvalue()
         self.assertEqual(exit_code, 0)
         self.assertIn("5h", output)
-        self.assertIn("weekly", output)
+        self.assertIn(i18n.t("claude_usage.display.weekly"), output)
         self.assertNotIn("private", output)
         self.assertNotIn("transcript", output)
         self.assertNotIn(SESSION_ONE, output)

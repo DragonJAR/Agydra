@@ -30,8 +30,12 @@ from unittest import mock
 
 import agydra
 import bootstrap
+import i18n
 import platforms
-from conftest import BaseCase, child_launch_double, posix_only, write_fake_binary
+try:
+    from conftest import BaseCase, child_launch_double, posix_only, write_fake_binary
+except ModuleNotFoundError:
+    from tests.conftest import BaseCase, child_launch_double, posix_only, write_fake_binary
 
 FAKE_CONSOLE_BODY = (
     "#!/bin/sh\n"
@@ -386,7 +390,8 @@ class TestCorruptManagedShimSelfHeals(BaseCaseWithCheckout):
         root = self._make_checkout("checkout", with_console=True)
         lines = []
         self.assertTrue(bootstrap.verify_install(root, lines.append))
-        self.assertTrue(any("verified" in line for line in lines))
+        expected = i18n.t("setup.step.verified", cand=bootstrap.console_script(root), version="agydra 1.1.0")
+        self.assertIn(expected, lines)
 
     @posix_only("shim is POSIX-only")
     def test_ensure_path_shim_replaces_an_unparseable_shim(self) -> None:

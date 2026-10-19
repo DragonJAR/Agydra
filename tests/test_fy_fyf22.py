@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import cli
+import i18n
 import locks
 try:
     from conftest import BaseCase, snapshot_tree
@@ -68,7 +69,7 @@ class TestTargetedReadsDuringPendingRename(BaseCase):
             with self.subTest(command=command):
                 code, _stdout, stderr = self._run_cli(*command)
                 self.assertEqual(code, 1)
-                self.assertIn("next launch or profile-changing command", stderr)
+                self.assertIn(i18n.t("store.rename.interrupted"), stderr)
                 self.assertEqual(snapshot_tree(self.store.root, metadata=True), before)
 
     def test_pending_rename_with_live_profile_lock_keeps_retry_message(self):
@@ -78,8 +79,8 @@ class TestTargetedReadsDuringPendingRename(BaseCase):
             before = snapshot_tree(self.store.root, metadata=True)
             code, _stdout, stderr = self._run_cli("status", "alice")
             self.assertEqual(code, 1)
-            self.assertIn("retry in a moment", stderr)
-            self.assertNotIn("next launch or profile-changing command", stderr)
+            self.assertIn(i18n.t("store.rename.pending"), stderr)
+            self.assertNotIn(i18n.t("store.rename.interrupted"), stderr)
             self.assertEqual(snapshot_tree(self.store.root, metadata=True), before)
         finally:
             handle.release()
@@ -93,8 +94,8 @@ class TestTargetedReadsDuringPendingRename(BaseCase):
             before = snapshot_tree(self.store.root, metadata=True)
             code, _stdout, stderr = self._run_cli("status", "alice")
             self.assertEqual(code, 1)
-            self.assertIn("retry in a moment", stderr)
-            self.assertNotIn("next launch or profile-changing command", stderr)
+            self.assertIn(i18n.t("store.rename.pending"), stderr)
+            self.assertNotIn(i18n.t("store.rename.interrupted"), stderr)
             self.assertEqual(snapshot_tree(self.store.root, metadata=True), before)
         finally:
             sequence_handle.release()
@@ -121,7 +122,7 @@ class TestTargetedReadsDuringPendingRename(BaseCase):
             with self.subTest(ref=ref):
                 code, _stdout, stderr = self._run_cli("usage", ref)
                 self.assertEqual(code, 1)
-                self.assertIn("next launch or profile-changing command", stderr)
+                self.assertIn(i18n.t("store.rename.interrupted"), stderr)
                 self.assertEqual(snapshot_tree(self.store.root, metadata=True), before)
 
 

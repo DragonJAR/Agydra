@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import account
+import i18n
 import isolation
 import keychain
 import locks
@@ -21,13 +22,22 @@ import platforms
 import profile_rotation
 import runner
 import usage_agy
-from conftest import (
-    BaseCase,
-    _make_jwt,
-    child_launch_double,
-    posix_only,
-    simulated_macos_keychain,
-)
+try:
+    from conftest import (
+        BaseCase,
+        _make_jwt,
+        child_launch_double,
+        posix_only,
+        simulated_macos_keychain,
+    )
+except ModuleNotFoundError:
+    from tests.conftest import (
+        BaseCase,
+        _make_jwt,
+        child_launch_double,
+        posix_only,
+        simulated_macos_keychain,
+    )
 from store import Store, StoreError
 
 
@@ -237,8 +247,10 @@ class TestAgyFileCredentials(BaseCase):
             self.assertEqual(json.loads(self._read()), json.loads(raw))
             with self.assertRaises(isolation.IsolationError) as caught:
                 self._prepare()
-            self.assertNotIn("no trusted Antigravity credential", str(caught.exception))
-            self.assertIn("finish its sessions", str(caught.exception))
+            expected_busy = i18n.t("isolation.cannot_prepare_private_antigravity_credentials_for_live_profile_finish", name="alpha")
+            expected_untrusted = i18n.t("isolation.no_trusted_antigravity_credential_for_profile_at_authenticate_that", name="alpha", path=self.token_path)
+            self.assertNotIn(expected_untrusted, str(caught.exception))
+            self.assertIn(expected_busy, str(caught.exception))
             self.assertFalse(self.token_path.exists())
             self.assertIsNone(self.store.get("alpha").email)
         finally:
@@ -254,7 +266,8 @@ class TestAgyFileCredentials(BaseCase):
         self._write_backup(self._payload("foreign@example.com"))
         with self.assertRaises(isolation.IsolationError) as caught:
             self._prepare()
-        self.assertIn("no trusted Antigravity credential", str(caught.exception))
+        expected_untrusted = i18n.t("isolation.no_trusted_antigravity_credential_for_profile_at_authenticate_that", name="alpha", path=self.token_path)
+        self.assertIn(expected_untrusted, str(caught.exception))
         self.assertFalse(self.token_path.exists())
         with simulated_macos_keychain():
             self.assertIsNone(account.sync_profile_email(self.store, "alpha"))
@@ -510,7 +523,9 @@ class TestRandomAgyFileLaunch(BaseCase):
         self.assertEqual((plan.profile, plan.agy_file_auth), ("alpha", True))
         with self.assertRaises(isolation.AgyCredentialUntrustedError) as caught:
             self._run(plan)
-        self.assertIn("no trusted Antigravity credential", str(caught.exception))
+        token_path = self.store.profile_data_dir("alpha") / account.AGY_CLI_DIR / account.TOKEN_FILE
+        expected_untrusted = i18n.t("isolation.no_trusted_antigravity_credential_for_profile_at_authenticate_that", name="alpha", path=token_path)
+        self.assertIn(expected_untrusted, str(caught.exception))
         self.assertEqual(self.launched, [])
         self.assertEqual(locks.lease_holders(self.store, "alpha"), [])
 
@@ -597,7 +612,9 @@ class TestRandomAgyFileLaunch(BaseCase):
         with self.assertRaises(StoreError) as caught:
             self._run(plan, guard=self._slot_owned_by("andrea"))
         self.assertIn("andrea", str(caught.exception))
-        self.assertIn("no trusted Antigravity credential", str(caught.exception))
+        token_path = self.store.profile_data_dir("alpha") / account.AGY_CLI_DIR / account.TOKEN_FILE
+        expected_untrusted = i18n.t("isolation.no_trusted_antigravity_credential_for_profile_at_authenticate_that", name="alpha", path=token_path)
+        self.assertIn(expected_untrusted, str(caught.exception))
         self.assertEqual(self.launched, [])
         self.assertEqual(locks.lease_holders(self.store, "alpha"), [])
 
@@ -681,7 +698,8 @@ class TestRandomAgyFileLaunch(BaseCase):
         with self.assertRaises(StoreError) as caught:
             self._run(self._forced_random_plan())
         message = str(caught.exception)
-        self.assertIn("finish its sessions", message)
+        expected_busy = i18n.t("isolation.cannot_prepare_private_antigravity_credentials_for_live_profile_finish", name="alpha")
+        self.assertIn(expected_busy, message)
         self.assertIn("alpha, beta already tried", message)
         self.assertEqual(self.launched, [])
         self.assertFalse(profile_rotation.state_path(self.store, "agy").exists())
@@ -696,5 +714,6 @@ class TestRandomAgyFileLaunch(BaseCase):
         self.assertEqual((plan.profile, plan.agy_file_auth), ("alpha", True))
         with self.assertRaises(isolation.IsolationError) as caught:
             self._run(plan)
-        self.assertIn("finish its sessions", str(caught.exception))
+        expected_busy = i18n.t("isolation.cannot_prepare_private_antigravity_credentials_for_live_profile_finish", name="alpha")
+        self.assertIn(expected_busy, str(caught.exception))
         self.assertEqual(self.launched, [])

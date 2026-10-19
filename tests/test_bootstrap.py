@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 import bootstrap
+import i18n
 from tests.conftest import child_launch_double, posix_only, write_fake_binary
 
 
@@ -370,7 +371,12 @@ class VerifyInstall(unittest.TestCase):
             with _sandbox_home(Path(td)):
                 captured: list[str] = []
                 self.assertTrue(bootstrap.verify_install(proj, captured.append))
-            self.assertTrue(any("verified" in line for line in captured))
+            expected_msg = i18n.t(
+                "setup.step.verified",
+                cand=bootstrap.console_script(proj),
+                version="agydra 9.9.9",
+            )
+            self.assertTrue(any(expected_msg in line for line in captured))
 
     def test_verify_reports_failure_when_no_candidate(self):
         with tempfile.TemporaryDirectory() as td:
@@ -378,7 +384,7 @@ class VerifyInstall(unittest.TestCase):
             with _sandbox_home(Path(td)):
                 captured: list[str] = []
                 self.assertFalse(bootstrap.verify_install(proj, captured.append))
-            self.assertTrue(any("no installed candidate" in line for line in captured))
+            self.assertTrue(any(i18n.t("setup.step.verify_failed") in line for line in captured))
 
 
 class EnsureVenvRecreate(unittest.TestCase):
@@ -413,7 +419,7 @@ class EnsureVenvRecreate(unittest.TestCase):
             self.assertTrue(vpy.exists())
             self.assertFalse((vdir / "leftover.txt").exists())
             self.assertTrue(calls, "_run should have been invoked once")
-            self.assertTrue(any("creating venv" in line for line in logs))
+            self.assertTrue(any(i18n.t("setup.step.creating_venv", path=vdir) in line for line in logs))
 
     def test_ensure_venv_raises_when_recreate_fails(self):
         with tempfile.TemporaryDirectory() as td:
@@ -746,7 +752,7 @@ class ShimInstall(unittest.TestCase):
                 res = bootstrap.ensure_path_shim(proj, logs.append, force=False)
                 self.assertEqual(res, expected)
                 self.assertIn(str(bootstrap.console_script(proj)), expected.read_text(encoding="utf-8"))
-                self.assertTrue(any("refreshing stale shim" in msg for msg in logs))
+                self.assertTrue(any(i18n.t("setup.step.refreshing_stale_shim", shim=shim) in msg for msg in logs))
 
                 logs.clear()
                 shim.write_text(stale_content, encoding="utf-8")
@@ -896,7 +902,7 @@ class RunDispatch(unittest.TestCase):
 
                 self.assertEqual(code, 0)
                 self.assertIn(bootstrap.SHIM_MARKER, expected.read_text(encoding="utf-8"))
-                self.assertTrue(any("setup: agydra is installed and ready" in msg for msg in captured))
+                self.assertTrue(any(i18n.t("setup.step.ready") in msg for msg in captured))
 
 
 def _isfile_hiding_console_script(installed_flag=None):

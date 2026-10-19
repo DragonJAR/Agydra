@@ -12,6 +12,7 @@ except ImportError:
 import account
 import doctor
 import engines
+import i18n
 import locks
 import orphans
 import profile_rotation
@@ -217,8 +218,14 @@ class TestFyaStoreAndDoctor(BaseCase):
         self.assertEqual(status, doctor.OK)
         for engine_name, driver in drivers.items():
             driver.resolve_configured_binary.assert_called_once()
+            key = (
+                "doctor.binary.codex_ok" if engine_name == "codex"
+                else "doctor.binary.claude_ok" if engine_name == "claude"
+                else "doctor.binary.grok_ok" if engine_name == "grok"
+                else "doctor.binary.ok"
+            )
             self.assertIn(
-                f"{engine_name} binary: {Path('/bin') / engine_name}", message
+                i18n.t(key, path=Path('/bin') / engine_name), message
             )
 
     def test_dead_shim_is_reported_as_dead(self):
@@ -236,7 +243,7 @@ class TestFyaStoreAndDoctor(BaseCase):
             status, message = doctor._check_bootstrap(self.store, None)
 
         self.assertEqual(status, doctor.WARN)
-        self.assertIn("shim dead", message)
+        self.assertIn(i18n.t("doctor.install.shim_dead"), message)
 
     def test_windows_bootstrap_check_uses_console_path_without_posix_shim(self):
         state = {
@@ -251,7 +258,7 @@ class TestFyaStoreAndDoctor(BaseCase):
             status, message = doctor._check_bootstrap(self.store, None)
 
         self.assertEqual(status, doctor.OK)
-        self.assertNotIn("shim dead", message)
+        self.assertNotIn(i18n.t("doctor.install.shim_dead"), message)
 
     def test_store_has_one_cannot_safely_proceed_message_format(self):
         message = cannot_safely_proceed_message(
@@ -259,7 +266,12 @@ class TestFyaStoreAndDoctor(BaseCase):
         )
         self.assertEqual(
             message,
-            "cannot safely proceed with deleting profile 'work': busy",
+            i18n.t(
+                "store.error.cannot_safely_proceed",
+                action=i18n.t("store.action.deleting"),
+                subject="profile 'work'",
+                cause="busy",
+            ),
         )
 
     def test_orphan_removal_uses_link_aware_store_removal(self):
@@ -302,8 +314,8 @@ class TestFyaRoundTwoDefects(BaseCase):
         with self.assertRaises(StoreError) as raised:
             self.store.get("work", profile=profile)
 
-        self.assertIn("does not exist", str(raised.exception))
-        self.assertNotIn("unreadable metadata", str(raised.exception))
+        self.assertEqual(str(raised.exception), i18n.t("store.profile.missing", name="work"))
+        self.assertNotIn(i18n.t("store.profile.metadata_unreadable", name="work"), str(raised.exception))
 
     def test_holder_explicitness_is_excluded_from_equality(self):
         first = locks.Holder(1234, "token", True, "session", None, False, False)
@@ -539,8 +551,9 @@ class TestFyaRoundTwoDefects(BaseCase):
             lambda: self.store.get("new"),
             lambda: self.store.get_readonly("new"),
         ):
-            with self.assertRaisesRegex(StoreError, "profile rename recovery is pending"):
+            with self.assertRaises(StoreError) as raised:
                 read()
+            self.assertEqual(str(raised.exception), i18n.t("store.rename.interrupted"))
         self.assertTrue(self.store.rename_journal_path.is_file())
 
         self.store.set_default("new")
@@ -558,7 +571,7 @@ class TestFyaRoundTwoDefects(BaseCase):
 
         status, message = doctor._check_persistent_state(self.store, context)
         self.assertEqual(status, doctor.FAIL)
-        self.assertIn("rename recovery is pending", message)
+        self.assertIn(i18n.t("store.rename.recovery_issue", old="old", new="new"), message)
 
         with mock.patch("doctor._fix_orphans"), mock.patch(
             "keychain.orphan_slots", return_value=[]
@@ -585,7 +598,7 @@ class TestFyaRoundTwoDefects(BaseCase):
             messages.append(str(raised.exception))
 
         self.assertEqual(len(set(messages)), 1)
-        self.assertIn("does not exist (see: agydra list)", messages[0])
+        self.assertEqual(messages[0], i18n.t("store.profile.missing", name="gone"))
 
     def test_doctor_identity_comparison_uses_profile_anchor_and_casefolding(self):
         profile = self.store.create("work")

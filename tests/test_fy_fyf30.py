@@ -1,12 +1,17 @@
 """FYF30 staged cleanup and defensive numeric parsing regressions."""
 import argparse
 import math
+import re
 import subprocess
 from pathlib import Path
 from unittest import mock
 
-from conftest import BaseCase
+try:
+    from conftest import BaseCase
+except ModuleNotFoundError:
+    from tests.conftest import BaseCase
 import cli
+import i18n
 import platforms
 import store
 import usage_agy
@@ -25,7 +30,8 @@ class TestFiniteNumber(BaseCase):
         for value in (0, 0.5, 1):
             self.assertEqual(cli.parse_finite_number(value, name="fraction", lo=0, hi=1), value)
         for value in (-1, 2):
-            with self.assertRaisesRegex(argparse.ArgumentTypeError, "fraction must be between 0 and 1, got"):
+            pattern = re.escape(i18n.t("cli.number_out_of_range", name="fraction", lo=0, hi=1, value=repr(value)))
+            with self.assertRaisesRegex(argparse.ArgumentTypeError, pattern):
                 cli.parse_finite_number(value, name="fraction", lo=0, hi=1)
 
     def test_conversion_overflow_is_argument_error(self):
@@ -72,7 +78,7 @@ class TestStagedCleanup(BaseCase):
         message = warn.call_args.args[0]
         self.assertIn(str(staged.resolve()), message)
         self.assertIn("cleanup denied", message)
-        self.assertIn("manual cleanup", message)
+        self.assertEqual(message, i18n.t("usage.staging_cleanup_failed", path=staged.resolve(), error="cleanup denied"))
 
     def test_cleanup_failure_preserves_launch_exception(self):
         with mock.patch.object(platforms, "run_with_group_kill", side_effect=OSError("launch failed")), mock.patch.object(store, "rmtree", side_effect=OSError("cleanup failed")) as cleanup, mock.patch.object(usage_agy, "warn") as warn:

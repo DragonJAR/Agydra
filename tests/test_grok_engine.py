@@ -14,6 +14,7 @@ from unittest import mock
 import account
 import cli
 import engines
+import i18n
 import isolation
 import platforms
 import store
@@ -94,7 +95,7 @@ class TestGrokEngine(unittest.TestCase):
         auth_info = account.inspect_grok_auth(data_dir)
         self.assertEqual(auth_info["auth_type"], "api_key")
         self.assertIsNone(account.detect_grok_email(data_dir))
-        self.assertEqual(account.detect_grok_plan(data_dir), "xAI API Key")
+        self.assertEqual(account.detect_grok_plan(data_dir), i18n.t("usage.xai_api_key"))
         self.assertEqual(account.auth_state(data_dir, self.store, "grok-api", engine="grok"), "authenticated")
 
     def test_detect_grok_plan_config_toml_api_key_without_auth_json(self):
@@ -102,7 +103,7 @@ class TestGrokEngine(unittest.TestCase):
         data_dir = self.store.profile_data_dir("grok-cfg-key", engine="grok")
         (data_dir / "config.toml").write_text('api_key = "xai-cfg-secret-key"\n', encoding="utf-8")
         self.assertFalse((data_dir / "auth.json").exists())
-        self.assertEqual(account.detect_grok_plan(data_dir), "xAI API Key")
+        self.assertEqual(account.detect_grok_plan(data_dir), i18n.t("usage.xai_api_key"))
 
 
     def test_auth_state_not_authenticated(self):
@@ -228,7 +229,7 @@ class TestGrokEngine(unittest.TestCase):
         # Not authenticated
         res = usage.query_profile_usage(self.store, "grok-query")
         self.assertFalse(res.ok)
-        self.assertEqual(res.error, "not authenticated")
+        self.assertEqual(res.error, i18n.t("usage.not_authenticated"))
         self.assertEqual(res.engine, "grok")
 
         # Authenticated with JWT tier 3 (mocked network payload)
@@ -244,7 +245,7 @@ class TestGrokEngine(unittest.TestCase):
             self.assertEqual(res_auth.engine, "grok")
             self.assertEqual(res_auth.email, "dev@x.ai")
             self.assertEqual(res_auth.plan, "Grok Pro")
-            self.assertEqual(res_auth.error, "no usage data in response")
+            self.assertEqual(res_auth.error, i18n.t("usage.no_data"))
 
     def test_cli_create_and_status(self):
         # Create profile via CLI
@@ -364,12 +365,13 @@ class TestGrokEngine(unittest.TestCase):
             self.assertAlmostEqual(res.groups[0].buckets[0].remaining_fraction, 0.95, places=4)
 
         # 2. Offline fallback
-        with patch("usage.fetch_grok_billing_payload", side_effect=urllib.error.URLError("Network down")), \
+        url_err = urllib.error.URLError("Network down")
+        with patch("usage.fetch_grok_billing_payload", side_effect=url_err), \
              patch("usage.fetch_grok_settings_payload", return_value=None):
             res_offline = usage.query_grok_usage(data_dir, "grok-mock")
             self.assertFalse(res_offline.ok)
             self.assertEqual(res_offline.groups, [])
-            self.assertIn("offline", res_offline.error)
+            self.assertEqual(res_offline.error, i18n.t("usage.offline", error=url_err))
 
         # 3. 401 session expired. The error body must be closed: urllib's
         # HTTPError warns at GC when the caller leaves it open.
@@ -384,7 +386,7 @@ class TestGrokEngine(unittest.TestCase):
         with patch("usage.fetch_grok_billing_payload", side_effect=expired):
             res_401 = usage.query_grok_usage(data_dir, "grok-mock")
             self.assertFalse(res_401.ok)
-            self.assertIn("session expired (401)", res_401.error)
+            self.assertEqual(res_401.error, i18n.t("usage.relogin_required", name="grok-mock"))
             self.assertIn("agydra login grok-mock", res_401.error)
         self.assertEqual(closed, [True])
 

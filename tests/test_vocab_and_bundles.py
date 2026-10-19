@@ -18,6 +18,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cli import (
     main,
@@ -34,6 +35,7 @@ from cli import (
 )
 from store import Store, StoreError
 
+import i18n
 import vocab
 from conftest import BaseCase, run_cli
 
@@ -146,8 +148,7 @@ class TestConsumeBundles(unittest.TestCase):
         self.assertIsNone(values["dry-run"])
         self.assertEqual(rest, ["-p", "beta", "-n", "chat"])
         out = buf.getvalue()
-        self.assertIn("'-p beta' was passed to agy", out)
-        self.assertIn("must come first", out)
+        self.assertIn(i18n.t("cli.note_late_flags", spelling="-p beta"), out)
 
     def test_reverse_order_control_still_consumes_dry_run(self):
         """Control case: same flags, ``-n`` placed BEFORE the repeat. The
@@ -162,7 +163,7 @@ class TestConsumeBundles(unittest.TestCase):
         self.assertTrue(values["dry-run"])
         self.assertEqual(values["profile"], "alpha")
         self.assertEqual(rest, ["-p", "beta"])
-        self.assertIn("'-p beta' was passed to agy", buf.getvalue())
+        self.assertIn(i18n.t("cli.note_late_flags", spelling="-p beta"), buf.getvalue())
 
 
 class TestLateBundleWarning(unittest.TestCase):
@@ -181,13 +182,11 @@ class TestLateBundleWarning(unittest.TestCase):
 
     def test_late_attached_value_warns(self):
         out = self._warn(["chat", "-pwork"])
-        self.assertIn("must come first", out)
-        self.assertIn("-pwork", out)
+        self.assertIn(i18n.t("cli.note_late_flags", spelling="-pwork"), out)
 
     def test_late_bundled_value_warns_with_next_token(self):
         out = self._warn(["chat", "-rp", "work"])
-        self.assertIn("must come first", out)
-        self.assertIn("-rp work", out)
+        self.assertIn(i18n.t("cli.note_late_flags", spelling="-rp work"), out)
 
     def test_late_unknown_bundle_stays_silent(self):
         self.assertEqual(self._warn(["chat", "-xfoo"]), "")
@@ -206,14 +205,14 @@ class TestReservedProfileNames(BaseCase):
             with self.subTest(name=name):
                 with self.assertRaises(StoreError) as cm:
                     self.store.create(name)
-                self.assertIn("reserved profile name", str(cm.exception))
+                self.assertEqual(str(cm.exception), i18n.t("store.profile.reserved", name=name))
 
     def test_alias_is_refused(self):
         for alias in ("ls", "mv", "rm", "c", "in", "imp", "us", "h"):
             with self.subTest(alias=alias):
                 with self.assertRaises(StoreError) as cm:
                     self.store.create(alias)
-                self.assertIn("reserved profile name", str(cm.exception))
+                self.assertEqual(str(cm.exception), i18n.t("store.profile.reserved", name=alias))
 
     def test_rename_into_reserved_name_is_refused(self):
         self.store.create("work")
@@ -244,7 +243,7 @@ class TestWindowsReservedDeviceNames(BaseCase):
             with self.subTest(name=name):
                 with self.assertRaises(StoreError) as cm:
                     self.store.create(name)
-                self.assertIn("reserved Windows device name", str(cm.exception))
+                self.assertEqual(str(cm.exception), i18n.t("store.profile.reserved_windows", name=name))
 
     def test_similar_but_distinct_names_still_pass(self):
         self.store.create("console")
@@ -265,7 +264,7 @@ class TestRuntimeBundleLaunch(BaseCase):
     def test_nr_with_late_p_fails_closed(self):
         result = self._run_cli("-nr", "-p", "lab", "chat")
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("mutually exclusive", result.stderr)
+        self.assertIn(i18n.t("cli.error_profile_and_random_exclusive", profile="lab"), result.stderr)
 
     def test_plain_bundle_still_launches_named_profile(self):
         self.store = Store()
@@ -435,13 +434,13 @@ class TestRuntimeCreateRefusesReservedName(BaseCase):
     def test_create_status_is_actionable(self):
         result = self._run("create", "status")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("reserved profile name", result.stderr)
+        self.assertIn(i18n.t("store.profile.reserved", name="status"), result.stderr)
         self.assertFalse((self.store_root / "profiles" / "status").exists())
 
     def test_create_alias_is_actionable(self):
         result = self._run("create", "ls")
         self.assertEqual(result.returncode, 1)
-        self.assertIn("reserved profile name", result.stderr)
+        self.assertIn(i18n.t("store.profile.reserved", name="ls"), result.stderr)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -469,17 +468,26 @@ class TestStatusWithoutEngineBinary(_CliSurfaceCase):
     def test_status_reports_the_profile_when_the_binary_is_not_installed(self):
         status, out, err = self._main(["status", "work"])
         self.assertEqual(status, 0, err)
-        self.assertIn("profile   : work", out)
-        self.assertIn("engine    : agy", out)
-        self.assertIn("binary    : (not found", out)
-        self.assertIn("AGYDRA_AGY_BIN", out)
+        self.assertIn(i18n.t("cmd.status.profile", name="work"), out)
+        self.assertIn(i18n.t("cmd.status.engine", engine="agy"), out)
+        self.assertIn(
+            i18n.t(
+                "cmd.status.binary",
+                path=i18n.t(
+                    "cmd.status.binary_missing",
+                    binary="agy",
+                    env_var="AGYDRA_AGY_BIN",
+                ),
+            ),
+            out,
+        )
         self.assertNotIn("could not find the agy binary", err)
 
     def test_status_still_prints_the_binary_path_when_installed(self):
         os.environ["AGYDRA_AGY_BIN"] = str(self.agy_bin)
         status, out, err = self._main(["status", "work"])
         self.assertEqual(status, 0, err)
-        self.assertIn(f"binary    : {self.agy_bin}", out)
+        self.assertIn(i18n.t("cmd.status.binary", path=str(self.agy_bin)), out)
 
     def test_status_dry_run_plan_still_requires_the_binary(self):
         status, out, err = self._main(["status", "work", "-n"])
@@ -489,7 +497,15 @@ class TestStatusWithoutEngineBinary(_CliSurfaceCase):
     def test_status_of_an_unknown_profile_is_still_an_error(self):
         status, out, err = self._main(["status", "ghost"])
         self.assertEqual(status, 1)
-        self.assertIn("unknown profile", err)
+        self.assertIn(
+            i18n.t(
+                "store.profile.unknown_ref",
+                ref="ghost",
+                names="work",
+                hint=i18n.t("store.profile.create_hint", ref="ghost"),
+            ),
+            err,
+        )
 
 
 class TestOptionsWithoutEffectAreRejected(_CliSurfaceCase):
@@ -526,9 +542,7 @@ class TestHelpMatchesBehaviour(_CliSurfaceCase):
         self.assertEqual(status, 0)
         flat = " ".join(out.split())
         self.assertNotIn("2+ profiles", flat)
-        self.assertIn("all engines by default", flat)
-        self.assertIn("unused profiles first", flat)
-        self.assertIn("saved quota ranks repeats", flat)
+        self.assertIn(i18n.t("launcher.random_help"), flat)
         self.assertIn("max_sessions_per_profile", flat)
         self.assertNotIn("compatibility alias", flat)
         self.assertIn("--lang CODE", flat)

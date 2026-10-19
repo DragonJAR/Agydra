@@ -10,8 +10,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from conftest import BaseCase, normalize_newlines
+try:
+    from conftest import BaseCase, normalize_newlines
+except ModuleNotFoundError:
+    from tests.conftest import BaseCase, normalize_newlines
 import cli
+import i18n
 import platforms
 import ui
 from store import Store
@@ -74,8 +78,7 @@ class TestPublicEngineHelp(BaseCase):
         result = self._run_cli("import", "--help")
         self.assertEqual(result.returncode, 0, result.stderr)
         text = " ".join(result.stdout.split())
-        self.assertIn("target engine", text)
-        self.assertIn("Claude Code import unsupported", text)
+        self.assertIn(" ".join(i18n.t("arg.import.source").split()), text)
         self.assertNotIn("generic agy data dir", text)
 
 
@@ -136,7 +139,7 @@ class TestWindowsTreeCleanup(BaseCase):
         stream.flush()
         self.assertEqual(status, 127)
         self.assertIn(b"\\u7528\\u6237", raw.getvalue())
-        self.assertIn(b"not found", raw.getvalue())
+        self.assertIn(i18n.t("platforms.reason_not_found").encode("cp1252"), raw.getvalue())
 
 
 class TestWindowsJunctionCreation(BaseCase):

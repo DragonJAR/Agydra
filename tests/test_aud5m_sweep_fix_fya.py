@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import cli
+import i18n
 import isolation
 import locks
 import platforms
@@ -181,6 +182,25 @@ handle.release()
         self.assertEqual(s.config_path.read_bytes(), raw)
         self.assertEqual(list(self.store_root.glob("*.corrupt-*")), [])
 
+    def test_mutation_failure_uses_quarantine_write_message(self) -> None:
+        s = store.Store(self.store_root)
+        s.config_path.write_bytes(b"{")
+        error = OSError("disk full")
+        with mock.patch.object(s, "_write_config", side_effect=error):
+            with self.assertRaises(store.StoreError) as caught:
+                s.repair_persistent_state(s.config_path)
+        self.assertEqual(
+            str(caught.exception),
+            i18n.t(
+                "store.state.quarantine_mutation_failed",
+                path=s.config_path,
+                error=error,
+            ),
+        )
+        backups = list(self.store_root.glob("agydra.json.corrupt-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), b"{")
+
     def test_update_config_does_not_report_success_when_capture_finds_valid_state(self) -> None:
         s = store.Store(self.store_root)
         raw = b'{"settings":{"lang":"es"}}'
@@ -249,6 +269,28 @@ class TestVerifiedCopy(BaseCase):
         self.assertEqual(foreign.read_bytes(), b"foreign")
         self.assertEqual(list(self._tmp.glob("destination.*.tmp")), [])
 
+    def test_copy_revalidates_source_after_replace_backoff(self) -> None:
+        source = self._tmp / "source"
+        source.write_bytes(b"old source")
+        destination = self._tmp / "destination"
+        destination.write_bytes(b"prior")
+        original_replace = os.replace
+        attempts = []
+
+        def change_before_retry(src, dst):
+            attempts.append(True)
+            if len(attempts) == 1:
+                source.write_bytes(b"new source has different length")
+                raise PermissionError("transient replace contention")
+            return original_replace(src, dst)
+
+        with mock.patch.object(store.os, "replace", side_effect=change_before_retry):
+            with self.assertRaises(OSError):
+                store.atomic_copy(source, destination)
+        self.assertEqual(attempts, [True])
+        self.assertEqual(destination.read_bytes(), b"prior")
+        self.assertEqual(list(self._tmp.glob("destination.*.tmp")), [])
+
     def test_read_failure_cleans_temp_without_publishing(self) -> None:
         source = self._tmp / "source"
         source.write_bytes(b"payload")
@@ -287,6 +329,58 @@ class TestVerifiedCopy(BaseCase):
             with self.assertRaises(platforms.FileLinkError):
                 cli._copy_import_file(str(source), str(self._tmp / "destination"))
         copy.assert_not_called()
+
+    def test_import_alias_rejects_opaque_destination_ancestor_before_copy(self) -> None:
+        opaque = self._tmp / "opaque-target-parent"
+        opaque.mkdir()
+        (opaque / "regular").write_bytes(b"foreign")
+        alias = self._tmp / "source-alias"
+        alias.symlink_to(opaque, target_is_directory=True)
+        original = platforms.is_link
+
+        def linked(path, *, strict=False):
+            return True if Path(path) == opaque else original(path, strict=strict)
+
+        with mock.patch.object(platforms, "is_link", side_effect=linked), \
+                mock.patch.object(cli, "atomic_copy") as copy:
+            with self.assertRaises(platforms.FileLinkError):
+                cli._copy_import_file(str(alias / "regular"), str(self._tmp / "destination"))
+        copy.assert_not_called()
+
+    def test_import_safe_ignore_rejects_opaque_destination_ancestor(self) -> None:
+        target_store = store.Store(self.store_root)
+        target_store.create("target", engine="codex")
+        source = self._tmp / "import-source"
+        source.mkdir()
+        opaque = self._tmp / "opaque-target-parent"
+        opaque.mkdir()
+        (opaque / "regular").write_bytes(b"foreign")
+        (source / "alias").symlink_to(opaque, target_is_directory=True)
+        original = platforms.is_link
+
+        def linked(path, *, strict=False):
+            return True if Path(path) == opaque else original(path, strict=strict)
+
+        real_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if Path(path) == source / "alias":
+                raise AssertionError("alias target followed before its destination was checked")
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(platforms, "is_link", side_effect=linked), \
+                mock.patch.object(Path, "stat", new=stat), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(platforms.FileLinkError):
+                cli.cmd_import(
+                    target_store,
+                    SimpleNamespace(ref="target", source=str(source)),
+                )
+        self.assertEqual(
+            list(target_store.profile_data_dir("target", engine="codex").iterdir()),
+            [],
+        )
 
     def test_import_command_rejects_even_an_empty_opaque_source_directory(self) -> None:
         s = store.Store(self.store_root)
