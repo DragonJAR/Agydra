@@ -1210,13 +1210,29 @@ class TestIsolatedEnvFileAuthMarker(BaseCase):
             )
             self.assertEqual(env.get(account.AGY_FILE_AUTH_ENV), account.AGY_FILE_AUTH_VALUE)
 
-    def test_genuine_ssh_tty_value_is_preserved_for_every_engine(self):
-        genuine_tty = "/dev/ttys003"
-        with mock.patch.dict(os.environ, {account.AGY_FILE_AUTH_ENV: genuine_tty}):
+    def test_marker_is_agys_native_forced_file_storage_switch(self):
+        # A faked SSH session (SSH_TTY) is overridden by agy whenever
+        # $HOME/Library/Keychains is visible, which every macOS overlay mirrors.
+        self.assertEqual(
+            (account.AGY_FILE_AUTH_ENV, account.AGY_FILE_AUTH_VALUE),
+            ("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "1"),
+        )
+
+    def test_inherited_marker_with_any_value_is_dropped_for_every_engine(self):
+        with mock.patch.dict(os.environ, {account.AGY_FILE_AUTH_ENV: "true"}):
             for engine in ("agy", "codex", "claude", "grok"):
                 with self.subTest(engine=engine):
                     env = isolation.isolated_env(self._target(engine), {}, engine=engine)
-                    self.assertEqual(env.get(account.AGY_FILE_AUTH_ENV), genuine_tty)
+                    self.assertNotIn(account.AGY_FILE_AUTH_ENV, env)
+
+    def test_genuine_ssh_tty_value_is_preserved_for_every_engine(self):
+        genuine_tty = "/dev/ttys003"
+        with mock.patch.dict(os.environ, {"SSH_TTY": genuine_tty}):
+            for engine in ("agy", "codex", "claude", "grok"):
+                for extra in ({}, {account.AGY_FILE_AUTH_ENV: account.AGY_FILE_AUTH_VALUE}):
+                    with self.subTest(engine=engine, extra=bool(extra)):
+                        env = isolation.isolated_env(self._target(engine), extra, engine=engine)
+                        self.assertEqual(env.get("SSH_TTY"), genuine_tty)
 
 
 class TestOverlayStoreSymlinkIsolation(BaseCase):

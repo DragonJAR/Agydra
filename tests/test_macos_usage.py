@@ -364,7 +364,7 @@ class TestMacosUsageRestoration(BaseCase):
             captured["token"] = staged_token.read_bytes()
             captured["mode"] = staged_token.stat().st_mode & 0o777
             captured["argv"] = argv
-            captured["ssh_tty"] = env.get(account.AGY_FILE_AUTH_ENV)
+            captured["file_auth"] = env.get(account.AGY_FILE_AUTH_ENV)
             return fake_proc
 
         with mock.patch.object(keychain, "supported", return_value=True), \
@@ -382,7 +382,7 @@ class TestMacosUsageRestoration(BaseCase):
         self.assertEqual(captured["token"], token_bytes)
         if os.name == "posix":
             self.assertEqual(captured["mode"], 0o600)
-        self.assertEqual(captured["ssh_tty"], "agydra-profile")
+        self.assertEqual(captured["file_auth"], account.AGY_FILE_AUTH_VALUE)
         self.assertEqual(captured["argv"][1:], ["--print", "/usage", "--output-format", "json"])
         self.assertNotEqual(captured["home"], Path(os.environ[platforms.home_redirect_var()]))
         self.assertFalse(captured["home"].exists())

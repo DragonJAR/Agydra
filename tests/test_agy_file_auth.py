@@ -590,7 +590,10 @@ class TestRandomAgyFileLaunch(BaseCase):
 
         def native_login(_argv, env):
             self.assertEqual(env["AGYDRA_PROFILE"], "gamma")
-            self.assertEqual(env[account.AGY_FILE_AUTH_ENV], account.AGY_FILE_AUTH_VALUE)
+            # agy honours $HOME/Library/Keychains over a faked SSH session, so
+            # only its own switch keeps the login off the shared Keychain slot.
+            self.assertEqual(env.get("AGY_CLI_FORCE_FILE_TOKEN_STORAGE"), "1")
+            self.assertNotIn("SSH_TTY", env)
             self.assertFalse(locks.lease_holders(self.store, "gamma")[0].keychain)
             token.parent.mkdir(parents=True, exist_ok=True)
             token.write_bytes(raw)
@@ -598,9 +601,11 @@ class TestRandomAgyFileLaunch(BaseCase):
             return 0
 
         plan = runner.build_plan(self.store, [], flag_ref=gamma.name, launch_as_child=True)
-        self.assertEqual(
-            self._run(plan, launch=native_login, guard=self._slot_owned_by("andrea")), 0
-        )
+        with mock.patch.dict(os.environ):
+            os.environ.pop("SSH_TTY", None)
+            self.assertEqual(
+                self._run(plan, launch=native_login, guard=self._slot_owned_by("andrea")), 0
+            )
         backup = keychain.load_profile_slot(self.store, "gamma")
         self.assertEqual(keychain.decode_go_keyring_secret(backup), json.loads(raw))
         self.assertEqual(self.store.get("gamma").email, "gamma@example.com")

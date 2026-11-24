@@ -3,7 +3,7 @@
 These tests pin the contract that ``usage.query_profile_usage`` for an
 Antigravity profile:
 - stages the profile's own credential into a throwaway HOME,
-- sets ``SSH_TTY`` so agy reads the file token instead of the shared
+- sets ``AGY_CLI_FORCE_FILE_TOKEN_STORAGE`` so agy reads the file token instead of the shared
   macOS keychain slot,
 - never touches ``swap.lock`` even while another process holds it,
 - degrades cleanly when no credential is resolvable.

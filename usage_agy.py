@@ -1,10 +1,12 @@
 """Keychain-free scoped quota queries for Antigravity profiles.
 
-``agy`` consults the shared macOS keychain slot only when it cannot use a
-file-based token: its composite token storage prefers the on-disk
-``antigravity-oauth-token`` whenever a non-empty ``SSH_TTY`` marks the
-process as non-interactive (verified against the agy binary itself, which
-embeds both the flag and the ``go-keyring`` fallback path). Staging the
+``agy``'s composite token storage uses the on-disk
+``antigravity-oauth-token`` instead of the OS keyring whenever
+``AGY_CLI_FORCE_FILE_TOKEN_STORAGE`` is set (``account.AGY_FILE_AUTH_ENV``;
+verified against agy 1.5: its log reports "Using file-based token storage
+because AGY_CLI_FORCE_FILE_TOKEN_STORAGE is set" even with
+``$HOME/Library/Keychains`` visible, which a faked ``SSH_TTY`` does not
+survive). Staging the
 profile's own credential into a throwaway ``HOME`` therefore lets
 ``agy --print /usage`` run as a pure, isolated read:
 

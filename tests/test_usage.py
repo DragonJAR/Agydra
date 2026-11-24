@@ -375,7 +375,7 @@ class TestQueryProfileUsageAlreadyBusyKeychainNoop(_UsageBase):
     """Querying usage must leave the shared macOS keychain slot untouched,
     even on a host whose keychain bridge is enabled. The staged-HOME path
     achieves this structurally: agy reads the staged file token via
-    ``SSH_TTY`` and never consults the shared slot at all.
+    ``AGY_CLI_FORCE_FILE_TOKEN_STORAGE`` and never consults the shared slot at all.
     """
 
     def test_usage_on_busy_profile_leaves_shared_slot_untouched(self):

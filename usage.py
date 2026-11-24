@@ -34,7 +34,7 @@ refresh itself fails the error names the re-login command.
 
 Antigravity queries run keychain-free through ``usage_agy``: the
 profile's own credential is staged into a throwaway ``HOME`` whose
-``SSH_TTY`` flag makes agy read the on-disk token file instead of the
+file-auth marker (``AGY_CLI_FORCE_FILE_TOKEN_STORAGE``) makes agy read the on-disk token file instead of the
 shared macOS keychain slot, so a query never swaps credentials, never
 takes ``swap.lock``, and coexists with live sessions of any profile. Any
 OAuth refresh agy performs lands inside the staging directory and is

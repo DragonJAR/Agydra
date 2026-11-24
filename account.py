@@ -28,8 +28,8 @@ from text import module_text
 
 AGY_CLI_DIR = "antigravity-cli"
 TOKEN_FILE = "antigravity-oauth-token"
-AGY_FILE_AUTH_ENV = "SSH_TTY"
-AGY_FILE_AUTH_VALUE = "agydra-profile"
+AGY_FILE_AUTH_ENV = "AGY_CLI_FORCE_FILE_TOKEN_STORAGE"
+AGY_FILE_AUTH_VALUE = "1"
 
 
 def _normalize_nonblank_text(value: object) -> Optional[str]:

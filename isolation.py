@@ -1387,9 +1387,11 @@ def isolated_env(
     agydra calls resolve the same store whatever ``HOME``/``XDG_*`` redirection
     the child sees. Without it an inherited ``AGYDRA_HOME`` is left untouched.
 
-    An inherited Antigravity file-authentication marker is dropped so nested
-    launches and other engines do not inherit it unless ``extra`` sets it;
-    genuine SSH sessions remain untouched.
+    An inherited Antigravity file-authentication marker is dropped, whatever
+    its value, so nested launches and other engines do not inherit it unless
+    ``extra`` sets it: agydra alone chooses agy's credential backend, and a
+    stray value would silently bypass the Keychain swap. ``SSH_TTY`` is never
+    touched, so genuine SSH sessions keep it.
 
     For engines without an overlay (``claude``) ``overlay`` is the physical
     config directory: ``HOME``/``USERPROFILE``/XDG stay untouched, inherited
@@ -1404,8 +1406,7 @@ def isolated_env(
 
     driver = engines.get_engine(engine)
     env = dict(os.environ)
-    if env.get(account.AGY_FILE_AUTH_ENV) == account.AGY_FILE_AUTH_VALUE:
-        env.pop(account.AGY_FILE_AUTH_ENV, None)
+    env.pop(account.AGY_FILE_AUTH_ENV, None)
     if not driver.uses_overlay:
         driver.scrub_inherited_state(env)
         env.update(extra)
