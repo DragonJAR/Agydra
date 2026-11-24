@@ -146,7 +146,6 @@ class TestMigrateRealDir(BaseCase):
         link = self.store.overlays_dir / "alpha" / platforms.AGY_DATA_DIR_NAME
         self.assertTrue(isolation._is_link(link))
 
-        # Replace the symlink with a real directory containing real data
         link.unlink()
         real_dir = link
         real_dir.mkdir()
@@ -795,7 +794,6 @@ class TestSandboxWrap(unittest.TestCase):
         self.assertIn("--tmpfs", wrapped)
         bus_dir = "/run/user/1000/bus"
         keyring_dir = "/run/user/1000/keyring"
-        # Verify --dir precedes --tmpfs for each mount
         bus_dir_idx = wrapped.index(bus_dir)
         self.assertEqual(wrapped[bus_dir_idx - 1], "--dir")
         bus_tmpfs_idx = wrapped.index(bus_dir, bus_dir_idx + 1)

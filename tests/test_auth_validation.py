@@ -59,7 +59,7 @@ class TestAuthValidation(unittest.TestCase):
 
         self.assertEqual(account._decode_jwt_payload(token), {})
         self.assertIsNone(account.detect_codex_email(data_dir))
-        self.assertIsNone(account.detect_codex_plan(data_dir))
+        self.assertIsNone(account.auth_snapshot(data_dir, "codex").plan)
 
         with mock.patch.object(
             usage,
@@ -159,7 +159,7 @@ class TestAuthValidation(unittest.TestCase):
         api_info = account.inspect_codex_auth(api_dir)
         self.assertEqual(api_info["auth_type"], "api_key")
         self.assertEqual(api_info["api_key"], "sk-project-example")
-        self.assertEqual(account.detect_codex_plan(api_dir), i18n.t("usage.openai_api_key"))
+        self.assertEqual(account.auth_snapshot(api_dir, "codex").plan, i18n.t("usage.openai_api_key"))
         self.assertEqual(account.auth_state(api_dir, engine="codex"), "authenticated")
 
         with mock.patch.object(usage, "fetch_codex_usage_payload") as fetch:
@@ -225,7 +225,7 @@ class TestAuthValidation(unittest.TestCase):
         self.assertEqual(opaque_info["key"], "opaque-not-a-verified-jwt")
         self.assertEqual(account.auth_state(opaque_key_dir, engine="grok"), "authenticated")
         self.assertIsNone(account.detect_grok_email(opaque_key_dir))
-        self.assertEqual(account.detect_grok_plan(opaque_key_dir), "Grok (xAI)")
+        self.assertEqual(account.auth_snapshot(opaque_key_dir, "grok").plan, "Grok (xAI)")
 
         api_dir = self._write_auth(
             "grok-api-key",

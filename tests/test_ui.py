@@ -109,10 +109,8 @@ class TestUiMetricsAndPad(unittest.TestCase):
         self.assertEqual(ui.bar(0.0, width=10), "----------")
         self.assertEqual(ui.bar(1.0, width=10), "##########")
         self.assertEqual(ui.bar(0.5, width=10), "#####-----")
-        # Clamping
         self.assertEqual(ui.bar(-0.5, width=10), "----------")
         self.assertEqual(ui.bar(1.5, width=10), "##########")
-        # Custom characters
         self.assertEqual(ui.bar(0.3, width=10, filled="*", empty="."), "***.......")
 
 

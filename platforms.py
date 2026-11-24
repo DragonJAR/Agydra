@@ -15,7 +15,7 @@ import stat
 import subprocess
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterator, Literal, Mapping, Optional, Sequence, Union
 
@@ -255,17 +255,9 @@ def _pathext_candidates(path: Path, suffixes: Optional[Sequence[str]] = None) ->
         yield Path(str(path) + suffix)
 
 
-def _probe_pathext(p: Path) -> Optional[Path]:
-    """Compatibility helper for the first existing PATHEXT-suffixed file."""
-    return next((candidate for candidate in _pathext_candidates(p) if candidate.is_file()), None)
-
-
 def clean_path_value(value: str) -> str:
     """Strip whitespace and surrounding quotes from a path or path list entry."""
     return value.strip().strip('"\'')
-
-
-_clean_path_entry = clean_path_value
 
 
 def normalize_path_entry(entry: str) -> str:
@@ -308,7 +300,6 @@ class BinaryResult:
     found: Optional[Path] = None
     reason: Optional[Literal["not_found", "not_executable"]] = None
     last_candidate: Optional[Path] = None
-    env_chain: list[str] = field(default_factory=list)
 
     @property
     def exit_code(self) -> int:
@@ -387,17 +378,12 @@ def resolve_binary_result(
     config_key: Optional[str] = None,
 ) -> BinaryResult:
     """Resolve explicit/env/config/PATH once, preserving binding inputs and 126/127."""
-    chain: list[str] = []
     selected = explicit
     binding = bool(explicit)
-    if binding:
-        chain.append("explicit")
-    elif env_var:
-        chain.append(env_var)
+    if not binding and env_var:
         selected = os.environ.get(env_var)
         binding = bool(selected)
     if not binding and config_val:
-        chain.append(config_key or f"{binary_name}_binary")
         selected = config_val
     candidate = None
     direct = BinaryResult(reason="not_found")
@@ -410,27 +396,26 @@ def resolve_binary_result(
         except (OSError, ValueError):
             candidate = None
         if direct.found is not None:
-            return replace(direct, env_chain=chain)
+            return direct
     names = []
     if candidate is not None and not os.path.dirname(str(candidate)):
         names.append(str(candidate))
     if not binding and binary_name and binary_name not in names:
         names.append(binary_name)
     if names:
-        chain.append("PATH")
         searched = _search_binary_path(names)
     else:
         searched = {}
     if selected and candidate is not None:
         result = searched.get(str(candidate), direct)
         if result.found is not None:
-            return replace(result, env_chain=chain)
+            return result
         if direct.reason == "not_executable":
             result = direct
     else:
         result = direct
     if binding:
-        return replace(result, env_chain=chain)
+        return result
     if config_val:
         import i18n
         import ui
@@ -445,12 +430,7 @@ def resolve_binary_result(
     fallback = searched.get(binary_name, BinaryResult(reason="not_found"))
     if fallback.found is not None or result.reason != "not_executable":
         result = fallback
-    return replace(result, env_chain=chain)
-
-
-def _validate_binary_candidate(candidate: str) -> Optional[Path]:
-    """Compatibility facade for a binding binary candidate."""
-    return resolve_binary_result("", explicit=candidate).found
+    return result
 
 
 def resolve_binary(
@@ -461,48 +441,10 @@ def resolve_binary(
     config_val: Optional[str] = None,
     config_key: Optional[str] = None,
 ) -> Optional[Path]:
-    """Compatibility facade returning only the resolved executable path."""
+    """Resolved executable path only; see :func:`resolve_binary_result`."""
     return resolve_binary_result(
         binary_name, env_var, explicit, config_val=config_val, config_key=config_key
     ).found
-
-
-def resolve_agy_binary(
-    explicit: Optional[str] = None,
-    *,
-    config_val: Optional[str] = None,
-) -> Optional[Path]:
-    """Locate the real agy binary without fragile heuristics.
-
-    Order: explicit flag → ``AGYDRA_AGY_BIN`` → config → PATH lookup for ``agy``.
-    Returns ``None`` when not found.
-    """
-    return resolve_binary(
-        "agy",
-        AGY_BIN_ENV,
-        explicit=explicit,
-        config_val=config_val,
-        config_key="agy_binary",
-    )
-
-
-def resolve_codex_binary(
-    explicit: Optional[str] = None,
-    *,
-    config_val: Optional[str] = None,
-) -> Optional[Path]:
-    """Locate the real codex binary without fragile heuristics.
-
-    Order: explicit flag → ``AGYDRA_CODEX_BIN`` → config → PATH lookup for ``codex``.
-    Returns ``None`` when not found.
-    """
-    return resolve_binary(
-        "codex",
-        CODEX_BIN_ENV,
-        explicit=explicit,
-        config_val=config_val,
-        config_key="codex_binary",
-    )
 
 
 def codex_data_dir(home: Optional[Path] = None) -> Path:
@@ -510,47 +452,9 @@ def codex_data_dir(home: Optional[Path] = None) -> Path:
     return (Path(home) if home is not None else real_home()) / CODEX_DATA_DIR_NAME
 
 
-def resolve_grok_binary(
-    explicit: Optional[str] = None,
-    *,
-    config_val: Optional[str] = None,
-) -> Optional[Path]:
-    """Locate the real grok binary without fragile heuristics.
-
-    Order: explicit flag → ``AGYDRA_GROK_BIN`` → config → PATH lookup for ``grok``.
-    Returns ``None`` when not found.
-    """
-    return resolve_binary(
-        "grok",
-        GROK_BIN_ENV,
-        explicit=explicit,
-        config_val=config_val,
-        config_key="grok_binary",
-    )
-
-
 def grok_data_dir(home: Optional[Path] = None) -> Path:
     """Grok's data directory (``.grok``) under the given home."""
     return (Path(home) if home is not None else real_home()) / GROK_DATA_DIR_NAME
-
-
-def resolve_claude_binary(
-    explicit: Optional[str] = None,
-    *,
-    config_val: Optional[str] = None,
-) -> Optional[Path]:
-    """Locate the real claude binary without fragile heuristics.
-
-    Order: explicit flag → ``AGYDRA_CLAUDE_BIN`` → config → PATH lookup for ``claude``.
-    Returns ``None`` when not found.
-    """
-    return resolve_binary(
-        "claude",
-        CLAUDE_BIN_ENV,
-        explicit=explicit,
-        config_val=config_val,
-        config_key="claude_binary",
-    )
 
 
 def claude_data_dir(home: Optional[Path] = None) -> Path:

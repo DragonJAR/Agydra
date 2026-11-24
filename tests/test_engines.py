@@ -54,12 +54,8 @@ class TestEngineDriverRegistry(BaseCase):
             engines.get_engine("unknown_cli")
         self.assertIn("unknown engine", str(ctx.exception))
 
-    def test_all_engines_returns_registered(self):
-        all_eng = engines.all_engines()
-        self.assertEqual({e.name for e in all_eng}, {"agy", "codex", "grok", "claude"})
-
     def test_flag_translation_maps_are_not_dataclass_fields(self):
-        for driver in engines.all_engines():
+        for driver in map(engines.get_engine, engines.SUPPORTED_ENGINES):
             with self.subTest(engine=driver.name):
                 field_names = {item.name for item in fields(type(driver))}
                 self.assertNotIn("UNIVERSAL_FLAG_TRANSLATIONS", field_names)

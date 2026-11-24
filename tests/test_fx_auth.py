@@ -60,14 +60,11 @@ class TestA1LoginCredentialAdoption(BaseCase):
         new_raw = _payload("new@example.com")
         keychain.adopt_login_credential(self.store, "alpha", self.data_dir, new_raw)
 
-        # 1. Profile metadata email updated
         profile = self.store.get("alpha")
         self.assertEqual(profile.email, "new@example.com")
 
-        # 2. Disk token updated
         self.assertEqual(self.token_path.read_bytes(), new_raw)
 
-        # 3. Private slot backup (.secret) updated
         saved_slot = keychain.load_profile_slot(self.store, "alpha")
         self.assertIsNotNone(saved_slot)
         self.assertEqual(
@@ -75,7 +72,6 @@ class TestA1LoginCredentialAdoption(BaseCase):
             json.loads(new_raw.decode("utf-8")),
         )
 
-        # 4. Old slot was quarantined
         slots_dir = self.store.root / "keychain"
         quarantined = [p for p in slots_dir.glob("alpha.secret.corrupt-*")]
         self.assertEqual(len(quarantined), 1)
@@ -100,7 +96,6 @@ class TestA2BeginOwnershipDiskFallback(BaseCase):
         self.raw_token = _payload("alpha@example.com")
         self.token_path.write_bytes(self.raw_token)
         self.token_path.chmod(0o600)
-        # Ensure no .secret file exists
         slot_file = keychain.slot_backup_path(self.store, "alpha")
         if slot_file.exists():
             slot_file.unlink()
@@ -165,7 +160,6 @@ class TestA3RestoreHadSharedOnLoginExit(BaseCase):
                 fresh_login_payload = _payload("new@example.com")
                 shared_state["gemini"] = fresh_login_payload
 
-            # After exit, shared slot MUST be restored to ambient_had_shared
             self.assertEqual(shared_state.get("gemini"), ambient_had_shared)
 
 
@@ -237,7 +231,6 @@ class TestF1ConcurrentLoginAdoption(BaseCase):
                 # Session 2 (login) exits FIRST while Session 1 is still live
                 guard2.__exit__(None, None, None)
 
-            # Credential MUST be adopted immediately upon login exit!
             self.assertEqual(self.store.get("alpha").email, "new@example.com")
             self.assertEqual(self.token_path.read_bytes(), fresh_raw)
             saved_slot = keychain.load_profile_slot(self.store, "alpha")
@@ -253,10 +246,8 @@ class TestF1ConcurrentLoginAdoption(BaseCase):
             with mock.patch("os.getpid", return_value=pid_session):
                 guard1.__exit__(None, None, None)
 
-            # Session 1's exit must NOT discard the adopted credential!
             self.assertEqual(self.store.get("alpha").email, "new@example.com")
             self.assertEqual(self.token_path.read_bytes(), fresh_raw)
-            # And now that the last session exited, shared slot is restored to ambient
             self.assertEqual(shared_state.get("gemini"), ambient_shared)
 
     def test_login_adopts_credential_when_another_session_is_live_session_exits_first(self):
@@ -314,7 +305,6 @@ class TestF1ConcurrentLoginAdoption(BaseCase):
             with mock.patch("os.getpid", return_value=pid_login):
                 guard2.__exit__(None, None, None)
 
-            # Credential adopted and ambient restored
             self.assertEqual(self.store.get("alpha").email, "new@example.com")
             self.assertEqual(self.token_path.read_bytes(), fresh_raw)
             saved_slot = keychain.load_profile_slot(self.store, "alpha")
@@ -427,7 +417,6 @@ class TestA6ResolveOnlyTargetKeychain(BaseCase):
                 mock.patch.object(keychain, "_login_keychain_path", return_value=Path("/nonexistent/login.keychain-db")):
             resolved = keychain._ensure_target_keychain(self.store, create=False)
             self.assertIsNone(resolved)
-            # Must NOT invoke create-keychain
             create_calls = [r for r in runs if "create-keychain" in r]
             self.assertEqual(create_calls, [])
 
@@ -438,7 +427,6 @@ class TestA7DescribeSharedSlotFormat(BaseCase):
         self.store = Store()
 
     def test_describe_recognizes_valid_go_keyring_envelope_as_valid_json(self):
-        # A valid go-keyring envelope secret should NOT be marked invalid
         envelope = keychain.envelope_token_bytes(_payload("user@example.com"))
 
         def fake_read(service, path=None):

@@ -103,8 +103,6 @@ class LaunchPlan:
     binary: Path
     args: List[str]
     overlay: Path
-    env_home_var: str
-    env_home_value: Path
     use_sandbox: bool
     engine: str = "agy"
     engine_filter: Optional[str] = None
@@ -340,8 +338,6 @@ def build_plan(
         binary=binary,
         args=driver.prepare_args(agy_args),
         overlay=overlay,
-        env_home_var=platforms.home_redirect_var() if driver.uses_overlay else driver.env_home_var,
-        env_home_value=overlay,
         use_sandbox=use_sandbox,
         engine=driver.name,
         profile_seq=profile.seq,

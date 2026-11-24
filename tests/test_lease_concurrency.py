@@ -180,21 +180,6 @@ class TestLeaseContracts(BaseCase):
             handle.release()
         self.assertFalse(locks.is_locked(self.store, "work"))
 
-    def test_lock_holder_pid_reads_first_registered_holder(self):
-        locks.acquire_lease(self.store, "work")
-        self.assertEqual(locks.lock_holder_pid(self.store, "work"), os.getpid())
-        locks.release_lease(self.store, "work")
-        self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
-
-    def test_lock_holder_pid_none_when_free(self):
-        self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
-
-    def test_in_use_names_reports_profiles_with_holders(self):
-        locks.acquire_lease(self.store, "work")
-        self.assertEqual(locks.in_use_names(self.store), ["work"])
-        locks.release_lease(self.store, "work")
-        self.assertEqual(locks.in_use_names(self.store), [])
-
     def test_concurrent_acquire_serializes_on_flock(self):
         first_count = locks.acquire_lease(self.store, "work")
         second_count = locks.acquire_lease(self.store, "work")

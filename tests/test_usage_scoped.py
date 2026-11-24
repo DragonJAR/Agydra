@@ -216,7 +216,7 @@ class TestScopedTokenBytes(_ScopedBase):
     def test_returns_none_when_store_error_raised_from_private_path_check(self):
         store, profile = self.store, self.store.get("alpha")
         data_dir = self.store.profile_data_dir("alpha", engine="agy")
-        with mock.patch.object(account, "scoped_agy_token_bytes", side_effect=StoreError("credential path must not be a link")):
+        with mock.patch.object(account, "usable_agy_credential", side_effect=StoreError("credential path must not be a link")):
             self.assertIsNone(usage_agy.scoped_token_bytes(store, "alpha", profile, data_dir))
 
 

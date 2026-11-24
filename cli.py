@@ -359,8 +359,7 @@ class LaunchFlagsResult(Tuple[Dict[str, object], List[str]]):
     also reports whether an already-consumed flag was repeated (causing the
     remaining argv to be swallowed into agy's args).
 
-    Inherits from tuple so existing callers unpacking ``values, rest = ...``
-    continue to work seamlessly (DRY, backwards compatible).
+    Inherits from tuple so callers unpack ``values, rest = ...`` directly.
     """
 
     swallowed: bool
@@ -638,13 +637,6 @@ _EMAIL_COL_WIDTH = 34
 """Shared EMAIL column width: `cmd_list`'s profile table and the usage
 compact table's header/rows both render this column at the same width --
 one named constant instead of two hand-copied ``34`` literals."""
-
-
-def __getattr__(name: str) -> object:
-    """Dynamic fallback for backward-compatible module attributes."""
-    if name == "_PROFILE_LABEL":
-        return i18n.t("cmd.list.header_name", default="PROFILE")
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _table_headers() -> Dict[str, str]:

@@ -649,11 +649,8 @@ class TestLaunchGuardAlreadyCurrent(unittest.TestCase):
                 )
                 guard = keychain.launch_guard(store, "alpha", capture=False)
                 state = guard.__enter__()
-                # Nothing swapped in on entry.
                 self.assertEqual(kc.calls, [])
                 state.__exit__(None, None, None)
-            # Nothing persisted/restored on exit either: still exactly what
-            # was there before the guard ran, and no write/delete happened.
             self.assertEqual(kc.calls, [])
             self.assertEqual(kc.shared, _slot_payload_json("alpha@example.com"))
             self.assertEqual(
@@ -685,8 +682,6 @@ class TestLaunchGuardAlreadyCurrent(unittest.TestCase):
                 state = guard.__enter__()
                 self.assertEqual(kc.shared, keychain.token_payload_for_slot(own_secret))
                 state.__exit__(None, None, None)
-            # Restored to the pre-call snapshot on exit, exactly as before
-            # this fix.
             self.assertEqual(kc.shared, _slot_payload_json("mallory@example.com"))
 
 

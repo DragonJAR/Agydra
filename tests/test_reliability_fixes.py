@@ -24,6 +24,13 @@ import runner
 from store import Store, StoreError
 
 
+def _first_holder_pid(store, name):
+    import locks
+
+    holders = locks.lease_holders(store, name)
+    return holders[0].pid if holders else None
+
+
 class _FakeCompleted:
     def __init__(self, returncode, stdout=b"", stderr=b""):
         self.returncode = returncode
@@ -490,7 +497,7 @@ class TestRunnerReleasesWaitedChildLock(unittest.TestCase):
                 os.environ.pop("AGYDRA_AGY_BIN", None)
 
 
-class TestLockHolderPidExecPathOnly(unittest.TestCase):
+class TestLeaseHolderPidPerLaunchPath(unittest.TestCase):
     """The lease registry names a process that is REALLY running for the
     session. On the plain ``execvpe`` path the pid survives the exec, so
     the entry names the engine itself; on ``launch_as_child``/sandboxed
@@ -509,7 +516,7 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
         captured = {}
 
         def fake_run_wait(argv, env):
-            captured["pid_while_held"] = locks.lock_holder_pid(store, "work")
+            captured["pid_while_held"] = _first_holder_pid(store, "work")
             return 0
 
         with isolated_store_env(), mock.patch.dict(
@@ -527,7 +534,7 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
             self.assertEqual(rc, 0)
         self.assertIn("pid_while_held", captured)
         self.assertEqual(captured["pid_while_held"], os.getpid())
-        self.assertIsNone(locks.lock_holder_pid(store, "work"))
+        self.assertIsNone(_first_holder_pid(store, "work"))
 
     @posix_only("the plain exec path is POSIX-only")
     def test_plain_exec_path_still_records_a_real_pid(self):
@@ -540,7 +547,7 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
         captured = {}
 
         def fake_launch_argv(*args):
-            captured["pid_while_held"] = locks.lock_holder_pid(store, "work")
+            captured["pid_while_held"] = _first_holder_pid(store, "work")
             return 0
 
         with isolated_store_env(), mock.patch.dict(
@@ -556,7 +563,7 @@ class TestLockHolderPidExecPathOnly(unittest.TestCase):
             self.assertEqual(rc, 0)
             launch_argv.assert_called_once()
             self.assertEqual(captured.get("pid_while_held"), os.getpid())
-            self.assertIsNone(locks.lock_holder_pid(store, "work"))
+            self.assertIsNone(_first_holder_pid(store, "work"))
 
 
 class TestRunnerReleasesLockOnSetupException(unittest.TestCase):

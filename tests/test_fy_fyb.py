@@ -215,8 +215,6 @@ class TestFybAuthLaunch(BaseCase):
             binary=self.agy_bin,
             args=[],
             overlay=self._tmp,
-            env_home_var="HOME",
-            env_home_value=self.fake_home,
             use_sandbox=False,
             random_pick=True,
         )

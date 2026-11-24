@@ -4,10 +4,12 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import cli
 import doctor
 import i18n
 import keychain
@@ -254,7 +256,7 @@ class TestRemoveOrphans(BaseCase):
         self.store.create("gone")
         archive = self.store.delete("gone")
         with mock.patch.object(doctor.keychain, "supported", return_value=False):
-            doctor.run_checks(self.store, fix=True)
+            cli.cmd_doctor(self.store, SimpleNamespace(fix=True, force=True))
         self.assertTrue(archive.is_file())
 
     def test_session_lock_files_are_not_cleanup_targets(self):

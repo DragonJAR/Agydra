@@ -25,6 +25,10 @@ from conftest import BaseCase, authenticate_agy_profile, child_launch_double, wr
 from store import Store, StoreError
 
 
+def _availability(store, profile, now=None):
+    return usage_snapshot.profile_quota_availabilities(store, [profile], now)[0]
+
+
 class TestProfileRotation(BaseCase):
     def setUp(self):
         super().setUp()
@@ -526,7 +530,7 @@ class TestProfileRotation(BaseCase):
 
         self.assertEqual(selected, ["c2", "g1", "c1", "g2"])
         self.assertIsNone(
-            usage_snapshot.profile_quota_availability(
+            _availability(
                 self.store, codex_profiles[0], now=self.now
             )
         )
@@ -730,11 +734,11 @@ class TestProfileRotation(BaseCase):
         ])
 
         self.assertEqual(
-            usage_snapshot.profile_quota_availability(self.store, legacy, now=self.now),
+            _availability(self.store, legacy, now=self.now),
             0.8,
         )
         self.assertEqual(
-            usage_snapshot.profile_quota_availability(self.store, peer, now=self.now),
+            _availability(self.store, peer, now=self.now),
             0.7,
         )
         self.assertEqual(self._launch_random(), "legacy")
@@ -777,7 +781,7 @@ class TestProfileRotation(BaseCase):
         ])
 
         self.assertIsNone(
-            usage_snapshot.profile_quota_availability(
+            _availability(
                 self.store, profile, now=self.now
             )
         )
@@ -786,7 +790,7 @@ class TestProfileRotation(BaseCase):
             self._entry(profile, 0.9, identity_verified=True),
         ])
         self.assertEqual(
-            usage_snapshot.profile_quota_availability(
+            _availability(
                 self.store, profile, now=self.now
             ),
             0.9,

@@ -15,7 +15,6 @@ class TestModels(unittest.TestCase):
         stamp = _utcnow_iso()
         self.assertIsInstance(stamp, str)
         self.assertIn("T", stamp)
-        # Should be ISO format with milliseconds and timezone offset
         self.assertTrue(stamp.endswith("+00:00") or "Z" in stamp)
 
     def test_profile_defaults(self):
@@ -191,7 +190,6 @@ class TestModels(unittest.TestCase):
         self.assertEqual(c2.grok_binary, "/bin/grok")
         self.assertFalse(c2.settings["copy_settings_on_create"])
         self.assertTrue(c2.settings["custom_key"])
-        # Unspecified settings should inherit defaults
         self.assertEqual(c2.settings["lang"], "auto")
 
     def test_config_preserves_extra_top_level_fields_and_known_fields_win(self):

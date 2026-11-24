@@ -73,7 +73,7 @@ class TestAgyFileCredentials(BaseCase):
         return raw
 
     def _read(self):
-        return account.scoped_agy_token_bytes(self.store, self.profile, self.data_dir)
+        return account.usable_agy_credential(self.store, self.profile, self.data_dir)
 
     def _prepare(self):
         return isolation.prepare_agy_file_auth(self.store, self.profile, self.data_dir)
@@ -82,7 +82,7 @@ class TestAgyFileCredentials(BaseCase):
         raw = self._write_disk()
         self.assertEqual(self._read(), raw)
         with mock.patch.object(
-            account, "scoped_agy_token_bytes", return_value=raw
+            account, "usable_agy_credential", return_value=raw
         ) as reader:
             self.assertEqual(
                 usage_agy.scoped_token_bytes(self.store, "alpha", self.profile, self.data_dir),
@@ -437,7 +437,7 @@ class TestRandomAgyFileLaunch(BaseCase):
     def test_dry_run_describes_file_auth_without_preparation_or_cycle_writes(self):
         before = {name: path.stat().st_mtime_ns for name, path in self.paths.items()}
         with mock.patch.object(isolation, "prepare_agy_file_auth") as prepare, \
-                mock.patch.object(account, "scoped_agy_token_bytes") as reader, \
+                mock.patch.object(account, "usable_agy_credential") as reader, \
                 mock.patch.object(keychain, "launch_guard") as guard, \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             plan = runner.build_plan(self.store, [], random_pick=True, engine="agy")

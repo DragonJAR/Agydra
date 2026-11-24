@@ -423,12 +423,11 @@ class TestBusyGuards(BaseCase):
 
     @posix_only("PID recording is POSIX-only by design")
     def test_delete_refuses_busy_profile_names_holder_pid(self):
-        """A legacy raw PID recorded by ``LockHandle.record_holder_pid()``
-        is not a verified lease holder: the busy message must say the
+        """A legacy raw PID left in the lock file is not a verified lease holder: the busy message must say the
         holder state could not be verified and must never suggest
         ``kill`` for it."""
         handle = locks.try_lock(self.store, "work")
-        handle.record_holder_pid()
+        locks.lock_path(self.store, "work").write_text(str(os.getpid()), encoding="ascii")
         try:
             result = self._run_cli("delete", "work", "-f")
             self.assertEqual(result.returncode, 1)

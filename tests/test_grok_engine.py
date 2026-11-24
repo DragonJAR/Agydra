@@ -60,13 +60,11 @@ class TestGrokEngine(unittest.TestCase):
         self.assertEqual(driver.login_args, ("login",))
 
     def test_binary_resolution(self):
-        # 1. Explicit path
         fake_bin = write_fake_binary(self._tmp, "fake_grok")
-        self.assertEqual(platforms.resolve_grok_binary(str(fake_bin)), fake_bin)
+        self.assertEqual(engines.get_engine("grok").resolve_binary(str(fake_bin)), fake_bin)
 
-        # 2. Environment variable
         os.environ[platforms.GROK_BIN_ENV] = str(fake_bin)
-        self.assertEqual(platforms.resolve_grok_binary(), fake_bin)
+        self.assertEqual(engines.get_engine("grok").resolve_binary(), fake_bin)
 
     def test_auth_detection_oidc_tier(self):
         self.store.create("grok-user", engine="grok")
@@ -83,7 +81,7 @@ class TestGrokEngine(unittest.TestCase):
 
         self.assertEqual(account.inspect_grok_auth(data_dir)["email"], "elon@x.ai")
         self.assertEqual(account.detect_grok_email(data_dir), "elon@x.ai")
-        self.assertEqual(account.detect_grok_plan(data_dir), "SuperGrok")
+        self.assertEqual(account.auth_snapshot(data_dir, "grok").plan, "SuperGrok")
         self.assertEqual(account.auth_state(data_dir, self.store, "grok-user", engine="grok"), "authenticated")
 
     def test_auth_detection_api_key(self):
@@ -95,7 +93,7 @@ class TestGrokEngine(unittest.TestCase):
         auth_info = account.inspect_grok_auth(data_dir)
         self.assertEqual(auth_info["auth_type"], "api_key")
         self.assertIsNone(account.detect_grok_email(data_dir))
-        self.assertEqual(account.detect_grok_plan(data_dir), i18n.t("usage.xai_api_key"))
+        self.assertEqual(account.auth_snapshot(data_dir, "grok").plan, i18n.t("usage.xai_api_key"))
         self.assertEqual(account.auth_state(data_dir, self.store, "grok-api", engine="grok"), "authenticated")
 
     def test_detect_grok_plan_config_toml_api_key_without_auth_json(self):
@@ -103,7 +101,7 @@ class TestGrokEngine(unittest.TestCase):
         data_dir = self.store.profile_data_dir("grok-cfg-key", engine="grok")
         (data_dir / "config.toml").write_text('api_key = "xai-cfg-secret-key"\n', encoding="utf-8")
         self.assertFalse((data_dir / "auth.json").exists())
-        self.assertEqual(account.detect_grok_plan(data_dir), i18n.t("usage.xai_api_key"))
+        self.assertEqual(account.auth_snapshot(data_dir, "grok").plan, i18n.t("usage.xai_api_key"))
 
 
     def test_auth_state_not_authenticated(self):
@@ -111,7 +109,7 @@ class TestGrokEngine(unittest.TestCase):
         data_dir = self.store.profile_data_dir("grok-empty", engine="grok")
         self.assertEqual(account.auth_state(data_dir, self.store, "grok-empty", engine="grok"), "not-authenticated")
         self.assertIsNone(account.detect_grok_email(data_dir))
-        self.assertIsNone(account.detect_grok_plan(data_dir))
+        self.assertIsNone(account.auth_snapshot(data_dir, "grok").plan)
 
     def test_inspect_grok_auth_oidc_fields(self):
         self.store.create("grok-oidc", engine="grok")
@@ -226,13 +224,11 @@ class TestGrokEngine(unittest.TestCase):
         self.store.create("grok-query", engine="grok")
         data_dir = self.store.profile_data_dir("grok-query", engine="grok")
 
-        # Not authenticated
         res = usage.query_profile_usage(self.store, "grok-query")
         self.assertFalse(res.ok)
         self.assertEqual(res.error, i18n.t("usage.not_authenticated"))
         self.assertEqual(res.engine, "grok")
 
-        # Authenticated with JWT tier 3 (mocked network payload)
         jwt = _make_dummy_jwt({"email": "dev@x.ai", "tier": 3})
         (data_dir / "auth.json").write_text(
             json.dumps({"https://auth.x.ai::1": {"email": "dev@x.ai", "key": jwt}}),
@@ -248,14 +244,12 @@ class TestGrokEngine(unittest.TestCase):
             self.assertEqual(res_auth.error, i18n.t("usage.no_data"))
 
     def test_cli_create_and_status(self):
-        # Create profile via CLI
         ret = cli.main(["create", "gk-test", "-e", "grok", "-d", "test xAI profile"])
         self.assertEqual(ret, 0)
         p = self.store.get("gk-test")
         self.assertEqual(p.engine, "grok")
         self.assertEqual(p.description, "test xAI profile")
 
-        # Status dry-run
         with mock.patch.dict(os.environ, {platforms.GROK_BIN_ENV: sys.executable}):
             ret_status = cli.main(["status", "gk-test", "-n"])
         self.assertEqual(ret_status, 0)
@@ -306,7 +300,6 @@ class TestGrokEngine(unittest.TestCase):
         self.assertAlmostEqual(groups2[0].buckets[0].remaining_fraction, 0.80, places=4)
         self.assertIsNotNone(reset_dt2)
 
-        # 3. Invalid payload
         self.assertEqual(usage.parse_grok_billing_payload({}), ([], None))
         self.assertEqual(usage.parse_grok_billing_payload(None), ([], None))
 
@@ -419,7 +412,7 @@ class TestGrokEngine(unittest.TestCase):
             self.assertIn("XAI GROK", out)
             self.assertIn("grok-active", out)
             self.assertIn("SuperGrok", out)
-            self.assertIn("90", out)  # 90% available
+            self.assertIn("90", out)
             self.assertIn("Grok → grok-active 90%", out)
 
 

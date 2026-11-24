@@ -25,7 +25,6 @@ class TestCodexRunner(BaseCase):
     def setUp(self):
         super().setUp()
         self.store = Store()
-        # Set up fake codex binary
         self.codex_bin = write_fake_binary(self.bin_dir, "codex")
         os.environ["AGYDRA_CODEX_BIN"] = str(self.codex_bin)
 
@@ -37,7 +36,7 @@ class TestCodexRunner(BaseCase):
         self.assertEqual(plan.engine, "codex")
         self.assertEqual(plan.binary, self.codex_bin)
         self.assertEqual(plan.args, ["--no-daemon", "exec", "test"])
-        self.assertEqual(plan.env_home_var, platforms.home_redirect_var())
+        self.assertEqual(plan.redirections[platforms.home_redirect_var()], str(plan.overlay))
 
     def test_describe_shows_effective_codex_home_destination(self):
         self.store.create("cx-home", engine="codex")

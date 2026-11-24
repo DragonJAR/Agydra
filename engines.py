@@ -384,11 +384,6 @@ def get_engine(name: Optional[str] = None) -> EngineDriver:
     return _REGISTRY[engine_name]
 
 
-def all_engines() -> List[EngineDriver]:
-    """List all registered EngineDriver instances."""
-    return list(_REGISTRY.values())
-
-
 class EngineExportError(ValueError):
     """Raised when an engine refuses to be exported.
 

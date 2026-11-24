@@ -109,9 +109,6 @@ class TestBatch3Contracts(BaseCase):
                         handle.release()
                     else:
                         self.assertIsNone(handle)
-                    with mock.patch.object(locks, "lease_holders", return_value=None), \
-                            mock.patch.object(locks, "is_locked", return_value=True):
-                        self.assertEqual(locks.lock_holder_pid(self.s, "windows"), 4321)
                 self.assertEqual(path.read_bytes(), raw)
 
     def test_windows_registry_replacement_is_refused_and_descriptor_closed(self):
@@ -211,7 +208,6 @@ class TestBatch3Contracts(BaseCase):
             'locks.try_mutation_lock(s,"pipe",patience_s=0)',
             'locks.acquire_lease(s,"pipe")',
             'locks.release_lease(s,"pipe")',
-            'locks.lock_holder_pid(s,"pipe")',
             'assert locks.lease_registry_state_issue(s,"pipe") is not None',
         ]
         for operation in operations:

@@ -28,7 +28,6 @@ class TestCodexParity(BaseCase):
     def setUp(self):
         super().setUp()
         self.store = Store()
-        # Create a fake codex binary
         bin_dir = self._tmp / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
         self.fake_codex = write_fake_binary(bin_dir, "codex")
@@ -51,7 +50,6 @@ class TestCodexParity(BaseCase):
         self.store.create("cx1", engine="codex")
         self.store.create("cx2", engine="codex")
 
-        # Fake auth for cx1 and cx2
         for name in ("cx1", "cx2"):
             d = self.store.profile_data_dir(name, engine="codex")
             (d / "auth.json").write_text(json.dumps({"OPENAI_API_KEY": "sk-test"}), encoding="utf-8")
@@ -82,14 +80,11 @@ class TestCodexParity(BaseCase):
         (src_dir / "auth.json").write_text(json.dumps({"secret": "src-secret"}), encoding="utf-8")
         (dst_dir / "auth.json").write_text(json.dumps({"secret": "dst-secret"}), encoding="utf-8")
 
-        # Copy config from src to dst
         cli._share_config(self.store, "src", ["dst"])
 
-        # config.toml must be copied
         self.assertTrue((dst_dir / "config.toml").is_file())
         self.assertEqual((dst_dir / "config.toml").read_text(encoding="utf-8"), "model = 'o3-mini'\n")
 
-        # auth.json in dst must NOT be overwritten!
         dst_auth = json.loads((dst_dir / "auth.json").read_text(encoding="utf-8"))
         self.assertEqual(dst_auth.get("secret"), "dst-secret")
 
@@ -101,38 +96,35 @@ class TestCodexParity(BaseCase):
         d_plus = self._tmp / "d_plus"
         d_plus.mkdir()
         (d_plus / "auth.json").write_text(json.dumps({"tokens": {"id_token": jwt_plus}}), encoding="utf-8")
-        self.assertEqual(account.detect_codex_plan(d_plus), "ChatGPT Plus")
+        self.assertEqual(account.auth_snapshot(d_plus, "codex").plan, "ChatGPT Plus")
 
         d_team = self._tmp / "d_team"
         d_team.mkdir()
         (d_team / "auth.json").write_text(json.dumps({"tokens": {"id_token": jwt_team}}), encoding="utf-8")
-        self.assertEqual(account.detect_codex_plan(d_team), "ChatGPT Team")
+        self.assertEqual(account.auth_snapshot(d_team, "codex").plan, "ChatGPT Team")
 
         d_pro = self._tmp / "d_pro"
         d_pro.mkdir()
         (d_pro / "auth.json").write_text(json.dumps({"tokens": {"id_token": jwt_pro}}), encoding="utf-8")
-        self.assertEqual(account.detect_codex_plan(d_pro), "ChatGPT Pro")
+        self.assertEqual(account.auth_snapshot(d_pro, "codex").plan, "ChatGPT Pro")
 
         d_key = self._tmp / "d_key"
         d_key.mkdir()
         (d_key / "auth.json").write_text(json.dumps({"OPENAI_API_KEY": "sk-12345"}), encoding="utf-8")
-        self.assertEqual(account.detect_codex_plan(d_key), i18n.t("usage.openai_api_key"))
+        self.assertEqual(account.auth_snapshot(d_key, "codex").plan, i18n.t("usage.openai_api_key"))
 
     def test_codex_lifecycle_crud_parity(self):
         profile = self.store.create("mycodex", engine="codex")
         self.assertEqual(profile.name, "mycodex")
         self.assertEqual(profile.engine, "codex")
 
-        # Set default
         self.store.set_default("mycodex")
         self.assertEqual(self.store.default_name(), "mycodex")
 
-        # Rename
         renamed = self.store.rename("mycodex", "codexrenamed")
         self.assertEqual(renamed.name, "codexrenamed")
         self.assertEqual(self.store.default_name(), "codexrenamed")
 
-        # Delete with backup
         backup_path = self.store.delete("codexrenamed", backup=True)
         self.assertIsNotNone(backup_path)
         self.assertTrue(backup_path.is_file())

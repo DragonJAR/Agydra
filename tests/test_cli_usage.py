@@ -111,20 +111,17 @@ class TestUsageCli(BaseCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         out = res.stdout
 
-        # Header contains the two model group categories and empty line before subheaders
         self.assertIn("GEMINI", out)
         self.assertIn("CLAUDE + GPT", out)
         lines = out.splitlines()
         agy_sec_idx = next(i for i, line in enumerate(lines) if "ANTIGRAVITY" in line)
         self.assertEqual(lines[agy_sec_idx + 1].strip(), "")
 
-        # alpha: healthy quota (>=50%) across buckets
         alpha_line = next(line for line in out.splitlines() if "alpha" in line)
         self.assertIn("95", alpha_line)
         self.assertIn("97", alpha_line)
         self.assertIn("100", alpha_line)
 
-        # beta: low quota -- renders 15 and 35
         beta_line = next(line for line in out.splitlines() if "beta" in line)
         self.assertIn("15", beta_line)
         self.assertIn("35", beta_line)
@@ -135,7 +132,6 @@ class TestUsageCli(BaseCase):
         delta_line = next(line for line in out.splitlines() if "delta" in line)
         self.assertIn(i18n.t("usage.agy_exited", code=3, detail=""), delta_line)
 
-        # Recommendations footer includes alpha
         self.assertIn("alpha", out)
 
     def _write_unrecorded_identity(self, name: str, email: str) -> None:

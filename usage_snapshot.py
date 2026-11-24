@@ -39,9 +39,9 @@ import usage
 SNAPSHOT_FILENAME = "usage-latest.json"
 SCHEMA_VERSION = 1
 MAX_QUOTA_AGE_SECONDS = 900
-"""Oldest observation :func:`profile_quota_availability` still trusts for five-hour windows."""
+"""Oldest observation :func:`profile_quota_availabilities` still trusts for five-hour windows."""
 MAX_WEEKLY_QUOTA_AGE_SECONDS = 86400
-"""Oldest observation :func:`profile_quota_availability` still trusts for weekly windows.
+"""Oldest observation :func:`profile_quota_availabilities` still trusts for weekly windows.
 
 The weekly window moves slowly and carries its own reset, so it remains
 trustworthy until its reset (bounded by one day), while the five-hour window
@@ -273,7 +273,6 @@ def _merged_entries(
             merged.append(dict(entry))
     merged.extend(fresh_by_id.values())
     return merged
-
 
 
 def _stale_flags(entries: Iterable[Dict[str, Any]], refreshed: Iterable[str]) -> None:
@@ -649,9 +648,21 @@ def profile_quota_availabilities(
     """Remaining quota fraction per profile, aligned with ``profiles``.
 
     The snapshot is read exactly once for the whole batch (and not at all
-    for an empty one), and every profile is judged by the same rules as
-    :func:`profile_quota_availability`: a remaining fraction in 0..1, or
+    for an empty one). Each entry is a remaining fraction in 0..1, or
     ``None`` when the reading is unknown or unusable.
+
+    Reads only ``usage-latest.json`` and evaluates availability per window
+    instead of re-deriving it. The profile is matched by immutable ``seq``
+    and normalized engine; a legacy ``seq == 0`` profile matches the single
+    ``seq == 0`` entry with the same normalized engine and name. Anything
+    unusable is unknown, never a guess: a missing, malformed or mismatched
+    document or entry, an error or ineligible result, an explicitly stale
+    carried entry, an untrusted quality, a non-finite or out-of-range figure,
+    a future-dated observation, or windows exceeding their freshness ceilings
+    (900 seconds for the five-hour window, seeded weekly windows, and legacy
+    snapshots; 86400 seconds for explicit weekly windows) or whose reset has
+    passed. ``agy`` takes the best valid family among its gemini/claude
+    summaries. Claude additionally needs ``identity_verified is True``.
     """
     candidates = list(profiles)
     if not candidates:
@@ -668,24 +679,3 @@ def profile_quota_availabilities(
         _availability_in_snapshot(document, generated, current, profile, index=index)
         for profile in candidates
     ]
-
-
-def profile_quota_availability(
-    store, profile: Any, now: Optional[datetime] = None
-) -> Optional[float]:
-    """Remaining quota fraction (0..1) for ``profile``, or ``None`` if unknown.
-
-    Reads only ``usage-latest.json`` and evaluates availability per window
-    instead of re-deriving it. The profile is matched by immutable ``seq``
-    and normalized engine; a legacy ``seq == 0`` profile matches the single
-    ``seq == 0`` entry with the same normalized engine and name. Anything
-    unusable is unknown, never a guess: a missing, malformed or mismatched
-    document or entry, an error or ineligible result, an explicitly stale
-    carried entry, an untrusted quality, a non-finite or out-of-range figure,
-    a future-dated observation, or windows exceeding their freshness ceilings
-    (900 seconds for the five-hour window, seeded weekly windows, and legacy
-    snapshots; 86400 seconds for explicit weekly windows) or whose reset has
-    passed. ``agy`` takes the best valid family among its gemini/claude
-    summaries. Claude additionally needs ``identity_verified is True``.
-    """
-    return profile_quota_availabilities(store, [profile], now)[0]

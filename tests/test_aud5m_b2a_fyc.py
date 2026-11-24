@@ -102,7 +102,7 @@ class TestBatch2AFyc(BaseCase):
             with self.subTest(engine=engine, payload=payload):
                 (data / "auth.json").write_text(json.dumps(payload), encoding="utf-8")
                 expected = (getattr(account, f"inspect_{engine}_auth")(data),
-                            getattr(account, f"detect_{engine}_plan")(data),
+                            account.auth_snapshot(data, engine).plan,
                             getattr(account, f"detect_{engine}_email")(data))
                 with mock.patch.object(store, "read_json_object", wraps=store.read_json_object) as read:
                     self.assertEqual(usage._usage_auth_snapshot(data, engine), expected)

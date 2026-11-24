@@ -38,8 +38,6 @@ class TestRunnerStartState(BaseCase):
             binary=self.bin_dir / "agy",
             args=[],
             overlay=self.store.overlays_dir / self.profile.name,
-            env_home_var="HOME",
-            env_home_value=self.store.overlays_dir / self.profile.name,
             use_sandbox=False,
             engine="agy",
         )

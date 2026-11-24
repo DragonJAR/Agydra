@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
+import engines
 import platforms
 from tests.conftest import macos_only, make_dir_link, posix_only, write_fake_binary
 
@@ -183,54 +184,54 @@ class TestResolveAgyBinary(unittest.TestCase):
         flag = self._touch("flag-agy")
         env_bin = self._touch("env-agy")
         os.environ[platforms.AGY_BIN_ENV] = str(env_bin)
-        self.assertEqual(platforms.resolve_agy_binary(str(flag)), flag)
+        self.assertEqual(engines.get_engine("agy").resolve_binary(str(flag)), flag)
 
     def test_env_var_before_path_lookup(self):
         env_bin = self._touch("env-agy")
         os.environ[platforms.AGY_BIN_ENV] = str(env_bin)
-        self.assertEqual(platforms.resolve_agy_binary(), env_bin)
+        self.assertEqual(engines.get_engine("agy").resolve_binary(), env_bin)
 
     def test_path_lookup_fallback(self):
         found = self._touch("agy")
         os.environ["PATH"] = str(found.parent)
-        self.assertEqual(platforms.resolve_agy_binary(), found)
+        self.assertEqual(engines.get_engine("agy").resolve_binary(), found)
 
     def test_candidate_command_name_on_path_resolved(self):
         """When candidate is a bare command name on PATH (not an existing path in CWD),
         it must be resolved via shutil.which on all platforms."""
         found = self._touch("agy-custom")
         os.environ["PATH"] = str(found.parent)
-        self.assertEqual(platforms.resolve_agy_binary("agy-custom"), found)
+        self.assertEqual(engines.get_engine("agy").resolve_binary("agy-custom"), found)
 
     def test_env_var_command_name_on_path_resolved(self):
         found = self._touch("agy-custom-env")
         os.environ["PATH"] = str(found.parent)
         os.environ[platforms.AGY_BIN_ENV] = "agy-custom-env"
-        self.assertEqual(platforms.resolve_agy_binary(), found)
+        self.assertEqual(engines.get_engine("agy").resolve_binary(), found)
 
     def test_quoted_explicit_binary_path_resolved(self):
         found = self._touch("agy")
-        self.assertEqual(platforms.resolve_agy_binary(f'"{found}"'), found)
+        self.assertEqual(engines.get_engine("agy").resolve_binary(f'"{found}"'), found)
 
     def test_quoted_env_var_binary_path_resolved(self):
         found = self._touch("agy")
         os.environ[platforms.AGY_BIN_ENV] = f'"{found}"'
-        self.assertEqual(platforms.resolve_agy_binary(), found)
+        self.assertEqual(engines.get_engine("agy").resolve_binary(), found)
 
     def test_quoted_command_name_on_path_resolved(self):
         found = self._touch("agy-quoted-cmd")
         os.environ["PATH"] = str(found.parent)
-        self.assertEqual(platforms.resolve_agy_binary('"agy-quoted-cmd"'), found)
+        self.assertEqual(engines.get_engine("agy").resolve_binary('"agy-quoted-cmd"'), found)
 
     def test_quoted_env_var_command_name_on_path_resolved(self):
         found = self._touch("agy-quoted-env-cmd")
         os.environ["PATH"] = str(found.parent)
         os.environ[platforms.AGY_BIN_ENV] = '"agy-quoted-env-cmd"'
-        self.assertEqual(platforms.resolve_agy_binary(), found)
+        self.assertEqual(engines.get_engine("agy").resolve_binary(), found)
 
     def test_nonexistent_explicit_returns_none(self):
         self.assertIsNone(
-            platforms.resolve_agy_binary(str(self._tmp / "missing-agy"))
+            engines.get_engine("agy").resolve_binary(str(self._tmp / "missing-agy"))
         )
 
     @posix_only("POSIX exec semantics")
@@ -239,7 +240,7 @@ class TestResolveAgyBinary(unittest.TestCase):
         on POSIX (would fail launch with exit 126 while doctor says ok)."""
         p = write_fake_binary(self._tmp, "noexec-agy", executable=False)
         os.environ[platforms.AGY_BIN_ENV] = str(p)
-        self.assertIsNone(platforms.resolve_agy_binary())
+        self.assertIsNone(engines.get_engine("agy").resolve_binary())
 
     def test_directory_explicit_returns_none(self):
         """Bug guard: a directory passes exists() but launching it fails;
@@ -247,8 +248,8 @@ class TestResolveAgyBinary(unittest.TestCase):
         d = self._tmp / "agy-dir"
         d.mkdir()
         os.environ[platforms.AGY_BIN_ENV] = str(d)
-        self.assertIsNone(platforms.resolve_agy_binary())
-        self.assertIsNone(platforms.resolve_agy_binary(str(d)))
+        self.assertIsNone(engines.get_engine("agy").resolve_binary())
+        self.assertIsNone(engines.get_engine("agy").resolve_binary(str(d)))
 
     def test_windows_pathext_resolution(self):
         """Real PATHEXT probing for an explicit, extension-less candidate
@@ -264,7 +265,7 @@ class TestResolveAgyBinary(unittest.TestCase):
         exe = self._touch("agy.EXE")
         candidate = self._tmp / "agy"
         with mock.patch.object(platforms, "is_windows", return_value=True):
-            res = platforms.resolve_agy_binary(str(candidate))
+            res = engines.get_engine("agy").resolve_binary(str(candidate))
         self.assertEqual(res, exe)
 
     def test_windows_pathext_resolution_no_match_returns_none(self):
@@ -272,7 +273,7 @@ class TestResolveAgyBinary(unittest.TestCase):
 
         candidate = self._tmp / "agy"
         with mock.patch.object(platforms, "is_windows", return_value=True):
-            res = platforms.resolve_agy_binary(str(candidate))
+            res = engines.get_engine("agy").resolve_binary(str(candidate))
         self.assertIsNone(res)
 
     def test_windows_pathext_resolution_skipped_when_extension_present(self):
@@ -283,7 +284,7 @@ class TestResolveAgyBinary(unittest.TestCase):
 
         candidate = self._tmp / "agy.exe"
         with mock.patch.object(platforms, "is_windows", return_value=True):
-            res = platforms.resolve_agy_binary(str(candidate))
+            res = engines.get_engine("agy").resolve_binary(str(candidate))
         self.assertIsNone(res)
 
 
@@ -587,7 +588,7 @@ class TestPathHelpers(unittest.TestCase):
         self.assertEqual(platforms.clean_path_value(" 'C:\\Path' "), "C:\\Path")
         self.assertEqual(platforms.clean_path_value('""'), "")
         self.assertEqual(platforms.clean_path_value("   "), "")
-        self.assertEqual(platforms._clean_path_entry('  "C:\\Path"  '), "C:\\Path")
+        self.assertEqual(platforms.clean_path_value('  "C:\\Path"  '), "C:\\Path")
 
     def test_binary_results_handle_quoted_values(self):
         with tempfile.TemporaryDirectory(prefix="agydra-runner-") as directory:
@@ -845,15 +846,12 @@ class TestCanonicalPath(unittest.TestCase):
                 probe.rmdir()
 
             if is_case_insensitive:
-                # Lowercase input
                 lower_path = base / "camelcasedir" / "testfile.txt"
                 self.assertEqual(platforms.canonical_path(lower_path), cased_file)
 
-                # Uppercase input
                 upper_path = base / "CAMELCASEDIR" / "TESTFILE.TXT"
                 self.assertEqual(platforms.canonical_path(upper_path), cased_file)
 
-                # Mixed-case input
                 mixed_path = base / "cAmElCaSeDiR" / "tEsTfIlE.tXt"
                 self.assertEqual(platforms.canonical_path(mixed_path), cased_file)
 
@@ -877,15 +875,12 @@ class TestCanonicalPath(unittest.TestCase):
 
             if is_case_insensitive:
                 with mock.patch.object(platforms, "is_macos", return_value=False):
-                    # Lowercase
                     lower_path = base / "camelcasedir" / "testfile.txt"
                     self.assertEqual(platforms.canonical_path(lower_path), cased_file)
 
-                    # Uppercase
                     upper_path = base / "CAMELCASEDIR" / "TESTFILE.TXT"
                     self.assertEqual(platforms.canonical_path(upper_path), cased_file)
 
-                    # Mixed-case
                     mixed_path = base / "cAmElCaSeDiR" / "tEsTfIlE.tXt"
                     self.assertEqual(platforms.canonical_path(mixed_path), cased_file)
 

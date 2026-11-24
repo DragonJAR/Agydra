@@ -1014,18 +1014,13 @@ def _post_fix_exit_code(store: Store) -> int:
     return _check_exit_code(_run_check_pass(store, _build_ctx(store)))
 
 
-def run_checks(store: Store, fix: bool = False, ctx: Optional["_DoctorContext"] = None) -> int:
+def run_checks(store: Store, ctx: Optional["_DoctorContext"] = None) -> int:
     """Run the check-and-print pass and return its exit code.
 
     ``ctx`` lets a caller that already built one (e.g. ``cmd_doctor``,
     which needs the same ctx again afterward for the ``--fix`` preview)
     pass it in instead of paying for another ``store.scan()`` here; omitted,
     one is built fresh as before.
-
-    ``fix=True`` is kept for test convenience (unit tests exercising
-    the combined check+fix flow in a single call); CLI production invocations
-    use ``cmd_doctor`` which calls ``_apply_fixes`` directly after user
-    confirmation.
     """
     console_print(paint(
         i18n.t(
@@ -1045,11 +1040,7 @@ def run_checks(store: Store, fix: bool = False, ctx: Optional["_DoctorContext"] 
         ctx = _build_ctx(store)
     results = _run_check_pass(store, ctx)
     _print_check_pass(results)
-    if fix:
-        _apply_fixes(store, ctx)
-        exit_code = _post_fix_exit_code(store)
-    else:
-        exit_code = _check_exit_code(results)
+    exit_code = _check_exit_code(results)
     if exit_code:
         console_print()
         console_print(paint(i18n.t("cmd.doctor.result_fail"), "red", "bold"))

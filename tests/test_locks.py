@@ -93,13 +93,6 @@ class TestLocks(BaseCase):
             with self.assertRaises(locks.LockError):
                 locks.try_lock(self.store, "work")
 
-    def test_in_use_names(self):
-        self.store.create("lab")
-        handle = locks.try_lock(self.store, "lab")
-        self.assertEqual(locks.in_use_names(self.store), ["lab"])
-        handle.release()
-        self.assertEqual(locks.in_use_names(self.store), [])
-
     def test_lock_files_live_in_store(self):
         locks.try_lock(self.store, "work")
         self.assertEqual(
@@ -122,106 +115,6 @@ class TestLocks(BaseCase):
         second = locks.try_sequence_lock(self.store)
         self.assertIsNotNone(second)
         second.release()
-
-class TestLockHolderPid(BaseCase):
-    """The busy-profile error must be able to name the holder's PID: the
-    lock file records the acquiring process's PID (POSIX only) using the
-    already-open fd, best-effort, without ever breaking acquisition.
-
-    ``try_lock`` itself no longer writes the PID unconditionally -- only
-    the verified plain-exec launch path does, via
-    ``LockHandle.record_holder_pid()`` (see ``runner.run`` and the module
-    docstring). These tests call it explicitly to simulate that path;
-    ``TestLockHolderPidExecPathOnly`` in ``tests/test_reliability_fixes.py``
-    covers that the OTHER launch paths never call it."""
-
-    def setUp(self):
-        super().setUp()
-        self.store = Store()
-        self.store.create("work")
-
-    @posix_only("PID recording is POSIX-only by design")
-    def test_holder_pid_matches_current_process(self):
-        import os
-
-        handle = locks.try_lock(self.store, "work")
-        try:
-            handle.record_holder_pid()
-            self.assertEqual(locks.lock_holder_pid(self.store, "work"), os.getpid())
-        finally:
-            handle.release()
-
-    def test_holder_pid_none_when_unlocked(self):
-        self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
-
-    @posix_only("PID recording is POSIX-only by design")
-    def test_holder_pid_none_when_unlocked_with_stale_pid(self):
-        """Even if the lock file retains a PID from a previous plain-exec session,
-        lock_holder_pid must return None when the profile is unlocked."""
-        handle = locks.try_lock(self.store, "work")
-        handle.record_holder_pid()
-        handle.release()
-        self.assertFalse(locks.is_locked(self.store, "work"))
-        self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
-
-    def test_holder_pid_none_on_missing_file(self):
-        self.assertIsNone(locks.lock_holder_pid(self.store, "missing"))
-
-    @posix_only("PID recording is POSIX-only by design")
-    def test_holder_pid_none_without_recording(self):
-        """A plain ``try_lock`` with no explicit ``record_holder_pid()``
-        call (any non-exec launch path) leaves the lock file without a
-        PID at all."""
-        handle = locks.try_lock(self.store, "work")
-        try:
-            self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
-        finally:
-            handle.release()
-
-    @posix_only("PID recording is POSIX-only by design")
-    def test_reacquire_without_recording_clears_stale_pid(self):
-        """A plain-exec session leaves its PID on disk. A subsequent session
-        that does NOT record a PID (waited-child, sandbox) must not inherit
-        that stale PID in lock_holder_pid."""
-        first = locks.try_lock(self.store, "work")
-        first.record_holder_pid()
-        first.release()
-
-        second = locks.try_lock(self.store, "work")
-        try:
-            self.assertTrue(locks.is_locked(self.store, "work"))
-            self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
-        finally:
-            second.release()
-
-    @posix_only("PID recording is POSIX-only by design")
-    def test_holder_pid_survives_reacquire_with_fresh_pid(self):
-        """A stale PID from a previous session must not linger: the second
-        acquisition overwrites it with the current process's PID."""
-        import os
-
-        first = locks.try_lock(self.store, "work")
-        first.record_holder_pid()
-        first.release()
-        handle = locks.try_lock(self.store, "work")
-        try:
-            handle.record_holder_pid()
-            self.assertEqual(locks.lock_holder_pid(self.store, "work"), os.getpid())
-        finally:
-            handle.release()
-
-    def test_holder_pid_none_on_unparseable_content(self):
-        """Corrupted/garbage lock-file content must fall back to None, not
-        raise — the reader is best-effort and must never fail the command."""
-        locks.lock_dir(self.store).mkdir(parents=True, exist_ok=True)
-        locks.lock_path(self.store, "work").write_bytes(b"not-a-pid")
-        self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
-
-    def test_holder_pid_none_on_empty_file(self):
-        locks.lock_dir(self.store).mkdir(parents=True, exist_ok=True)
-        locks.lock_path(self.store, "work").write_bytes(b"")
-        self.assertIsNone(locks.lock_holder_pid(self.store, "work"))
-
 
 class TestLockInodeConsistency(BaseCase):
     """The TOCTOU-at-acquire/probe-time guard (``locks._same_file``) and its

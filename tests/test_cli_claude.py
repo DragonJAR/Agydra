@@ -76,8 +76,8 @@ class TestClaudeCli(BaseCase):
         plan = run.call_args.args[0]
         self.assertEqual(plan.args[-2:], ["auth", "login"])
         self.assertNotIn("--no-daemon", plan.args)
-        self.assertEqual(plan.env_home_var, "CLAUDE_CONFIG_DIR")
-        self.assertEqual(plan.env_home_value, self.store.claude_config_dir("cc"))
+        self.assertIn("CLAUDE_CONFIG_DIR", plan.env)
+        self.assertEqual(plan.overlay, self.store.claude_config_dir("cc"))
         env = cli.runner.isolation.isolated_env(plan.overlay, {}, engine="claude")
         self.assertEqual(env["HOME"], str(self.fake_home))
 

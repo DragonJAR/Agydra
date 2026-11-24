@@ -2534,7 +2534,6 @@ Store(root=root).rename("old", "new")
         p1.write_bytes(b"zip1")
         p2.write_bytes(b"zip2")
         p3.write_bytes(b"zip3")
-        # Explicitly set identical mtime
         import os
         now = 1700000000.0
         os.utime(p1, (now, now))

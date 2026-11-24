@@ -346,7 +346,7 @@ def anchor_for(
     *,
     include_secret: bool = True,
 ) -> Optional[str]:
-    """Compatibility reader: return verified evidence or raise a typed refusal."""
+    """Return verified identity evidence or raise a typed refusal."""
     result = identity_anchor_for(
         profile_store, name, data_dir, include_secret=include_secret
     )
@@ -426,13 +426,6 @@ def usable_agy_credential(
     ):
         return None
     return json.dumps(decoded, separators=(",", ":")).encode("utf-8")
-
-
-def scoped_agy_token_bytes(
-    profile_store: store.Store, profile: Profile, data_dir: Path
-) -> Optional[bytes]:
-    """Compatibility name for the shared usable-credential reader."""
-    return usable_agy_credential(profile_store, profile, data_dir)
 
 
 CODEX_AUTH_FILE = "auth.json"
@@ -517,18 +510,13 @@ def auth_snapshot(
 
 
 def inspect_codex_auth(data_dir: Path) -> Optional[dict]:
-    """Read-on-demand compatibility facade for Codex credentials."""
+    """Codex credentials read from ``auth.json`` on demand."""
     return codex_auth_from_payload(_read_auth_payload(data_dir))[0]
 
 
 def detect_codex_email(data_dir: Path) -> Optional[str]:
-    """Read-on-demand compatibility facade for Codex email."""
+    """Codex account email read from ``auth.json`` on demand."""
     return codex_auth_from_payload(_read_auth_payload(data_dir))[2]
-
-
-def detect_codex_plan(data_dir: Path) -> Optional[str]:
-    """Read-on-demand compatibility facade for Codex plan."""
-    return codex_auth_from_payload(_read_auth_payload(data_dir))[1]
 
 
 GROK_AUTH_FILE = "auth.json"
@@ -684,18 +672,13 @@ def grok_auth_from_payload(
 
 
 def inspect_grok_auth(data_dir: Path) -> Optional[dict]:
-    """Read-on-demand compatibility facade for Grok credentials."""
+    """Grok credentials read from disk on demand."""
     return grok_auth_from_payload(_read_auth_payload(data_dir), data_dir)[0]
 
 
 def detect_grok_email(data_dir: Path) -> Optional[str]:
-    """Read-on-demand compatibility facade for Grok email."""
+    """Grok account email read from disk on demand."""
     return grok_auth_from_payload(_read_auth_payload(data_dir), data_dir)[2]
-
-
-def detect_grok_plan(data_dir: Path) -> Optional[str]:
-    """Read-on-demand compatibility facade for Grok plan."""
-    return grok_auth_from_payload(_read_auth_payload(data_dir), data_dir)[1]
 
 
 

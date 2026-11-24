@@ -107,7 +107,7 @@ class TestListHeaderNeverFusesColumns(BaseCase):
         lines = self.capture_list()
         header = lines[0]
         headers = cli._table_headers()
-        self.assertIn(f"{cli._PROFILE_LABEL}  {headers['email']}", header)
+        self.assertIn(f"{headers['profile']}  {headers['email']}", header)
 
     def test_long_profile_name_still_aligned(self):
         import cli

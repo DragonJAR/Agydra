@@ -34,7 +34,12 @@ from conftest import BaseCase
 from models import Profile
 from store import Store
 
-NOW = datetime(2026, 10, 2, 3, 0, 0, tzinfo=timezone.utc)
+
+def _availability(store, profile, now=None):
+    return usage_snapshot.profile_quota_availabilities(store, [profile], now)[0]
+
+
+NOW =datetime(2026, 10, 2, 3, 0, 0, tzinfo=timezone.utc)
 
 
 def _bucket(bucket_id: str, fraction: float, *, reset_hours: float = 5.0):
@@ -520,7 +525,7 @@ class SnapshotStoreIntegrationTests(BaseCase):
         )
 
         expected = [
-            usage_snapshot.profile_quota_availability(self.store, profile, now=NOW)
+            _availability(self.store, profile, now=NOW)
             for profile in profiles
         ]
         self.assertEqual(expected, [0.4, None, None, 0.8])
@@ -692,24 +697,24 @@ class SnapshotStoreIntegrationTests(BaseCase):
         )
 
         self.assertEqual(
-            usage_snapshot.profile_quota_availability(self.store, p_weekly, now=NOW),
+            _availability(self.store, p_weekly, now=NOW),
             0.4,
         )
         self.assertIsNone(
-            usage_snapshot.profile_quota_availability(self.store, p_expired_reset, now=NOW)
+            _availability(self.store, p_expired_reset, now=NOW)
         )
         self.assertEqual(
-            usage_snapshot.profile_quota_availability(self.store, p_edge_86400, now=NOW),
+            _availability(self.store, p_edge_86400, now=NOW),
             0.4,
         )
         self.assertIsNone(
-            usage_snapshot.profile_quota_availability(self.store, p_edge_86401, now=NOW)
+            _availability(self.store, p_edge_86401, now=NOW)
         )
         self.assertIsNone(
-            usage_snapshot.profile_quota_availability(self.store, p_edge_reset_now, now=NOW)
+            _availability(self.store, p_edge_reset_now, now=NOW)
         )
         self.assertEqual(
-            usage_snapshot.profile_quota_availability(self.store, p_five_h_unusable, now=NOW),
+            _availability(self.store, p_five_h_unusable, now=NOW),
             0.8,
         )
 
@@ -744,12 +749,12 @@ class SnapshotStoreIntegrationTests(BaseCase):
 
         write_legacy(obs_5m)
         self.assertEqual(
-            usage_snapshot.profile_quota_availability(self.store, p_legacy, now=NOW),
+            _availability(self.store, p_legacy, now=NOW),
             0.5,
         )
         write_legacy(obs_1h)
         self.assertIsNone(
-            usage_snapshot.profile_quota_availability(self.store, p_legacy, now=NOW)
+            _availability(self.store, p_legacy, now=NOW)
         )
 
     def test_seeded_weekly_window_uses_five_hour_freshness_ceiling(self):
@@ -838,14 +843,14 @@ class SnapshotStoreIntegrationTests(BaseCase):
             encoding="utf-8",
         )
         self.assertIsNone(
-            usage_snapshot.profile_quota_availability(self.store, p_seeded_old, now=NOW)
+            _availability(self.store, p_seeded_old, now=NOW)
         )
         self.assertEqual(
-            usage_snapshot.profile_quota_availability(self.store, p_seeded_fresh, now=NOW),
+            _availability(self.store, p_seeded_fresh, now=NOW),
             0.4,
         )
         self.assertEqual(
-            usage_snapshot.profile_quota_availability(self.store, p_explicit_old, now=NOW),
+            _availability(self.store, p_explicit_old, now=NOW),
             0.4,
         )
 

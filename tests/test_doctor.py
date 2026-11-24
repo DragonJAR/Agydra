@@ -10,11 +10,13 @@ import sys
 import tokenize
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import cli
 import doctor
 import i18n
 import isolation
@@ -634,7 +636,6 @@ class TestIsolationRecovery(BaseCase):
                 handle.release()
             return original_build_overlay(*args, **kwargs)
 
-        # pre-conditions: data dir empty of the marker file, overlay has it
         self.assertFalse((data_dir / "antigravity-cli" / "token.json").exists())
         self.assertTrue((link / "antigravity-cli" / "token.json").exists())
 
@@ -645,7 +646,7 @@ class TestIsolationRecovery(BaseCase):
                 mock.patch.object(
                     isolation, "build_overlay", side_effect=inspect_relink
                 ):
-            rc = doctor.run_checks(self.store, fix=True)
+            rc = cli.cmd_doctor(self.store, SimpleNamespace(fix=True, force=True))
 
         self.assertEqual(rc, 0)
         self.assertEqual(lock_checks, [True, True])
@@ -814,7 +815,7 @@ class TestIsolationRecovery(BaseCase):
         self.assertEqual(self.store.default_name(), "ghost")
 
         with mock.patch.object(keychain, "supported", return_value=False):
-            doctor.run_checks(self.store, fix=True)
+            cli.cmd_doctor(self.store, SimpleNamespace(fix=True, force=True))
         self.assertIsNone(self.store.default_name())
 
     def test_fix_purges_orphan_keychain_slots(self):
@@ -852,7 +853,7 @@ class TestIsolationRecovery(BaseCase):
                     doctor.keychain, "serialized_access", side_effect=inspect_swap_lock
                 ), \
                 mock.patch.object(doctor.keychain, "delete_slot", fake_delete_slot):
-            doctor.run_checks(self.store, fix=True)
+            cli.cmd_doctor(self.store, SimpleNamespace(fix=True, force=True))
 
         self.assertIn(("orphan_slots", fake_path), calls)
         self.assertIn(("delete_slot", "gemini/agydra/ghost", fake_path), calls)

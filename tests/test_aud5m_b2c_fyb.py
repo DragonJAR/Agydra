@@ -146,8 +146,6 @@ class TestBatchTwoC(BaseCase):
         self.assertEqual(126, denied.exit_code)
         self.assertEqual("not_found", missing.reason)
         self.assertEqual(127, missing.exit_code)
-        self.assertTrue(denied.env_chain)
-        self.assertTrue(missing.env_chain)
 
     def test_binary_legacy_facade_remains_path_or_none(self):
         driver = engines.get_engine("codex")
@@ -181,16 +179,15 @@ class TestBatchTwoC(BaseCase):
             result = platforms.resolve_binary_result("codex", config_val="preferred", config_key="codex_binary")
         self.assertEqual(configured, result.found)
         self.assertEqual(1, paths.call_count)
-        self.assertEqual(["codex_binary", "PATH"], result.env_chain)
 
-    def test_invalid_environment_is_binding_and_chain_has_no_values(self):
+    def test_invalid_environment_is_binding(self):
         driver = engines.get_engine("codex")
         absent = str(self._tmp / "synthetic-missing")
+        write_fake_binary(self.bin_dir, "codex")
         with mock.patch.dict(os.environ, {driver.env_bin_var: absent, "PATH": str(self.bin_dir)}):
             result = driver.resolve_configured_binary_result(None)
+        self.assertIsNone(result.found)
         self.assertEqual("not_found", result.reason)
-        self.assertEqual([driver.env_bin_var], result.env_chain)
-        self.assertNotIn(absent, result.env_chain)
 
     def test_windows_pathext_bare_name_and_explicit_path(self):
         target = self.bin_dir / "tool.CMD"

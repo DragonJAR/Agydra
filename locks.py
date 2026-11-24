@@ -170,20 +170,13 @@ class LockHandle:
     process image, the fd survives inside agy, and the kernel releases the
     lock when agy exits. Store-maintenance locks are released by their caller
     and are not inherited by child processes.
-
-    A handle that recorded its PID (legacy plain-exec path) truncates that
-    PID on ``release`` so the file's content cannot masquerade as a live
-    registered holder once the flock is gone; the exec path itself never
-    releases, which is exactly why its PID content stays meaningful for
-    as long as the exec'd process lives.
     """
 
-    __slots__ = ("_fd", "_released", "_recorded_pid")
+    __slots__ = ("_fd", "_released")
 
     def __init__(self, fd: int) -> None:
         self._fd = fd
         self._released = False
-        self._recorded_pid = False
 
     def __enter__(self) -> "LockHandle":
         return self
@@ -195,26 +188,8 @@ class LockHandle:
         if self._released:
             return
         self._released = True
-        if self._recorded_pid:
-            try:
-                os.ftruncate(self._fd, 0)
-            except OSError:
-                pass
         _unlock_fd(self._fd)
         os.close(self._fd)
-
-    def record_holder_pid(self) -> None:
-        """Record the current process's PID as this lock's holder.
-
-        Call this ONLY from the verified plain-exec launch path (POSIX,
-        not sandboxed, not a waited child) right before the exec call --
-        see the module docstring and ``_write_holder_pid``. Every other
-        path must never call this, so the lock file is left without a
-        PID and ``lock_holder_pid`` correctly reports ``None`` for it.
-        """
-        _write_holder_pid(self._fd)
-        self._recorded_pid = True
-
 
 class ReadLeaseHandle:
     __slots__ = ("_release_callback", "_released")
@@ -1183,54 +1158,6 @@ def try_sequence_lock(store) -> Optional[LockHandle]:
     )
 
 
-def _write_holder_pid(fd: int) -> None:
-    """Record this process's PID in the lock file, reusing an already-open
-    fd (no extra open). Called ONLY by ``LockHandle.record_holder_pid``,
-    itself called ONLY from the verified plain-exec launch path: on that
-    path ``execvpe`` replaces the process image but keeps the PID, so
-    recording it before exec already names the process that will actually
-    be running when a reader checks. Never call this from ``try_lock``
-    itself or from any waited-child/sandboxed/Windows path -- those get a
-    different PID from a spawned subprocess that never touches this file,
-    and recording the wrapper's own PID there would let a user `kill` the
-    wrong process (see the module docstring). Best-effort only — a failure
-    here must never turn a successful lock acquisition into a launch
-    failure (fail-open, mirrors the keychain bridge)."""
-    try:
-        _write_in_place(fd, str(os.getpid()).encode("ascii"))
-    except (LockError, OSError):
-        pass
-
-
-def lock_holder_pid(store, name: str) -> Optional[int]:
-    """Best-effort PID of a session currently using this profile.
-
-    Reads the first live registered holder (see ``lease_holders``). When
-    the profile is only flock-busy with no readable registry entry — a
-    store mutation, or a session recorded through the legacy plain-exec
-    PID write — returns that legacy PID when the content parses, else
-    None. Returns None whenever the profile is not in use at all;
-    callers must fall back to the generic busy message."""
-    if not is_locked(store, name):
-        return None
-    holders = lease_holders(store, name)
-    if holders:
-        return holders[0].pid
-    path = lock_path(store, name)
-    try:
-        fd = _open_registry_path(path)
-        try:
-            raw = _read_all(fd)
-        finally:
-            os.close(fd)
-    except OSError:
-        return None
-    parsed = _parse_holders(raw)
-    if parsed:
-        return parsed[0].pid
-    return None
-
-
 def _flock_probe_locked(store, name: str) -> bool:
     """True iff a live flock holder exists on the lock INODE itself.
 
@@ -1272,16 +1199,6 @@ def is_locked(store, name: str) -> bool:
         return True
     holders = lease_holders(store, name)
     return holders is None or bool(holders)
-
-
-def in_use_names(store, names: Optional[List[str]] = None) -> List[str]:
-    """Profiles whose lock is currently held by a running session.
-
-    Pass ``names`` to skip the store scan when the caller already holds a
-    list (e.g. doctor); without it the lock probe still pays one ``names()``
-    to discover candidates."""
-    candidates = names if names is not None else store.names()
-    return [n for n in candidates if is_locked(store, n)]
 
 
 def forget(store, name: str) -> None:

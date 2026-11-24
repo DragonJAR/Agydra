@@ -74,7 +74,7 @@ def scoped_token_bytes(store, name: str, profile, data_dir: Path) -> Optional[by
     An unusable credential returns ``None`` for a clean caller error.
     """
     try:
-        return account.scoped_agy_token_bytes(store, profile, data_dir)
+        return account.usable_agy_credential(store, profile, data_dir)
     except StoreException:
         return None
 
